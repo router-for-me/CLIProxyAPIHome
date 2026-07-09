@@ -73,6 +73,11 @@ func (r *RouteRegistry) Register(group *gin.RouterGroup) {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool {
+		iWildcard := routePathHasWildcard(keys[i].Path)
+		jWildcard := routePathHasWildcard(keys[j].Path)
+		if iWildcard != jWildcard {
+			return !iWildcard
+		}
 		if keys[i].Path == keys[j].Path {
 			return keys[i].Method < keys[j].Method
 		}
@@ -85,6 +90,15 @@ func (r *RouteRegistry) Register(group *gin.RouterGroup) {
 		}
 		group.Handle(k.Method, k.Path, h)
 	}
+}
+
+func routePathHasWildcard(path string) bool {
+	for _, segment := range strings.Split(path, "/") {
+		if strings.HasPrefix(segment, ":") || strings.HasPrefix(segment, "*") {
+			return true
+		}
+	}
+	return false
 }
 
 type RouteOption func(*RouteRegistry)
@@ -190,6 +204,10 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodGet, "/usage/realtime", handler.GetUsageRealtime)
 	r.Set(http.MethodGet, "/usage/health/providers", handler.GetUsageProviderHealth)
 	r.Set(http.MethodGet, "/usage/health/credentials", handler.GetUsageCredentialHealth)
+	r.Set(http.MethodGet, "/request-events", handler.ListRequestEvents)
+	r.Set(http.MethodGet, "/request-events/export", handler.ExportRequestEvents)
+	r.Set(http.MethodGet, "/request-events/filter-options", handler.GetRequestEventFilterOptions)
+	r.Set(http.MethodGet, "/request-events/:id", handler.GetRequestEvent)
 	r.Set(http.MethodGet, "/request-logs", handler.ListRequestLogs)
 	r.Set(http.MethodGet, "/billing/overview", handler.GetBillingOverview)
 	r.Set(http.MethodGet, "/billing/charges", handler.ListBillingCharges)

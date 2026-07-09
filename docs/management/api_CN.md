@@ -126,6 +126,10 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/usage/realtime` |
 | `GET` | `/usage/health/providers` |
 | `GET` | `/usage/health/credentials` |
+| `GET` | `/request-events` |
+| `GET` | `/request-events/export` |
+| `GET` | `/request-events/filter-options` |
+| `GET` | `/request-events/:id` |
 | `GET` | `/request-logs` |
 | `GET` | `/proxy/proxy-pools` |
 | `POST` | `/proxy/proxy-pools` |
@@ -2115,6 +2119,10 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 | `capabilities.usage_credential_health` | boolean | 是否支持 `GET /usage/health/credentials`。 |
 | `capabilities.usage_realtime` | boolean | 是否支持 `GET /usage/realtime`。 |
 | `capabilities.request_log_index` | boolean | 是否支持 `GET /request-logs`。 |
+| `capabilities.request_events` / `capabilities.requestEvents` | boolean | 是否支持 `GET /request-events`。 |
+| `capabilities.request_event_details` / `capabilities.requestEventDetails` | boolean | 是否支持 `GET /request-events/:id`。 |
+| `capabilities.request_event_export` / `capabilities.requestEventExport` | boolean | 是否支持 `GET /request-events/export`。 |
+| `capabilities.request_event_filters` / `capabilities.requestEventFilters` | boolean | 是否支持 `GET /request-events/filter-options`。 |
 | `capabilities.oauth_usage` | boolean | OAuth/file-backed credential usage 归因是否可靠。 |
 | `capabilities.logs` | boolean | 是否支持应用日志接口。 |
 | `capabilities.request_error_logs` | boolean | 是否支持 request error log file list/download。 |
@@ -2146,12 +2154,16 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `upstream_request_id` | string/null | payload 中可解析到的上游 request ID。 |
+| `event_type` | string/null | 事件类型，来自 payload 字段或由 endpoint 派生。 |
+| `upstream_status_code` | integer/null | 从结构化 usage 列或 payload 字段解析出的上游状态码。 |
 | `source` | string/null | usage payload 的来源。 |
 | `service_tier` | string/null | usage payload 的 service tier。 |
 | `reasoning_effort` | string/null | usage payload 的 reasoning effort。 |
-| `client.client_ip` | string/null | payload 中可关联的调用方 IP。 |
+| `client.client_ip` | string/null | payload 中可关联的调用方 IP；不会被当作 CPA 节点 IP。 |
 | `credential.api_key_preview` | string/null | 仅 provider API key 可用时返回脱敏 preview；不会返回 raw key。 |
 | `billing.balance_before` / `billing.balance_after` | number/null | 关联 `billing_charge` 时的扣款前后余额。 |
+| `runtime.home_ip` / `runtime.home_port` | string/integer/null | 写入 usage 的 Home 节点标识。 |
+| `runtime.cpa_node_id` / `runtime.cpa_ip` / `runtime.cpa_port` / `runtime.cpa_label` | mixed | CPA 归属信息；CPA payload 未上报时，Home 会从可信 RESP/mTLS 运行时身份补齐 CPA node ID/IP。 |
 | `runtime.request_log_available` | boolean | 当前 Home 节点是否能找到可下载的本地 request log 文件。 |
 | `runtime.log_home_ip_required` | boolean | 下载 request log 时是否必须带上 Home IP。 |
 
@@ -2189,10 +2201,12 @@ Query 参数：
 | `limit` | integer | `50` | 最大 `200`。 |
 | `offset` | integer | `0` | page offset。 |
 | `sort` | string | `timestamp_desc` | 支持 `timestamp_desc`、`timestamp_asc`、`tokens_desc`、`tokens_asc`、`cost_desc`、`cost_asc`、`latency_desc`、`latency_asc`、`failed_first`。 |
-| `search` | string | 无 | request ID、provider、model、endpoint、Home IP、username、masked key、credential label 的宽松搜索。 |
+| `search` | string | 无 | request ID、provider、model、endpoint、Home IP、CPA node ID/IP/label、username、masked key、credential label 的宽松搜索。 |
 | `status` | string | 无 | `success` 或 `failed`。 |
 | `status_code` | integer | 无 | HTTP/失败状态码；2xx/3xx 会匹配成功请求，其他值匹配 `fail_status_code`。 |
 | `request_id` | string | 无 | request ID 精确筛选。 |
+| `event_type` | string | 无 | 事件类型筛选，常见值为 `completion`、`response`、`message`、`embedding`、`stream`。 |
+| `cpa_node` | string | 无 | 按结构化 CPA node ID、CPA IP、CPA label、CPA port 做模糊筛选。 |
 | `user` / `user_id` | string / integer | 无 | 用户名或用户 ID。 |
 | `client_key` / `client_key_id` | string / integer | 无 | client access key 的 masked/label/ID 筛选。 |
 | `credential_id` / `auth_index` | string | 无 | 执行凭证筛选。 |
@@ -2245,6 +2259,80 @@ Query 参数：
 响应为 attachment。CSV 使用 `text/csv; charset=utf-8`，JSONL 使用 `application/x-ndjson`。
 
 导出字段是展平后的脱敏摘要，除 records 响应中的核心字段外，还包含 `error_status_code`、`error_message`、`error_body_preview`、`request_log_available` 和 `log_home_ip_required`。
+
+### GET `/request-events`
+
+返回面向管理界面的请求事件列表。该接口是 DB-backed、非破坏性只读接口，数据来源为持久化 usage observability records，不读取也不消费 `/usage-queue`。
+
+Query 参数：
+
+| Query | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `from` / `to` / `timezone` | string | 无 / `UTC` | 与 `/usage/records` 相同。 |
+| `limit` / `offset` | integer | `50` / `0` | 服务端分页，`limit` 最大 `200`。 |
+| `sort` | string | `timestamp_desc` | 支持 `timestamp_desc`、`timestamp_asc`、`latency_desc`、`latency_asc`、`tokens_desc`、`tokens_asc`、`cost_desc`、`cost_asc`、`failed_first`。 |
+| `search` | string | 无 | request ID、provider、model、endpoint、Home IP、username、masked key、credential label 的宽松搜索。 |
+| `request_id` | string | 无 | request ID 精确筛选。 |
+| `event_type` | string | 无 | 事件类型筛选。当前由 payload 中的 `event_type`/`type` 或 endpoint 派生，常见值为 `completion`、`response`、`message`、`embedding`、`stream`。 |
+| `status` / `status_code` | string / integer | 无 | `success`、`failed` 或状态码筛选。 |
+| `provider` / `model` | string | 无 | Provider 精确筛选，model 模糊筛选。 |
+| `home_ip` | string | 无 | Home 节点筛选。 |
+| `cpa_node` | string | 无 | 按结构化 CPA node ID、CPA IP、CPA label、CPA port 做模糊筛选；CPA payload 未上报时，Home 会尽量从可信 RESP/mTLS 运行时身份补齐。 |
+| `credential_id` / `auth_index` | string | 无 | 执行凭证筛选。 |
+| `user` | string | 无 | 用户名或用户 ID 搜索。 |
+| `client_key` | string | 无 | client access key 的 masked/label/ID 搜索。 |
+| `min_latency_ms` / `max_latency_ms` | integer | 无 | 延迟范围。 |
+
+响应包含 `items`、`total`、`limit`、`offset` 和 `sort`。`items[]` 为请求事件对象，关键字段包括：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 稳定事件 ID，格式为 `evt_<usage_id>`。 |
+| `event_type` | string | 事件类型，优先来自 payload，缺失时由 endpoint 派生。 |
+| `status` / `failed` / `status_code` / `upstream_status_code` | mixed | 请求成功/失败和 HTTP 状态。成功请求默认 `status_code=200`。 |
+| `provider` / `model` / `original_model` / `model_alias` / `endpoint` | mixed | 模型和路由信息。 |
+| `runtime.home_ip` / `runtime.home_port` / `runtime.home_id` | mixed | 写入 usage 的 Home 节点；有端口时 `home_id` 为 `home_ip:home_port`。 |
+| `runtime.cpa_node_id` / `runtime.cpa_ip` / `runtime.cpa_port` / `runtime.cpa_label` | mixed | CPA 归属信息；CPA payload 未上报时，Home 会从可信 RESP/mTLS 运行时身份补齐 CPA node ID/IP。 |
+| `credential` | object | 执行凭证类型、ID、auth index、provider、label、source 和脱敏 `api_key_preview`。 |
+| `client` | object | 用户、client key ID/label、脱敏 `client_key_masked` 和 client IP。 |
+| `error` | object | 脱敏错误状态、上游状态、原因、消息和 body preview。 |
+| `tokens` / `performance` / `billing` | object | token、latency/TTFT/TPS 和 billing 关联信息。 |
+| `related.request_log` | object | request log 关联信息；只有当前 Home 能找到本地日志文件时 `available=true` 并返回 download URL。 |
+
+### GET `/request-events/filter-options`
+
+返回请求事件筛选 UI 所需的紧凑选项列表。该接口接受与 `GET /request-events` 相同的筛选参数，忽略分页参数，并从筛选后的结果集中返回去重值。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `event_types` | array | 去重后的事件类型。 |
+| `providers` | array | 去重后的 provider。 |
+| `models` | array | 去重后的 model。 |
+| `home_ips` | array | 去重后的 Home IP。 |
+| `cpa_nodes` | array | 去重后的 CPA label、node ID 或 IP。 |
+| `status_codes` | array | 去重后的 HTTP/上游状态码，以字符串返回，便于前端 select 控件使用。 |
+
+### GET `/request-events/:id`
+
+返回单条请求事件详情。`id` 接受 `evt_<usage_id>` 或原始 usage ID。
+
+Query 参数：
+
+| Query | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `include_payload` | boolean | `false` | 返回脱敏 payload summary；不会返回原始 payload。 |
+| `include_logs` | boolean | `false` | 找到本地 request log 时返回最多 20 行脱敏日志片段。 |
+| `include_related` | boolean | `false` | 兼容参数；事件对象始终包含 `related`。 |
+
+响应包含 `event`、`payload_summary` 和 `log_excerpt`。`event` 与列表项同形；`payload_summary.body_preview` 当前固定为 `null`，避免暴露 request body。
+
+### GET `/request-events/export`
+
+按当前筛选条件导出请求事件。支持 `format=csv` 和 `format=jsonl`，响应为 attachment，文件名分别为 `request-events.csv` 或 `request-events.jsonl`。
+
+该接口接受与 `GET /request-events` 相同的筛选和排序参数，但忽略分页参数，最多导出 `10000` 条。导出字段是列表事件对象的展平脱敏摘要，包含 Home/CPA、credential、client、error、tokens、performance、billing 和 request log 关联字段。
 
 ### GET `/usage/realtime`
 

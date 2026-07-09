@@ -83,6 +83,51 @@ func TestMigrateAuthNextRetryAfterBackfillsJSON(t *testing.T) {
 	}
 }
 
+func TestMigrateUsageDerivedColumnsBackfillsStructuredMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	payload := `{"timestamp":"2026-07-09T01:02:03Z","event_type":"stream","request_id":"req-derived","upstream_request_id":"upstream-derived","upstream_status_code":202,"home_port":8328,"cpa_node_id":"node-derived","cpa_ip":"10.0.0.5","cpa_port":8317,"provider":"openai","model":"gpt-4.1-mini","endpoint":"/v1/chat/completions"}`
+	record := UsageRecord{
+		Timestamp:   time.Date(2026, time.July, 9, 1, 2, 3, 0, time.UTC),
+		RequestID:   "req-derived",
+		HomeIP:      "192.0.2.10",
+		PayloadJSON: JSONB(payload),
+		CreatedAt:   time.Now().UTC(),
+	}
+	if errCreate := db.Create(&record).Error; errCreate != nil {
+		t.Fatalf("Create(usage) error = %v", errCreate)
+	}
+
+	if errMigrate := migrateUsageDerivedColumns(db); errMigrate != nil {
+		t.Fatalf("migrateUsageDerivedColumns() error = %v", errMigrate)
+	}
+
+	var updated UsageRecord
+	if errFirst := db.First(&updated, "id = ?", record.ID).Error; errFirst != nil {
+		t.Fatalf("First(usage) error = %v", errFirst)
+	}
+	if updated.EventType != "stream" {
+		t.Fatalf("event_type = %q, want stream", updated.EventType)
+	}
+	if updated.UpstreamRequestID != "upstream-derived" || updated.UpstreamStatusCode != 202 {
+		t.Fatalf("upstream = %q/%d, want upstream-derived/202", updated.UpstreamRequestID, updated.UpstreamStatusCode)
+	}
+	if updated.HomePort != 8328 {
+		t.Fatalf("home_port = %d, want 8328", updated.HomePort)
+	}
+	if updated.CPANodeID != "node-derived" || updated.CPAIP != "10.0.0.5" || updated.CPAPort != 8317 || updated.CPALabel != "node-derived" {
+		t.Fatalf("CPA ownership = node:%q ip:%q port:%d label:%q, want node-derived 10.0.0.5 8317 node-derived", updated.CPANodeID, updated.CPAIP, updated.CPAPort, updated.CPALabel)
+	}
+}
+
 func TestUsageObservabilityOverviewTopCredentialUsesModelStateNextRetry(t *testing.T) {
 	t.Parallel()
 

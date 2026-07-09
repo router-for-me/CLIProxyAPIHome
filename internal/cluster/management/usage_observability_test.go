@@ -75,7 +75,7 @@ func TestGetCapabilitiesReturnsUsageObservabilityFlags(t *testing.T) {
 	if !ok {
 		t.Fatalf("capabilities = %T, want object", payload["capabilities"])
 	}
-	for _, key := range []string{"usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "request_log_index", "oauth_usage", "logs", "request_error_logs"} {
+	for _, key := range []string{"usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs"} {
 		if capabilities[key] != true {
 			t.Fatalf("capabilities[%s] = %v, want true", key, capabilities[key])
 		}
@@ -142,6 +142,195 @@ func TestListUsageRecordsReturnsJoinedItems(t *testing.T) {
 	}
 	if _, ok := payload["sortable_fields"].([]any); !ok {
 		t.Fatalf("sortable_fields = %T, want array", payload["sortable_fields"])
+	}
+}
+
+func TestListRequestEventsReturnsFrontendContract(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	seedUsageObservabilityManagementRecord(t, handler)
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/request-events", handler.ListRequestEvents)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/request-events?limit=10&event_type=completion&cpa_node=cpa-a", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusOK)
+	}
+	if strings.Contains(resp.Body.String(), "client-key-secret") {
+		t.Fatalf("response leaked raw client key: %s", resp.Body.String())
+	}
+
+	var payload map[string]any
+	if errDecode := json.Unmarshal(resp.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if payload["total"] != float64(1) || payload["sort"] != "timestamp_desc" {
+		t.Fatalf("page metadata = %#v, want one timestamp-desc event", payload)
+	}
+	items, ok := payload["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("items = %#v, want one item", payload["items"])
+	}
+	item, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("item = %T, want object", items[0])
+	}
+	if item["id"] != "evt_1" || item["event_type"] != "completion" || item["status"] != "success" || item["upstream_status_code"] != float64(201) {
+		t.Fatalf("item identity = %#v, want request event identity", item)
+	}
+	runtime, ok := item["runtime"].(map[string]any)
+	if !ok {
+		t.Fatalf("runtime = %T, want object", item["runtime"])
+	}
+	if runtime["home_ip"] != "192.0.2.10" || runtime["cpa_node_id"] != "cpa-a" || runtime["cpa_label"] != "cpa-a:8317" {
+		t.Fatalf("runtime = %#v, want Home and CPA ownership", runtime)
+	}
+	if runtime["home_port"] != float64(8327) || runtime["home_id"] != "192.0.2.10:8327" {
+		t.Fatalf("runtime Home identity = %#v, want 192.0.2.10:8327", runtime)
+	}
+	client, ok := item["client"].(map[string]any)
+	if !ok {
+		t.Fatalf("client = %T, want object", item["client"])
+	}
+	if client["client_key_masked"] != "clie...1234" {
+		t.Fatalf("client_key_masked = %v, want clie...1234", client["client_key_masked"])
+	}
+	if _, ok := item["related"].(map[string]any); !ok {
+		t.Fatalf("related = %T, want object", item["related"])
+	}
+}
+
+func TestGetRequestEventFilterOptionsReturnsDistinctOptions(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	seedUsageObservabilityManagementRecord(t, handler)
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/request-events/filter-options", handler.GetRequestEventFilterOptions)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/request-events/filter-options?event_type=completion&cpa_node=cpa-a&limit=99999&offset=20", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusOK)
+	}
+	var payload map[string][]string
+	if errDecode := json.Unmarshal(resp.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	for key, want := range map[string]string{
+		"event_types":  "completion",
+		"providers":    "openai",
+		"models":       "gpt-4.1-mini",
+		"home_ips":     "192.0.2.10",
+		"cpa_nodes":    "cpa-a:8317",
+		"status_codes": "201",
+	} {
+		if !stringSliceContains(payload[key], want) {
+			t.Fatalf("%s = %#v, want %q", key, payload[key], want)
+		}
+	}
+}
+
+func TestGetRequestEventReturnsDetailWithRedactedLogExcerpt(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	seedUsageObservabilityManagementRecord(t, handler)
+
+	if errMkdir := os.MkdirAll(homeLogDirectory, 0o755); errMkdir != nil {
+		t.Fatalf("MkdirAll(logs) error = %v", errMkdir)
+	}
+	logPath := filepath.Join(homeLogDirectory, "20260610010203-req-obs-1.log")
+	logBody := "request line\nAuthorization: Bearer secret-token\nresponse line\n"
+	if errWrite := os.WriteFile(logPath, []byte(logBody), 0o644); errWrite != nil {
+		t.Fatalf("WriteFile(log) error = %v", errWrite)
+	}
+	defer func() {
+		if errRemove := os.Remove(logPath); errRemove != nil && !os.IsNotExist(errRemove) {
+			t.Errorf("remove log: %v", errRemove)
+		}
+	}()
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/request-events/:id", handler.GetRequestEvent)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/request-events/evt_1?include_payload=true&include_logs=true&include_related=true", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusOK)
+	}
+	if strings.Contains(resp.Body.String(), "secret-token") || strings.Contains(resp.Body.String(), "client-key-secret") {
+		t.Fatalf("detail response leaked secret: %s", resp.Body.String())
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(resp.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	event, ok := payload["event"].(map[string]any)
+	if !ok {
+		t.Fatalf("event = %T, want object", payload["event"])
+	}
+	if event["id"] != "evt_1" || event["request_id"] != "req-obs-1" {
+		t.Fatalf("event identity = %#v, want evt_1 req-obs-1", event)
+	}
+	payloadSummary, ok := payload["payload_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload_summary = %T, want object", payload["payload_summary"])
+	}
+	if payloadSummary["body_preview"] != nil {
+		t.Fatalf("payload_summary.body_preview = %v, want nil", payloadSummary["body_preview"])
+	}
+	excerpt, ok := payload["log_excerpt"].([]any)
+	if !ok || len(excerpt) == 0 {
+		t.Fatalf("log_excerpt = %#v, want non-empty array", payload["log_excerpt"])
+	}
+}
+
+func TestExportRequestEventsReturnsJSONLWithoutRawKey(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	seedUsageObservabilityManagementRecord(t, handler)
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/request-events/export", handler.ExportRequestEvents)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/request-events/export?format=jsonl&event_type=completion&cpa_node=cpa-a&limit=99999&offset=10", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusOK)
+	}
+	if disposition := resp.Header().Get("Content-Disposition"); !strings.Contains(disposition, `request-events.jsonl`) {
+		t.Fatalf("Content-Disposition = %q, want request-events.jsonl", disposition)
+	}
+	body := resp.Body.String()
+	if strings.Contains(body, "client-key-secret") {
+		t.Fatalf("export leaked raw client key: %s", body)
+	}
+	var row map[string]any
+	line := strings.TrimSpace(body)
+	if errDecode := json.Unmarshal([]byte(line), &row); errDecode != nil {
+		t.Fatalf("decode jsonl row: %v body=%s", errDecode, body)
+	}
+	for _, key := range []string{"id", "event_type", "home_ip", "cpa_node_id", "client_key_masked", "usage_record_id", "request_log_available"} {
+		if _, ok := row[key]; !ok {
+			t.Fatalf("export row missing %s: %#v", key, row)
+		}
+	}
+	if row["id"] != "evt_1" || row["event_type"] != "completion" || row["cpa_node_id"] != "cpa-a" {
+		t.Fatalf("export row identity = %#v, want request event fields", row)
 	}
 }
 
@@ -1005,8 +1194,8 @@ func seedUsageObservabilityManagementRecord(t *testing.T, handler *Handler) {
 	if _, errCreatePrice := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{Provider: "openai", Model: "gpt-4.1-mini", RequestPrice: 2, Enabled: true}); errCreatePrice != nil {
 		t.Fatalf("CreateBillingModelPrice() error = %v", errCreatePrice)
 	}
-	payload := `{"timestamp":"2026-06-10T01:02:03Z","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key-secret-1234","request_id":"req-obs-1","endpoint":"/v1/chat/completions","executor_type":"CodexWebsocketsExecutor","auth_index":"auth-observability","auth_type":"oauth","latency_ms":1460,"ttft_ms":333,"tokens":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}`
-	if _, errUsage := handler.repo.AppendUsage(ctx, payload, "192.0.2.10"); errUsage != nil {
+	payload := `{"timestamp":"2026-06-10T01:02:03Z","event_type":"completion","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key-secret-1234","request_id":"req-obs-1","upstream_status_code":201,"client_ip":"203.0.113.8","cpa_node_id":"cpa-a","cpa_ip":"10.0.0.5","cpa_port":8317,"cpa_label":"cpa-a:8317","method":"POST","stream":true,"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function"}],"endpoint":"/v1/chat/completions","executor_type":"CodexWebsocketsExecutor","auth_index":"auth-observability","auth_type":"oauth","latency_ms":1460,"ttft_ms":333,"tokens":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}`
+	if _, errUsage := handler.repo.AppendUsageWithRuntime(ctx, payload, cluster.UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327}); errUsage != nil {
 		t.Fatalf("AppendUsage() error = %v", errUsage)
 	}
 }

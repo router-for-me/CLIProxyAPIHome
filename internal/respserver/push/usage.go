@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -29,6 +30,11 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	if payload == "" || !gjson.Valid(payload) {
 		return dispatch.Err("invalid usage json")
 	}
+	enrichedPayload, errEnrich := usagePayloadWithCPAIdentity(payload, env)
+	if errEnrich != nil {
+		return dispatch.Err("invalid usage json")
+	}
+	payload = enrichedPayload
 
 	// Always update scheduler state before queuing persistence so cooldowns are applied even if log persistence fails.
 	if env.Runtime != nil {
@@ -52,6 +58,13 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	// This server doesn't maintain a real list, so always return 1 as a stable
 	// integer reply and avoid client retries.
 	return dispatch.Integer(1)
+}
+
+func usagePayloadWithCPAIdentity(payload string, env dispatch.Env) (string, error) {
+	return cluster.UsagePayloadWithRuntimeMetadata(payload, cluster.UsageRuntimeMetadata{
+		CPANodeID: strings.TrimSpace(env.NodeID),
+		CPAIP:     strings.TrimSpace(env.ClientIP),
+	})
 }
 
 // appendUsageLog appends an usage log.

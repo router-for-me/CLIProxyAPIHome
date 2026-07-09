@@ -245,6 +245,9 @@ func run() int {
 		log.Errorf("failed to resolve database node port: listen port must be greater than 0")
 		return 1
 	}
+	if clusterAdapter != nil {
+		clusterAdapter.SetHomePort(clusterAdvertisedPort)
+	}
 
 	if clusterRepo != nil {
 		coordinator = cluster.NewCoordinator(clusterRepo, cluster.NodeIdentity{

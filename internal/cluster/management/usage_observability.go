@@ -36,6 +36,20 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			"usage_credential_health": true,
 			"usage_realtime":          true,
 			"request_log_index":       true,
+			"request_events":          true,
+			"request_event_details":   true,
+			"request_event_export":    true,
+			"request_event_filters":   true,
+			"request_events_details":  true,
+			"request_events_export":   true,
+			"request_events_filters":  true,
+			"requestEvents":           true,
+			"requestEventDetails":     true,
+			"requestEventExport":      true,
+			"requestEventFilters":     true,
+			"requestEventsDetails":    true,
+			"requestEventsExport":     true,
+			"requestEventsFilters":    true,
 			"oauth_usage":             true,
 			"logs":                    true,
 			"request_error_logs":      true,
@@ -409,6 +423,8 @@ type usageRecordHTTPQuery struct {
 	CredentialID   string
 	AuthIndex      string
 	ExecutorType   string
+	EventType      string
+	CPANode        string
 	MinLatencyMS   *int64
 	MaxLatencyMS   *int64
 	MinAmount      *float64
@@ -474,6 +490,14 @@ type usageHealthHTTPQuery struct {
 }
 
 func parseUsageRecordHTTPQuery(c *gin.Context) (usageRecordHTTPQuery, *usageHTTPError) {
+	return parseUsageRecordHTTPQueryWithPagination(c, true)
+}
+
+func parseUsageRecordHTTPQueryWithoutPagination(c *gin.Context) (usageRecordHTTPQuery, *usageHTTPError) {
+	return parseUsageRecordHTTPQueryWithPagination(c, false)
+}
+
+func parseUsageRecordHTTPQueryWithPagination(c *gin.Context, includePagination bool) (usageRecordHTTPQuery, *usageHTTPError) {
 	query := usageRecordHTTPQuery{}
 	if c == nil {
 		return query, newUsageHTTPError("invalid_request", "request is unavailable")
@@ -491,13 +515,19 @@ func parseUsageRecordHTTPQuery(c *gin.Context) (usageRecordHTTPQuery, *usageHTTP
 	query.To = to
 	query.Timezone = timezone
 
-	limit, errLimit := parseUsageLimit(c.Query("limit"), cluster.UsageObservabilityDefaultRecordLimit, cluster.UsageObservabilityMaxRecordLimit)
-	if errLimit != nil {
-		return query, errLimit
-	}
-	offset, errOffset := parseUsageOffset(c.Query("offset"))
-	if errOffset != nil {
-		return query, errOffset
+	limit := cluster.UsageObservabilityDefaultRecordLimit
+	offset := 0
+	if includePagination {
+		parsedLimit, errLimit := parseUsageLimit(c.Query("limit"), cluster.UsageObservabilityDefaultRecordLimit, cluster.UsageObservabilityMaxRecordLimit)
+		if errLimit != nil {
+			return query, errLimit
+		}
+		parsedOffset, errOffset := parseUsageOffset(c.Query("offset"))
+		if errOffset != nil {
+			return query, errOffset
+		}
+		limit = parsedLimit
+		offset = parsedOffset
 	}
 	sortValue, errSort := parseUsageSort(c.Query("sort"))
 	if errSort != nil {
@@ -557,6 +587,8 @@ func parseUsageRecordHTTPQuery(c *gin.Context) (usageRecordHTTPQuery, *usageHTTP
 	query.CredentialID = strings.TrimSpace(c.Query("credential_id"))
 	query.AuthIndex = strings.TrimSpace(c.Query("auth_index"))
 	query.ExecutorType = strings.TrimSpace(c.Query("executor_type"))
+	query.EventType = strings.TrimSpace(c.Query("event_type"))
+	query.CPANode = strings.TrimSpace(c.Query("cpa_node"))
 	query.MinLatencyMS = minLatency
 	query.MaxLatencyMS = maxLatency
 	query.MinAmount = minAmount
@@ -1041,6 +1073,8 @@ func usageObservabilityRecordQueryFromHTTP(query usageRecordHTTPQuery) cluster.U
 		CredentialID:   query.CredentialID,
 		AuthIndex:      query.AuthIndex,
 		ExecutorType:   query.ExecutorType,
+		EventType:      query.EventType,
+		CPANode:        query.CPANode,
 		MinLatencyMS:   query.MinLatencyMS,
 		MaxLatencyMS:   query.MaxLatencyMS,
 		MinAmount:      query.MinAmount,
@@ -1470,22 +1504,24 @@ func usageRecordSummaryResponse(record *cluster.UsageObservabilityRecord) gin.H 
 		}
 	}
 	return gin.H{
-		"id":                  record.ID,
-		"usage_id":            record.UsageID,
-		"timestamp":           record.Timestamp.UTC().Format(time.RFC3339Nano),
-		"request_id":          record.RequestID,
-		"upstream_request_id": emptyStringAsNil(record.UpstreamRequestID),
-		"status":              record.Status,
-		"failed":              record.Failed,
-		"status_code":         record.StatusCode,
-		"source":              emptyStringAsNil(record.Source),
-		"provider":            record.Provider,
-		"model":               record.Model,
-		"original_model":      record.OriginalModel,
-		"endpoint":            record.Endpoint,
-		"service_tier":        emptyStringAsNil(record.ServiceTier),
-		"reasoning_effort":    emptyStringAsNil(record.ReasoningEffort),
-		"executor_type":       record.ExecutorType,
+		"id":                   record.ID,
+		"usage_id":             record.UsageID,
+		"timestamp":            record.Timestamp.UTC().Format(time.RFC3339Nano),
+		"request_id":           record.RequestID,
+		"upstream_request_id":  emptyStringAsNil(record.UpstreamRequestID),
+		"event_type":           emptyStringAsNil(record.EventType),
+		"status":               record.Status,
+		"failed":               record.Failed,
+		"status_code":          record.StatusCode,
+		"upstream_status_code": optionalPositiveIntValue(record.UpstreamStatusCode),
+		"source":               emptyStringAsNil(record.Source),
+		"provider":             record.Provider,
+		"model":                record.Model,
+		"original_model":       record.OriginalModel,
+		"endpoint":             record.Endpoint,
+		"service_tier":         emptyStringAsNil(record.ServiceTier),
+		"reasoning_effort":     emptyStringAsNil(record.ReasoningEffort),
+		"executor_type":        record.ExecutorType,
 		"tokens": gin.H{
 			"input_tokens":          record.Tokens.InputTokens,
 			"output_tokens":         record.Tokens.OutputTokens,
@@ -1529,6 +1565,11 @@ func usageRecordSummaryResponse(record *cluster.UsageObservabilityRecord) gin.H 
 		},
 		"runtime": gin.H{
 			"home_ip":               record.Runtime.HomeIP,
+			"home_port":             optionalPositiveIntValue(record.Runtime.HomePort),
+			"cpa_node_id":           emptyStringAsNil(record.Runtime.CPANodeID),
+			"cpa_ip":                emptyStringAsNil(record.Runtime.CPAIP),
+			"cpa_port":              optionalPositiveIntValue(record.Runtime.CPAPort),
+			"cpa_label":             emptyStringAsNil(record.Runtime.CPALabel),
 			"request_log_available": record.Runtime.RequestLogAvailable,
 			"log_home_ip_required":  record.Runtime.LogHomeIPRequired,
 		},
@@ -1609,9 +1650,11 @@ func usageExportRecordMap(record *cluster.UsageObservabilityRecord) map[string]a
 		"timestamp":                  record.Timestamp.UTC().Format(time.RFC3339Nano),
 		"request_id":                 record.RequestID,
 		"upstream_request_id":        emptyStringAsNil(record.UpstreamRequestID),
+		"event_type":                 emptyStringAsNil(record.EventType),
 		"status":                     record.Status,
 		"failed":                     record.Failed,
 		"status_code":                record.StatusCode,
+		"upstream_status_code":       optionalPositiveIntValue(record.UpstreamStatusCode),
 		"source":                     emptyStringAsNil(record.Source),
 		"provider":                   record.Provider,
 		"model":                      record.Model,
@@ -1652,6 +1695,11 @@ func usageExportRecordMap(record *cluster.UsageObservabilityRecord) map[string]a
 		"balance_before":             optionalFloat64Value(record.Billing.BalanceBefore),
 		"balance_after":              optionalFloat64Value(record.Billing.BalanceAfter),
 		"home_ip":                    record.Runtime.HomeIP,
+		"home_port":                  optionalPositiveIntValue(record.Runtime.HomePort),
+		"cpa_node_id":                emptyStringAsNil(record.Runtime.CPANodeID),
+		"cpa_ip":                     emptyStringAsNil(record.Runtime.CPAIP),
+		"cpa_port":                   optionalPositiveIntValue(record.Runtime.CPAPort),
+		"cpa_label":                  emptyStringAsNil(record.Runtime.CPALabel),
 		"request_log_available":      record.Runtime.RequestLogAvailable,
 		"log_home_ip_required":       record.Runtime.LogHomeIPRequired,
 		"error_status_code":          errorStatusCode,
@@ -1662,13 +1710,13 @@ func usageExportRecordMap(record *cluster.UsageObservabilityRecord) map[string]a
 
 func usageExportCSVHeader() []string {
 	return []string{
-		"id", "usage_id", "timestamp", "request_id", "upstream_request_id", "status", "failed", "status_code",
+		"id", "usage_id", "timestamp", "request_id", "upstream_request_id", "event_type", "status", "failed", "status_code", "upstream_status_code",
 		"source", "provider", "model", "original_model", "endpoint", "service_tier", "reasoning_effort", "executor_type",
 		"input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
 		"latency_ms", "ttft_ms", "tps", "api_key_id", "api_key_label", "api_key_masked", "user_id", "username", "client_ip",
 		"credential_id", "credential_type", "auth_index", "credential_provider", "credential_label", "credential_source", "credential_status", "credential_api_key_preview",
 		"charge_id", "amount", "currency", "billing_basis", "matched_price_rule", "balance_before", "balance_after",
-		"home_ip", "request_log_available", "log_home_ip_required", "error_status_code", "error_message", "error_body_preview",
+		"home_ip", "home_port", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label", "request_log_available", "log_home_ip_required", "error_status_code", "error_message", "error_body_preview",
 	}
 }
 
@@ -1707,6 +1755,13 @@ func optionalIntValue(value *int) any {
 		return nil
 	}
 	return *value
+}
+
+func optionalPositiveIntValue(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
 }
 
 func optionalStringValue(value *string) any {

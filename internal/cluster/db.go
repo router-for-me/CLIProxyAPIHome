@@ -124,6 +124,9 @@ func AutoMigrate(db *gorm.DB) error {
 	if errMigrate := migrateUsageObservabilityIndexes(db); errMigrate != nil {
 		return errMigrate
 	}
+	if errMigrate := migrateUsageDerivedColumns(db); errMigrate != nil {
+		return errMigrate
+	}
 	return migrateLegacyAPIKeys(db)
 }
 
@@ -134,6 +137,9 @@ func migrateUsageObservabilityIndexes(db *gorm.DB) error {
 	statements := []string{
 		`CREATE INDEX IF NOT EXISTS idx_usage_provider_lower_time ON "usage" (LOWER("provider"), "timestamp" DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_auth_type_normalized_time ON "usage" (LOWER(REPLACE("auth_type", '-', '_')), "timestamp" DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_event_type_time ON "usage" ("event_type", "timestamp" DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_cpa_node_time ON "usage" ("cpa_node_id", "timestamp" DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_home_port_time ON "usage" ("home_ip", "home_port", "timestamp" DESC)`,
 	}
 	for _, statement := range statements {
 		if errExec := db.Exec(statement).Error; errExec != nil {
@@ -141,6 +147,171 @@ func migrateUsageObservabilityIndexes(db *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+func migrateUsageDerivedColumns(db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	var records []UsageRecord
+	where, args := usageDerivedColumnBackfillWhere()
+	return db.
+		Select("id", "payload", "home_ip", "home_port", "event_type", "upstream_request_id", "upstream_status_code", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label").
+		Where(where, args...).
+		FindInBatches(&records, 500, func(tx *gorm.DB, _ int) error {
+			for _, record := range records {
+				derived, errRecord := UsageRecordFromPayloadWithRuntime(string(record.PayloadJSON), UsageRuntimeMetadata{
+					HomeIP:   record.HomeIP,
+					HomePort: record.HomePort,
+				})
+				if errRecord != nil {
+					continue
+				}
+				updates := map[string]any{}
+				if strings.TrimSpace(record.EventType) == "" && strings.TrimSpace(derived.EventType) != "" {
+					updates["event_type"] = derived.EventType
+				}
+				if strings.TrimSpace(record.UpstreamRequestID) == "" && strings.TrimSpace(derived.UpstreamRequestID) != "" {
+					updates["upstream_request_id"] = derived.UpstreamRequestID
+				}
+				if record.UpstreamStatusCode == 0 && derived.UpstreamStatusCode > 0 {
+					updates["upstream_status_code"] = derived.UpstreamStatusCode
+				}
+				if record.HomePort == 0 && derived.HomePort > 0 {
+					updates["home_port"] = derived.HomePort
+				}
+				if strings.TrimSpace(record.CPANodeID) == "" && strings.TrimSpace(derived.CPANodeID) != "" {
+					updates["cpa_node_id"] = derived.CPANodeID
+				}
+				if strings.TrimSpace(record.CPAIP) == "" && strings.TrimSpace(derived.CPAIP) != "" {
+					updates["cpa_ip"] = derived.CPAIP
+				}
+				if record.CPAPort == 0 && derived.CPAPort > 0 {
+					updates["cpa_port"] = derived.CPAPort
+				}
+				if strings.TrimSpace(record.CPALabel) == "" && strings.TrimSpace(derived.CPALabel) != "" {
+					updates["cpa_label"] = derived.CPALabel
+				}
+				if len(updates) == 0 {
+					continue
+				}
+				if errUpdate := tx.Model(&UsageRecord{}).Where("id = ?", record.ID).Updates(updates).Error; errUpdate != nil {
+					return errUpdate
+				}
+			}
+			return nil
+		}).Error
+}
+
+func usageDerivedColumnBackfillWhere() (string, []any) {
+	upstreamRequestID := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"upstream_request_id"`),
+		usagePayloadTextContainsAll(`"upstream"`, `"request_id"`),
+		usagePayloadTextContainsAll(`"response"`, `"request_id"`),
+		usagePayloadTextContainsAll(`"response"`, `"id"`),
+	)
+	upstreamStatusCode := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"upstream_status_code"`),
+		usagePayloadTextContainsAll(`"upstream"`, `"status_code"`),
+		usagePayloadTextContainsAll(`"response"`, `"status_code"`),
+	)
+	homePort := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"home_port"`),
+		usagePayloadTextContainsAll(`"home"`, `"port"`),
+	)
+	cpaNodeID := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"cpa_node_id"`, `"node_id"`),
+		usagePayloadTextContainsAll(`"cpa"`, `"node_id"`),
+	)
+	cpaIP := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"cpa_ip"`),
+		usagePayloadTextContainsAll(`"cpa"`, `"ip"`),
+	)
+	cpaPort := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"cpa_port"`),
+		usagePayloadTextContainsAll(`"cpa"`, `"port"`),
+	)
+	cpaLabel := usagePayloadTextAnyCondition(
+		usagePayloadTextContainsAny(`"cpa_label"`, `"cpa_node_id"`, `"node_id"`, `"cpa_ip"`),
+		usagePayloadTextContainsAll(`"cpa"`, `"label"`),
+		usagePayloadTextContainsAll(`"cpa"`, `"node_id"`),
+		usagePayloadTextContainsAll(`"cpa"`, `"ip"`),
+	)
+
+	clauses := []string{
+		`event_type = '' OR event_type IS NULL`,
+		`((upstream_request_id = '' OR upstream_request_id IS NULL) AND ` + upstreamRequestID.clause + `)`,
+		`(upstream_status_code = 0 AND ` + upstreamStatusCode.clause + `)`,
+		`(home_port = 0 AND ` + homePort.clause + `)`,
+		`((cpa_node_id = '' OR cpa_node_id IS NULL) AND ` + cpaNodeID.clause + `)`,
+		`((cpa_ip = '' OR cpa_ip IS NULL) AND ` + cpaIP.clause + `)`,
+		`(cpa_port = 0 AND ` + cpaPort.clause + `)`,
+		`((cpa_label = '' OR cpa_label IS NULL) AND ` + cpaLabel.clause + `)`,
+	}
+	args := make([]any, 0, upstreamRequestID.argCount()+upstreamStatusCode.argCount()+homePort.argCount()+cpaNodeID.argCount()+cpaIP.argCount()+cpaPort.argCount()+cpaLabel.argCount())
+	for _, condition := range []usagePayloadTextCondition{upstreamRequestID, upstreamStatusCode, homePort, cpaNodeID, cpaIP, cpaPort, cpaLabel} {
+		args = append(args, condition.args...)
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
+type usagePayloadTextCondition struct {
+	clause string
+	args   []any
+}
+
+func (c usagePayloadTextCondition) argCount() int {
+	return len(c.args)
+}
+
+func usagePayloadTextContainsAny(markers ...string) usagePayloadTextCondition {
+	conditions := make([]string, 0, len(markers))
+	args := make([]any, 0, len(markers))
+	for _, marker := range markers {
+		marker = strings.TrimSpace(marker)
+		if marker == "" {
+			continue
+		}
+		conditions = append(conditions, `CAST("payload" AS TEXT) LIKE ?`)
+		args = append(args, "%"+marker+"%")
+	}
+	if len(conditions) == 0 {
+		return usagePayloadTextCondition{clause: "1 = 0"}
+	}
+	return usagePayloadTextCondition{clause: "(" + strings.Join(conditions, " OR ") + ")", args: args}
+}
+
+func usagePayloadTextContainsAll(markers ...string) usagePayloadTextCondition {
+	conditions := make([]string, 0, len(markers))
+	args := make([]any, 0, len(markers))
+	for _, marker := range markers {
+		marker = strings.TrimSpace(marker)
+		if marker == "" {
+			continue
+		}
+		conditions = append(conditions, `CAST("payload" AS TEXT) LIKE ?`)
+		args = append(args, "%"+marker+"%")
+	}
+	if len(conditions) == 0 {
+		return usagePayloadTextCondition{clause: "1 = 0"}
+	}
+	return usagePayloadTextCondition{clause: "(" + strings.Join(conditions, " AND ") + ")", args: args}
+}
+
+func usagePayloadTextAnyCondition(conditions ...usagePayloadTextCondition) usagePayloadTextCondition {
+	clauses := make([]string, 0, len(conditions))
+	args := []any{}
+	for _, condition := range conditions {
+		if strings.TrimSpace(condition.clause) == "" {
+			continue
+		}
+		clauses = append(clauses, condition.clause)
+		args = append(args, condition.args...)
+	}
+	if len(clauses) == 0 {
+		return usagePayloadTextCondition{clause: "1 = 0"}
+	}
+	return usagePayloadTextCondition{clause: "(" + strings.Join(clauses, " OR ") + ")", args: args}
 }
 
 func migrateAuthNextRetryAfter(db *gorm.DB) error {

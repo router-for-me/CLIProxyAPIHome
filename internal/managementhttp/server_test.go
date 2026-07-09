@@ -128,10 +128,56 @@ func TestClusterManagementUsageObservabilityRoutesRegistered(t *testing.T) {
 		{Method: http.MethodGet, Path: "/usage/realtime"},
 		{Method: http.MethodGet, Path: "/usage/health/providers"},
 		{Method: http.MethodGet, Path: "/usage/health/credentials"},
+		{Method: http.MethodGet, Path: "/request-events"},
+		{Method: http.MethodGet, Path: "/request-events/export"},
+		{Method: http.MethodGet, Path: "/request-events/filter-options"},
+		{Method: http.MethodGet, Path: "/request-events/:id"},
 		{Method: http.MethodGet, Path: "/request-logs"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
+		}
+	}
+}
+
+func TestRouteRegistryRegistersStaticRoutesBeforeWildcards(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	group := engine.Group("")
+	reg := newRouteRegistry()
+	reg.Set(http.MethodGet, "/request-events/:id", func(c *gin.Context) {
+		c.String(http.StatusOK, "id:"+c.Param("id"))
+	})
+	reg.Set(http.MethodGet, "/request-events/export", func(c *gin.Context) {
+		c.String(http.StatusOK, "export")
+	})
+	reg.Set(http.MethodGet, "/request-events/filter-options", func(c *gin.Context) {
+		c.String(http.StatusOK, "filter-options")
+	})
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("Register() panic = %v", recovered)
+		}
+	}()
+	reg.Register(group)
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{path: "/request-events/export", want: "export"},
+		{path: "/request-events/filter-options", want: "filter-options"},
+		{path: "/request-events/evt_1", want: "id:evt_1"},
+	} {
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", tc.path, resp.Code, http.StatusOK)
+		}
+		if got := resp.Body.String(); got != tc.want {
+			t.Fatalf("%s body = %q, want %q", tc.path, got, tc.want)
 		}
 	}
 }

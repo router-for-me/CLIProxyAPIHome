@@ -46,6 +46,8 @@ type UsageObservabilityRecordQuery struct {
 	CredentialID     string
 	AuthIndex        string
 	ExecutorType     string
+	EventType        string
+	CPANode          string
 	MinLatencyMS     *int64
 	MaxLatencyMS     *int64
 	MinAmount        *float64
@@ -61,6 +63,15 @@ type UsageObservabilityRecordQuery struct {
 type UsageObservabilityRecordListResult struct {
 	Records []UsageObservabilityRecord
 	Total   int64
+}
+
+type UsageObservabilityFilterOptions struct {
+	EventTypes  []string
+	Providers   []string
+	Models      []string
+	HomeIPs     []string
+	CPANodes    []string
+	StatusCodes []int
 }
 
 type UsageObservabilityAggregateQuery struct {
@@ -221,29 +232,31 @@ type UsageObservabilityAggregateItem struct {
 }
 
 type UsageObservabilityRecord struct {
-	ID                string
-	UsageID           uint
-	Timestamp         time.Time
-	RequestID         string
-	UpstreamRequestID string
-	Status            string
-	Failed            bool
-	StatusCode        int
-	Source            string
-	Provider          string
-	Model             string
-	OriginalModel     string
-	Endpoint          string
-	ServiceTier       string
-	ReasoningEffort   string
-	ExecutorType      string
-	Tokens            UsageObservabilityTokens
-	Performance       UsageObservabilityPerformance
-	Client            UsageObservabilityClient
-	Credential        UsageObservabilityCredential
-	Billing           UsageObservabilityBilling
-	Runtime           UsageObservabilityRuntime
-	Error             *UsageObservabilityError
+	ID                 string
+	UsageID            uint
+	Timestamp          time.Time
+	RequestID          string
+	UpstreamRequestID  string
+	EventType          string
+	Status             string
+	Failed             bool
+	StatusCode         int
+	UpstreamStatusCode int
+	Source             string
+	Provider           string
+	Model              string
+	OriginalModel      string
+	Endpoint           string
+	ServiceTier        string
+	ReasoningEffort    string
+	ExecutorType       string
+	Tokens             UsageObservabilityTokens
+	Performance        UsageObservabilityPerformance
+	Client             UsageObservabilityClient
+	Credential         UsageObservabilityCredential
+	Billing            UsageObservabilityBilling
+	Runtime            UsageObservabilityRuntime
+	Error              *UsageObservabilityError
 }
 
 type UsageObservabilityTokens struct {
@@ -295,14 +308,21 @@ type UsageObservabilityBilling struct {
 
 type UsageObservabilityRuntime struct {
 	HomeIP              string
+	HomePort            int
+	CPANodeID           string
+	CPAIP               string
+	CPAPort             int
+	CPALabel            string
 	RequestLogAvailable bool
 	LogHomeIPRequired   bool
 }
 
 type UsageObservabilityError struct {
-	StatusCode  int
-	Message     string
-	BodyPreview string
+	StatusCode         int
+	UpstreamStatusCode int
+	Reason             string
+	Message            string
+	BodyPreview        string
 }
 
 type UsageObservabilityPayloadSummary struct {
@@ -338,7 +358,15 @@ type usageObservabilityRecordRow struct {
 	AuthType             string          `gorm:"column:auth_type"`
 	RawAPIKey            string          `gorm:"column:raw_api_key"`
 	RequestID            string          `gorm:"column:request_id"`
+	UpstreamRequestID    string          `gorm:"column:upstream_request_id"`
+	EventType            string          `gorm:"column:event_type"`
+	UpstreamStatusCode   int             `gorm:"column:upstream_status_code"`
 	HomeIP               string          `gorm:"column:home_ip"`
+	HomePort             int             `gorm:"column:home_port"`
+	CPANodeID            string          `gorm:"column:cpa_node_id"`
+	CPAIP                string          `gorm:"column:cpa_ip"`
+	CPAPort              int             `gorm:"column:cpa_port"`
+	CPALabel             string          `gorm:"column:cpa_label"`
 	PayloadJSON          JSONB           `gorm:"column:payload_json"`
 	ClientAPIKeyID       *uint           `gorm:"column:client_api_key_id"`
 	ClientAPIKeyLabel    string          `gorm:"column:client_api_key_label"`
@@ -585,6 +613,35 @@ func (r *Repository) GetUsageObservabilityRecord(ctx context.Context, id string)
 	}
 	record := usageObservabilityRecordFromRow(&rows[0])
 	return &record, nil
+}
+
+func (r *Repository) UsageObservabilityFilterOptions(ctx context.Context, query UsageObservabilityRecordQuery) (UsageObservabilityFilterOptions, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return UsageObservabilityFilterOptions{}, errDB
+	}
+	ctx = contextOrBackground(ctx)
+	options := UsageObservabilityFilterOptions{}
+	var errOptions error
+	if options.EventTypes, errOptions = usageObservabilityDistinctStrings(ctx, db, query, `"usage"."event_type"`); errOptions != nil {
+		return UsageObservabilityFilterOptions{}, errOptions
+	}
+	if options.Providers, errOptions = usageObservabilityDistinctStrings(ctx, db, query, `"usage"."provider"`); errOptions != nil {
+		return UsageObservabilityFilterOptions{}, errOptions
+	}
+	if options.Models, errOptions = usageObservabilityDistinctStrings(ctx, db, query, `"usage"."model"`); errOptions != nil {
+		return UsageObservabilityFilterOptions{}, errOptions
+	}
+	if options.HomeIPs, errOptions = usageObservabilityDistinctStrings(ctx, db, query, `"usage"."home_ip"`); errOptions != nil {
+		return UsageObservabilityFilterOptions{}, errOptions
+	}
+	if options.CPANodes, errOptions = usageObservabilityDistinctStrings(ctx, db, query, `COALESCE(NULLIF("usage"."cpa_label", ''), NULLIF("usage"."cpa_node_id", ''), NULLIF("usage"."cpa_ip", ''))`); errOptions != nil {
+		return UsageObservabilityFilterOptions{}, errOptions
+	}
+	if options.StatusCodes, errOptions = usageObservabilityDistinctStatusCodes(ctx, db, query); errOptions != nil {
+		return UsageObservabilityFilterOptions{}, errOptions
+	}
+	return options, nil
 }
 
 func (r *Repository) GetUsageObservabilityPayloadSummary(ctx context.Context, id string) (*UsageObservabilityPayloadSummary, error) {
@@ -1815,7 +1872,15 @@ func usageObservabilityRecordSelect() string {
 		"usage"."auth_type" AS auth_type,
 		"usage"."api_key" AS raw_api_key,
 		"usage"."request_id" AS request_id,
+		"usage"."upstream_request_id" AS upstream_request_id,
+		"usage"."event_type" AS event_type,
+		"usage"."upstream_status_code" AS upstream_status_code,
 		"usage"."home_ip" AS home_ip,
+		"usage"."home_port" AS home_port,
+		"usage"."cpa_node_id" AS cpa_node_id,
+		"usage"."cpa_ip" AS cpa_ip,
+		"usage"."cpa_port" AS cpa_port,
+		"usage"."cpa_label" AS cpa_label,
 		"usage"."payload" AS payload_json,
 		"usage"."auth_index" AS usage_auth_index,
 		COALESCE("billing_charge"."api_key_id", "api_key"."id") AS client_api_key_id,
@@ -1850,6 +1915,66 @@ func usageObservabilityRecordScope(scope *gorm.DB, query UsageObservabilityRecor
 		Joins(`LEFT JOIN "auth" AS "auth_by_index" ON "auth_uuid"."uuid" IS NULL AND "auth_by_index"."deleted_at" IS NULL AND "auth_by_index"."index" = "usage"."auth_index"`).
 		Joins(`LEFT JOIN "auth" AS "auth_by_id" ON "auth_uuid"."uuid" IS NULL AND "auth_by_index"."uuid" IS NULL AND "auth_by_id"."deleted_at" IS NULL AND "auth_by_id"."id" = "usage"."auth_index"`)
 	return usageObservabilityApplyRecordFilters(scope, query)
+}
+
+func usageObservabilityDistinctStrings(ctx context.Context, db *gorm.DB, query UsageObservabilityRecordQuery, expression string) ([]string, error) {
+	type valueRow struct {
+		Value string `gorm:"column:value"`
+	}
+	var rows []valueRow
+	scope := usageObservabilityRecordScope(db.WithContext(ctx).Table("usage"), query).
+		Where(expression + ` IS NOT NULL`).
+		Where(`TRIM(` + expression + `) <> ''`).
+		Select(`DISTINCT ` + expression + ` AS value`).
+		Order("value ASC").
+		Limit(500)
+	if errFind := scope.Scan(&rows).Error; errFind != nil {
+		return nil, errFind
+	}
+	values := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		value := strings.TrimSpace(row.Value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func usageObservabilityDistinctStatusCodes(ctx context.Context, db *gorm.DB, query UsageObservabilityRecordQuery) ([]int, error) {
+	type valueRow struct {
+		Value int `gorm:"column:value"`
+	}
+	expression := `CASE WHEN "usage"."failed" THEN "usage"."fail_status_code" WHEN "usage"."upstream_status_code" > 0 THEN "usage"."upstream_status_code" ELSE 200 END`
+	var rows []valueRow
+	scope := usageObservabilityRecordScope(db.WithContext(ctx).Table("usage"), query).
+		Where(expression + ` > 0`).
+		Select(`DISTINCT ` + expression + ` AS value`).
+		Order("value ASC").
+		Limit(500)
+	if errFind := scope.Scan(&rows).Error; errFind != nil {
+		return nil, errFind
+	}
+	values := make([]int, 0, len(rows))
+	seen := make(map[int]struct{}, len(rows))
+	for _, row := range rows {
+		if row.Value <= 0 {
+			continue
+		}
+		if _, exists := seen[row.Value]; exists {
+			continue
+		}
+		seen[row.Value] = struct{}{}
+		values = append(values, row.Value)
+	}
+	return values, nil
 }
 
 func usageObservabilityUsageBillingScope(scope *gorm.DB, query UsageObservabilityRecordQuery) *gorm.DB {
@@ -1909,6 +2034,11 @@ func usageObservabilityApplyRecordFilters(scope *gorm.DB, query UsageObservabili
 	if executorType := strings.TrimSpace(query.ExecutorType); executorType != "" {
 		scope = scope.Where(`"usage"."executor_type" = ?`, executorType)
 	}
+	scope = usageObservabilityEventTypeScope(scope, query.EventType)
+	if cpaNode := strings.TrimSpace(query.CPANode); cpaNode != "" {
+		matcher := "%" + strings.ToLower(cpaNode) + "%"
+		scope = scope.Where(`LOWER("usage"."cpa_node_id") LIKE ? OR LOWER("usage"."cpa_ip") LIKE ? OR LOWER("usage"."cpa_label") LIKE ? OR CAST("usage"."cpa_port" AS TEXT) LIKE ?`, matcher, matcher, matcher, "%"+cpaNode+"%")
+	}
 	if query.MinLatencyMS != nil {
 		scope = scope.Where(`"usage"."latency_ms" >= ?`, *query.MinLatencyMS)
 	}
@@ -1930,11 +2060,14 @@ func usageObservabilityApplyRecordFilters(scope *gorm.DB, query UsageObservabili
 			"usage"."model" LIKE ? OR
 			"usage"."endpoint" LIKE ? OR
 			"usage"."home_ip" LIKE ? OR
+			"usage"."cpa_node_id" LIKE ? OR
+			"usage"."cpa_ip" LIKE ? OR
+			"usage"."cpa_label" LIKE ? OR
 			"user"."username" LIKE ? OR
 			"billing_charge"."api_key_masked" LIKE ? OR
 			COALESCE("auth_uuid"."label", "auth_by_index"."label", "auth_by_id"."label") LIKE ? OR
 			"usage"."auth_index" LIKE ?)`,
-			matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher)
+			matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher, matcher)
 	}
 	if search := strings.TrimSpace(query.RequestLogSearch); search != "" {
 		matcher := "%" + search + "%"
@@ -1977,6 +2110,11 @@ func usageObservabilityApplyUsageFilters(scope *gorm.DB, query UsageObservabilit
 	}
 	if executorType := strings.TrimSpace(query.ExecutorType); executorType != "" {
 		scope = scope.Where(`"usage"."executor_type" = ?`, executorType)
+	}
+	scope = usageObservabilityEventTypeScope(scope, query.EventType)
+	if cpaNode := strings.TrimSpace(query.CPANode); cpaNode != "" {
+		matcher := "%" + strings.ToLower(cpaNode) + "%"
+		scope = scope.Where(`LOWER("usage"."cpa_node_id") LIKE ? OR LOWER("usage"."cpa_ip") LIKE ? OR LOWER("usage"."cpa_label") LIKE ? OR CAST("usage"."cpa_port" AS TEXT) LIKE ?`, matcher, matcher, matcher, "%"+cpaNode+"%")
 	}
 	if query.MinLatencyMS != nil {
 		scope = scope.Where(`"usage"."latency_ms" >= ?`, *query.MinLatencyMS)
@@ -2050,6 +2188,99 @@ func usageObservabilityStatusCodeScope(scope *gorm.DB, statusCode *int) *gorm.DB
 	return scope.Where(`"usage"."fail_status_code" = ?`, *statusCode)
 }
 
+func usageObservabilityEventTypeScope(scope *gorm.DB, eventType string) *gorm.DB {
+	value := strings.ToLower(strings.TrimSpace(eventType))
+	if value == "all" {
+		value = ""
+	}
+	if value == "" {
+		return scope
+	}
+	normalized := normalizeUsageObservabilityEventType(value)
+	if normalized == "" {
+		normalized = value
+	}
+	return scope.Where(`LOWER("usage"."event_type") = ?`, normalized)
+}
+
+func usageObservabilityEventType(row *usageObservabilityRecordRow, payload map[string]any) string {
+	if row != nil {
+		if normalized := normalizeUsageObservabilityEventType(row.EventType); normalized != "" {
+			return normalized
+		}
+	}
+	raw := firstStringFromPayload(payload, "event_type", "event.type", "type")
+	if normalized := normalizeUsageObservabilityEventType(raw); normalized != "" {
+		return normalized
+	}
+	if row != nil {
+		return normalizeUsageObservabilityEndpointEventType(row.Endpoint)
+	}
+	return "completion"
+}
+
+func firstNonZeroInt(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func normalizeUsageObservabilityEventType(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, ".", "_")
+	switch normalized {
+	case "":
+		return ""
+	case "embedding", "embeddings":
+		return "embedding"
+	case "response", "responses":
+		return "response"
+	case "message", "messages":
+		return "message"
+	case "stream", "streaming", "delta", "chunk":
+		return "stream"
+	case "completion", "completions", "chat_completion", "chat_completions":
+		return "completion"
+	default:
+		if strings.Contains(normalized, "embedding") {
+			return "embedding"
+		}
+		if strings.Contains(normalized, "response") {
+			return "response"
+		}
+		if strings.Contains(normalized, "message") {
+			return "message"
+		}
+		if strings.Contains(normalized, "stream") || strings.Contains(normalized, "delta") || strings.Contains(normalized, "chunk") {
+			return "stream"
+		}
+		if strings.Contains(normalized, "completion") || strings.Contains(normalized, "chat") {
+			return "completion"
+		}
+		return normalized
+	}
+}
+
+func normalizeUsageObservabilityEndpointEventType(endpoint string) string {
+	normalized := strings.ToLower(strings.TrimSpace(endpoint))
+	switch {
+	case strings.Contains(normalized, "embedding"):
+		return "embedding"
+	case strings.Contains(normalized, "response"):
+		return "response"
+	case strings.Contains(normalized, "message"):
+		return "message"
+	case strings.Contains(normalized, "completion"), strings.Contains(normalized, "chat"):
+		return "completion"
+	default:
+		return "completion"
+	}
+}
+
 func usageObservabilityRecordOrder(sortValue string) string {
 	switch strings.TrimSpace(sortValue) {
 	case "timestamp_asc":
@@ -2079,22 +2310,24 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 	}
 	payload := usageObservabilityPayloadMap(row.PayloadJSON)
 	record := UsageObservabilityRecord{
-		ID:                strconv.FormatUint(uint64(row.UsageID), 10),
-		UsageID:           row.UsageID,
-		Timestamp:         row.Timestamp.UTC(),
-		RequestID:         strings.TrimSpace(row.RequestID),
-		UpstreamRequestID: firstStringFromPayload(payload, "upstream_request_id", "upstream.request_id", "response.request_id", "response.id"),
-		Status:            usageObservabilityRecordStatus(row.Failed),
-		Failed:            row.Failed,
-		StatusCode:        usageObservabilityStatusCode(row.Failed, row.FailStatusCode),
-		Source:            strings.TrimSpace(row.Source),
-		Provider:          strings.TrimSpace(row.Provider),
-		Model:             strings.TrimSpace(row.Model),
-		OriginalModel:     firstNonEmptyUsageObservabilityString(row.Alias, row.Model),
-		Endpoint:          strings.TrimSpace(row.Endpoint),
-		ServiceTier:       strings.TrimSpace(row.ServiceTier),
-		ReasoningEffort:   strings.TrimSpace(row.ReasoningEffort),
-		ExecutorType:      strings.TrimSpace(row.ExecutorType),
+		ID:                 strconv.FormatUint(uint64(row.UsageID), 10),
+		UsageID:            row.UsageID,
+		Timestamp:          row.Timestamp.UTC(),
+		RequestID:          strings.TrimSpace(row.RequestID),
+		UpstreamRequestID:  firstNonEmptyUsageObservabilityString(row.UpstreamRequestID, firstStringFromPayload(payload, "upstream_request_id", "upstream.request_id", "response.request_id", "response.id")),
+		EventType:          usageObservabilityEventType(row, payload),
+		Status:             usageObservabilityRecordStatus(row.Failed),
+		Failed:             row.Failed,
+		StatusCode:         usageObservabilityStatusCode(row.Failed, row.FailStatusCode),
+		UpstreamStatusCode: firstNonZeroInt(row.UpstreamStatusCode, int(firstIntFromPayload(payload, "upstream_status_code", "upstream.status_code", "response.status_code"))),
+		Source:             strings.TrimSpace(row.Source),
+		Provider:           strings.TrimSpace(row.Provider),
+		Model:              strings.TrimSpace(row.Model),
+		OriginalModel:      firstNonEmptyUsageObservabilityString(row.Alias, row.Model),
+		Endpoint:           strings.TrimSpace(row.Endpoint),
+		ServiceTier:        strings.TrimSpace(row.ServiceTier),
+		ReasoningEffort:    strings.TrimSpace(row.ReasoningEffort),
+		ExecutorType:       strings.TrimSpace(row.ExecutorType),
 		Tokens: UsageObservabilityTokens{
 			InputTokens:         row.InputTokens,
 			OutputTokens:        row.OutputTokens,
@@ -2110,15 +2343,22 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 		Billing:     usageObservabilityBilling(row),
 		Runtime: UsageObservabilityRuntime{
 			HomeIP:              strings.TrimSpace(row.HomeIP),
+			HomePort:            row.HomePort,
+			CPANodeID:           firstNonEmptyUsageObservabilityString(row.CPANodeID, firstStringFromPayload(payload, "cpa_node_id", "cpa.node_id", "node_id")),
+			CPAIP:               firstNonEmptyUsageObservabilityString(row.CPAIP, firstStringFromPayload(payload, "cpa_ip", "cpa.ip")),
+			CPAPort:             firstNonZeroInt(row.CPAPort, int(firstIntFromPayload(payload, "cpa_port", "cpa.port"))),
+			CPALabel:            firstNonEmptyUsageObservabilityString(row.CPALabel, firstStringFromPayload(payload, "cpa_label", "cpa.label")),
 			RequestLogAvailable: strings.TrimSpace(row.RequestID) != "",
 			LogHomeIPRequired:   true,
 		},
 	}
 	if row.Failed {
 		record.Error = &UsageObservabilityError{
-			StatusCode:  row.FailStatusCode,
-			Message:     usageObservabilityErrorMessage(row.FailBody),
-			BodyPreview: usageObservabilityBodyPreview(row.FailBody),
+			StatusCode:         row.FailStatusCode,
+			UpstreamStatusCode: record.UpstreamStatusCode,
+			Reason:             firstStringFromPayload(payload, "fail.reason", "error.reason", "error.type", "error.code"),
+			Message:            usageObservabilityErrorMessage(row.FailBody),
+			BodyPreview:        usageObservabilityBodyPreview(row.FailBody),
 		}
 	}
 	return record
@@ -3143,6 +3383,31 @@ func firstStringFromPayload(payload map[string]any, paths ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstIntFromPayload(payload map[string]any, paths ...string) int64 {
+	for _, path := range paths {
+		value := payloadPathValue(payload, path)
+		switch typed := value.(type) {
+		case float64:
+			return int64(typed)
+		case int64:
+			return typed
+		case int:
+			return int64(typed)
+		case json.Number:
+			parsed, errParse := typed.Int64()
+			if errParse == nil {
+				return parsed
+			}
+		case string:
+			parsed, errParse := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+			if errParse == nil {
+				return parsed
+			}
+		}
+	}
+	return 0
 }
 
 func firstBoolFromPayload(payload map[string]any, paths ...string) (bool, bool) {

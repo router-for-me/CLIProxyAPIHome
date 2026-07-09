@@ -126,6 +126,10 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/usage/realtime` |
 | `GET` | `/usage/health/providers` |
 | `GET` | `/usage/health/credentials` |
+| `GET` | `/request-events` |
+| `GET` | `/request-events/export` |
+| `GET` | `/request-events/filter-options` |
+| `GET` | `/request-events/:id` |
 | `GET` | `/request-logs` |
 | `GET` | `/proxy/proxy-pools` |
 | `POST` | `/proxy/proxy-pools` |
@@ -2099,194 +2103,278 @@ Example response:
 
 ### GET `/capabilities`
 
-返回当前 Home Management API 暴露的前端能力开关和构建信息。该接口用于管理面板判断是否可以启用用量总览、请求明细、聚合排行、导出、实时诊断、健康归因和 request log index。
+Returns the frontend capability flags and build metadata exposed by the current Home Management API. The management panel uses this endpoint to decide whether to enable usage overview, request records, aggregate rankings, export, realtime diagnostics, health attribution, request events, and request log indexes.
 
-输出字段：
+Response fields:
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 | --- | --- | --- |
-| `capabilities.usage` | boolean | 是否支持旧版 `GET /api-key-usage` 能力。 |
-| `capabilities.usage_overview` | boolean | 是否支持 `GET /usage/overview`。 |
-| `capabilities.usage_records` | boolean | 是否支持 `GET /usage/records`。 |
-| `capabilities.usage_record_details` | boolean | 是否支持 `GET /usage/records/:id`。 |
-| `capabilities.usage_aggregates` | boolean | 是否支持 `GET /usage/aggregates`。 |
-| `capabilities.usage_export` | boolean | 是否支持 `GET /usage/export`。 |
-| `capabilities.usage_provider_health` | boolean | 是否支持 `GET /usage/health/providers`。 |
-| `capabilities.usage_credential_health` | boolean | 是否支持 `GET /usage/health/credentials`。 |
-| `capabilities.usage_realtime` | boolean | 是否支持 `GET /usage/realtime`。 |
-| `capabilities.request_log_index` | boolean | 是否支持 `GET /request-logs`。 |
-| `capabilities.oauth_usage` | boolean | OAuth/file-backed credential usage 归因是否可靠。 |
-| `capabilities.logs` | boolean | 是否支持应用日志接口。 |
-| `capabilities.request_error_logs` | boolean | 是否支持 request error log file list/download。 |
-| `server_info.home_version` | string | Home 构建版本。 |
-| `server_info.home_commit` | string | Home 构建 commit。 |
-| `server_info.home_build_date` | string | Home 构建时间。 |
+| `capabilities.usage` | boolean | Whether the legacy `GET /api-key-usage` capability is available. |
+| `capabilities.usage_overview` | boolean | Whether `GET /usage/overview` is available. |
+| `capabilities.usage_records` | boolean | Whether `GET /usage/records` is available. |
+| `capabilities.usage_record_details` | boolean | Whether `GET /usage/records/:id` is available. |
+| `capabilities.usage_aggregates` | boolean | Whether `GET /usage/aggregates` is available. |
+| `capabilities.usage_export` | boolean | Whether `GET /usage/export` is available. |
+| `capabilities.usage_provider_health` | boolean | Whether `GET /usage/health/providers` is available. |
+| `capabilities.usage_credential_health` | boolean | Whether `GET /usage/health/credentials` is available. |
+| `capabilities.usage_realtime` | boolean | Whether `GET /usage/realtime` is available. |
+| `capabilities.request_log_index` | boolean | Whether `GET /request-logs` is available. |
+| `capabilities.request_events` / `capabilities.requestEvents` | boolean | Whether `GET /request-events` is available. |
+| `capabilities.request_event_details` / `capabilities.requestEventDetails` | boolean | Whether `GET /request-events/:id` is available. |
+| `capabilities.request_event_export` / `capabilities.requestEventExport` | boolean | Whether `GET /request-events/export` is available. |
+| `capabilities.request_event_filters` / `capabilities.requestEventFilters` | boolean | Whether `GET /request-events/filter-options` is available. |
+| `capabilities.oauth_usage` | boolean | Whether OAuth/file-backed credential usage attribution is reliable. |
+| `capabilities.logs` | boolean | Whether application log APIs are available. |
+| `capabilities.request_error_logs` | boolean | Whether request error log file list/download APIs are available. |
+| `server_info.home_version` | string | Home build version. |
+| `server_info.home_commit` | string | Home build commit. |
+| `server_info.home_build_date` | string | Home build time. |
 
-### 用量观测接口通用约定
+### Usage Observability Conventions
 
-这些接口读取持久化 `usage`、`billing_charge`、`api_key`、`user` 和 `auth` 数据。响应不会返回 raw client access key、provider API key、OAuth token、cookie、authorization header、完整 payload 或完整失败 body。允许返回 `api_key_masked`、脱敏 `body_preview` 和 payload summary。
+These endpoints read persisted `usage`, `billing_charge`, `api_key`, `user`, and `auth` data. Responses never return raw client access keys, provider API keys, OAuth tokens, cookies, authorization headers, complete payloads, or complete failure bodies. They may return `api_key_masked`, redacted `body_preview`, and payload summaries.
 
-汇总范围参数适用于 `/usage/overview`、`/usage/aggregates`、`/usage/realtime`、`/usage/health/providers`、`/usage/health/credentials`，也作为 `/usage/records` 和 `/usage/export` 的基础范围。`/usage/overview` 和 `/usage/aggregates` 在缺少 `from` 或 `to` 时会自动补齐最近 24 小时窗口；`/usage/records` 和 `/usage/export` 不自动补齐时间范围。
+The aggregate range parameters apply to `/usage/overview`, `/usage/aggregates`, `/usage/realtime`, `/usage/health/providers`, and `/usage/health/credentials`, and they also act as the base range for `/usage/records` and `/usage/export`. `/usage/overview` and `/usage/aggregates` automatically fill a recent 24-hour window when `from` or `to` is missing; `/usage/records` and `/usage/export` do not fill a time range automatically.
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `from` | string | `/usage/overview` 和 `/usage/aggregates` 默认为 `to - 24h`；其他接口无 | 起始时间，支持 `YYYY-MM-DD`、RFC3339 或 Unix 秒；只有日期时按 `timezone` 解释为当天 00:00:00。 |
-| `to` | string | `/usage/overview` 和 `/usage/aggregates` 默认为当前时间；其他接口无 | 结束时间，支持 `YYYY-MM-DD`、RFC3339 或 Unix 秒；只有日期时按 `timezone` 解释并包含当天完整一天。 |
-| `timezone` | string | `UTC` | 用于日期型 `from`/`to` 和 `day`/`week` 趋势桶的统计时区。 |
-| `provider` | string | 无 | Provider 精确筛选。 |
-| `model` | string | 无 | 模型模糊筛选。 |
-| `credential_type` | string | 无 | 执行凭证类型：`provider_api_key`、`oauth`、`file_auth`、`vertex`、`unknown`。 |
-| `home_ip` | string | 无 | Home 节点 IP。 |
-| `endpoint` | string | 无 | endpoint 模糊筛选。 |
+| `from` | string | `to - 24h` for `/usage/overview` and `/usage/aggregates`; none for other endpoints | Start time. Supports `YYYY-MM-DD`, RFC3339, or Unix seconds. Date-only values are interpreted as 00:00:00 in `timezone`. |
+| `to` | string | current time for `/usage/overview` and `/usage/aggregates`; none for other endpoints | End time. Supports `YYYY-MM-DD`, RFC3339, or Unix seconds. Date-only values include the full day in `timezone`. |
+| `timezone` | string | `UTC` | Statistics timezone for date-only `from`/`to` and `day`/`week` trend buckets. |
+| `provider` | string | none | Exact provider filter. |
+| `model` | string | none | Fuzzy model filter. |
+| `credential_type` | string | none | Execution credential type: `provider_api_key`, `oauth`, `file_auth`, `vertex`, or `unknown`. |
+| `home_ip` | string | none | Home node IP. |
+| `endpoint` | string | none | Fuzzy endpoint filter. |
 
-金额字段使用当前 Home billing 系统中的 credits/points 口径。启用 billing 且 usage 可归因到 `billing_charge` 时，`amount` 或 `total_amount` 返回数值，`currency` 返回 `credits`，`billing_basis` 返回 `billing_charge`；无法可靠归因时金额返回 `null`，不会伪造估算金额。
+Amount fields use the current Home billing credit/point unit. When billing is enabled and usage can be attributed to `billing_charge`, `amount` or `total_amount` returns a number, `currency` returns `credits`, and `billing_basis` returns `billing_charge`. When attribution is not reliable, amount fields return `null`; the API does not fabricate estimated charges.
 
-`UsageRecordSummary` 关键字段：
+Key `UsageRecordSummary` fields:
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 | --- | --- | --- |
-| `upstream_request_id` | string/null | payload 中可解析到的上游 request ID。 |
-| `source` | string/null | usage payload 的来源。 |
-| `service_tier` | string/null | usage payload 的 service tier。 |
-| `reasoning_effort` | string/null | usage payload 的 reasoning effort。 |
-| `client.client_ip` | string/null | payload 中可关联的调用方 IP。 |
-| `credential.api_key_preview` | string/null | 仅 provider API key 可用时返回脱敏 preview；不会返回 raw key。 |
-| `billing.balance_before` / `billing.balance_after` | number/null | 关联 `billing_charge` 时的扣款前后余额。 |
-| `runtime.request_log_available` | boolean | 当前 Home 节点是否能找到可下载的本地 request log 文件。 |
-| `runtime.log_home_ip_required` | boolean | 下载 request log 时是否必须带上 Home IP。 |
+| `upstream_request_id` | string/null | Upstream request ID parsed from the payload. |
+| `event_type` | string/null | Normalized event type, parsed from payload fields or derived from the endpoint. |
+| `upstream_status_code` | integer/null | Upstream status code parsed from structured usage columns or payload fields. |
+| `source` | string/null | Usage payload source. |
+| `service_tier` | string/null | Usage payload service tier. |
+| `reasoning_effort` | string/null | Usage payload reasoning effort. |
+| `client.client_ip` | string/null | Caller IP associated with the usage payload. This is not treated as the CPA node IP. |
+| `credential.api_key_preview` | string/null | Redacted provider API key preview when available; raw keys are never returned. |
+| `billing.balance_before` / `billing.balance_after` | number/null | Balance before and after the charge when linked to `billing_charge`. |
+| `runtime.home_ip` / `runtime.home_port` | string/integer/null | Home node identity that persisted the usage record. |
+| `runtime.cpa_node_id` / `runtime.cpa_ip` / `runtime.cpa_port` / `runtime.cpa_label` | mixed | CPA ownership fields. Home fills missing CPA node ID/IP from the trusted RESP/mTLS runtime identity when the CPA payload does not report them. |
+| `runtime.request_log_available` | boolean | Whether the current Home node can find a downloadable local request log file. |
+| `runtime.log_home_ip_required` | boolean | Whether request log download requires the Home IP. |
 
 ### GET `/usage/overview`
 
-返回请求用量总览，包括范围、短窗口 live snapshot、总量、趋势、默认 top groups 和 activity 桶。
+Returns a usage overview with the applied range, short-window live snapshot, totals, trends, default top groups, and activity buckets.
 
-Query 参数除汇总范围参数外还支持：
+Query parameters in addition to aggregate range parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `interval` | string | `auto` | `minute`、`hour`、`day`、`week` 或 `auto`。`day` 和 `week` 会按 `timezone` 切桶，响应时间仍为 UTC RFC3339。 |
+| `interval` | string | `auto` | `minute`, `hour`, `day`, `week`, or `auto`. `day` and `week` buckets use `timezone`; response timestamps remain UTC RFC3339. |
 
-输出顶层字段：
+Top-level response fields:
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 | --- | --- | --- |
-| `range` | object | 应用后的时间范围、timezone 和 interval。 |
-| `live` | object | 最近短窗口 RPM、TPM、错误率和延迟。 |
-| `totals` | object | 请求数、成功/失败数、token、金额、延迟和活跃主体数量。 |
-| `trend` | array | 按 `interval` 聚合的趋势桶。 |
-| `cost_breakdown` | array | 当前不伪造不可拆分的费用明细，无法可靠拆分时为空数组。 |
-| `model_efficiency` | array | 按总 token 排序的模型效率列表。 |
-| `top` | object | `users`、`client_keys`、`credentials`、`providers`、`models`、`endpoints` 和 `errors`。 |
-| `activity` | array | 与趋势桶一致的健康活动序列。 |
+| `range` | object | Applied time range, timezone, and interval. |
+| `live` | object | Recent short-window RPM, TPM, error rate, and latency. |
+| `totals` | object | Request counts, success/failure counts, tokens, amount, latency, and active subject counts. |
+| `trend` | array | Trend buckets aggregated by `interval`. |
+| `cost_breakdown` | array | Empty when reliable cost splitting is unavailable; the API does not fabricate indivisible cost details. |
+| `model_efficiency` | array | Model efficiency list sorted by total tokens. |
+| `top` | object | `users`, `client_keys`, `credentials`, `providers`, `models`, `endpoints`, and `errors`. |
+| `activity` | array | Health activity series aligned with the trend buckets. |
 
 ### GET `/usage/records`
 
-返回请求明细表，服务端分页、筛选和排序。
+Returns the request record table with server-side pagination, filters, and sorting.
 
-Query 参数：
+Query parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `limit` | integer | `50` | 最大 `200`。 |
-| `offset` | integer | `0` | page offset。 |
-| `sort` | string | `timestamp_desc` | 支持 `timestamp_desc`、`timestamp_asc`、`tokens_desc`、`tokens_asc`、`cost_desc`、`cost_asc`、`latency_desc`、`latency_asc`、`failed_first`。 |
-| `search` | string | 无 | request ID、provider、model、endpoint、Home IP、username、masked key、credential label 的宽松搜索。 |
-| `status` | string | 无 | `success` 或 `failed`。 |
-| `status_code` | integer | 无 | HTTP/失败状态码；2xx/3xx 会匹配成功请求，其他值匹配 `fail_status_code`。 |
-| `request_id` | string | 无 | request ID 精确筛选。 |
-| `user` / `user_id` | string / integer | 无 | 用户名或用户 ID。 |
-| `client_key` / `client_key_id` | string / integer | 无 | client access key 的 masked/label/ID 筛选。 |
-| `credential_id` / `auth_index` | string | 无 | 执行凭证筛选。 |
-| `executor_type` | string | 无 | executor type 精确筛选。 |
-| `min_latency_ms` / `max_latency_ms` | integer | 无 | 延迟范围。 |
-| `min_amount` / `max_amount` | number | 无 | billing amount 范围。 |
+| `limit` | integer | `50` | Maximum `200`. |
+| `offset` | integer | `0` | Page offset. |
+| `sort` | string | `timestamp_desc` | Supports `timestamp_desc`, `timestamp_asc`, `tokens_desc`, `tokens_asc`, `cost_desc`, `cost_asc`, `latency_desc`, `latency_asc`, and `failed_first`. |
+| `search` | string | none | Fuzzy search across request ID, provider, model, endpoint, Home IP, CPA node ID/IP/label, username, masked key, and credential label. |
+| `status` | string | none | `success` or `failed`. |
+| `status_code` | integer | none | HTTP/failure status code. 2xx/3xx values match successful requests; other values match `fail_status_code`. |
+| `request_id` | string | none | Exact request ID filter. |
+| `event_type` | string | none | Normalized event type filter. Common values include `completion`, `response`, `message`, `embedding`, and `stream`. |
+| `cpa_node` | string | none | Fuzzy filter across structured CPA node ID, CPA IP, CPA label, and CPA port. |
+| `user` / `user_id` | string / integer | none | Username or user ID. |
+| `client_key` / `client_key_id` | string / integer | none | Client access key masked value, label, or ID. |
+| `credential_id` / `auth_index` | string | none | Execution credential filter. |
+| `executor_type` | string | none | Exact executor type filter. |
+| `min_latency_ms` / `max_latency_ms` | integer | none | Latency range. |
+| `min_amount` / `max_amount` | number | none | Billing amount range. |
 
-响应包含 `items`、`total`、`limit`、`offset`、`sort` 和 `sortable_fields`。`items[]` 为脱敏后的请求摘要，包含 `tokens`、`performance`、`client`、`credential`、`billing`、`runtime` 和可选 `error`。
+The response contains `items`, `total`, `limit`, `offset`, `sort`, and `sortable_fields`. `items[]` is a redacted request summary with `tokens`, `performance`, `client`, `credential`, `billing`, `runtime`, and optional `error`.
 
 ### GET `/usage/records/:id`
 
-返回单条 usage 详情。`id` 为 usage ID。
+Returns one usage detail. `id` is the usage ID.
 
-Query 参数：
+Query parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `include_payload` | boolean | `false` | 返回脱敏 payload summary。 |
-| `include_logs` | boolean | `false` | 找到本地 request log 时返回最多 20 行脱敏日志片段；远端节点或文件不存在时返回空数组。 |
+| `include_payload` | boolean | `false` | Return a redacted payload summary. |
+| `include_logs` | boolean | `false` | Return up to 20 redacted log lines when a local request log is found. Remote nodes or missing files return an empty array. |
 
-响应包含 `record`、`payload_summary`、`log_excerpt` 和 `related`。`payload_summary` 只包含 `method`、`stream`、`message_count`、`tool_count`，不会返回原始 payload。
+The response contains `record`, `payload_summary`, `log_excerpt`, and `related`. `payload_summary` only contains `method`, `stream`, `message_count`, and `tool_count`; raw payloads are never returned.
 
 ### GET `/usage/aggregates`
 
-返回服务端全量排序后的聚合排行。
+Returns server-side aggregate rankings after full-result sorting.
 
-Query 参数：
+Query parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `group_by` | string | 必填 | `user`、`client_key`、`credential`、`provider`、`model`、`endpoint`、`home_ip`、`executor_type`、`status_code`。 |
+| `group_by` | string | required | `user`, `client_key`, `credential`, `provider`, `model`, `endpoint`, `home_ip`, `executor_type`, or `status_code`. |
 | `metric` | string | `request_count` | `request_count`、`total_tokens`、`total_amount`、`failed_count`、`avg_latency_ms`、`p95_latency_ms`。 |
-| `direction` | string | `desc` | `desc` 或 `asc`。 |
-| `limit` | integer | `20` | 最大 `100`。 |
-| `offset` | integer | `0` | page offset。 |
+| `direction` | string | `desc` | `desc` or `asc`. |
+| `limit` | integer | `20` | Maximum `100`. |
+| `offset` | integer | `0` | Page offset. |
 
-响应包含 `group_by`、`metric`、`direction`、`items`、`total`、`limit`、`offset` 和 `sortable_metrics`。
+The response contains `group_by`, `metric`, `direction`, `items`, `total`, `limit`, `offset`, and `sortable_metrics`.
 
 ### GET `/usage/export`
 
-按当前 records 筛选导出脱敏后的请求记录。
+Exports redacted request records for the current records filters.
 
-Query 参数：
+Query parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `format` | string | `csv` | `csv` 或 `jsonl`。 |
-| records filters | mixed | 无 | 与 `GET /usage/records` 相同。未显式传 `limit` 时默认最多导出 `10000` 条；显式 `limit` 也最多 `10000` 条。 |
+| `format` | string | `csv` | `csv` or `jsonl`. |
+| records filters | mixed | none | Same as `GET /usage/records`. When `limit` is omitted, the endpoint exports at most `10000` rows by default; explicit `limit` values are also capped at `10000`. |
 
-响应为 attachment。CSV 使用 `text/csv; charset=utf-8`，JSONL 使用 `application/x-ndjson`。
+Responses are attachments. CSV uses `text/csv; charset=utf-8`; JSONL uses `application/x-ndjson`.
 
-导出字段是展平后的脱敏摘要，除 records 响应中的核心字段外，还包含 `error_status_code`、`error_message`、`error_body_preview`、`request_log_available` 和 `log_home_ip_required`。
+Export fields are flattened redacted summaries. In addition to core record response fields, they include `error_status_code`, `error_message`, `error_body_preview`, `request_log_available`, and `log_home_ip_required`.
+
+### GET `/request-events`
+
+Returns the request event list for the management UI. This endpoint is DB-backed and read-only. It reads persisted usage observability records and does not read or consume `/usage-queue`.
+
+Query parameters:
+
+| Query | Type | Default | Description |
+| --- | --- | --- | --- |
+| `from` / `to` / `timezone` | string | none / `UTC` | Same as `/usage/records`. |
+| `limit` / `offset` | integer | `50` / `0` | Server-side pagination. `limit` is capped at `200`. |
+| `sort` | string | `timestamp_desc` | Supports `timestamp_desc`, `timestamp_asc`, `latency_desc`, `latency_asc`, `tokens_desc`, `tokens_asc`, `cost_desc`, `cost_asc`, and `failed_first`. |
+| `search` | string | none | Fuzzy search across request ID, provider, model, endpoint, Home IP, CPA node ID/IP/label, username, masked key, and credential label. |
+| `request_id` | string | none | Exact request ID filter. |
+| `event_type` | string | none | Event type filter. The value is parsed from `event_type`/`type` payload fields or derived from the endpoint. Common values are `completion`, `response`, `message`, `embedding`, and `stream`. |
+| `status` / `status_code` | string / integer | none | `success`, `failed`, or status code filter. |
+| `provider` / `model` | string | none | Exact provider filter and fuzzy model filter. |
+| `home_ip` | string | none | Home node filter. |
+| `cpa_node` | string | none | Fuzzy filter across structured CPA node ID, CPA IP, CPA label, and CPA port. Home fills missing CPA node ID/IP from the trusted RESP/mTLS runtime identity when available. |
+| `credential_id` / `auth_index` | string | none | Execution credential filter. |
+| `user` | string | none | Username or user ID search. |
+| `client_key` | string | none | Client access key masked value, label, or ID search. |
+| `min_latency_ms` / `max_latency_ms` | integer | none | Latency range. |
+
+The response contains `items`, `total`, `limit`, `offset`, and `sort`. `items[]` is a request event object with these key fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | string | Stable event ID in the `evt_<usage_id>` format. |
+| `event_type` | string | Event type, parsed from the payload first and derived from the endpoint when absent. |
+| `status` / `failed` / `status_code` / `upstream_status_code` | mixed | Request success/failure state and HTTP status. Successful requests default to `status_code=200` when no explicit status is available. |
+| `provider` / `model` / `original_model` / `model_alias` / `endpoint` | mixed | Model and routing metadata. |
+| `runtime.home_ip` / `runtime.home_port` / `runtime.home_id` | mixed | Home node that persisted the usage record. `home_id` is `home_ip:home_port` when the port is available. |
+| `runtime.cpa_node_id` / `runtime.cpa_ip` / `runtime.cpa_port` / `runtime.cpa_label` | mixed | CPA ownership metadata. Home fills missing CPA node ID/IP from the trusted RESP/mTLS runtime identity when the CPA payload does not report them. |
+| `credential` | object | Execution credential type, ID, auth index, provider, label, source, and redacted `api_key_preview`. |
+| `client` | object | User, client key ID/label, redacted `client_key_masked`, and caller client IP. |
+| `error` | object | Redacted error status, upstream status, reason, message, and body preview. |
+| `tokens` / `performance` / `billing` | object | Token, latency/TTFT/TPS, and billing metadata. |
+| `related.request_log` | object | Request log link metadata. `available=true` and `download_url` are returned only when the current Home can find the local log file. |
+
+### GET `/request-events/filter-options`
+
+Returns compact option lists for the request event filter UI. It accepts the same filters as `GET /request-events`, ignores pagination parameters, and returns distinct values from the filtered result set.
+
+Response fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `event_types` | array | Distinct normalized event types. |
+| `providers` | array | Distinct providers. |
+| `models` | array | Distinct models. |
+| `home_ips` | array | Distinct Home IPs. |
+| `cpa_nodes` | array | Distinct CPA labels, node IDs, or IPs. |
+| `status_codes` | array | Distinct HTTP/upstream status codes encoded as strings for UI select controls. |
+
+### GET `/request-events/:id`
+
+Returns a single request event. `id` accepts either `evt_<usage_id>` or the raw usage ID.
+
+Query parameters:
+
+| Query | Type | Default | Description |
+| --- | --- | --- | --- |
+| `include_payload` | boolean | `false` | Return a redacted payload summary. Raw payloads are never returned. |
+| `include_logs` | boolean | `false` | Return up to 20 redacted log lines when a local request log is found. |
+| `include_related` | boolean | `false` | Compatibility parameter. The event object always includes `related`. |
+
+The response contains `event`, `payload_summary`, and `log_excerpt`. `event` has the same shape as list items. `payload_summary.body_preview` is always `null` to avoid exposing request bodies.
+
+### GET `/request-events/export`
+
+Exports request events for the current filters. Supports `format=csv` and `format=jsonl`; responses are attachments named `request-events.csv` or `request-events.jsonl`.
+
+This endpoint accepts the same filters and sort parameter as `GET /request-events`, ignores pagination parameters, and exports at most `10000` rows. Export fields are flattened redacted summaries of list event objects, including Home/CPA, credential, client, error, token, performance, billing, and request log link fields.
 
 ### GET `/usage/realtime`
 
-返回短窗口实时快照，适合管理面板短轮询。
+Returns a short-window realtime snapshot suitable for management panel polling.
 
-Query 参数：
+Query parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `window_seconds` | integer | `900` | 统计窗口。 |
-| `bucket_seconds` | integer | `60` | velocity bucket 大小。 |
+| `window_seconds` | integer | `900` | Statistics window. |
+| `bucket_seconds` | integer | `60` | Velocity bucket size. |
 | `group_by` | string | `model` | `model`、`provider`、`client_key`、`credential`。 |
 
-除上述参数外支持汇总范围参数。响应包含 `velocity`、`latency_distribution` 和按 `group_by` 聚合的 `current_usage`。
+Aggregate range parameters are also supported. The response contains `velocity`, `latency_distribution`, and `current_usage` grouped by `group_by`.
 
 ### GET `/usage/health/providers`
 
-返回 provider 维度最近窗口健康状态。支持 `window_seconds` 和汇总范围参数。
+Returns recent-window health status by provider. Supports `window_seconds` and aggregate range parameters.
 
-`items[]` 包含 `id`、`label`、`status`、`provider`、`recent_success_count`、`recent_failed_count`、`recent_error_rate`、`last_error_at`、`last_error_status`、`last_error_message`、`next_retry_at`、`avg_latency_ms` 和 `p95_latency_ms`。`next_retry_at` 来自执行凭证的 retry/cooldown 元数据，无法归因时为 `null`。`status` 为 `healthy`、`degraded`、`unavailable` 或 `unknown`。
+`items[]` contains `id`, `label`, `status`, `provider`, `recent_success_count`, `recent_failed_count`, `recent_error_rate`, `last_error_at`, `last_error_status`, `last_error_message`, `next_retry_at`, `avg_latency_ms`, and `p95_latency_ms`. `next_retry_at` comes from execution credential retry/cooldown metadata and is `null` when attribution is unavailable. `status` is `healthy`, `degraded`, `unavailable`, or `unknown`.
 
 ### GET `/usage/health/credentials`
 
-返回执行凭证维度最近窗口健康状态。参数与 provider health 相同，响应 `subject` 为 `credential`，`items[].credential_type` 来自 usage/auth 元数据。凭证 metadata 标记为 `disabled` 或 `unavailable` 时，`status` 优先返回该状态。
+Returns recent-window health status by execution credential. Parameters are the same as provider health. The response `subject` is `credential`, and `items[].credential_type` comes from usage/auth metadata. When credential metadata marks a credential as `disabled` or `unavailable`, `status` returns that state first.
 
 ### GET `/request-logs`
 
-返回 request log index。索引基于 usage 记录生成，并在当前 Home 节点本地查找匹配 request log 文件。
+Returns the request log index. The index is generated from usage records and checks the current Home node for matching local request log files.
 
-Query 参数：
+Query parameters:
 
-| Query | 类型 | 默认值 | 说明 |
+| Query | Type | Default | Description |
 | --- | --- | --- | --- |
-| `request_id` | string | 无 | request ID 筛选。 |
-| `home_ip` | string | 无 | Home 节点筛选。 |
-| `from` / `to` | string | 无 | 时间范围。 |
-| `provider` / `model` | string | 无 | Provider/model 筛选。 |
-| `status` / `status_code` | string / integer | 无 | 状态筛选。 |
-| `limit` / `offset` | integer | `50` / `0` | 分页。 |
-| `search` | string | 无 | 对 request ID、model、provider 和 status 做 DB 侧宽松搜索；纯数字时间戳或 `.log` 文件名搜索会在最多 `10000` 条基础记录内匹配本地文件名。 |
+| `request_id` | string | none | Request ID filter. |
+| `home_ip` | string | none | Home node filter. |
+| `from` / `to` | string | none | Time range. |
+| `provider` / `model` | string | none | Provider/model filter. |
+| `status` / `status_code` | string / integer | none | Status filter. |
+| `limit` / `offset` | integer | `50` / `0` | Pagination. |
+| `search` | string | none | DB-side fuzzy search across request ID, model, provider, and status. Numeric timestamps or `.log` file name searches are matched against local file names within at most `10000` base records. |
 
-`items[]` 包含 `id`、`request_id`、`timestamp`、`home_ip`、`file_name`、`size_bytes`、`available`、`provider`、`model`、`status` 和 `download_url`。只有当前节点能找到本地文件时，`available=true` 且 `download_url` 非空；文件不存在或属于远端节点时返回 `available=false`。实际下载仍使用已有 `GET /request-log-by-id/:id`。
+`items[]` contains `id`, `request_id`, `timestamp`, `home_ip`, `file_name`, `size_bytes`, `available`, `provider`, `model`, `status`, and `download_url`. `available=true` and a non-empty `download_url` are returned only when the current node can find the local file. Missing files or files owned by remote nodes return `available=false`. Actual downloads still use the existing `GET /request-log-by-id/:id`.
 
 ### GET `/usage-queue`
 

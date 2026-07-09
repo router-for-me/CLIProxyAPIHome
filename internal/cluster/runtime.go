@@ -22,17 +22,33 @@ type RuntimeAdapter struct {
 	index     map[string]AuthIndex
 	fullCache map[string]*coreauth.Auth
 	homeIP    string
+	homePort  int
 	mu        sync.RWMutex
 }
 
 // NewRuntimeAdapter creates a new runtime adapter.
-func NewRuntimeAdapter(repo *Repository, homeIP string) *RuntimeAdapter {
+func NewRuntimeAdapter(repo *Repository, homeIP string, homePort ...int) *RuntimeAdapter {
+	port := 0
+	if len(homePort) > 0 && homePort[0] > 0 {
+		port = homePort[0]
+	}
 	return &RuntimeAdapter{
 		repo:      repo,
 		index:     make(map[string]AuthIndex),
 		fullCache: make(map[string]*coreauth.Auth),
 		homeIP:    strings.TrimSpace(homeIP),
+		homePort:  port,
 	}
+}
+
+// SetHomePort updates the advertised Home port used for future usage records.
+func (a *RuntimeAdapter) SetHomePort(port int) {
+	if a == nil || port <= 0 {
+		return
+	}
+	a.mu.Lock()
+	a.homePort = port
+	a.mu.Unlock()
 }
 
 // Enabled handles an enabled.
@@ -95,7 +111,13 @@ func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string) 
 	if !a.Enabled() {
 		return fmt.Errorf("cluster runtime adapter is disabled")
 	}
-	_, errAppend := a.repo.AppendUsage(ctx, payload, a.homeIP)
+	a.mu.RLock()
+	metadata := UsageRuntimeMetadata{
+		HomeIP:   a.homeIP,
+		HomePort: a.homePort,
+	}
+	a.mu.RUnlock()
+	_, errAppend := a.repo.AppendUsageWithRuntime(ctx, payload, metadata)
 	return errAppend
 }
 
