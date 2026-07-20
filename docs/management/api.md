@@ -3167,7 +3167,9 @@ Supported channels:
 ```text
 claude
 gemini
+gemini-interactions
 vertex
+aistudio
 codex
 codex-free
 codex-team

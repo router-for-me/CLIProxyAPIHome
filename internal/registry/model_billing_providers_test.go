@@ -49,7 +49,9 @@ func TestStaticModelDefinitionsExposeCanonicalBillingProviders(t *testing.T) {
 	}{
 		{channel: "claude", provider: "claude"},
 		{channel: "gemini", provider: "gemini"},
+		{channel: "gemini-interactions", provider: "gemini-interactions"},
 		{channel: "vertex", provider: "vertex"},
+		{channel: "aistudio", provider: "aistudio"},
 		{channel: "codex-free", provider: "codex"},
 		{channel: "codex-pro", provider: "codex"},
 		{channel: "kimi", provider: "kimi"},
@@ -78,6 +80,22 @@ func TestStaticModelDefinitionsExposeCanonicalBillingProviders(t *testing.T) {
 	}
 }
 
+func TestDetectChangedProvidersIncludesCPAProviderAliases(t *testing.T) {
+	oldData := &staticModelsJSON{
+		Gemini:   []*ModelInfo{{ID: "gemini-old"}},
+		AIStudio: []*ModelInfo{{ID: "aistudio-old"}},
+	}
+	newData := &staticModelsJSON{
+		Gemini:   []*ModelInfo{{ID: "gemini-new"}},
+		AIStudio: []*ModelInfo{{ID: "aistudio-new"}},
+	}
+
+	wantProviders := []string{"gemini", "gemini-interactions", "aistudio"}
+	if providers := detectChangedProviders(oldData, newData); !reflect.DeepEqual(providers, wantProviders) {
+		t.Fatalf("detectChangedProviders() = %#v, want %#v", providers, wantProviders)
+	}
+}
+
 func TestModelRegistrationProvidersNormalizesAndFiltersCounts(t *testing.T) {
 	registration := &ModelRegistration{Providers: map[string]int{
 		"Codex":        2,
@@ -94,20 +112,32 @@ func TestModelRegistrationProvidersNormalizesAndFiltersCounts(t *testing.T) {
 	}
 }
 
-func TestAllStaticModelDefinitionsUseCanonicalCodexProvider(t *testing.T) {
+func TestAllStaticModelDefinitionsUseCanonicalProviders(t *testing.T) {
 	modelsByChannel := GetAllStaticModelDefinitions()
-	for _, channel := range []string{"codex-free", "codex-team", "codex-plus", "codex-pro"} {
-		models := modelsByChannel[channel]
+	tests := []struct {
+		channel  string
+		provider string
+	}{
+		{channel: "gemini-interactions", provider: "gemini-interactions"},
+		{channel: "aistudio", provider: "aistudio"},
+		{channel: "codex-free", provider: "codex"},
+		{channel: "codex-team", provider: "codex"},
+		{channel: "codex-plus", provider: "codex"},
+		{channel: "codex-pro", provider: "codex"},
+	}
+
+	for _, test := range tests {
+		models := modelsByChannel[test.channel]
 		if len(models) == 0 {
-			t.Fatalf("channel %q returned no models", channel)
+			t.Fatalf("channel %q returned no models", test.channel)
 		}
 		for _, model := range models {
 			if model == nil {
 				continue
 			}
-			wantProviders := []string{"codex"}
+			wantProviders := []string{test.provider}
 			if !reflect.DeepEqual(model.Providers, wantProviders) {
-				t.Fatalf("channel %q model %q providers = %#v, want %#v", channel, model.ID, model.Providers, wantProviders)
+				t.Fatalf("channel %q model %q providers = %#v, want %#v", test.channel, model.ID, model.Providers, wantProviders)
 			}
 		}
 	}

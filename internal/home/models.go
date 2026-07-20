@@ -185,6 +185,12 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+	case "gemini-interactions":
+		models = registry.GetGeminiModels()
+		if len(configModels) > 0 {
+			models = configModels
+		}
+		models = applyExcludedModels(models, excluded)
 	case "vertex":
 		models = registry.GetGeminiVertexModels()
 		if len(configModels) > 0 {
@@ -196,6 +202,12 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "aistudio":
+		models = registry.GetAIStudioModels()
+		if len(configModels) > 0 {
+			models = configModels
 		}
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":

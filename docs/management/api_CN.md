@@ -3137,7 +3137,9 @@ Query 参数：
 ```text
 claude
 gemini
+gemini-interactions
 vertex
+aistudio
 codex
 codex-free
 codex-team

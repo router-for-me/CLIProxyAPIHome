@@ -216,7 +216,9 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 	sections := []section{
 		{"claude", oldData.Claude, newData.Claude},
 		{"gemini", oldData.Gemini, newData.Gemini},
+		{"gemini-interactions", oldData.Gemini, newData.Gemini},
 		{"vertex", oldData.Vertex, newData.Vertex},
+		{"aistudio", oldData.AIStudio, newData.AIStudio},
 		{"codex", oldData.CodexFree, newData.CodexFree},
 		{"codex", oldData.CodexTeam, newData.CodexTeam},
 		{"codex", oldData.CodexPlus, newData.CodexPlus},
@@ -343,6 +345,7 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "claude", models: data.Claude},
 		{name: "gemini", models: data.Gemini},
 		{name: "vertex", models: data.Vertex},
+		{name: "aistudio", models: data.AIStudio},
 		{name: "codex-free", models: data.CodexFree},
 		{name: "codex-team", models: data.CodexTeam},
 		{name: "codex-plus", models: data.CodexPlus},
