@@ -308,6 +308,170 @@ func TestInFlightLeaseRenewDoesNotShortenExistingTTL(t *testing.T) {
 	}
 }
 
+func TestInFlightLeaseRenewReportsFalseWhenExpiryWins(t *testing.T) {
+	repo := newInFlightTestRepository(t)
+	upsertInFlightTestAuth(t, repo, "auth-renew-expiry-race", 1, nil)
+
+	lease, errReserve := reserveInFlightTestLease(repo, "dispatch-renew-expiry-race", "auth-renew-expiry-race", "gpt-5", time.Minute)
+	if errReserve != nil || lease == nil {
+		t.Fatalf("reserve lease = %#v, %v", lease, errReserve)
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	var expireOnce sync.Once
+	if errRegister := db.Callback().Update().Before("gorm:update").Register("test:expire_before_renew_update", func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]any)
+		if !ok {
+			return
+		}
+		if _, renewing := updates["last_renewed_at"]; !renewing {
+			return
+		}
+		expireOnce.Do(func() {
+			closedAt := time.Now().UTC()
+			errExpire := tx.Exec(
+				"UPDATE in_flight_lease SET status = ?, closed_at = ?, close_reason = ? WHERE id = ?",
+				InFlightLeaseStatusExpired,
+				closedAt,
+				"ttl_expired",
+				lease.ID,
+			).Error
+			if errExpire != nil {
+				tx.AddError(errExpire)
+			}
+		})
+	}); errRegister != nil {
+		t.Fatalf("register expiry callback: %v", errRegister)
+	}
+
+	renewed, errRenew := repo.RenewInFlightLease(context.Background(), lease.LeaseID, "node-a", 2*time.Minute)
+	if errRenew != nil || renewed {
+		t.Fatalf("RenewInFlightLease() = %v, %v, want false, nil", renewed, errRenew)
+	}
+	record := InFlightLeaseRecord{}
+	if errFirst := db.Where("lease_id = ?", lease.LeaseID).First(&record).Error; errFirst != nil {
+		t.Fatalf("load lease after renewal race: %v", errFirst)
+	}
+	if record.Status != InFlightLeaseStatusExpired {
+		t.Fatalf("lease status = %q, want %q", record.Status, InFlightLeaseStatusExpired)
+	}
+}
+
+func TestInFlightLeaseExpiryDoesNotOverwriteConcurrentRenewal(t *testing.T) {
+	repo := newInFlightTestRepository(t)
+	upsertInFlightTestAuth(t, repo, "auth-expiry-renew-race", 1, nil)
+
+	lease, errReserve := reserveInFlightTestLease(repo, "dispatch-expiry-renew-race", "auth-expiry-renew-race", "gpt-5", time.Minute)
+	if errReserve != nil || lease == nil {
+		t.Fatalf("reserve lease = %#v, %v", lease, errReserve)
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	if errExpire := db.Model(&InFlightLeaseRecord{}).
+		Where("id = ?", lease.ID).
+		Update("expires_at", time.Now().UTC().Add(-time.Second)).Error; errExpire != nil {
+		t.Fatalf("prepare expired lease: %v", errExpire)
+	}
+	var renewOnce sync.Once
+	if errRegister := db.Callback().Update().Before("gorm:update").Register("test:renew_before_expiry_update", func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]any)
+		if !ok {
+			return
+		}
+		if _, expiring := updates["status"]; !expiring {
+			return
+		}
+		renewOnce.Do(func() {
+			lastRenewedAt := time.Now().UTC()
+			errRenew := tx.Exec(
+				"UPDATE in_flight_lease SET status = ?, last_renewed_at = ?, expires_at = ?, closed_at = NULL, close_reason = '' WHERE id = ?",
+				InFlightLeaseStatusActive,
+				lastRenewedAt,
+				lastRenewedAt.Add(2*time.Minute),
+				lease.ID,
+			).Error
+			if errRenew != nil {
+				tx.AddError(errRenew)
+			}
+		})
+	}); errRegister != nil {
+		t.Fatalf("register renewal callback: %v", errRegister)
+	}
+
+	renewed, errRenew := repo.RenewInFlightLease(context.Background(), lease.LeaseID, "node-a", time.Minute)
+	if errRenew != nil || !renewed {
+		t.Fatalf("RenewInFlightLease() = %v, %v, want true, nil", renewed, errRenew)
+	}
+	record := InFlightLeaseRecord{}
+	if errFirst := db.Where("lease_id = ?", lease.LeaseID).First(&record).Error; errFirst != nil {
+		t.Fatalf("load lease after expiry race: %v", errFirst)
+	}
+	if record.Status != InFlightLeaseStatusActive || !record.ExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("lease after expiry race = status:%q expires:%v, want active future lease", record.Status, record.ExpiresAt)
+	}
+}
+
+func TestInFlightLeaseConcurrentRenewalDoesNotMoveExpiryBackward(t *testing.T) {
+	repo := newInFlightTestRepository(t)
+	upsertInFlightTestAuth(t, repo, "auth-concurrent-renew", 1, nil)
+
+	lease, errReserve := reserveInFlightTestLease(repo, "dispatch-concurrent-renew", "auth-concurrent-renew", "gpt-5", time.Minute)
+	if errReserve != nil || lease == nil {
+		t.Fatalf("reserve lease = %#v, %v", lease, errReserve)
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	futureRenewedAt := time.Now().UTC().Add(time.Minute)
+	futureExpiresAt := futureRenewedAt.Add(2 * time.Minute)
+	var renewOnce sync.Once
+	if errRegister := db.Callback().Update().Before("gorm:update").Register("test:newer_concurrent_renewal", func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]any)
+		if !ok {
+			return
+		}
+		if _, renewing := updates["last_renewed_at"]; !renewing {
+			return
+		}
+		renewOnce.Do(func() {
+			errRenew := tx.Exec(
+				"UPDATE in_flight_lease SET last_renewed_at = ?, expires_at = ? WHERE id = ?",
+				futureRenewedAt,
+				futureExpiresAt,
+				lease.ID,
+			).Error
+			if errRenew != nil {
+				tx.AddError(errRenew)
+			}
+		})
+	}); errRegister != nil {
+		t.Fatalf("register concurrent renewal callback: %v", errRegister)
+	}
+
+	renewed, errRenew := repo.RenewInFlightLease(context.Background(), lease.LeaseID, "node-a", time.Minute)
+	if errRenew != nil || !renewed {
+		t.Fatalf("RenewInFlightLease() = %v, %v, want true, nil", renewed, errRenew)
+	}
+	record := InFlightLeaseRecord{}
+	if errFirst := db.Where("lease_id = ?", lease.LeaseID).First(&record).Error; errFirst != nil {
+		t.Fatalf("load lease after concurrent renewal: %v", errFirst)
+	}
+	if !record.LastRenewedAt.Equal(futureRenewedAt) || !record.ExpiresAt.Equal(futureExpiresAt) {
+		t.Fatalf(
+			"lease renewal moved backward: last_renewed_at=%v expires_at=%v, want %v and %v",
+			record.LastRenewedAt,
+			record.ExpiresAt,
+			futureRenewedAt,
+			futureExpiresAt,
+		)
+	}
+}
+
 func TestUsageDoesNotReleaseLeaseBeforeExplicitTerminalSignal(t *testing.T) {
 	repo := newInFlightTestRepository(t)
 	upsertInFlightTestAuth(t, repo, "auth-usage-release", 1, nil)

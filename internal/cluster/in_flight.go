@@ -219,29 +219,41 @@ func (r *Repository) RenewInFlightLease(ctx context.Context, leaseID string, nod
 	if leaseID == "" || ttl <= 0 {
 		return false, nil
 	}
-	now := time.Now().UTC()
-	renewed := false
-	errTx := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	db = db.WithContext(contextOrBackground(ctx))
+	for attempt := 0; attempt < 4; attempt++ {
 		record := InFlightLeaseRecord{}
-		if errFirst := tx.Where("lease_id = ?", leaseID).First(&record).Error; errFirst != nil {
+		if errFirst := db.Where("lease_id = ?", leaseID).First(&record).Error; errFirst != nil {
 			if errors.Is(errFirst, gorm.ErrRecordNotFound) {
-				return nil
+				return false, nil
 			}
-			return errFirst
+			return false, errFirst
 		}
 		if record.Status != InFlightLeaseStatusActive {
-			return nil
+			return false, nil
 		}
+		now := time.Now().UTC()
 		if !record.ExpiresAt.After(now) {
 			closedAt := now
-			return tx.Model(&record).Updates(map[string]any{
-				"status":       InFlightLeaseStatusExpired,
-				"closed_at":    &closedAt,
-				"close_reason": "ttl_expired",
-			}).Error
+			result := db.Model(&InFlightLeaseRecord{}).
+				Where("id = ? AND status = ? AND last_renewed_at = ? AND expires_at = ? AND expires_at <= ?", record.ID, InFlightLeaseStatusActive, record.LastRenewedAt, record.ExpiresAt, now).
+				Updates(map[string]any{
+					"status":       InFlightLeaseStatusExpired,
+					"closed_at":    &closedAt,
+					"close_reason": "ttl_expired",
+				})
+			if result.Error != nil {
+				return false, result.Error
+			}
+			if result.RowsAffected == 1 {
+				return false, nil
+			}
+			continue
 		}
 		if !inFlightLeaseNodeMatches(&record, nodeID) {
-			return fmt.Errorf("lease belongs to a different CPA node")
+			return false, fmt.Errorf("lease belongs to a different CPA node")
+		}
+		if record.LastRenewedAt.After(now) {
+			return true, nil
 		}
 		renewTTL := ttl
 		if existingTTL := record.ExpiresAt.Sub(record.LastRenewedAt); existingTTL > renewTTL {
@@ -250,13 +262,34 @@ func (r *Repository) RenewInFlightLease(ctx context.Context, leaseID string, nod
 			// that cadence, or a healthy long-running request could expire early.
 			renewTTL = existingTTL
 		}
-		renewed = true
-		return tx.Model(&record).Updates(map[string]any{
-			"last_renewed_at": now,
-			"expires_at":      now.Add(renewTTL),
-		}).Error
-	})
-	return renewed, errTx
+		result := db.Model(&InFlightLeaseRecord{}).
+			Where("id = ? AND status = ? AND last_renewed_at = ? AND expires_at = ? AND expires_at > ?", record.ID, InFlightLeaseStatusActive, record.LastRenewedAt, record.ExpiresAt, now).
+			Updates(map[string]any{
+				"last_renewed_at": now,
+				"expires_at":      now.Add(renewTTL),
+			})
+		if result.Error != nil {
+			return false, result.Error
+		}
+		if result.RowsAffected == 1 {
+			return true, nil
+		}
+	}
+
+	record := InFlightLeaseRecord{}
+	if errFirst := db.Where("lease_id = ?", leaseID).First(&record).Error; errFirst != nil {
+		if errors.Is(errFirst, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, errFirst
+	}
+	if record.Status != InFlightLeaseStatusActive || !record.ExpiresAt.After(time.Now().UTC()) {
+		return false, nil
+	}
+	if !inFlightLeaseNodeMatches(&record, nodeID) {
+		return false, fmt.Errorf("lease belongs to a different CPA node")
+	}
+	return true, nil
 }
 
 func (r *Repository) ReleaseInFlightLease(ctx context.Context, leaseID string, nodeID string, reason string) (bool, error) {

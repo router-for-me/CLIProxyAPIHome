@@ -2336,12 +2336,14 @@ Selector 字段：
 ```
 
 在途跟踪采用显式调度租约生命周期。CPA 为整个客户端请求保持同一个
-`request_id`，为每次向 Home 申请预留生成唯一 `dispatch_id`，在请求执行期间续租
-Home 返回的 `lease_id`，并且只在整个请求最终成功、失败或取消时释放租约。usage
-事件可以携带 `lease_id` 用于关联，但不能据此关闭租约，因为同一个客户端请求可能
-为多次上游尝试分别上报 usage。TTL 过期仍作为进程异常退出后的兜底回收机制。
+`request_id`，并为每次凭证执行尝试生成唯一的 `dispatch_id` 和 `lease_id`。CPA
+在该次尝试仍活跃时续租，并在该次尝试成功、失败或取消后立即释放；后续 fallback
+尝试会获得独立租约。usage 事件可以携带 `lease_id` 用于关联，但不能据此关闭租约，
+因为一次尝试可能上报多个 usage 事件。TTL 过期仍作为进程异常退出后的兜底回收机制。
 CPA 可以在 auth dispatch 传输结果不确定时使用同一个 `dispatch_id` 重试一次；只有
-CPA 节点、`request_id` 和请求模型均一致时，Home 才会返回原有 active lease。
+CPA 节点、`request_id`、请求模型和当前凭证授权范围均一致时，Home 才会返回原有
+active lease。如果重放 lease 已接近过期，CPA 会根据 `lease_expires_at` 提前执行首次
+续租。
 
 Home 在 RESP auth dispatch 的错误 envelope 中返回以下稳定错误类型：
 
@@ -2351,7 +2353,7 @@ Home 在 RESP auth dispatch 的错误 envelope 中返回以下稳定错误类型
 | `credential_model_concurrency_exceeded` | 所有可用凭证都达到实际上游模型的并发上限。可重试；Home 当前返回 `retry_after_ms: 250`。 |
 | `concurrency_identity_required` | 候选凭证配置了并发上限，但请求缺少 `request_id` 或 `dispatch_id`；该凭证不会被派发。 |
 | `concurrency_tracker_unavailable` | Home 无法确认受限凭证仍有容量，因此按 fail-closed 拒绝派发。无限制凭证仍按 best-effort 处理，可以在无 lease 时派发。 |
-| `dispatch_replayed` | 已完成或已过期的 dispatch ID 被复用，或者 active dispatch ID 被不同 CPA 节点、请求 ID 或请求模型复用。 |
+| `dispatch_replayed` | 已完成或已过期的 dispatch ID 被复用，或者 active dispatch ID 被不同 CPA 节点、请求 ID、请求模型或当前凭证授权范围复用。 |
 
 Session affinity 不能绕过这些检查；首选凭证饱和时会先跳过该凭证，所有候选均不可用后才返回 busy 错误。
 

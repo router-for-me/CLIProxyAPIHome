@@ -860,6 +860,9 @@ func (r *Runtime) dispatchWithLeaseOptions(ctx context.Context, reqModel string,
 			}
 			return nil, &coreauth.Error{Code: "concurrency_tracker_unavailable", Message: "credential concurrency tracker unavailable", Retryable: true}
 		}
+		if lease.Reused && !dispatchMetadataAllowsAuthID(opts.Metadata, lease.CredentialID) {
+			return nil, &DispatchReplayError{DispatchID: lease.DispatchID}
+		}
 		if lease.CredentialID != result.AuthID {
 			reusedResult, errReused := r.dispatchResultForLease(ctx, lease)
 			if errReused != nil {
@@ -868,7 +871,7 @@ func (r *Runtime) dispatchWithLeaseOptions(ctx context.Context, reqModel string,
 			result = reusedResult
 		}
 		result.LeaseID = lease.LeaseID
-		result.LeaseTTL = r.inFlightLeaseTTL()
+		result.LeaseTTL = dispatchLeaseTTL(lease, r.inFlightLeaseTTL())
 		result.LeaseExpiresAt = lease.ExpiresAt
 		return result, nil
 	}
@@ -968,27 +971,63 @@ func cloneDispatchMetadata(metadata map[string]any) map[string]any {
 	return out
 }
 
-func dispatchAllowedAuthIDs(auths []*coreauth.Auth, metadata map[string]any, excluded map[string]struct{}) []string {
-	var configured map[string]struct{}
-	if metadata != nil {
-		if raw, ok := metadata[coreauth.AllowedAuthIDsMetadataKey]; ok {
-			configured = make(map[string]struct{})
-			switch values := raw.(type) {
-			case []string:
-				for _, value := range values {
-					if id := strings.TrimSpace(value); id != "" {
-						configured[id] = struct{}{}
-					}
-				}
-			case []any:
-				for _, value := range values {
-					if id := strings.TrimSpace(fmt.Sprint(value)); id != "" {
-						configured[id] = struct{}{}
-					}
-				}
+func dispatchLeaseTTL(lease *InFlightLease, fallback time.Duration) time.Duration {
+	if lease != nil {
+		if ttl := lease.ExpiresAt.Sub(lease.LastRenewedAt); ttl > 0 {
+			return ttl
+		}
+	}
+	return fallback
+}
+
+func dispatchAllowedAuthIDSet(metadata map[string]any) (map[string]struct{}, bool) {
+	if metadata == nil {
+		return nil, false
+	}
+	raw, configured := metadata[coreauth.AllowedAuthIDsMetadataKey]
+	if !configured {
+		return nil, false
+	}
+	allowed := make(map[string]struct{})
+	add := func(value string) {
+		if id := strings.TrimSpace(value); id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+	switch values := raw.(type) {
+	case []string:
+		for _, value := range values {
+			add(value)
+		}
+	case []any:
+		for _, value := range values {
+			add(fmt.Sprint(value))
+		}
+	case map[string]struct{}:
+		for value := range values {
+			add(value)
+		}
+	case map[string]bool:
+		for value, enabled := range values {
+			if enabled {
+				add(value)
 			}
 		}
 	}
+	return allowed, true
+}
+
+func dispatchMetadataAllowsAuthID(metadata map[string]any, authID string) bool {
+	allowed, configured := dispatchAllowedAuthIDSet(metadata)
+	if !configured {
+		return true
+	}
+	_, ok := allowed[strings.TrimSpace(authID)]
+	return ok
+}
+
+func dispatchAllowedAuthIDs(auths []*coreauth.Auth, metadata map[string]any, excluded map[string]struct{}) []string {
+	configured, restricted := dispatchAllowedAuthIDSet(metadata)
 	out := make([]string, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil {
@@ -998,7 +1037,7 @@ func dispatchAllowedAuthIDs(auths []*coreauth.Auth, metadata map[string]any, exc
 		if id == "" {
 			continue
 		}
-		if configured != nil {
+		if restricted {
 			if _, ok := configured[id]; !ok {
 				continue
 			}

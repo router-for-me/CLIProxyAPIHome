@@ -2336,15 +2336,17 @@ Example response:
 ```
 
 In-flight tracking uses an explicit dispatch lease lifecycle. CPA keeps one
-`request_id` for the overall client request, creates a unique `dispatch_id` for
-each Home reservation attempt, renews the returned `lease_id` while work is
-active, and releases that lease only when the overall request reaches a final
-success, failure, or cancellation path. Usage events may carry `lease_id` for
-correlation, but they do not close leases because one client request can emit
-usage for multiple upstream attempts. TTL expiry remains the crash-recovery
-fallback. CPA may replay the same `dispatch_id` once to recover an ambiguous
-auth-dispatch transport failure; Home returns the original active reservation
-only when the CPA node, `request_id`, and requested model still match.
+`request_id` for the overall client request and creates a unique `dispatch_id`
+and `lease_id` for each credential execution attempt. CPA renews a lease while
+that attempt remains active and releases it as soon as the attempt succeeds,
+fails, or is cancelled; a later fallback attempt receives a separate lease.
+Usage events may carry `lease_id` for correlation, but they do not close leases
+because one attempt can emit multiple usage events. TTL expiry remains the
+crash-recovery fallback. CPA may replay the same `dispatch_id` once to recover
+an ambiguous auth-dispatch transport failure; Home returns the original active
+reservation only when the CPA node, `request_id`, requested model, and current
+credential authorization scope still match. CPA uses `lease_expires_at` to move
+the first renewal earlier when a replayed lease is already near expiry.
 
 Home returns stable error types in the RESP auth-dispatch error envelope:
 
@@ -2354,7 +2356,7 @@ Home returns stable error types in the RESP auth-dispatch error envelope:
 | `credential_model_concurrency_exceeded` | Every eligible credential is full for the effective model. Retryable; Home currently suggests `retry_after_ms: 250`. |
 | `concurrency_identity_required` | A capped credential was considered, but `request_id` or `dispatch_id` was missing. That credential is not issued. |
 | `concurrency_tracker_unavailable` | Home could not prove capacity for a capped credential, so dispatch fails closed. Unlimited credentials remain best-effort and may be issued without a lease. |
-| `dispatch_replayed` | A completed/expired dispatch ID was reused, or an active dispatch ID was reused with a different CPA node, request ID, or requested model. |
+| `dispatch_replayed` | A completed/expired dispatch ID was reused, or an active dispatch ID was reused with a different CPA node, request ID, requested model, or current credential authorization scope. |
 
 Session affinity never bypasses these checks. A saturated preferred credential
 is skipped before Home returns a busy error.
