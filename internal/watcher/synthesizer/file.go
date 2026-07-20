@@ -3,6 +3,7 @@ package synthesizer
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -100,6 +101,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 				auth.Attributes["source"] = fullPath
 				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
 				coreauth.ApplyCustomHeadersFromMetadata(auth)
+				if !applyConcurrencyLimitsFromMetadata(auth, metadata) {
+					return nil
+				}
 				applyClusterUUID(ctx, auth)
 			}
 			return auths
@@ -184,6 +188,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+	if !applyConcurrencyLimitsFromMetadata(a, metadata) {
+		return nil
+	}
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
@@ -196,6 +203,61 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	applyClusterUUID(ctx, a)
 	return []*coreauth.Auth{a}
+}
+
+func applyConcurrencyLimitsFromMetadata(auth *coreauth.Auth, metadata map[string]any) bool {
+	if auth == nil || metadata == nil {
+		return true
+	}
+	if rawLimit, exists := metadata["max_in_flight"]; exists && rawLimit != nil {
+		limit, valid := nonNegativeMetadataInt(rawLimit)
+		if !valid {
+			return false
+		}
+		if limit > 0 {
+			auth.MaxInFlight = limit
+		}
+	}
+	rawModelLimits, exists := metadata["max_in_flight_by_model"]
+	if !exists || rawModelLimits == nil {
+		return true
+	}
+	rawLimits, ok := rawModelLimits.(map[string]any)
+	if !ok {
+		return false
+	}
+	limits := make(map[string]int, len(rawLimits))
+	for rawModel, rawLimit := range rawLimits {
+		model := coreauth.CanonicalModelKey(rawModel)
+		limit, valid := nonNegativeMetadataInt(rawLimit)
+		if model == "" || !valid {
+			return false
+		}
+		if limit <= 0 {
+			continue
+		}
+		if current, exists := limits[model]; !exists || limit < current {
+			limits[model] = limit
+		}
+	}
+	if len(limits) > 0 {
+		auth.MaxInFlightByModel = limits
+	}
+	return true
+}
+
+func nonNegativeMetadataInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, typed >= 0
+	case float64:
+		if typed < 0 || typed > float64(^uint(0)>>1) || typed != math.Trunc(typed) {
+			return 0, false
+		}
+		return int(typed), true
+	default:
+		return 0, false
+	}
 }
 
 func parsePluginFileAuths(parser PluginAuthParser, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {

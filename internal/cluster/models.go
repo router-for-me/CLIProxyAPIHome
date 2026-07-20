@@ -118,6 +118,43 @@ func (AuthRecord) TableName() string {
 	return "auth"
 }
 
+const (
+	InFlightLeaseStatusActive   = "active"
+	InFlightLeaseStatusReleased = "released"
+	InFlightLeaseStatusExpired  = "expired"
+)
+
+// InFlightLeaseRecord stores one Home dispatch reservation. Closed rows are
+// retained briefly so repeated dispatch and release messages remain idempotent.
+type InFlightLeaseRecord struct {
+	ID             uint       `gorm:"column:id;primaryKey;autoIncrement"`
+	LeaseID        string     `gorm:"column:lease_id;not null;uniqueIndex"`
+	DispatchID     string     `gorm:"column:dispatch_id;not null;uniqueIndex"`
+	RequestID      string     `gorm:"column:request_id;index"`
+	CredentialID   string     `gorm:"column:credential_id;not null;index:idx_in_flight_credential_status,priority:1;index:idx_in_flight_credential_model_status,priority:1"`
+	Provider       string     `gorm:"column:provider"`
+	RequestedModel string     `gorm:"column:requested_model"`
+	Model          string     `gorm:"column:model;not null;index:idx_in_flight_credential_model_status,priority:2"`
+	CPANodeID      string     `gorm:"column:cpa_node_id;index"`
+	CPAIP          string     `gorm:"column:cpa_ip"`
+	CPALabel       string     `gorm:"column:cpa_label"`
+	ForceMapping   bool       `gorm:"column:force_mapping;not null;default:false"`
+	OriginalAlias  string     `gorm:"column:original_alias"`
+	Status         string     `gorm:"column:status;not null;index:idx_in_flight_credential_status,priority:2;index:idx_in_flight_credential_model_status,priority:3;index:idx_in_flight_status_expiry,priority:1"`
+	StartedAt      time.Time  `gorm:"column:started_at;not null;index"`
+	LastRenewedAt  time.Time  `gorm:"column:last_renewed_at;not null"`
+	ExpiresAt      time.Time  `gorm:"column:expires_at;not null;index:idx_in_flight_status_expiry,priority:2"`
+	ClosedAt       *time.Time `gorm:"column:closed_at;index"`
+	CloseReason    string     `gorm:"column:close_reason"`
+	CreatedAt      time.Time  `gorm:"column:created_at"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at"`
+}
+
+// TableName returns the database table name.
+func (InFlightLeaseRecord) TableName() string {
+	return "in_flight_lease"
+}
+
 type ConfigRecord struct {
 	Key       string    `gorm:"column:key;primaryKey"`
 	Value     JSONB     `gorm:"column:value;not null"`

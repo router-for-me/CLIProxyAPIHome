@@ -37,7 +37,7 @@ xai-api-key:
       - name: grok-4.5
         alias: grok-latest
 `)
-	writeFile(t, filepath.Join(authDir, "codex.json"), `{"type":"codex","email":"a@example.com","access_token":"token"}`)
+	writeFile(t, filepath.Join(authDir, "codex.json"), `{"type":"codex","email":"a@example.com","access_token":"token","max_in_flight":4,"max_in_flight_by_model":{"gpt-5.5":2}}`)
 
 	db := openImportTestSQLite(t)
 	repo := NewRepository(db)
@@ -65,6 +65,20 @@ xai-api-key:
 	}
 	assertTableCount(t, db, &APIKeyRecord{}, 1)
 	assertActiveAuthCount(t, db, 3)
+	auths, errAuths := repo.ListAuths(context.Background())
+	if errAuths != nil {
+		t.Fatalf("ListAuths() error = %v", errAuths)
+	}
+	var codexAuth *coreauth.Auth
+	for _, auth := range auths {
+		if auth != nil && auth.Provider == "codex" {
+			codexAuth = auth
+			break
+		}
+	}
+	if codexAuth == nil || codexAuth.MaxInFlight != 4 || codexAuth.MaxInFlightByModel["gpt-5.5"] != 2 {
+		t.Fatalf("imported codex concurrency limits = %#v", codexAuth)
+	}
 }
 
 func TestRepositoryUpsertResult_UsesSemanticJSONEquality(t *testing.T) {
@@ -237,7 +251,10 @@ func TestExportLocalState_DefaultWritesConfigToCurrentDirAndAuthToHome(t *testin
 		t.Fatalf("ExportLocalState() AuthFiles = %d, want 1", stats.AuthFiles)
 	}
 	assertFileContains(t, filepath.Join(workDir, "config.yaml"), "auth-dir: ~/.cli-proxy-api")
-	assertFileExists(t, filepath.Join(homeDir, ".cli-proxy-api", "codex.json"))
+	exportedAuthPath := filepath.Join(homeDir, ".cli-proxy-api", "codex.json")
+	assertFileContains(t, exportedAuthPath, `"max_in_flight": 4`)
+	assertFileContains(t, exportedAuthPath, `"gpt-5.5": 2`)
+	assertFileNotContains(t, exportedAuthPath, `"in_flight"`)
 }
 
 func TestExportLocalState_CustomOutputDirWritesAuthsUnderOutputDir(t *testing.T) {
@@ -258,7 +275,10 @@ func TestExportLocalState_CustomOutputDirWritesAuthsUnderOutputDir(t *testing.T)
 		t.Fatalf("ExportLocalState() AuthFiles = %d, want 1", stats.AuthFiles)
 	}
 	assertFileContains(t, filepath.Join(outputDir, "config.yaml"), "auth-dir: auths")
-	assertFileExists(t, filepath.Join(outputDir, "auths", "codex.json"))
+	exportedAuthPath := filepath.Join(outputDir, "auths", "codex.json")
+	assertFileContains(t, exportedAuthPath, `"max_in_flight": 4`)
+	assertFileContains(t, exportedAuthPath, `"gpt-5.5": 2`)
+	assertFileNotContains(t, exportedAuthPath, `"in_flight"`)
 }
 
 func openImportTestSQLite(t *testing.T) *gorm.DB {
@@ -299,14 +319,17 @@ func seedExportState(t *testing.T, repo *Repository) {
 		t.Fatal(errUpsert)
 	}
 	auth := &coreauth.Auth{
-		ID:       "codex-auth",
-		Index:    "codex-auth",
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
+		ID:                 "codex-auth",
+		Index:              "codex-auth",
+		Provider:           "codex",
+		Status:             coreauth.StatusActive,
+		MaxInFlight:        4,
+		MaxInFlightByModel: map[string]int{"gpt-5.5": 2},
 		Metadata: map[string]any{
-			"type":     "codex",
-			"filename": "codex.json",
-			"token":    "test-token",
+			"type":      "codex",
+			"filename":  "codex.json",
+			"token":     "test-token",
+			"in_flight": 99,
 		},
 	}
 	if _, _, errUpsertAuth := repo.UpsertAuthWithResult(ctx, auth, "upsert"); errUpsertAuth != nil {
@@ -323,6 +346,18 @@ func assertFileContains(t *testing.T, path string, want string) {
 	}
 	if !strings.Contains(string(raw), want) {
 		t.Fatalf("%s does not contain %q:\n%s", path, want, string(raw))
+	}
+}
+
+func assertFileNotContains(t *testing.T, path string, unwanted string) {
+	t.Helper()
+
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read %s: %v", path, errRead)
+	}
+	if strings.Contains(string(raw), unwanted) {
+		t.Fatalf("%s unexpectedly contains %q:\n%s", path, unwanted, string(raw))
 	}
 }
 

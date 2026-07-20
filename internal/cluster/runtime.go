@@ -121,6 +121,34 @@ func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string) 
 	return errAppend
 }
 
+func (a *RuntimeAdapter) ReserveInFlightLease(ctx context.Context, input home.InFlightReserveInput) (*home.InFlightLease, error) {
+	if !a.Enabled() {
+		return nil, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.ReserveInFlightLease(ctx, input)
+}
+
+func (a *RuntimeAdapter) RenewInFlightLease(ctx context.Context, leaseID string, nodeID string, ttl time.Duration) (bool, error) {
+	if !a.Enabled() {
+		return false, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.RenewInFlightLease(ctx, leaseID, nodeID, ttl)
+}
+
+func (a *RuntimeAdapter) ReleaseInFlightLease(ctx context.Context, leaseID string, nodeID string, reason string) (bool, error) {
+	if !a.Enabled() {
+		return false, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.ReleaseInFlightLease(ctx, leaseID, nodeID, reason)
+}
+
+func (a *RuntimeAdapter) PurgeInFlightLeases(ctx context.Context, now time.Time, retention time.Duration, limit int) (int64, error) {
+	if !a.Enabled() {
+		return 0, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.PurgeInFlightLeases(ctx, now, retention, limit)
+}
+
 // StoreAppLogPayload stores a CPA app log payload.
 func (a *RuntimeAdapter) StoreAppLogPayload(ctx context.Context, clientIP string, payload string) error {
 	if !a.Enabled() {
@@ -458,7 +486,24 @@ func (a *RuntimeAdapter) GetFullAuth(ctx context.Context, uuid string) (*coreaut
 		return cached.Clone(), nil
 	}
 	a.mu.RUnlock()
+	return a.loadFullAuth(ctx, uuid)
+}
 
+// GetFreshFullAuth loads a full auth directly from the database and refreshes
+// the local cache. Concurrency safety checks use this path when cached runtime
+// state may lag a mutation committed by another Home node.
+func (a *RuntimeAdapter) GetFreshFullAuth(ctx context.Context, uuid string) (*coreauth.Auth, error) {
+	if !a.Enabled() {
+		return nil, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	uuid = strings.TrimSpace(uuid)
+	if uuid == "" {
+		return nil, fmt.Errorf("cluster auth uuid is required")
+	}
+	return a.loadFullAuth(ctx, uuid)
+}
+
+func (a *RuntimeAdapter) loadFullAuth(ctx context.Context, uuid string) (*coreauth.Auth, error) {
 	auth, _, errAuth := a.repo.GetAuth(ctx, uuid)
 	if errAuth != nil {
 		if errors.Is(errAuth, gorm.ErrRecordNotFound) {

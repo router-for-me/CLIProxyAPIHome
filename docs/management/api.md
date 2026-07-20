@@ -152,6 +152,9 @@ The table below is extracted from the final Home route registry built by `intern
 | `PATCH` | `/auth-files/fields` |
 | `GET` | `/auth-files/models` |
 | `PATCH` | `/auth-files/status` |
+| `GET` | `/credentials/in-flight` |
+| `GET` | `/credentials/in-flight/summary` |
+| `GET` | `/credentials/:credential_id/in-flight` |
 | `POST` | `/certificates/clients` |
 | `GET` | `/channel-group-details` |
 | `POST` | `/channel-group-details` |
@@ -2112,6 +2115,7 @@ Example response:
 
 ```json
 {
+  "in_flight_observed_at": "2026-07-20T12:00:00Z",
   "files": [
     {
       "id": "auth-db-id",
@@ -2130,6 +2134,12 @@ Example response:
       "email": "user@example.com",
       "priority": 10,
       "note": "operator note",
+      "max_in_flight": 4,
+      "max_in_flight_by_model": { "gpt-5.5": 2 },
+      "in_flight": 2,
+      "remaining": 2,
+      "total_saturated": false,
+      "saturated_model_count": 1,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2137,6 +2147,10 @@ Example response:
   ]
 }
 ```
+
+The in-flight fields are a convenience snapshot taken at `in_flight_observed_at`. Use `/credentials/in-flight/summary` for lightweight polling; an in-flight read failure does not make the credential list unavailable, and the snapshot fields are omitted in that case.
+
+Credential downloads and `-export` preserve `max_in_flight` and `max_in_flight_by_model`. Volatile count fields are never written to credential files.
 
 ### GET `/auth-files/models?name=<name-or-id>`
 
@@ -2283,6 +2297,8 @@ Example request:
   "priority": 10,
   "note": "operator note",
   "websockets": true,
+  "max_in_flight": 4,
+  "max_in_flight_by_model": { "gpt-5.5": 2 },
   "disabled": false
 }
 ```
@@ -2306,14 +2322,169 @@ Editable fields:
 | `priority` | integer or numeric string | Credential selection priority. |
 | `note` | string | Operator note; empty value clears it. |
 | `websockets` | boolean or string bool | Runtime websocket flag for supported auths. |
+| `max_in_flight` | non-negative integer or `null` | Credential-wide hard concurrency cap. `0` or `null` clears the cap. |
+| `max_in_flight_by_model` | object of model ID to non-negative integer, or `null` | Per-effective-model hard caps. Trailing thinking suffixes such as `(high)` are normalized to the base model so reasoning variants share one concurrency pool. Entries with value `0` are removed; an empty object or `null` clears all model caps. |
 | `disabled` | boolean or string bool | Updates auth disabled state and status. |
 | any nested path | any valid JSON | Sets arbitrary metadata paths such as `token.access_token`. |
+
+`in_flight`, `remaining`, `total_saturated`, and `saturated_model_count` are derived read-only fields. PATCH requests containing them are rejected.
 
 Example response:
 
 ```json
 { "status": "ok" }
 ```
+
+In-flight tracking uses an explicit dispatch lease lifecycle. CPA keeps one
+`request_id` for the overall client request, creates a unique `dispatch_id` for
+each Home reservation attempt, renews the returned `lease_id` while work is
+active, and releases that lease only when the overall request reaches a final
+success, failure, or cancellation path. Usage events may carry `lease_id` for
+correlation, but they do not close leases because one client request can emit
+usage for multiple upstream attempts. TTL expiry remains the crash-recovery
+fallback. CPA may replay the same `dispatch_id` once to recover an ambiguous
+auth-dispatch transport failure; Home returns the original active reservation
+only when the CPA node, `request_id`, and requested model still match.
+
+Home returns stable error types in the RESP auth-dispatch error envelope:
+
+| Error type | Meaning |
+| --- | --- |
+| `credential_concurrency_exceeded` | Every eligible credential is full at the credential-wide limit. Retryable; Home currently suggests `retry_after_ms: 250`. |
+| `credential_model_concurrency_exceeded` | Every eligible credential is full for the effective model. Retryable; Home currently suggests `retry_after_ms: 250`. |
+| `concurrency_identity_required` | A capped credential was considered, but `request_id` or `dispatch_id` was missing. That credential is not issued. |
+| `concurrency_tracker_unavailable` | Home could not prove capacity for a capped credential, so dispatch fails closed. Unlimited credentials remain best-effort and may be issued without a lease. |
+| `dispatch_replayed` | A completed/expired dispatch ID was reused, or an active dispatch ID was reused with a different CPA node, request ID, or requested model. |
+
+Session affinity never bypasses these checks. A saturated preferred credential
+is skipped before Home returns a busy error.
+
+Rollout requirement: upgrade Home and every dispatching CPA node before setting
+non-zero concurrency limits. Older CPA nodes omit dispatch identity, so Home
+intentionally refuses to issue capped credentials to them.
+
+### GET `/credentials/in-flight`
+
+Returns a cursor-paginated list of all active dispatch leases. Request payloads and secrets are never included.
+
+| Query | Type | Required | Description |
+| --- | --- | --- | --- |
+| `credential_id` | string | no | Restrict results to one credential ID. Unknown IDs return an empty page. |
+| `limit` | integer | no | Page size from `1` to `200`. Default: `50`. |
+| `cursor` | unsigned integer string | no | Opaque cursor returned by the previous page. |
+
+Example response:
+
+```json
+{
+  "observed_at": "2026-07-20T12:00:00Z",
+  "items": [
+    {
+      "lease_id": "dispatch-uuid",
+      "request_id": "request-uuid",
+      "credential_id": "auth-db-id",
+      "provider": "codex",
+      "requested_model": "team/gpt-5.5",
+      "model": "gpt-5.5",
+      "cpa_node_id": "cpa-a",
+      "cpa_ip": "192.0.2.20",
+      "cpa_label": "cpa-a:8317",
+      "started_at": "2026-07-20T11:59:30Z",
+      "last_renewed_at": "2026-07-20T11:59:50Z",
+      "expires_at": "2026-07-20T12:29:50Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+### GET `/credentials/in-flight/summary`
+
+Returns current in-flight totals for every visible credential. This is a read-only database view; expired leases are excluded immediately and are cleaned up asynchronously.
+
+`max_in_flight` and `remaining` are `null` when the credential-wide limit is unlimited. Model entries use the effective upstream model selected by Home, not necessarily the client-requested alias. Trailing thinking suffixes are collapsed into the base model key. A model's `remaining` value reflects both its model cap and the credential-wide cap.
+
+Example response:
+
+```json
+{
+  "observed_at": "2026-07-20T12:00:00Z",
+  "items": [
+    {
+      "credential_id": "auth-db-id",
+      "in_flight": 2,
+      "max_in_flight": 4,
+      "remaining": 2,
+      "total_saturated": false,
+      "saturated_model_count": 1,
+      "models": [
+        {
+          "model": "gpt-5.5",
+          "in_flight": 2,
+          "max_in_flight": 2,
+          "remaining": 0,
+          "saturated": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+### GET `/credentials/:credential_id/in-flight`
+
+Returns one credential's concurrency summary and a cursor-paginated list of active dispatch leases.
+
+| Query | Type | Required | Description |
+| --- | --- | --- | --- |
+| `limit` | integer | no | Page size from `1` to `200`. Default: `50`. |
+| `cursor` | unsigned integer string | no | Opaque cursor returned by the previous page. |
+
+Example response:
+
+```json
+{
+  "observed_at": "2026-07-20T12:00:00Z",
+  "credential": {
+    "credential_id": "auth-db-id",
+    "in_flight": 1,
+    "max_in_flight": 4,
+    "remaining": 3,
+    "total_saturated": false,
+    "saturated_model_count": 0,
+    "models": [
+      {
+        "model": "gpt-5.5",
+        "in_flight": 1,
+        "max_in_flight": 2,
+        "remaining": 1,
+        "saturated": false
+      }
+    ]
+  },
+  "requests": {
+    "items": [
+      {
+        "lease_id": "dispatch-uuid",
+        "request_id": "request-uuid",
+        "credential_id": "auth-db-id",
+        "provider": "codex",
+        "requested_model": "team/gpt-5.5",
+        "model": "gpt-5.5",
+        "cpa_node_id": "cpa-a",
+        "cpa_ip": "192.0.2.20",
+        "cpa_label": "cpa-a:8317",
+        "started_at": "2026-07-20T11:59:30Z",
+        "last_renewed_at": "2026-07-20T11:59:50Z",
+        "expires_at": "2026-07-20T12:29:50Z"
+      }
+    ],
+    "next_cursor": null
+  }
+}
+```
+
+Missing credentials return `404`. Invalid pagination returns `400`. Request payloads and secrets are never included.
 
 ### OAuth Start Routes
 
@@ -2540,6 +2711,8 @@ Response fields:
 | `capabilities.logs` | boolean | Whether application log APIs are available. |
 | `capabilities.request_error_logs` | boolean | Whether request error log file list/download APIs are available. |
 | `capabilities.topology` | boolean | Whether `GET /topology` is available for Home + CPA cluster topology. |
+| `capabilities.credential_in_flight` | boolean | Whether credential/model in-flight summary and detail APIs are available. |
+| `capabilities.credential_concurrency_limits` | boolean | Whether `max_in_flight` and `max_in_flight_by_model` can be edited through auth fields. |
 | `server_info.home_version` | string | Home build version. |
 | `server_info.home_commit` | string | Home build commit. |
 | `server_info.home_build_date` | string | Home build time. |
@@ -3716,6 +3889,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `plugins.configs` | object | Per-plugin config keyed by plugin ID. Store installs write a pinned `store` manifest under each plugin entry. Home-mode CPA nodes download store entries from that manifest; Home downloads and loads them only when `load-in-home: true` is explicitly set. |
 | `usage-statistics-enabled` | boolean | Enables in-memory usage aggregation. Home forces this to `true` for downstream CPA nodes and rejects disabling it through Management API updates. |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue retention window. Default `60`, max `3600`. |
+| `in-flight-lease-ttl` | duration string | Crash-recovery TTL for unrenewed dispatch leases. Default `30m`; values below `1m` fall back to the default. Decreasing it affects new leases only; renewal never shortens an existing lease below the TTL cadence returned to CPA at dispatch. |
 | `disable-cooling` | boolean | Globally disables quota cooldown scheduling. Home forces this to `true` for downstream CPA nodes. |
 | `auth-auto-refresh-workers` | integer | Overrides auth auto-refresh worker count. |
 | `request-retry` | integer | Failed request retry count. |

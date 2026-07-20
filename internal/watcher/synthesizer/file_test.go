@@ -57,6 +57,44 @@ func TestSynthesizeAuthFileUsesPluginMultiAuthParser(t *testing.T) {
 	}
 }
 
+func TestSynthesizeAuthFileReadsConcurrencyLimits(t *testing.T) {
+	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	auths := SynthesizeAuthFile(&SynthesisContext{
+		Config:  &config.Config{},
+		AuthDir: t.TempDir(),
+		Now:     now,
+	}, "codex.json", []byte(`{"type":"codex","max_in_flight":4,"max_in_flight_by_model":{"gpt-5.5":3,"gpt-5.5(high)":2,"ignored":0}}`))
+	if len(auths) != 1 || auths[0] == nil {
+		t.Fatalf("auths = %#v, want one auth", auths)
+	}
+	if auths[0].MaxInFlight != 4 {
+		t.Fatalf("MaxInFlight = %d, want 4", auths[0].MaxInFlight)
+	}
+	if len(auths[0].MaxInFlightByModel) != 1 || auths[0].MaxInFlightByModel["gpt-5.5"] != 2 {
+		t.Fatalf("MaxInFlightByModel = %#v, want gpt-5.5=2", auths[0].MaxInFlightByModel)
+	}
+}
+
+func TestSynthesizeAuthFileRejectsInvalidConcurrencyLimits(t *testing.T) {
+	for _, payload := range []string{
+		`{"type":"codex","max_in_flight":-1}`,
+		`{"type":"codex","max_in_flight":1.5}`,
+		`{"type":"codex","max_in_flight":"2"}`,
+		`{"type":"codex","max_in_flight_by_model":[]}`,
+		`{"type":"codex","max_in_flight_by_model":{" ":1}}`,
+		`{"type":"codex","max_in_flight_by_model":{"gpt-5":null}}`,
+		`{"type":"codex","max_in_flight_by_model":{"gpt-5":-1}}`,
+	} {
+		auths := SynthesizeAuthFile(&SynthesisContext{
+			Now:         time.Now(),
+			IDGenerator: NewStableIDGenerator(),
+		}, "codex.json", []byte(payload))
+		if len(auths) != 0 {
+			t.Fatalf("SynthesizeAuthFile(%s) = %#v, want rejected credential", payload, auths)
+		}
+	}
+}
+
 type multiAuthParser struct {
 	t          *testing.T
 	parseAuths func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error)
