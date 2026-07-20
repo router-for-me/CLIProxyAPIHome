@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
@@ -150,6 +152,12 @@ func TestHandleAuthValidateRejectsWhenNoAPIKeysConfigured(t *testing.T) {
 
 func newAuthValidateRuntime(t *testing.T, ctx context.Context, validKey string, deletedKey string) *home.Runtime {
 	t.Helper()
+	runtime, _ := newAuthValidateRuntimeWithRepository(t, ctx, validKey, deletedKey)
+	return runtime
+}
+
+func newAuthValidateRuntimeWithRepository(t *testing.T, ctx context.Context, validKey string, deletedKey string) (*home.Runtime, *cluster.Repository) {
+	t.Helper()
 
 	db, errOpen := cluster.OpenSQLite(ctx, filepath.Join(t.TempDir(), "home.db"))
 	if errOpen != nil {
@@ -190,7 +198,51 @@ func newAuthValidateRuntime(t *testing.T, ctx context.Context, validKey string, 
 		t.Fatalf("NewRuntime() error = %v", errRuntime)
 	}
 	rt.SetClusterAdapter(cluster.NewRuntimeAdapter(repo, "192.0.2.10"))
-	return rt
+	return rt, repo
+}
+
+func TestHandleAuthValidateDoesNotReserveInFlightLease(t *testing.T) {
+	ctx := context.Background()
+	rt, repo := newAuthValidateRuntimeWithRepository(t, ctx, "valid-client-key", "deleted-client-key")
+	now := time.Now().UTC()
+	auth := &coreauth.Auth{
+		ID:          "auth-validate-upstream",
+		Index:       "auth-validate-upstream",
+		Provider:    "codex",
+		Status:      coreauth.StatusActive,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		MaxInFlight: 1,
+		Metadata:    map[string]any{"type": "codex"},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "test"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+	if errReload := rt.ReloadAuths(ctx); errReload != nil {
+		t.Fatalf("ReloadAuths() error = %v", errReload)
+	}
+
+	reply := handleAuthValidate(ctx, dispatch.Env{Runtime: rt}, []string{"RPOP", `{"type":"auth-validate","headers":{"authorization":"Bearer valid-client-key"}}`})
+	if reply.Kind != dispatch.ReplyKindBulkString {
+		t.Fatalf("reply kind = %v, want bulk string", reply.Kind)
+	}
+	summaries, _, errSummaries := repo.ListInFlightCredentialSummaries(ctx)
+	if errSummaries != nil {
+		t.Fatalf("ListInFlightCredentialSummaries() error = %v", errSummaries)
+	}
+	found := false
+	for _, summary := range summaries {
+		if summary.CredentialID != auth.ID {
+			continue
+		}
+		found = true
+		if summary.InFlight != 0 {
+			t.Fatalf("auth-validate reserved %d leases, want 0", summary.InFlight)
+		}
+	}
+	if !found {
+		t.Fatalf("credential %q missing from in-flight summaries", auth.ID)
+	}
 }
 
 func newAuthValidateRuntimeWithoutKeys(t *testing.T, ctx context.Context) *home.Runtime {
@@ -267,5 +319,27 @@ func TestHandleAuthRejectsBadCredentials(t *testing.T) {
 				t.Fatalf("error.type = %q, want %q; body=%s", got.Error.Type, tc.wantError, string(reply.BulkString))
 			}
 		})
+	}
+}
+
+func TestBuildDispatchErrorJSONUsesModelConcurrencyType(t *testing.T) {
+	payload := buildDispatchErrorJSON(&home.ConcurrencyExceededError{
+		Scope:        "model",
+		CredentialID: "auth-model-limit",
+		Model:        "gpt-5",
+		Current:      2,
+		Limit:        2,
+	})
+	var got struct {
+		Error struct {
+			Type  string `json:"type"`
+			Scope string `json:"scope"`
+		} `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(payload), &got); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v", errUnmarshal)
+	}
+	if got.Error.Type != "credential_model_concurrency_exceeded" || got.Error.Scope != "model" {
+		t.Fatalf("error = %#v", got.Error)
 	}
 }

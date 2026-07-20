@@ -17,7 +17,9 @@ import (
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
+	log "github.com/sirupsen/logrus"
 )
 
 // ListAuthFiles returns an auth files.
@@ -29,17 +31,30 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "auth_load_failed", errAuths)
 		return
 	}
+	summaries, observedAt, errSummaries := h.repo.ListInFlightCredentialSummaries(ctx)
+	summaryByCredentialID := make(map[string]*home.InFlightCredentialSummary, len(summaries))
+	if errSummaries != nil {
+		log.WithError(errSummaries).Warn("management auth files: in-flight counts unavailable")
+	} else {
+		for i := range summaries {
+			summaryByCredentialID[summaries[i].CredentialID] = &summaries[i]
+		}
+	}
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if !isOAuthAuth(auth) {
 			continue
 		}
-		files = append(files, authFileEntry(auth))
+		files = append(files, authFileEntry(auth, summaryByCredentialID[auth.ID]))
 	}
 	sort.Slice(files, func(i, j int) bool {
 		return fmt.Sprint(files[i]["name"]) < fmt.Sprint(files[j]["name"])
 	})
-	c.JSON(http.StatusOK, gin.H{"files": files})
+	response := gin.H{"files": files}
+	if errSummaries == nil {
+		response["in_flight_observed_at"] = observedAt.UTC()
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // DownloadAuthFile downloads an auth file.
@@ -55,7 +70,7 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "not_found", nil)
 		return
 	}
-	data, errMarshal := json.MarshalIndent(auth.Metadata, "", "  ")
+	data, errMarshal := json.MarshalIndent(authFilePayload(auth), "", "  ")
 	if errMarshal != nil {
 		respondError(c, http.StatusInternalServerError, "marshal_failed", errMarshal)
 		return
@@ -496,22 +511,33 @@ func applyAuthDisabledStatus(auth *coreauth.Auth, disabled bool) {
 }
 
 // authFileEntry handles an auth file entry.
-func authFileEntry(auth *coreauth.Auth) gin.H {
+func authFileEntry(auth *coreauth.Auth, inFlight *home.InFlightCredentialSummary) gin.H {
 	// Validate request inputs before mutating persisted state.
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.ID,
-		"name":           authFileDisplayName(auth),
-		"file_name":      authFileName(auth),
-		"type":           auth.Provider,
-		"provider":       auth.Provider,
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   auth.Attributes != nil && strings.EqualFold(auth.Attributes["runtime_only"], "true"),
-		"source":         "db",
+		"id":                     auth.ID,
+		"auth_index":             auth.ID,
+		"name":                   authFileDisplayName(auth),
+		"file_name":              authFileName(auth),
+		"type":                   auth.Provider,
+		"provider":               auth.Provider,
+		"label":                  auth.Label,
+		"status":                 auth.Status,
+		"status_message":         auth.StatusMessage,
+		"disabled":               auth.Disabled,
+		"unavailable":            auth.Unavailable,
+		"runtime_only":           auth.Attributes != nil && strings.EqualFold(auth.Attributes["runtime_only"], "true"),
+		"source":                 "db",
+		"max_in_flight":          nil,
+		"max_in_flight_by_model": normalizedConcurrencyModelLimits(auth.MaxInFlightByModel),
+	}
+	if auth.MaxInFlight > 0 {
+		entry["max_in_flight"] = auth.MaxInFlight
+	}
+	if inFlight != nil {
+		entry["in_flight"] = inFlight.InFlight
+		entry["remaining"] = inFlight.Remaining
+		entry["total_saturated"] = inFlight.TotalSaturated
+		entry["saturated_model_count"] = inFlight.SaturatedModelCount
 	}
 	if email := stringFromAny(auth.Metadata["email"]); email != "" {
 		entry["email"] = email
@@ -530,6 +556,31 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 		entry["modtime"] = auth.UpdatedAt
 	}
 	return entry
+}
+
+func authFilePayload(auth *coreauth.Auth) map[string]any {
+	payload := make(map[string]any)
+	if auth == nil {
+		return payload
+	}
+	for key, value := range auth.Metadata {
+		payload[key] = value
+	}
+	for _, key := range []string{"in_flight", "remaining", "total_saturated", "saturated_model_count"} {
+		delete(payload, key)
+	}
+	if auth.MaxInFlight > 0 {
+		payload["max_in_flight"] = auth.MaxInFlight
+	} else {
+		delete(payload, "max_in_flight")
+	}
+	limits := normalizedConcurrencyModelLimits(auth.MaxInFlightByModel)
+	if len(limits) > 0 {
+		payload["max_in_flight_by_model"] = limits
+	} else {
+		delete(payload, "max_in_flight_by_model")
+	}
+	return payload
 }
 
 // authFileName handles an auth file name.
@@ -566,9 +617,40 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 		if fieldPath == "" {
 			return false, fmt.Errorf("field name is required")
 		}
+		if isReadOnlyConcurrencyField(fieldPath) {
+			return false, fmt.Errorf("field %s is read-only", fieldPath)
+		}
 		value, errDecode := decodeOAuthFieldPatchValue(rawValue)
 		if errDecode != nil {
 			return false, fmt.Errorf("invalid field %s", fieldPath)
+		}
+		if fieldPath == "max_in_flight" {
+			limit, errLimit := concurrencyLimitValue(value)
+			if errLimit != nil {
+				return false, fmt.Errorf("invalid field %s: %w", fieldPath, errLimit)
+			}
+			auth.MaxInFlight = limit
+			if limit > 0 {
+				auth.Metadata[fieldPath] = limit
+			} else {
+				delete(auth.Metadata, fieldPath)
+			}
+			changed = true
+			continue
+		}
+		if fieldPath == "max_in_flight_by_model" {
+			limits, errLimits := concurrencyModelLimitsValue(value)
+			if errLimits != nil {
+				return false, fmt.Errorf("invalid field %s: %w", fieldPath, errLimits)
+			}
+			auth.MaxInFlightByModel = limits
+			if len(limits) > 0 {
+				auth.Metadata[fieldPath] = limits
+			} else {
+				delete(auth.Metadata, fieldPath)
+			}
+			changed = true
+			continue
 		}
 		metadataPath := oauthMetadataFieldPath(fieldPath)
 		if metadataPath == "headers" {
@@ -585,6 +667,96 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 		syncOAuthMetadataFields(auth, touchedRoots)
 	}
 	return changed, nil
+}
+
+func isReadOnlyConcurrencyField(field string) bool {
+	switch strings.TrimSpace(field) {
+	case "in_flight", "remaining", "total_saturated", "saturated_model_count":
+		return true
+	default:
+		return false
+	}
+}
+
+func concurrencyLimitValue(value any) (int, error) {
+	if value == nil {
+		return 0, nil
+	}
+	var limit64 int64
+	switch typed := value.(type) {
+	case int:
+		if typed < 0 {
+			return 0, fmt.Errorf("must not be negative")
+		}
+		return typed, nil
+	case int64:
+		limit64 = typed
+	case json.Number:
+		parsed, errParse := typed.Int64()
+		if errParse != nil {
+			return 0, fmt.Errorf("must be an integer")
+		}
+		limit64 = parsed
+	default:
+		return 0, fmt.Errorf("must be an integer")
+	}
+	if limit64 < 0 {
+		return 0, fmt.Errorf("must not be negative")
+	}
+	if uint64(limit64) > uint64(^uint(0)>>1) {
+		return 0, fmt.Errorf("is too large")
+	}
+	return int(limit64), nil
+}
+
+func concurrencyModelLimitsValue(value any) (map[string]int, error) {
+	if value == nil {
+		return nil, nil
+	}
+	rawLimits, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be an object")
+	}
+	limits := make(map[string]int, len(rawLimits))
+	for rawModel, rawLimit := range rawLimits {
+		model := coreauth.CanonicalModelKey(rawModel)
+		if model == "" {
+			return nil, fmt.Errorf("model name is required")
+		}
+		if _, duplicate := limits[model]; duplicate {
+			return nil, fmt.Errorf("model %s is duplicated", model)
+		}
+		if rawLimit == nil {
+			return nil, fmt.Errorf("model %s must be an integer", model)
+		}
+		limit, errLimit := concurrencyLimitValue(rawLimit)
+		if errLimit != nil {
+			return nil, fmt.Errorf("model %s %w", model, errLimit)
+		}
+		if limit > 0 {
+			limits[model] = limit
+		}
+	}
+	if len(limits) == 0 {
+		return nil, nil
+	}
+	return limits, nil
+}
+
+func normalizedConcurrencyModelLimits(input map[string]int) map[string]int {
+	if len(input) == 0 {
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(input))
+	for rawModel, limit := range input {
+		model := coreauth.CanonicalModelKey(rawModel)
+		if model != "" && limit > 0 {
+			if current, exists := out[model]; !exists || limit < current {
+				out[model] = limit
+			}
+		}
+	}
+	return out
 }
 
 func decodeOAuthFieldPatchValues(fields map[string]json.RawMessage) (map[string]any, error) {

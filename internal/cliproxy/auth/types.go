@@ -65,6 +65,10 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// MaxInFlight limits concurrent dispatches for this credential. Zero means unlimited.
+	MaxInFlight int `json:"max_in_flight,omitempty"`
+	// MaxInFlightByModel limits concurrent dispatches by effective upstream model.
+	MaxInFlightByModel map[string]int `json:"max_in_flight_by_model,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -220,6 +224,12 @@ func (a *Auth) Clone() *Auth {
 		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
+		}
+	}
+	if len(a.MaxInFlightByModel) > 0 {
+		copyAuth.MaxInFlightByModel = make(map[string]int, len(a.MaxInFlightByModel))
+		for model, limit := range a.MaxInFlightByModel {
+			copyAuth.MaxInFlightByModel[model] = limit
 		}
 	}
 	copyAuth.Runtime = a.Runtime

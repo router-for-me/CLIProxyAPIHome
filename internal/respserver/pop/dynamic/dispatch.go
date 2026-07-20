@@ -3,11 +3,14 @@ package dynamic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
@@ -126,6 +129,13 @@ func handleAuth(ctx context.Context, env dispatch.Env, args []string) dispatch.R
 	}
 	out, _ = sjson.SetBytes(out, "auth_index", authIndex)
 	out, _ = sjson.SetBytes(out, "user_api_key", strings.TrimSpace(userAPIKey))
+	if leaseID := strings.TrimSpace(result.LeaseID); leaseID != "" {
+		out, _ = sjson.SetBytes(out, "lease_id", leaseID)
+		out, _ = sjson.SetBytes(out, "lease_ttl_seconds", int64(result.LeaseTTL/time.Second))
+		if !result.LeaseExpiresAt.IsZero() {
+			out, _ = sjson.SetBytes(out, "lease_expires_at", result.LeaseExpiresAt.UTC().Format(time.RFC3339Nano))
+		}
+	}
 	out, _ = sjson.SetRawBytes(out, "auth", authJSON)
 	return dispatch.BulkString(out)
 }
@@ -158,6 +168,8 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		return nil, "", &reply
 	}
 	count := dispatchCount(jsonArg)
+	requestID := strings.TrimSpace(gjson.Get(jsonArg, "request_id").String())
+	dispatchID := strings.TrimSpace(gjson.Get(jsonArg, "dispatch_id").String())
 
 	headers := parseHeaders(jsonArg)
 	sessionID := strings.TrimSpace(gjson.Get(jsonArg, "session_id").String())
@@ -180,9 +192,15 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		userAPIKey = authRes.Principal
 	}
 
-	result, errDispatch := env.Runtime.DispatchForAPIKey(ctx, model, headers, userAPIKey)
+	result, errDispatch := env.Runtime.DispatchForAPIKeyWithLease(ctx, model, headers, userAPIKey, home.DispatchLeaseContext{
+		RequestID:  requestID,
+		DispatchID: dispatchID,
+		CPANodeID:  strings.TrimSpace(env.NodeID),
+		CPAIP:      strings.TrimSpace(env.ClientIP),
+		CPALabel:   strings.TrimSpace(env.NodeID),
+	})
 	if errDispatch != nil {
-		reply := dispatch.BulkString([]byte(buildErrorJSON(errDispatch.Error())))
+		reply := dispatch.BulkString([]byte(buildDispatchErrorJSON(errDispatch)))
 		return nil, "", &reply
 	}
 
@@ -344,6 +362,57 @@ func buildErrorJSON(message string) string {
 	out, _ = sjson.Set(out, "error.type", errorType)
 	out, _ = sjson.Set(out, "error.message", errorMessage)
 	return out
+}
+
+func buildDispatchErrorJSON(err error) string {
+	if err == nil {
+		return buildErrorJSON(homeerrors.MessageNoAuthAvailable)
+	}
+	var concurrencyErr *home.ConcurrencyExceededError
+	if errors.As(err, &concurrencyErr) && concurrencyErr != nil {
+		out := "{}"
+		errorType := "credential_concurrency_exceeded"
+		if strings.TrimSpace(concurrencyErr.Scope) == "model" {
+			errorType = "credential_model_concurrency_exceeded"
+		}
+		out, _ = sjson.Set(out, "error.type", errorType)
+		out, _ = sjson.Set(out, "error.message", concurrencyErr.Error())
+		out, _ = sjson.Set(out, "error.retryable", true)
+		out, _ = sjson.Set(out, "error.retry_after_ms", 250)
+		out, _ = sjson.Set(out, "error.scope", strings.TrimSpace(concurrencyErr.Scope))
+		if credentialID := strings.TrimSpace(concurrencyErr.CredentialID); credentialID != "" {
+			out, _ = sjson.Set(out, "error.credential_id", credentialID)
+		}
+		if model := strings.TrimSpace(concurrencyErr.Model); model != "" {
+			out, _ = sjson.Set(out, "error.model", model)
+		}
+		if concurrencyErr.Limit > 0 {
+			out, _ = sjson.Set(out, "error.current", concurrencyErr.Current)
+			out, _ = sjson.Set(out, "error.limit", concurrencyErr.Limit)
+		}
+		return out
+	}
+	var authErr *coreauth.Error
+	if errors.As(err, &authErr) && authErr != nil {
+		out := "{}"
+		errorType := strings.TrimSpace(authErr.Code)
+		if errorType == "" {
+			errorType = homeerrors.TypeError
+		}
+		out, _ = sjson.Set(out, "error.type", errorType)
+		out, _ = sjson.Set(out, "error.message", strings.TrimSpace(authErr.Message))
+		out, _ = sjson.Set(out, "error.retryable", authErr.Retryable)
+		return out
+	}
+	var replayErr *home.DispatchReplayError
+	if errors.As(err, &replayErr) {
+		out := "{}"
+		out, _ = sjson.Set(out, "error.type", "dispatch_replayed")
+		out, _ = sjson.Set(out, "error.message", replayErr.Error())
+		out, _ = sjson.Set(out, "error.retryable", false)
+		return out
+	}
+	return buildErrorJSON(err.Error())
 }
 
 // buildAuthErrorJSON renders an access error as the standard {error:{type,message}} envelope,

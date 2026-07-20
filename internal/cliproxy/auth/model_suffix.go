@@ -24,3 +24,19 @@ func parseModelSuffix(model string) suffixResult {
 		RawSuffix: model[lastOpen+1 : len(model)-1],
 	}
 }
+
+// CanonicalModelKey returns the base model identifier used for scheduling and
+// per-model state. A trailing thinking suffix changes request behavior, not the
+// upstream model's concurrency pool.
+func CanonicalModelKey(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	parsed := parseModelSuffix(model)
+	canonical := strings.TrimSpace(parsed.ModelName)
+	if canonical == "" {
+		return model
+	}
+	return canonical
+}

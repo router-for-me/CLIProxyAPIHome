@@ -101,6 +101,10 @@ usage-statistics-enabled: false
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
 
+# In-flight dispatch leases expire unless CPA renews them. The default is 30m;
+# values below 1m fall back to the default. Decreases apply to new leases only.
+in-flight-lease-ttl: "30m"
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""

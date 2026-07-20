@@ -8,6 +8,7 @@ func Register(reg *dispatch.Registry) {
 		return
 	}
 	_ = reg.RegisterDirect("LPUSH", "usage", handleUsage)
+	_ = reg.RegisterDirect("LPUSH", "in-flight", handleInFlight)
 	_ = reg.SetDirectDefault("LPUSH", handleUsage)
 	_ = reg.RegisterDirect("LPRUSH", "usage", handleUsage)
 

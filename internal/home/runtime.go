@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -113,6 +114,10 @@ type ClusterAdapter interface {
 	ListMinimalAuths() []*coreauth.Auth
 	GetFullAuth(ctx context.Context, uuid string) (*coreauth.Auth, error)
 	LoadConfigYAML(ctx context.Context) ([]byte, error)
+}
+
+type freshFullAuthResolver interface {
+	GetFreshFullAuth(ctx context.Context, uuid string) (*coreauth.Auth, error)
 }
 
 type clusterUsageStore interface {
@@ -257,6 +262,7 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	r.cancel = cancel
 	r.startClusterUsageWriter(runCtx)
 	r.startKVCleanupLoop(runCtx)
+	r.startInFlightCleanupLoop(runCtx)
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -702,14 +708,31 @@ type DispatchResult struct {
 	ForceMapping  bool
 	OriginalAlias string
 
-	AuthID   string
-	Provider string
+	AuthID         string
+	Provider       string
+	LeaseID        string
+	LeaseTTL       time.Duration
+	LeaseExpiresAt time.Time
 
 	Auth *coreauth.Auth
 }
 
+type DispatchLeaseContext struct {
+	RequestID  string
+	DispatchID string
+	CPANodeID  string
+	CPAIP      string
+	CPALabel   string
+}
+
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
 func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string) (*DispatchResult, error) {
+	return r.DispatchForAPIKeyWithLease(ctx, reqModel, headers, apiKey, DispatchLeaseContext{})
+}
+
+// DispatchForAPIKeyWithLease selects a credential and atomically reserves its
+// concurrency slot when the caller supplies request and dispatch identity.
+func (r *Runtime) DispatchForAPIKeyWithLease(ctx context.Context, reqModel string, headers http.Header, apiKey string, leaseCtx DispatchLeaseContext) (*DispatchResult, error) {
 	opts := coreauth.Options{}
 	if headers != nil {
 		opts.Headers = headers.Clone()
@@ -728,7 +751,127 @@ func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, header
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
 	}
-	return r.dispatchWithOptions(ctx, reqModel, opts)
+	return r.dispatchWithLeaseOptions(ctx, reqModel, opts, leaseCtx)
+}
+
+func (r *Runtime) dispatchWithLeaseOptions(ctx context.Context, reqModel string, opts coreauth.Options, leaseCtx DispatchLeaseContext) (*DispatchResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestID := strings.TrimSpace(leaseCtx.RequestID)
+	dispatchID := strings.TrimSpace(leaseCtx.DispatchID)
+	excluded := make(map[string]struct{})
+	var lastConcurrencyErr *ConcurrencyExceededError
+	var lastIdentityErr error
+	for {
+		attemptOpts := opts
+		attemptOpts.Metadata = cloneDispatchMetadata(opts.Metadata)
+		if len(excluded) > 0 {
+			allowed := dispatchAllowedAuthIDs(r.coreManager.List(), attemptOpts.Metadata, excluded)
+			if len(allowed) == 0 {
+				if lastIdentityErr != nil {
+					return nil, lastIdentityErr
+				}
+				if lastConcurrencyErr != nil {
+					return nil, lastConcurrencyErr
+				}
+				return nil, &coreauth.Error{Code: "auth_unavailable", Message: "no auth available"}
+			}
+			if attemptOpts.Metadata == nil {
+				attemptOpts.Metadata = make(map[string]any)
+			}
+			attemptOpts.Metadata[coreauth.AllowedAuthIDsMetadataKey] = allowed
+		}
+
+		result, errDispatch := r.dispatchWithOptions(ctx, reqModel, attemptOpts)
+		if errDispatch != nil {
+			if lastIdentityErr != nil {
+				return nil, lastIdentityErr
+			}
+			if lastConcurrencyErr != nil {
+				return nil, lastConcurrencyErr
+			}
+			return nil, errDispatch
+		}
+		if result == nil || result.Auth == nil {
+			return result, nil
+		}
+
+		limited := authConcurrencyLimitedForModel(result.Auth, result.Model)
+		if requestID == "" || dispatchID == "" {
+			if !limited {
+				limited = r.persistedAuthConcurrencyLimitedForModel(ctx, result.Auth, result.Model)
+			}
+			if !limited {
+				return result, nil
+			}
+			excluded[result.AuthID] = struct{}{}
+			lastIdentityErr = &coreauth.Error{
+				Code:    "concurrency_identity_required",
+				Message: "request_id and dispatch_id are required for a concurrency-limited credential",
+			}
+			continue
+		}
+
+		lease, errReserve := r.ReserveInFlightLease(ctx, InFlightReserveInput{
+			DispatchID:     dispatchID,
+			RequestID:      requestID,
+			CredentialID:   result.AuthID,
+			Provider:       result.Provider,
+			RequestedModel: reqModel,
+			Model:          coreauth.CanonicalModelKey(result.Model),
+			CPANodeID:      leaseCtx.CPANodeID,
+			CPAIP:          leaseCtx.CPAIP,
+			CPALabel:       leaseCtx.CPALabel,
+			ForceMapping:   result.ForceMapping,
+			OriginalAlias:  result.OriginalAlias,
+		})
+		if errReserve != nil {
+			var concurrencyErr *ConcurrencyExceededError
+			if errors.As(errReserve, &concurrencyErr) {
+				excluded[result.AuthID] = struct{}{}
+				lastConcurrencyErr = mergeConcurrencyError(lastConcurrencyErr, concurrencyErr)
+				continue
+			}
+			var replayErr *DispatchReplayError
+			if errors.As(errReserve, &replayErr) {
+				return nil, replayErr
+			}
+			if errCtx := ctx.Err(); errCtx != nil {
+				return nil, errCtx
+			}
+			if !limited {
+				limited = r.persistedAuthConcurrencyLimitedForModel(ctx, result.Auth, result.Model)
+			}
+			if !limited {
+				return result, nil
+			}
+			excluded[result.AuthID] = struct{}{}
+			lastIdentityErr = &coreauth.Error{
+				Code:      "concurrency_tracker_unavailable",
+				Message:   "credential concurrency tracker unavailable",
+				Retryable: true,
+			}
+			continue
+		}
+		if lease == nil {
+			if !limited {
+				return result, nil
+			}
+			return nil, &coreauth.Error{Code: "concurrency_tracker_unavailable", Message: "credential concurrency tracker unavailable", Retryable: true}
+		}
+		if lease.CredentialID != result.AuthID {
+			reusedResult, errReused := r.dispatchResultForLease(ctx, lease)
+			if errReused != nil {
+				return nil, errReused
+			}
+			result = reusedResult
+		}
+		result.LeaseID = lease.LeaseID
+		result.LeaseTTL = r.inFlightLeaseTTL()
+		result.LeaseExpiresAt = lease.ExpiresAt
+		return result, nil
+	}
 }
 
 func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options) (*DispatchResult, error) {
@@ -769,7 +912,13 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	if upstreamModel == "" {
 		upstreamModel = strings.TrimSpace(reqModel)
 	}
+	return dispatchResultFromAuth(auth, upstreamModel, decision.Provider, decision.ForceMapping, decision.OriginalAlias), nil
+}
 
+func dispatchResultFromAuth(auth *coreauth.Auth, model string, provider string, forceMapping bool, originalAlias string) *DispatchResult {
+	if auth == nil {
+		return nil
+	}
 	accessToken := extractAccessToken(auth)
 	baseURL := ""
 	apiKey := ""
@@ -779,16 +928,132 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	}
 
 	return &DispatchResult{
-		Model:         upstreamModel,
+		Model:         strings.TrimSpace(model),
 		AccessToken:   accessToken,
 		BaseURL:       baseURL,
 		APIKey:        apiKey,
-		ForceMapping:  decision.ForceMapping,
-		OriginalAlias: decision.OriginalAlias,
+		ForceMapping:  forceMapping,
+		OriginalAlias: strings.TrimSpace(originalAlias),
 		AuthID:        auth.ID,
-		Provider:      decision.Provider,
+		Provider:      strings.TrimSpace(provider),
 		Auth:          auth.Clone(),
-	}, nil
+	}
+}
+
+func (r *Runtime) dispatchResultForLease(ctx context.Context, lease *InFlightLease) (*DispatchResult, error) {
+	if r == nil || lease == nil || strings.TrimSpace(lease.CredentialID) == "" {
+		return nil, fmt.Errorf("home runtime: invalid reused lease")
+	}
+	if r.clusterAdapter == nil {
+		return nil, fmt.Errorf("home runtime: cluster adapter unavailable")
+	}
+	auth, errAuth := r.clusterAdapter.GetFullAuth(ctx, lease.CredentialID)
+	if errAuth != nil {
+		return nil, errAuth
+	}
+	if auth == nil {
+		return nil, fmt.Errorf("home runtime: leased auth not found")
+	}
+	return dispatchResultFromAuth(auth, lease.Model, lease.Provider, lease.ForceMapping, lease.OriginalAlias), nil
+}
+
+func cloneDispatchMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		out[key] = value
+	}
+	return out
+}
+
+func dispatchAllowedAuthIDs(auths []*coreauth.Auth, metadata map[string]any, excluded map[string]struct{}) []string {
+	var configured map[string]struct{}
+	if metadata != nil {
+		if raw, ok := metadata[coreauth.AllowedAuthIDsMetadataKey]; ok {
+			configured = make(map[string]struct{})
+			switch values := raw.(type) {
+			case []string:
+				for _, value := range values {
+					if id := strings.TrimSpace(value); id != "" {
+						configured[id] = struct{}{}
+					}
+				}
+			case []any:
+				for _, value := range values {
+					if id := strings.TrimSpace(fmt.Sprint(value)); id != "" {
+						configured[id] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		id := strings.TrimSpace(auth.ID)
+		if id == "" {
+			continue
+		}
+		if configured != nil {
+			if _, ok := configured[id]; !ok {
+				continue
+			}
+		}
+		if _, skip := excluded[id]; skip {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func authConcurrencyLimitedForModel(auth *coreauth.Auth, model string) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.MaxInFlight > 0 {
+		return true
+	}
+	model = coreauth.CanonicalModelKey(model)
+	for candidate, limit := range auth.MaxInFlightByModel {
+		if coreauth.CanonicalModelKey(candidate) == model && limit > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runtime) persistedAuthConcurrencyLimitedForModel(ctx context.Context, auth *coreauth.Auth, model string) bool {
+	if r == nil || r.clusterAdapter == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return false
+	}
+	var (
+		persisted *coreauth.Auth
+		errAuth   error
+	)
+	if resolver, ok := r.clusterAdapter.(freshFullAuthResolver); ok && resolver != nil {
+		persisted, errAuth = resolver.GetFreshFullAuth(ctx, auth.ID)
+	} else {
+		persisted, errAuth = r.clusterAdapter.GetFullAuth(ctx, auth.ID)
+	}
+	if errAuth != nil || persisted == nil {
+		return false
+	}
+	return authConcurrencyLimitedForModel(persisted, model)
+}
+
+func mergeConcurrencyError(previous *ConcurrencyExceededError, current *ConcurrencyExceededError) *ConcurrencyExceededError {
+	if previous == nil {
+		return current
+	}
+	if current == nil || previous.Scope == current.Scope {
+		return previous
+	}
+	return &ConcurrencyExceededError{Scope: "mixed"}
 }
 
 func (r *Runtime) allowedAuthIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
@@ -836,23 +1101,11 @@ func (r *Runtime) supportsRequestedModel(model string) bool {
 	if trimmedModel == "" {
 		return false
 	}
-	modelKey := strings.TrimSpace(stripModelSuffix(trimmedModel))
+	modelKey := coreauth.CanonicalModelKey(trimmedModel)
 	if modelKey == "" {
 		modelKey = trimmedModel
 	}
 	return registry.LookupModelInfo(modelKey) != nil
-}
-
-// stripModelSuffix handles a strip model suffix.
-func stripModelSuffix(model string) string {
-	lastOpen := strings.LastIndex(model, "(")
-	if lastOpen == -1 {
-		return model
-	}
-	if !strings.HasSuffix(model, ")") {
-		return model
-	}
-	return model[:lastOpen]
 }
 
 // AddToken stores a credential JSON blob into the auth directory and schedules it for use.

@@ -152,6 +152,9 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `PATCH` | `/auth-files/fields` |
 | `GET` | `/auth-files/models` |
 | `PATCH` | `/auth-files/status` |
+| `GET` | `/credentials/in-flight` |
+| `GET` | `/credentials/in-flight/summary` |
+| `GET` | `/credentials/:credential_id/in-flight` |
 | `POST` | `/certificates/clients` |
 | `GET` | `/channel-group-details` |
 | `POST` | `/channel-group-details` |
@@ -2112,6 +2115,7 @@ Query 参数：
 
 ```json
 {
+  "in_flight_observed_at": "2026-07-20T12:00:00Z",
   "files": [
     {
       "id": "auth-db-id",
@@ -2130,6 +2134,12 @@ Query 参数：
       "email": "user@example.com",
       "priority": 10,
       "note": "operator note",
+      "max_in_flight": 4,
+      "max_in_flight_by_model": { "gpt-5.5": 2 },
+      "in_flight": 2,
+      "remaining": 2,
+      "total_saturated": false,
+      "saturated_model_count": 1,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2137,6 +2147,10 @@ Query 参数：
   ]
 }
 ```
+
+在途字段是 `in_flight_observed_at` 时刻的便捷快照。轻量轮询请使用 `/credentials/in-flight/summary`；如果在途快照读取失败，凭证列表仍会返回，但会省略这些快照字段。
+
+凭证下载和 `-export` 会保留 `max_in_flight` 与 `max_in_flight_by_model`；易变的计数字段不会写入凭证文件。
 
 ### GET `/auth-files/models?name=<name-or-id>`
 
@@ -2283,6 +2297,8 @@ Query 参数：
   "priority": 10,
   "note": "operator note",
   "websockets": true,
+  "max_in_flight": 4,
+  "max_in_flight_by_model": { "gpt-5.5": 2 },
   "disabled": false
 }
 ```
@@ -2306,14 +2322,163 @@ Selector 字段：
 | `priority` | integer or numeric string | 凭证选择优先级。 |
 | `note` | string | 操作备注；空值清空。 |
 | `websockets` | boolean or string bool | 支持的 auth 的 runtime websocket flag。 |
+| `max_in_flight` | 非负整数或 `null` | 凭证级硬并发上限；`0` 或 `null` 清除上限。 |
+| `max_in_flight_by_model` | 模型 ID 到非负整数的对象，或 `null` | 按实际上游模型设置硬并发上限。末尾的 thinking 后缀（例如 `(high)`）会归一到基础模型，使不同推理档位共享同一个并发池。值为 `0` 的条目会被移除；空对象或 `null` 清除全部模型上限。 |
 | `disabled` | boolean or string bool | 更新 auth disabled state 和 status。 |
 | 任意 nested path | any valid JSON | 可以设置任意 metadata path，例如 `token.access_token`。 |
+
+`in_flight`、`remaining`、`total_saturated` 和 `saturated_model_count` 是派生只读字段；PATCH 包含这些字段时会被拒绝。
 
 输出示例：
 
 ```json
 { "status": "ok" }
 ```
+
+在途跟踪采用显式调度租约生命周期。CPA 为整个客户端请求保持同一个
+`request_id`，为每次向 Home 申请预留生成唯一 `dispatch_id`，在请求执行期间续租
+Home 返回的 `lease_id`，并且只在整个请求最终成功、失败或取消时释放租约。usage
+事件可以携带 `lease_id` 用于关联，但不能据此关闭租约，因为同一个客户端请求可能
+为多次上游尝试分别上报 usage。TTL 过期仍作为进程异常退出后的兜底回收机制。
+CPA 可以在 auth dispatch 传输结果不确定时使用同一个 `dispatch_id` 重试一次；只有
+CPA 节点、`request_id` 和请求模型均一致时，Home 才会返回原有 active lease。
+
+Home 在 RESP auth dispatch 的错误 envelope 中返回以下稳定错误类型：
+
+| 错误类型 | 含义 |
+| --- | --- |
+| `credential_concurrency_exceeded` | 所有可用凭证都达到凭证总并发上限。可重试；Home 当前返回 `retry_after_ms: 250`。 |
+| `credential_model_concurrency_exceeded` | 所有可用凭证都达到实际上游模型的并发上限。可重试；Home 当前返回 `retry_after_ms: 250`。 |
+| `concurrency_identity_required` | 候选凭证配置了并发上限，但请求缺少 `request_id` 或 `dispatch_id`；该凭证不会被派发。 |
+| `concurrency_tracker_unavailable` | Home 无法确认受限凭证仍有容量，因此按 fail-closed 拒绝派发。无限制凭证仍按 best-effort 处理，可以在无 lease 时派发。 |
+| `dispatch_replayed` | 已完成或已过期的 dispatch ID 被复用，或者 active dispatch ID 被不同 CPA 节点、请求 ID 或请求模型复用。 |
+
+Session affinity 不能绕过这些检查；首选凭证饱和时会先跳过该凭证，所有候选均不可用后才返回 busy 错误。
+
+上线顺序要求：配置非零并发上限前，必须先升级 Home 和所有参与调度的 CPA 节点。旧 CPA 不会上报 dispatch identity，因此 Home 会按设计拒绝向其派发受限凭证。
+
+### GET `/credentials/in-flight`
+
+返回所有活跃调度租约的游标分页列表。响应不会包含请求正文或凭证秘密。
+
+| 查询参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `credential_id` | string | 否 | 仅返回指定凭证 ID；未知 ID 返回空页。 |
+| `limit` | integer | 否 | 每页 `1` 到 `200` 条，默认 `50`。 |
+| `cursor` | unsigned integer string | 否 | 上一页返回的不透明游标。 |
+
+响应示例：
+
+```json
+{
+  "observed_at": "2026-07-20T12:00:00Z",
+  "items": [
+    {
+      "lease_id": "dispatch-uuid",
+      "request_id": "request-uuid",
+      "credential_id": "auth-db-id",
+      "provider": "codex",
+      "requested_model": "team/gpt-5.5",
+      "model": "gpt-5.5",
+      "cpa_node_id": "cpa-a",
+      "cpa_ip": "192.0.2.20",
+      "cpa_label": "cpa-a:8317",
+      "started_at": "2026-07-20T11:59:30Z",
+      "last_renewed_at": "2026-07-20T11:59:50Z",
+      "expires_at": "2026-07-20T12:29:50Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+### GET `/credentials/in-flight/summary`
+
+返回所有可见凭证当前的在途汇总。该接口是只读数据库视图；已过期 lease 会立即从结果中排除，并由后台异步清理。
+
+凭证总上限为无限制时，`max_in_flight` 和 `remaining` 返回 `null`。模型项使用 Home 实际选择的上游模型，不一定等于客户端请求的 alias；末尾 thinking 后缀会合并到基础模型 key。模型的 `remaining` 会同时考虑模型上限和凭证总上限。
+
+示例响应：
+
+```json
+{
+  "observed_at": "2026-07-20T12:00:00Z",
+  "items": [
+    {
+      "credential_id": "auth-db-id",
+      "in_flight": 2,
+      "max_in_flight": 4,
+      "remaining": 2,
+      "total_saturated": false,
+      "saturated_model_count": 1,
+      "models": [
+        {
+          "model": "gpt-5.5",
+          "in_flight": 2,
+          "max_in_flight": 2,
+          "remaining": 0,
+          "saturated": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+### GET `/credentials/:credential_id/in-flight`
+
+返回单个凭证的并发汇总，以及使用 cursor 分页的 active dispatch lease 列表。
+
+| Query | Type | Required | Description |
+| --- | --- | --- | --- |
+| `limit` | integer | 否 | 每页 `1` 到 `200` 条，默认 `50`。 |
+| `cursor` | unsigned integer string | 否 | 上一页返回的不透明 cursor。 |
+
+示例响应：
+
+```json
+{
+  "observed_at": "2026-07-20T12:00:00Z",
+  "credential": {
+    "credential_id": "auth-db-id",
+    "in_flight": 1,
+    "max_in_flight": 4,
+    "remaining": 3,
+    "total_saturated": false,
+    "saturated_model_count": 0,
+    "models": [
+      {
+        "model": "gpt-5.5",
+        "in_flight": 1,
+        "max_in_flight": 2,
+        "remaining": 1,
+        "saturated": false
+      }
+    ]
+  },
+  "requests": {
+    "items": [
+      {
+        "lease_id": "dispatch-uuid",
+        "request_id": "request-uuid",
+        "credential_id": "auth-db-id",
+        "provider": "codex",
+        "requested_model": "team/gpt-5.5",
+        "model": "gpt-5.5",
+        "cpa_node_id": "cpa-a",
+        "cpa_ip": "192.0.2.20",
+        "cpa_label": "cpa-a:8317",
+        "started_at": "2026-07-20T11:59:30Z",
+        "last_renewed_at": "2026-07-20T11:59:50Z",
+        "expires_at": "2026-07-20T12:29:50Z"
+      }
+    ],
+    "next_cursor": null
+  }
+}
+```
+
+凭证不存在返回 `404`，分页参数非法返回 `400`。接口不会返回 request payload 或任何 secret。
 
 ### OAuth 启动路由
 
@@ -2540,6 +2705,8 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 | `capabilities.logs` | boolean | 是否支持应用日志接口。 |
 | `capabilities.request_error_logs` | boolean | 是否支持 request error log file list/download。 |
 | `capabilities.topology` | boolean | 是否支持 `GET /topology` Home + CPA 集群拓扑接口。 |
+| `capabilities.credential_in_flight` | boolean | 是否支持凭证/模型在途汇总与详情接口。 |
+| `capabilities.credential_concurrency_limits` | boolean | 是否可通过 auth fields 编辑 `max_in_flight` 和 `max_in_flight_by_model`。 |
 | `server_info.home_version` | string | Home 构建版本。 |
 | `server_info.home_commit` | string | Home 构建 commit。 |
 | `server_info.home_build_date` | string | Home 构建时间。 |
@@ -3686,6 +3853,7 @@ DELETE query：
 | `plugins.configs` | object | 以插件 ID 为 key 的单插件配置。插件商店安装会在插件条目下写入固定 `store` manifest；Home-mode CPA 节点根据该 manifest 下载产物，Home 仅在显式设置 `load-in-home: true` 时下载并加载。 |
 | `usage-statistics-enabled` | boolean | 启用内存 usage aggregation。Home 会向下游 CPA 强制为 `true`，并拒绝通过 Management API 关闭。 |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue 保留窗口；默认 `60`，最大 `3600`。 |
+| `in-flight-lease-ttl` | duration string | 未续租 dispatch lease 的故障恢复 TTL。默认 `30m`；小于 `1m` 的值会回退到默认值。下调只影响新 lease；续租不会把现有 lease 缩短到低于派发时返回给 CPA 的 TTL 节奏。 |
 | `disable-cooling` | boolean | 全局禁用 quota cooldown scheduling。Home 会向下游 CPA 强制为 `true`。 |
 | `auth-auto-refresh-workers` | integer | 覆盖 auth auto-refresh worker 数量。 |
 | `request-retry` | integer | 失败请求重试次数。 |

@@ -567,6 +567,32 @@ func writeExportAuthFilesExclusive(auths []*coreauth.Auth, authDir string) (int,
 		seen[fullPath] = struct{}{}
 
 		payload := cloneAnyMap(auth.Metadata)
+		for _, key := range []string{"in_flight", "remaining", "total_saturated", "saturated_model_count"} {
+			delete(payload, key)
+		}
+		if auth.MaxInFlight > 0 {
+			payload["max_in_flight"] = auth.MaxInFlight
+		} else {
+			delete(payload, "max_in_flight")
+		}
+		if len(auth.MaxInFlightByModel) > 0 {
+			limits := make(map[string]int, len(auth.MaxInFlightByModel))
+			for rawModel, limit := range auth.MaxInFlightByModel {
+				model := coreauth.CanonicalModelKey(rawModel)
+				if model != "" && limit > 0 {
+					if current, exists := limits[model]; !exists || limit < current {
+						limits[model] = limit
+					}
+				}
+			}
+			if len(limits) > 0 {
+				payload["max_in_flight_by_model"] = limits
+			} else {
+				delete(payload, "max_in_flight_by_model")
+			}
+		} else {
+			delete(payload, "max_in_flight_by_model")
+		}
 		if strings.TrimSpace(stringFromAny(payload["uuid"])) == "" && strings.TrimSpace(auth.ID) != "" {
 			payload["uuid"] = strings.TrimSpace(auth.ID)
 		}
