@@ -25,6 +25,8 @@ type ModelInfo struct {
 	OwnedBy string `json:"owned_by"`
 	// Type indicates the model type (e.g., "claude", "gemini", "openai")
 	Type string `json:"type"`
+	// Providers lists the exact provider identifiers used by usage records and billing rules.
+	Providers []string `json:"providers,omitempty"`
 	// DisplayName is the human-readable name for the model
 	DisplayName string `json:"display_name,omitempty"`
 	// Name is used for Gemini-style model names
@@ -466,6 +468,9 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	if len(model.SupportedOutputModalities) > 0 {
 		copyModel.SupportedOutputModalities = append([]string(nil), model.SupportedOutputModalities...)
 	}
+	if len(model.Providers) > 0 {
+		copyModel.Providers = append([]string(nil), model.Providers...)
+	}
 	if model.Thinking != nil {
 		copyThinking := *model.Thinking
 		if len(model.Thinking.Levels) > 0 {
@@ -664,10 +669,38 @@ func (r *ModelRegistry) GetAvailableModelDefinitions() []*ModelInfo {
 		if !available || registration == nil || registration.Info == nil {
 			continue
 		}
-		models = append(models, cloneModelInfo(registration.Info))
+		model := cloneModelInfo(registration.Info)
+		model.Providers = modelRegistrationProviders(registration)
+		models = append(models, model)
 	}
 	sortModelInfosByID(models)
 	return models
+}
+
+// modelRegistrationProviders returns stable billing provider identifiers for a model registration.
+func modelRegistrationProviders(registration *ModelRegistration) []string {
+	if registration == nil || len(registration.Providers) == 0 {
+		return nil
+	}
+
+	providerSet := make(map[string]struct{}, len(registration.Providers))
+	for provider, count := range registration.Providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "" || count <= 0 {
+			continue
+		}
+		providerSet[provider] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return nil
+	}
+
+	providers := make([]string, 0, len(providerSet))
+	for provider := range providerSet {
+		providers = append(providers, provider)
+	}
+	sort.Strings(providers)
+	return providers
 }
 
 // modelRegistrationAvailability applies the registry visibility rules to one model registration.

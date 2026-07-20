@@ -3093,6 +3093,16 @@ Response: file attachment.
 
 Returns model definitions from either the current runtime registry or the static model catalog.
 
+Each model includes `providers`, the authoritative provider identifiers used by `usage.provider`
+and Billing model-price rules. Clients must create one candidate per `(provider, model)` pair and
+must not derive Billing providers from `type`, `owned_by`, or a static catalog group name.
+Clients must omit model records whose `providers` field is absent or empty because they do not have
+a safe Billing identity.
+
+Provider implementations must register every executor identifier that can appear in
+`usage.provider` under the same normalized runtime registry provider key. Adding or renaming an
+executor identifier requires updating the registry mapping and this model contract together.
+
 Query parameters:
 
 | Query | Type | Required | Description |
@@ -3119,6 +3129,7 @@ Example available response:
       "created": 1704067200,
       "owned_by": "openai",
       "type": "openai",
+      "providers": ["codex"],
       "display_name": "GPT-5.5"
     }
   ]
@@ -3138,6 +3149,7 @@ Example static response:
         "created": 1704067200,
         "owned_by": "openai",
         "type": "openai",
+        "providers": ["codex"],
         "display_name": "GPT-5.5"
       }
     ]
@@ -3148,6 +3160,7 @@ Example static response:
 ### GET `/model-definitions/:channel`
 
 Returns static model metadata for one channel.
+Returned model entries include the same authoritative `providers` field described above.
 
 Supported channels:
 

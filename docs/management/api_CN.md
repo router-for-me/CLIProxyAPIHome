@@ -3063,6 +3063,16 @@ Query 参数：
 
 从当前 runtime registry 或静态模型目录返回模型定义。
 
+每个模型都包含 `providers`，其值是 `usage.provider` 和 Billing 模型价格规则使用的权威
+provider 标识。客户端必须按每个 `(provider, model)` 组合生成一个候选项，不能从 `type`、
+`owned_by` 或静态目录分组名称推导 Billing provider。
+如果模型记录缺少 `providers` 或数组为空，客户端必须忽略该记录，因为它没有安全的 Billing
+匹配标识。
+
+Provider 实现必须把所有可能写入 `usage.provider` 的 executor 标识，以相同的归一化 provider
+key 注册到 runtime registry。新增或重命名 executor 标识时，必须同步更新 registry 映射和本模型
+契约。
+
 Query 参数：
 
 | Query | 类型 | 必填 | 说明 |
@@ -3089,6 +3099,7 @@ Query 参数：
       "created": 1704067200,
       "owned_by": "openai",
       "type": "openai",
+      "providers": ["codex"],
       "display_name": "GPT-5.5"
     }
   ]
@@ -3108,6 +3119,7 @@ Query 参数：
         "created": 1704067200,
         "owned_by": "openai",
         "type": "openai",
+        "providers": ["codex"],
         "display_name": "GPT-5.5"
       }
     ]
@@ -3118,6 +3130,7 @@ Query 参数：
 ### GET `/model-definitions/:channel`
 
 返回指定 channel 的静态模型 metadata。
+返回的模型记录同样包含上文所述的权威 `providers` 字段。
 
 支持的 channel：
 

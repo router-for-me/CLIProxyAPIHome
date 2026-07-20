@@ -3,6 +3,7 @@
 package registry
 
 import (
+	"sort"
 	"strings"
 )
 
@@ -80,18 +81,53 @@ func GetXAIModels() []*ModelInfo {
 
 // GetAllStaticModelDefinitions returns static model definitions grouped by channel.
 func GetAllStaticModelDefinitions() map[string][]*ModelInfo {
-	return map[string][]*ModelInfo{
-		"claude":      GetClaudeModels(),
-		"gemini":      GetGeminiModels(),
-		"vertex":      GetGeminiVertexModels(),
-		"codex-free":  GetCodexFreeModels(),
-		"codex-team":  GetCodexTeamModels(),
-		"codex-plus":  GetCodexPlusModels(),
-		"codex-pro":   GetCodexProModels(),
-		"kimi":        GetKimiModels(),
-		"antigravity": GetAntigravityModels(),
-		"xai":         GetXAIModels(),
+	channels := []string{
+		"claude",
+		"gemini",
+		"vertex",
+		"codex-free",
+		"codex-team",
+		"codex-plus",
+		"codex-pro",
+		"kimi",
+		"antigravity",
+		"xai",
 	}
+	definitions := make(map[string][]*ModelInfo, len(channels))
+	for _, channel := range channels {
+		definitions[channel] = GetStaticModelDefinitionsByChannel(channel)
+	}
+	return definitions
+}
+
+// withStaticModelProviders annotates management-facing static definitions with billing providers.
+func withStaticModelProviders(models []*ModelInfo, providers ...string) []*ModelInfo {
+	if len(models) == 0 {
+		return models
+	}
+
+	normalizedProviders := make([]string, 0, len(providers))
+	seen := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "" {
+			continue
+		}
+		if _, exists := seen[provider]; exists {
+			continue
+		}
+		seen[provider] = struct{}{}
+		normalizedProviders = append(normalizedProviders, provider)
+	}
+	sort.Strings(normalizedProviders)
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		model.Providers = append([]string(nil), normalizedProviders...)
+	}
+	return models
 }
 
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
@@ -250,30 +286,38 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	// Normalize source data before building the derived payload.
 	key := strings.ToLower(strings.TrimSpace(channel))
+	provider := key
+	var models []*ModelInfo
 	switch key {
 	case "claude":
-		return GetClaudeModels()
+		models = GetClaudeModels()
 	case "gemini":
-		return GetGeminiModels()
+		models = GetGeminiModels()
 	case "vertex":
-		return GetGeminiVertexModels()
+		models = GetGeminiVertexModels()
 	case "codex", "codex-pro":
-		return GetCodexProModels()
+		models = GetCodexProModels()
+		provider = "codex"
 	case "codex-plus":
-		return GetCodexPlusModels()
+		models = GetCodexPlusModels()
+		provider = "codex"
 	case "codex-team":
-		return GetCodexTeamModels()
+		models = GetCodexTeamModels()
+		provider = "codex"
 	case "codex-free":
-		return GetCodexFreeModels()
+		models = GetCodexFreeModels()
+		provider = "codex"
 	case "kimi":
-		return GetKimiModels()
+		models = GetKimiModels()
 	case "antigravity":
-		return GetAntigravityModels()
+		models = GetAntigravityModels()
 	case "xai", "x-ai", "grok":
-		return GetXAIModels()
+		models = GetXAIModels()
+		provider = "xai"
 	default:
 		return nil
 	}
+	return withStaticModelProviders(models, provider)
 }
 
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
