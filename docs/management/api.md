@@ -1133,6 +1133,7 @@ Example request:
 
 All request fields are optional, but `username`, if present, must not be empty. `credits`, if present, replaces the user's current credit balance. For billing workflows, prefer `/billing/balance-records/recharge` and `/billing/balance-records/deduct` so balance changes have ledger records.
 Set `credits_unlimited` to `true` when the user should have unlimited total balance but still be constrained by configured period limits.
+When `password` is present, a successful update increments the user's session version and invalidates all previously issued User API bearer tokens. The Management API does not issue a replacement user session.
 
 Response: same shape as `GET /users/:id`.
 
@@ -3688,11 +3689,24 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `tls.enable` | boolean | Enable HTTPS. |
 | `tls.cert` | string | TLS certificate path. |
 | `tls.key` | string | TLS private key path. |
+| `trusted-proxies` | array of string | Explicit reverse-proxy IP/CIDR allowlist used for forwarded client addresses. Empty trusts none; trust-all networks are rejected; restart after changes. |
 | `remote-management.allow-remote` | boolean | Allows non-localhost Management API requests when true. |
 | `remote-management.secret-key` | string | Management key. In local config mode, plaintext is hashed at startup. |
 | `remote-management.disable-control-panel` | boolean | Disables the embedded panel routes: `/`, `/index.html`, `/management.html`, `/user.html`, and `/assets/*`. |
 | `remote-management.disable-auto-update-panel` | boolean | Legacy compatibility flag; embedded panel assets are not updated at runtime. |
 | `remote-management.panel-github-repository` | string | Legacy compatibility field for the embedded panel source repository. |
+| `user-email.enabled` | boolean | Enables verified-email registration and password recovery when all mail settings are valid. |
+| `user-email.public-user-url` | string | Absolute public user-panel URL used in verify/reset links; production requires HTTPS. |
+| `user-email.from-address` | string | SMTP envelope/header mailbox without a display name. |
+| `user-email.from-name` | string | Optional safe display name for user email. |
+| `user-email.sender.type` | string | Mail sender type; currently only `smtp`. |
+| `user-email.sender.smtp.host` | string | SMTP host. Non-loopback hosts require STARTTLS. |
+| `user-email.sender.smtp.port` | integer | SMTP port; implicit TLS port `465` is unsupported. |
+| `user-email.sender.smtp.username` | string | Optional SMTP username. |
+| `user-email.sender.smtp.password-env` | string | Environment variable containing the SMTP password; the secret is not stored in config. |
+| `user-email.sender.smtp.starttls` | boolean | Requires STARTTLS with TLS 1.2 or newer. |
+| `user-email.verification-token-ttl` | string | Positive Go duration for verification tokens. |
+| `user-email.reset-token-ttl` | string | Positive Go duration for password-reset tokens. |
 | `auth-dir` | string | Local auth token directory. |
 | `proxy-url` | string | Global outbound proxy URL. |
 | `disable-image-generation` | boolean or `"chat"` | `false` enables image generation; `true` disables it globally; `"chat"` disables injection for non-image endpoints. |

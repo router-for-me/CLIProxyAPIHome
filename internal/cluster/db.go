@@ -123,7 +123,7 @@ func AutoMigrate(db *gorm.DB) error {
 }
 
 func autoMigrate(db *gorm.DB) error {
-	if errMigrate := db.AutoMigrate(&AuthRecord{}, &ConfigRecord{}, &KVRecord{}, &PluginStatusRecord{}, &PluginTaskRecord{}, &PluginStoreAuthRecord{}, &PluginStoreAuthKeyRecord{}, &UserRecord{}, &APIKeyRecord{}, &ChannelGroupRecord{}, &ChannelGroupDetailRecord{}, &ModelGroupRecord{}, &ModelGroupDetailRecord{}, &ClusterNodeRecord{}, &CPANodeRecord{}, &ClusterEventRecord{}, &UsageRecord{}, &QuotaSnapshotRecord{}, &QuotaWindowRecord{}, &BillingModelPriceRecord{}, &BillingModelPriceImportPreviewRecord{}, &BillingModelPriceImportOperationRecord{}, &BillingBalanceRecord{}, &BillingChargeRecord{}, &ProxyPoolRecord{}, &AppLogRecord{}, &OAuthSessionRecord{}, &CertificateRecord{}); errMigrate != nil {
+	if errMigrate := db.AutoMigrate(&AuthRecord{}, &ConfigRecord{}, &KVRecord{}, &PluginStatusRecord{}, &PluginTaskRecord{}, &PluginStoreAuthRecord{}, &PluginStoreAuthKeyRecord{}, &UserRecord{}, &UserSecurityTokenRecord{}, &UserMailJobRecord{}, &UserSecurityThrottleRecord{}, &APIKeyRecord{}, &ChannelGroupRecord{}, &ChannelGroupDetailRecord{}, &ModelGroupRecord{}, &ModelGroupDetailRecord{}, &ClusterNodeRecord{}, &CPANodeRecord{}, &ClusterEventRecord{}, &UsageRecord{}, &QuotaSnapshotRecord{}, &QuotaWindowRecord{}, &BillingModelPriceRecord{}, &BillingModelPriceImportPreviewRecord{}, &BillingModelPriceImportOperationRecord{}, &BillingBalanceRecord{}, &BillingChargeRecord{}, &ProxyPoolRecord{}, &AppLogRecord{}, &OAuthSessionRecord{}, &CertificateRecord{}); errMigrate != nil {
 		return errMigrate
 	}
 	if errMigrate := migrateBillingIndexes(db); errMigrate != nil {
@@ -142,6 +142,9 @@ func autoMigrate(db *gorm.DB) error {
 		return errMigrate
 	}
 	if errMigrate := migrateUserUniqueUsername(db); errMigrate != nil {
+		return errMigrate
+	}
+	if errMigrate := migrateUserUniqueEmail(db); errMigrate != nil {
 		return errMigrate
 	}
 	if errMigrate := migrateAuthNextRetryAfter(db); errMigrate != nil {
@@ -616,6 +619,16 @@ func migrateUserUniqueUsername(db *gorm.DB) error {
 		return fmt.Errorf("database connection is nil")
 	}
 	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_username_active_unique ON "user" ("username") WHERE "deleted_at" IS NULL`).Error
+}
+
+func migrateUserUniqueEmail(db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	if errCreate := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_email_verified_active_unique ON "user" ("email") WHERE "deleted_at" IS NULL AND "email" IS NOT NULL AND "email_verified_at" IS NOT NULL`).Error; errCreate != nil {
+		return errCreate
+	}
+	return db.Exec(`DROP INDEX IF EXISTS idx_user_email_active_unique`).Error
 }
 
 func migrateCertificateFingerprints(db *gorm.DB) error {

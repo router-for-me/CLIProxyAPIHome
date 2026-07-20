@@ -81,6 +81,11 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 		return nil, nil, errUnmarshal
 	}
 	cfg.NormalizePluginsConfig()
+	cfg.NormalizeUserEmailConfig()
+	cfg.NormalizeTrustedProxies()
+	if errTrustedProxies := appconfig.ValidateTrustedProxies(cfg.TrustedProxies); errTrustedProxies != nil {
+		return nil, nil, errTrustedProxies
+	}
 	cfg.SanitizeGeminiKeys()
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()

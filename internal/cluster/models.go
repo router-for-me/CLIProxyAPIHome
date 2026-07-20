@@ -223,12 +223,16 @@ func (PluginTaskRecord) TableName() string {
 }
 
 type UserRecord struct {
-	ID               uint    `gorm:"column:id;primaryKey;autoIncrement;index:idx_user_active_order,priority:2"`
-	Username         string  `gorm:"column:username;not null;index;index:idx_user_username_active,priority:1"`
-	Password         string  `gorm:"column:password;type:text"`
-	Credits          float64 `gorm:"column:credits;not null;default:0"`
-	CreditsUnlimited bool    `gorm:"column:credits_unlimited;not null;default:false"`
-	Timezone         string  `gorm:"column:timezone;not null;default:Asia/Shanghai"`
+	ID               uint       `gorm:"column:id;primaryKey;autoIncrement;index:idx_user_active_order,priority:2"`
+	Username         string     `gorm:"column:username;not null;index;index:idx_user_username_active,priority:1"`
+	Password         string     `gorm:"column:password;type:text"`
+	Email            *string    `gorm:"column:email;type:text;index"`
+	EmailVerifiedAt  *time.Time `gorm:"column:email_verified_at"`
+	EmailVersion     uint64     `gorm:"column:email_version;not null;default:0"`
+	SessionVersion   uint64     `gorm:"column:session_version;not null;default:0"`
+	Credits          float64    `gorm:"column:credits;not null;default:0"`
+	CreditsUnlimited bool       `gorm:"column:credits_unlimited;not null;default:false"`
+	Timezone         string     `gorm:"column:timezone;not null;default:Asia/Shanghai"`
 	// Period cost limits (null = disabled). Subject is user; all API keys inherit.
 	// window_mode_*: first_use (default; first billable charge opens a duration
 	// window, Claude/Codex-style session), sliding (rolling last-N duration),
@@ -263,6 +267,56 @@ type UserRecord struct {
 // TableName returns the database table name.
 func (UserRecord) TableName() string {
 	return "user"
+}
+
+type UserSecurityTokenRecord struct {
+	ID           uint       `gorm:"column:id;primaryKey;autoIncrement"`
+	UserID       uint       `gorm:"column:user_id;not null;index:idx_user_security_token_user_purpose,priority:1"`
+	Purpose      string     `gorm:"column:purpose;type:varchar(32);not null;index:idx_user_security_token_user_purpose,priority:2"`
+	TokenHash    string     `gorm:"column:token_hash;type:varchar(64);not null;uniqueIndex"`
+	EmailVersion uint64     `gorm:"column:email_version;not null;default:0"`
+	ExpiresAt    time.Time  `gorm:"column:expires_at;not null;index"`
+	UsedAt       *time.Time `gorm:"column:used_at;index"`
+	CreatedAt    time.Time  `gorm:"column:created_at"`
+}
+
+// TableName returns the database table name.
+func (UserSecurityTokenRecord) TableName() string {
+	return "user_security_token"
+}
+
+type UserMailJobRecord struct {
+	ID             uint       `gorm:"column:id;primaryKey;autoIncrement;index:idx_user_mail_job_status_next,priority:3"`
+	UserID         uint       `gorm:"column:user_id;not null;index:idx_user_mail_job_user_purpose,priority:1"`
+	Purpose        string     `gorm:"column:purpose;type:varchar(32);not null;index:idx_user_mail_job_user_purpose,priority:2"`
+	EmailVersion   uint64     `gorm:"column:email_version;not null;default:0"`
+	SessionVersion uint64     `gorm:"column:session_version;not null;default:0"`
+	Status         string     `gorm:"column:status;type:varchar(24);not null;index:idx_user_mail_job_status_next,priority:1"`
+	Attempts       int        `gorm:"column:attempts;not null;default:0"`
+	NextAttemptAt  time.Time  `gorm:"column:next_attempt_at;not null;index:idx_user_mail_job_status_next,priority:2"`
+	ClaimedBy      string     `gorm:"column:claimed_by;type:varchar(128)"`
+	ClaimExpiresAt *time.Time `gorm:"column:claim_expires_at;index"`
+	LastErrorCode  string     `gorm:"column:last_error_code;type:varchar(64)"`
+	SentAt         *time.Time `gorm:"column:sent_at"`
+	CreatedAt      time.Time  `gorm:"column:created_at"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at"`
+}
+
+// TableName returns the database table name.
+func (UserMailJobRecord) TableName() string {
+	return "user_mail_job"
+}
+
+type UserSecurityThrottleRecord struct {
+	Key       string    `gorm:"column:key;type:varchar(160);primaryKey"`
+	Count     int       `gorm:"column:count;not null;default:0"`
+	ExpiresAt time.Time `gorm:"column:expires_at;not null;index"`
+	UpdatedAt time.Time `gorm:"column:updated_at"`
+}
+
+// TableName returns the database table name.
+func (UserSecurityThrottleRecord) TableName() string {
+	return "user_security_throttle"
 }
 
 type APIKeyRecord struct {

@@ -1133,6 +1133,7 @@ Path 参数：
 
 所有字段均可选；如果出现 `username`，则不能为空。`credits` 如果出现，会替换用户当前点数余额。对于计费工作流，优先使用 `/billing/balance-records/recharge` 和 `/billing/balance-records/deduct`，以便余额变更拥有分类账记录。
 当用户需要无限总余额、但仍受独立周期限额约束时，将 `credits_unlimited` 设为 `true`。
+请求中出现 `password` 且更新成功时，会递增用户 session version，使此前签发的所有 User API bearer token 失效。Management API 不会签发替换用户 session。
 
 输出：与 `GET /users/:id` 相同。
 
@@ -3658,11 +3659,24 @@ DELETE query：
 | `tls.enable` | boolean | 启用 HTTPS。 |
 | `tls.cert` | string | TLS certificate 路径。 |
 | `tls.key` | string | TLS private key 路径。 |
+| `trusted-proxies` | array of string | 允许提供转发客户端地址的明确反向代理 IP/CIDR 列表；空列表表示全部不信任，trust-all 网段会被拒绝，修改后需重启。 |
 | `remote-management.allow-remote` | boolean | 为 `true` 时允许非 localhost Management API 请求。 |
 | `remote-management.secret-key` | string | Management key；本地配置模式下明文会在启动时 hash。 |
 | `remote-management.disable-control-panel` | boolean | 禁用内嵌 panel routes：`/`、`/index.html`、`/management.html`、`/user.html`、`/assets/*`。 |
 | `remote-management.disable-auto-update-panel` | boolean | 兼容旧配置的字段；内嵌 panel assets 不会在运行时更新。 |
 | `remote-management.panel-github-repository` | string | 兼容旧配置的内嵌 panel 源仓库字段。 |
+| `user-email.enabled` | boolean | 邮件配置全部有效时启用已验证邮箱注册与密码找回。 |
+| `user-email.public-user-url` | string | verify/reset 链接使用的绝对公开用户面板 URL；生产环境要求 HTTPS。 |
+| `user-email.from-address` | string | 不带 display name 的 SMTP envelope/header 邮箱。 |
+| `user-email.from-name` | string | 用户邮件的可选安全 display name。 |
+| `user-email.sender.type` | string | 邮件 sender 类型；当前仅支持 `smtp`。 |
+| `user-email.sender.smtp.host` | string | SMTP host；非回环地址必须启用 STARTTLS。 |
+| `user-email.sender.smtp.port` | integer | SMTP 端口；不支持 implicit TLS 的 `465` 端口。 |
+| `user-email.sender.smtp.username` | string | 可选 SMTP username。 |
+| `user-email.sender.smtp.password-env` | string | 保存 SMTP 密码的环境变量名；secret 不写入 config。 |
+| `user-email.sender.smtp.starttls` | boolean | 要求使用 TLS 1.2 或更高版本的 STARTTLS。 |
+| `user-email.verification-token-ttl` | string | 验证 token 的正数 Go duration。 |
+| `user-email.reset-token-ttl` | string | 密码重置 token 的正数 Go duration。 |
 | `auth-dir` | string | 本地 auth token 目录。 |
 | `proxy-url` | string | 全局出站代理 URL。 |
 | `disable-image-generation` | boolean or `"chat"` | `false` 启用图像生成；`true` 全局禁用；`"chat"` 只对非 image endpoints 禁用注入。 |

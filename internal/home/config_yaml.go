@@ -136,6 +136,8 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	doc := yamlRoot.Content[0]
 	removeConfigKeysForDownstream(doc, []string{
 		"remote-management",
+		"trusted-proxies",
+		"user-email",
 		"api-keys",
 		"auth-dir",
 		"tls",

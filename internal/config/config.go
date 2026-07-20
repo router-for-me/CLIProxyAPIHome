@@ -40,11 +40,18 @@ type Config struct {
 	// TLS config controls HTTPS server settings.
 	TLS TLSConfig `yaml:"tls" json:"tls"`
 
+	// TrustedProxies lists reverse-proxy IPs or CIDRs whose forwarded client
+	// address headers the HTTP server may trust. Empty disables forwarded headers.
+	TrustedProxies []string `yaml:"trusted-proxies" json:"-"`
+
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
 
 	// Plugins configures dynamic plugin distribution for downstream CPA nodes.
 	Plugins PluginsConfig `yaml:"plugins" json:"plugins"`
+
+	// UserEmail configures verified user emails and password-recovery delivery.
+	UserEmail UserEmailConfig `yaml:"user-email" json:"-"`
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
@@ -189,6 +196,32 @@ type PprofConfig struct {
 	Enable bool `yaml:"enable" json:"enable"`
 	// Addr is the host:port address for the pprof HTTP server.
 	Addr string `yaml:"addr" json:"addr"`
+}
+
+// UserEmailConfig controls optional verified-email and password-recovery behavior.
+type UserEmailConfig struct {
+	Enabled              bool                  `yaml:"enabled" json:"enabled"`
+	PublicUserURL        string                `yaml:"public-user-url" json:"public-user-url"`
+	FromAddress          string                `yaml:"from-address" json:"from-address"`
+	FromName             string                `yaml:"from-name" json:"from-name"`
+	Sender               UserEmailSenderConfig `yaml:"sender" json:"sender"`
+	VerificationTokenTTL string                `yaml:"verification-token-ttl" json:"verification-token-ttl"`
+	ResetTokenTTL        string                `yaml:"reset-token-ttl" json:"reset-token-ttl"`
+}
+
+// UserEmailSenderConfig selects the configured mail transport.
+type UserEmailSenderConfig struct {
+	Type string              `yaml:"type" json:"type"`
+	SMTP UserEmailSMTPConfig `yaml:"smtp" json:"smtp"`
+}
+
+// UserEmailSMTPConfig configures SMTP delivery without persisting the password itself.
+type UserEmailSMTPConfig struct {
+	Host        string `yaml:"host" json:"host"`
+	Port        int    `yaml:"port" json:"port"`
+	Username    string `yaml:"username" json:"username"`
+	PasswordEnv string `yaml:"password-env" json:"password-env"`
+	StartTLS    bool   `yaml:"starttls" json:"starttls"`
 }
 
 // RemoteManagement holds management API configuration under 'remote-management'.
@@ -626,6 +659,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 
 	cfg.NormalizePluginsConfig()
+	cfg.NormalizeUserEmailConfig()
+	cfg.NormalizeTrustedProxies()
+	if errTrustedProxies := ValidateTrustedProxies(cfg.TrustedProxies); errTrustedProxies != nil {
+		return nil, errTrustedProxies
+	}
 
 	normalizedSecret, secretChanged, errNormalizeSecret := NormalizeRemoteManagementSecret(cfg.RemoteManagement.SecretKey)
 	if errNormalizeSecret != nil {

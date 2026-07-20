@@ -45,6 +45,50 @@ func TestRuntimeConfigFromRootAppliesHomeModeScalarsAndPreservesRemoteManagement
 	}
 }
 
+func TestRuntimeConfigFromRootPreservesAndNormalizesUserEmailConfig(t *testing.T) {
+	root := map[string]any{
+		"trusted-proxies": []any{" 127.0.0.1 ", "10.0.0.0/8", "127.0.0.1"},
+		"user-email": map[string]any{
+			"enabled":         true,
+			"public-user-url": " https://home.example.com/user.html ",
+			"from-address":    " no-reply@example.com ",
+			"sender": map[string]any{
+				"type": " SMTP ",
+				"smtp": map[string]any{
+					"host":         " smtp.example.com ",
+					"password-env": " HOME_USER_EMAIL_SMTP_PASSWORD ",
+				},
+			},
+		},
+	}
+
+	cfg, payload, errConfig := RuntimeConfigFromRoot(root)
+	if errConfig != nil {
+		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
+	}
+	if !cfg.UserEmail.Enabled || cfg.UserEmail.PublicUserURL != "https://home.example.com/user.html" || cfg.UserEmail.Sender.Type != "smtp" {
+		t.Fatalf("normalized user email config = %#v", cfg.UserEmail)
+	}
+	if cfg.UserEmail.Sender.SMTP.Port != 587 || cfg.UserEmail.VerificationTokenTTL != "24h" || cfg.UserEmail.ResetTokenTTL != "30m" {
+		t.Fatalf("user email defaults = %#v", cfg.UserEmail)
+	}
+	if len(cfg.TrustedProxies) != 2 || cfg.TrustedProxies[0] != "127.0.0.1" || cfg.TrustedProxies[1] != "10.0.0.0/8" {
+		t.Fatalf("trusted proxies = %#v", cfg.TrustedProxies)
+	}
+	if !strings.Contains(string(payload), "user-email:") || !strings.Contains(string(payload), "HOME_USER_EMAIL_SMTP_PASSWORD") {
+		t.Fatalf("runtime payload lost user email config:\n%s", payload)
+	}
+}
+
+func TestRuntimeConfigFromRootRejectsUnsafeTrustedProxy(t *testing.T) {
+	_, _, errConfig := RuntimeConfigFromRoot(map[string]any{
+		"trusted-proxies": []any{"0.0.0.0/0"},
+	})
+	if errConfig == nil {
+		t.Fatal("RuntimeConfigFromRoot(trust-all proxy) succeeded")
+	}
+}
+
 func TestLoadConfigAsRuntimeConfigProjectsPluginAuthRevisionWithoutStoreAuth(t *testing.T) {
 	db, errOpen := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
 	if errOpen != nil {
