@@ -429,6 +429,7 @@ func run() int {
 			go respSrv.HandleConn(runCtx, conn)
 		}, nil, clusterTLSConfig)
 	}()
+	go runUsageDerivedColumnBackfillMaintenance(runCtx, repo)
 	go runUsageCacheReadBackfillMaintenance(runCtx, repo)
 
 	go func() {
@@ -631,6 +632,30 @@ func listenPortFromAddress(addr string) (int, error) {
 		return 0, errPort
 	}
 	return port, nil
+}
+
+func runUsageDerivedColumnBackfillMaintenance(ctx context.Context, repo *cluster.Repository) {
+	if repo == nil {
+		return
+	}
+	for {
+		batchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		result, errBackfill := repo.RunUsageDerivedColumnBackfillBatch(batchCtx)
+		cancel()
+		delay := time.Minute
+		if errBackfill != nil {
+			if ctx.Err() == nil {
+				log.WithError(errBackfill).Warn("usage derived-column backfill batch failed")
+			}
+		} else if !result.Done && !result.Skipped {
+			delay = 100 * time.Millisecond
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
 }
 
 func runUsageCacheReadBackfillMaintenance(ctx context.Context, repo *cluster.Repository) {

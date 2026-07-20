@@ -15,10 +15,13 @@ import (
 )
 
 const (
-	migrationAdvisoryLockKey              int64 = 749327842680272315
-	usageCacheReadBackfillAdvisoryLockKey int64 = 749327842680272316
-	usageCacheReadBackfillBatchSize             = 500
-	usageCacheReadBackfillStateKey              = "internal:migration:usage-cache-read:v1"
+	migrationAdvisoryLockKey                  int64 = 749327842680272315
+	usageCacheReadBackfillAdvisoryLockKey     int64 = 749327842680272316
+	usageDerivedColumnBackfillAdvisoryLockKey int64 = 749327842680272317
+	usageCacheReadBackfillBatchSize                 = 500
+	usageDerivedColumnBackfillBatchSize             = 100
+	usageCacheReadBackfillStateKey                  = "internal:migration:usage-cache-read:v1"
+	usageDerivedColumnBackfillStateKey              = "internal:migration:usage-derived-columns:v1"
 )
 
 // Open opens the resource.
@@ -147,9 +150,6 @@ func autoMigrate(db *gorm.DB) error {
 	if errMigrate := migrateUsageObservabilityIndexes(db); errMigrate != nil {
 		return errMigrate
 	}
-	if errMigrate := migrateUsageDerivedColumns(db); errMigrate != nil {
-		return errMigrate
-	}
 	if errMigrate := migrateUsageProviderAPIKeySources(db); errMigrate != nil {
 		return errMigrate
 	}
@@ -178,58 +178,216 @@ func migrateUsageObservabilityIndexes(db *gorm.DB) error {
 	return nil
 }
 
-func migrateUsageDerivedColumns(db *gorm.DB) error {
-	if db == nil {
-		return fmt.Errorf("database connection is nil")
+type usageDerivedColumnBackfillState struct {
+	HighWaterID   uint `json:"high_water_id"`
+	LastScannedID uint `json:"last_scanned_id"`
+	Done          bool `json:"done"`
+}
+
+// UsageDerivedColumnBackfillResult describes one bounded historical usage metadata backfill batch.
+type UsageDerivedColumnBackfillResult struct {
+	Scanned int
+	Updated int64
+	Done    bool
+	Skipped bool
+}
+
+// RunUsageDerivedColumnBackfillBatch advances the historical usage metadata
+// migration without blocking startup on a full payload scan.
+func (r *Repository) RunUsageDerivedColumnBackfillBatch(ctx context.Context) (UsageDerivedColumnBackfillResult, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return UsageDerivedColumnBackfillResult{}, errDB
 	}
-	var records []UsageRecord
-	where, args := usageDerivedColumnBackfillWhere()
-	return db.
-		Select("id", "payload", "home_ip", "home_port", "event_type", "upstream_request_id", "upstream_status_code", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label").
-		Where(where, args...).
-		FindInBatches(&records, 500, func(tx *gorm.DB, _ int) error {
-			for _, record := range records {
-				derived, errRecord := UsageRecordFromPayloadWithRuntime(string(record.PayloadJSON), UsageRuntimeMetadata{
-					HomeIP:   record.HomeIP,
-					HomePort: record.HomePort,
-				})
-				if errRecord != nil {
-					continue
-				}
-				updates := map[string]any{}
-				if strings.TrimSpace(record.EventType) == "" && strings.TrimSpace(derived.EventType) != "" {
-					updates["event_type"] = derived.EventType
-				}
-				if strings.TrimSpace(record.UpstreamRequestID) == "" && strings.TrimSpace(derived.UpstreamRequestID) != "" {
-					updates["upstream_request_id"] = derived.UpstreamRequestID
-				}
-				if record.UpstreamStatusCode == 0 && derived.UpstreamStatusCode > 0 {
-					updates["upstream_status_code"] = derived.UpstreamStatusCode
-				}
-				if record.HomePort == 0 && derived.HomePort > 0 {
-					updates["home_port"] = derived.HomePort
-				}
-				if strings.TrimSpace(record.CPANodeID) == "" && strings.TrimSpace(derived.CPANodeID) != "" {
-					updates["cpa_node_id"] = derived.CPANodeID
-				}
-				if strings.TrimSpace(record.CPAIP) == "" && strings.TrimSpace(derived.CPAIP) != "" {
-					updates["cpa_ip"] = derived.CPAIP
-				}
-				if record.CPAPort == 0 && derived.CPAPort > 0 {
-					updates["cpa_port"] = derived.CPAPort
-				}
-				if strings.TrimSpace(record.CPALabel) == "" && strings.TrimSpace(derived.CPALabel) != "" {
-					updates["cpa_label"] = derived.CPALabel
-				}
-				if len(updates) == 0 {
-					continue
-				}
-				if errUpdate := tx.Model(&UsageRecord{}).Where("id = ?", record.ID).Updates(updates).Error; errUpdate != nil {
-					return errUpdate
-				}
+	return runUsageDerivedColumnBackfillBatch(contextOrBackground(ctx), db, usageDerivedColumnBackfillBatchSize)
+}
+
+func runUsageDerivedColumnBackfillBatch(ctx context.Context, db *gorm.DB, batchSize int) (UsageDerivedColumnBackfillResult, error) {
+	if db == nil {
+		return UsageDerivedColumnBackfillResult{}, fmt.Errorf("database connection is nil")
+	}
+	if batchSize <= 0 {
+		return UsageDerivedColumnBackfillResult{}, fmt.Errorf("usage derived-column backfill batch size must be positive")
+	}
+	result := UsageDerivedColumnBackfillResult{}
+	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+			var acquired bool
+			if errLock := tx.Raw("SELECT pg_try_advisory_xact_lock(?)", usageDerivedColumnBackfillAdvisoryLockKey).Scan(&acquired).Error; errLock != nil {
+				return errLock
 			}
-			return nil
-		}).Error
+			if !acquired {
+				result.Skipped = true
+				return nil
+			}
+		}
+		return runUsageDerivedColumnBackfillBatchTx(ctx, tx, batchSize, &result)
+	})
+	if errTransaction != nil {
+		return UsageDerivedColumnBackfillResult{}, errTransaction
+	}
+	return result, nil
+}
+
+func runUsageDerivedColumnBackfillBatchTx(ctx context.Context, tx *gorm.DB, batchSize int, result *UsageDerivedColumnBackfillResult) error {
+	if tx == nil {
+		return fmt.Errorf("database transaction is nil")
+	}
+	if result == nil {
+		return fmt.Errorf("usage derived-column backfill result is nil")
+	}
+
+	state, stateRecord, exists, errState := loadUsageDerivedColumnBackfillState(ctx, tx)
+	if errState != nil {
+		return errState
+	}
+	if state.Done {
+		return runUsageDerivedColumnCatchUpBatchTx(ctx, tx, batchSize, result)
+	}
+	if !exists {
+		var latest UsageRecord
+		latestResult := tx.WithContext(contextOrBackground(ctx)).Select("id").Order("id DESC").Limit(1).Find(&latest)
+		if latestResult.Error != nil {
+			return latestResult.Error
+		}
+		state.HighWaterID = latest.ID
+		if state.HighWaterID == 0 {
+			state.Done = true
+		}
+	}
+	if state.LastScannedID >= state.HighWaterID {
+		state.Done = true
+	}
+	if state.Done {
+		result.Done = true
+		return saveUsageDerivedColumnBackfillState(ctx, tx, stateRecord, exists, state)
+	}
+
+	var records []UsageRecord
+	if errFind := tx.WithContext(contextOrBackground(ctx)).
+		Select("id", "payload", "endpoint", "home_ip", "home_port", "event_type", "upstream_request_id", "upstream_status_code", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label").
+		Where("id > ? AND id <= ?", state.LastScannedID, state.HighWaterID).
+		Order("id ASC").
+		Limit(batchSize).
+		Find(&records).Error; errFind != nil {
+		return errFind
+	}
+	if len(records) == 0 {
+		state.Done = true
+		result.Done = true
+		return saveUsageDerivedColumnBackfillState(ctx, tx, stateRecord, exists, state)
+	}
+
+	result.Scanned = len(records)
+	if errUpdate := updateUsageDerivedColumnRecords(ctx, tx, records, result); errUpdate != nil {
+		return errUpdate
+	}
+	state.LastScannedID = records[len(records)-1].ID
+	state.Done = state.LastScannedID >= state.HighWaterID
+	result.Done = state.Done
+	return saveUsageDerivedColumnBackfillState(ctx, tx, stateRecord, exists, state)
+}
+
+func runUsageDerivedColumnCatchUpBatchTx(ctx context.Context, tx *gorm.DB, batchSize int, result *UsageDerivedColumnBackfillResult) error {
+	var records []UsageRecord
+	if errFind := tx.WithContext(contextOrBackground(ctx)).
+		Select("id", "payload", "endpoint", "home_ip", "home_port", "event_type", "upstream_request_id", "upstream_status_code", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label").
+		Where("event_type = '' OR event_type IS NULL").
+		Limit(batchSize).
+		Find(&records).Error; errFind != nil {
+		return errFind
+	}
+	result.Scanned = len(records)
+	if len(records) == 0 {
+		result.Done = true
+		return nil
+	}
+	if errUpdate := updateUsageDerivedColumnRecords(ctx, tx, records, result); errUpdate != nil {
+		return errUpdate
+	}
+	result.Done = len(records) < batchSize
+	return nil
+}
+
+func updateUsageDerivedColumnRecords(ctx context.Context, tx *gorm.DB, records []UsageRecord, result *UsageDerivedColumnBackfillResult) error {
+	for _, record := range records {
+		derived, errRecord := UsageRecordFromPayloadWithRuntime(string(record.PayloadJSON), UsageRuntimeMetadata{
+			HomeIP:   record.HomeIP,
+			HomePort: record.HomePort,
+		})
+		updates := map[string]any{}
+		if errRecord != nil {
+			if strings.TrimSpace(record.EventType) == "" {
+				updates["event_type"] = usageEventTypeFromPayload(string(record.PayloadJSON), record.Endpoint)
+			}
+		} else {
+			if strings.TrimSpace(record.EventType) == "" && strings.TrimSpace(derived.EventType) != "" {
+				updates["event_type"] = derived.EventType
+			}
+			if strings.TrimSpace(record.UpstreamRequestID) == "" && strings.TrimSpace(derived.UpstreamRequestID) != "" {
+				updates["upstream_request_id"] = derived.UpstreamRequestID
+			}
+			if record.UpstreamStatusCode == 0 && derived.UpstreamStatusCode > 0 {
+				updates["upstream_status_code"] = derived.UpstreamStatusCode
+			}
+			if record.HomePort == 0 && derived.HomePort > 0 {
+				updates["home_port"] = derived.HomePort
+			}
+			if strings.TrimSpace(record.CPANodeID) == "" && strings.TrimSpace(derived.CPANodeID) != "" {
+				updates["cpa_node_id"] = derived.CPANodeID
+			}
+			if strings.TrimSpace(record.CPAIP) == "" && strings.TrimSpace(derived.CPAIP) != "" {
+				updates["cpa_ip"] = derived.CPAIP
+			}
+			if record.CPAPort == 0 && derived.CPAPort > 0 {
+				updates["cpa_port"] = derived.CPAPort
+			}
+			if strings.TrimSpace(record.CPALabel) == "" && strings.TrimSpace(derived.CPALabel) != "" {
+				updates["cpa_label"] = derived.CPALabel
+			}
+		}
+		if len(updates) == 0 {
+			continue
+		}
+		update := tx.WithContext(contextOrBackground(ctx)).Model(&UsageRecord{}).Where("id = ?", record.ID).Updates(updates)
+		if update.Error != nil {
+			return update.Error
+		}
+		result.Updated += update.RowsAffected
+	}
+	return nil
+}
+
+func loadUsageDerivedColumnBackfillState(ctx context.Context, tx *gorm.DB) (usageDerivedColumnBackfillState, KVRecord, bool, error) {
+	record := KVRecord{}
+	errFind := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).Where("key = ?", usageDerivedColumnBackfillStateKey).First(&record).Error
+	if errors.Is(errFind, gorm.ErrRecordNotFound) {
+		return usageDerivedColumnBackfillState{}, KVRecord{}, false, nil
+	}
+	if errFind != nil {
+		return usageDerivedColumnBackfillState{}, KVRecord{}, false, errFind
+	}
+	state := usageDerivedColumnBackfillState{}
+	if errDecode := json.Unmarshal(record.Value, &state); errDecode != nil {
+		return usageDerivedColumnBackfillState{}, KVRecord{}, false, fmt.Errorf("decode usage derived-column backfill state: %w", errDecode)
+	}
+	return state, record, true, nil
+}
+
+func saveUsageDerivedColumnBackfillState(ctx context.Context, tx *gorm.DB, record KVRecord, exists bool, state usageDerivedColumnBackfillState) error {
+	value, errEncode := json.Marshal(state)
+	if errEncode != nil {
+		return fmt.Errorf("encode usage derived-column backfill state: %w", errEncode)
+	}
+	if !exists {
+		return tx.WithContext(contextOrBackground(ctx)).Create(&KVRecord{Key: usageDerivedColumnBackfillStateKey, Value: value, Version: 1}).Error
+	}
+	record.Value = value
+	record.Version++
+	if record.Version <= 1 {
+		record.Version = 1
+	}
+	return tx.WithContext(contextOrBackground(ctx)).Save(&record).Error
 }
 
 func migrateUsageProviderAPIKeySources(db *gorm.DB) error {
@@ -426,117 +584,6 @@ func saveUsageCacheReadBackfillState(ctx context.Context, tx *gorm.DB, record KV
 		record.Version = 1
 	}
 	return tx.WithContext(contextOrBackground(ctx)).Save(&record).Error
-}
-
-func usageDerivedColumnBackfillWhere() (string, []any) {
-	upstreamRequestID := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"upstream_request_id"`),
-		usagePayloadTextContainsAll(`"upstream"`, `"request_id"`),
-		usagePayloadTextContainsAll(`"response"`, `"request_id"`),
-		usagePayloadTextContainsAll(`"response"`, `"id"`),
-	)
-	upstreamStatusCode := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"upstream_status_code"`),
-		usagePayloadTextContainsAll(`"upstream"`, `"status_code"`),
-		usagePayloadTextContainsAll(`"response"`, `"status_code"`),
-	)
-	homePort := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"home_port"`),
-		usagePayloadTextContainsAll(`"home"`, `"port"`),
-	)
-	cpaNodeID := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"cpa_node_id"`, `"node_id"`),
-		usagePayloadTextContainsAll(`"cpa"`, `"node_id"`),
-	)
-	cpaIP := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"cpa_ip"`),
-		usagePayloadTextContainsAll(`"cpa"`, `"ip"`),
-	)
-	cpaPort := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"cpa_port"`),
-		usagePayloadTextContainsAll(`"cpa"`, `"port"`),
-	)
-	cpaLabel := usagePayloadTextAnyCondition(
-		usagePayloadTextContainsAny(`"cpa_label"`, `"cpa_node_id"`, `"node_id"`, `"cpa_ip"`),
-		usagePayloadTextContainsAll(`"cpa"`, `"label"`),
-		usagePayloadTextContainsAll(`"cpa"`, `"node_id"`),
-		usagePayloadTextContainsAll(`"cpa"`, `"ip"`),
-	)
-
-	clauses := []string{
-		`event_type = '' OR event_type IS NULL`,
-		`((upstream_request_id = '' OR upstream_request_id IS NULL) AND ` + upstreamRequestID.clause + `)`,
-		`(upstream_status_code = 0 AND ` + upstreamStatusCode.clause + `)`,
-		`(home_port = 0 AND ` + homePort.clause + `)`,
-		`((cpa_node_id = '' OR cpa_node_id IS NULL) AND ` + cpaNodeID.clause + `)`,
-		`((cpa_ip = '' OR cpa_ip IS NULL) AND ` + cpaIP.clause + `)`,
-		`(cpa_port = 0 AND ` + cpaPort.clause + `)`,
-		`((cpa_label = '' OR cpa_label IS NULL) AND ` + cpaLabel.clause + `)`,
-	}
-	args := make([]any, 0, upstreamRequestID.argCount()+upstreamStatusCode.argCount()+homePort.argCount()+cpaNodeID.argCount()+cpaIP.argCount()+cpaPort.argCount()+cpaLabel.argCount())
-	for _, condition := range []usagePayloadTextCondition{upstreamRequestID, upstreamStatusCode, homePort, cpaNodeID, cpaIP, cpaPort, cpaLabel} {
-		args = append(args, condition.args...)
-	}
-	return strings.Join(clauses, " OR "), args
-}
-
-type usagePayloadTextCondition struct {
-	clause string
-	args   []any
-}
-
-func (c usagePayloadTextCondition) argCount() int {
-	return len(c.args)
-}
-
-func usagePayloadTextContainsAny(markers ...string) usagePayloadTextCondition {
-	conditions := make([]string, 0, len(markers))
-	args := make([]any, 0, len(markers))
-	for _, marker := range markers {
-		marker = strings.TrimSpace(marker)
-		if marker == "" {
-			continue
-		}
-		conditions = append(conditions, `CAST("payload" AS TEXT) LIKE ?`)
-		args = append(args, "%"+marker+"%")
-	}
-	if len(conditions) == 0 {
-		return usagePayloadTextCondition{clause: "1 = 0"}
-	}
-	return usagePayloadTextCondition{clause: "(" + strings.Join(conditions, " OR ") + ")", args: args}
-}
-
-func usagePayloadTextContainsAll(markers ...string) usagePayloadTextCondition {
-	conditions := make([]string, 0, len(markers))
-	args := make([]any, 0, len(markers))
-	for _, marker := range markers {
-		marker = strings.TrimSpace(marker)
-		if marker == "" {
-			continue
-		}
-		conditions = append(conditions, `CAST("payload" AS TEXT) LIKE ?`)
-		args = append(args, "%"+marker+"%")
-	}
-	if len(conditions) == 0 {
-		return usagePayloadTextCondition{clause: "1 = 0"}
-	}
-	return usagePayloadTextCondition{clause: "(" + strings.Join(conditions, " AND ") + ")", args: args}
-}
-
-func usagePayloadTextAnyCondition(conditions ...usagePayloadTextCondition) usagePayloadTextCondition {
-	clauses := make([]string, 0, len(conditions))
-	args := []any{}
-	for _, condition := range conditions {
-		if strings.TrimSpace(condition.clause) == "" {
-			continue
-		}
-		clauses = append(clauses, condition.clause)
-		args = append(args, condition.args...)
-	}
-	if len(clauses) == 0 {
-		return usagePayloadTextCondition{clause: "1 = 0"}
-	}
-	return usagePayloadTextCondition{clause: "(" + strings.Join(clauses, " OR ") + ")", args: args}
 }
 
 func migrateAuthNextRetryAfter(db *gorm.DB) error {

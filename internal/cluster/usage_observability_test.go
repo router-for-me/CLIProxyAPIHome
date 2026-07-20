@@ -84,7 +84,7 @@ func TestMigrateAuthNextRetryAfterBackfillsJSON(t *testing.T) {
 	}
 }
 
-func TestMigrateUsageDerivedColumnsBackfillsStructuredMetadata(t *testing.T) {
+func TestUsageDerivedColumnBackfillBatchBackfillsStructuredMetadataIdempotently(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -107,8 +107,19 @@ func TestMigrateUsageDerivedColumnsBackfillsStructuredMetadata(t *testing.T) {
 		t.Fatalf("Create(usage) error = %v", errCreate)
 	}
 
-	if errMigrate := migrateUsageDerivedColumns(db); errMigrate != nil {
-		t.Fatalf("migrateUsageDerivedColumns() error = %v", errMigrate)
+	first, errBackfill := repo.RunUsageDerivedColumnBackfillBatch(ctx)
+	if errBackfill != nil {
+		t.Fatalf("RunUsageDerivedColumnBackfillBatch() error = %v", errBackfill)
+	}
+	if first.Scanned != 1 || first.Updated != 1 || !first.Done || first.Skipped {
+		t.Fatalf("first backfill result = %+v, want scanned=1 updated=1 done=true", first)
+	}
+	second, errBackfill := repo.RunUsageDerivedColumnBackfillBatch(ctx)
+	if errBackfill != nil {
+		t.Fatalf("RunUsageDerivedColumnBackfillBatch(second) error = %v", errBackfill)
+	}
+	if second.Scanned != 0 || second.Updated != 0 || !second.Done || second.Skipped {
+		t.Fatalf("second backfill result = %+v, want completed no-op", second)
 	}
 
 	var updated UsageRecord
@@ -126,6 +137,126 @@ func TestMigrateUsageDerivedColumnsBackfillsStructuredMetadata(t *testing.T) {
 	}
 	if updated.CPANodeID != "node-derived" || updated.CPAIP != "10.0.0.5" || updated.CPAPort != 8317 || updated.CPALabel != "node-derived" {
 		t.Fatalf("CPA ownership = node:%q ip:%q port:%d label:%q, want node-derived 10.0.0.5 8317 node-derived", updated.CPANodeID, updated.CPAIP, updated.CPAPort, updated.CPALabel)
+	}
+}
+
+func TestUsageDerivedColumnBackfillBatchResumesByCursor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	now := time.Date(2026, time.July, 9, 1, 2, 3, 0, time.UTC)
+	for index := 0; index < 3; index++ {
+		record := UsageRecord{
+			Timestamp:   now,
+			PayloadJSON: JSONB(`{"timestamp":"2026-07-09T01:02:03Z","endpoint":"/v1/chat/completions"}`),
+			CreatedAt:   now,
+		}
+		if errCreate := db.Create(&record).Error; errCreate != nil {
+			t.Fatalf("Create(usage %d) error = %v", index, errCreate)
+		}
+	}
+
+	first, errBackfill := runUsageDerivedColumnBackfillBatch(ctx, db, 2)
+	if errBackfill != nil {
+		t.Fatalf("runUsageDerivedColumnBackfillBatch(first) error = %v", errBackfill)
+	}
+	if first.Scanned != 2 || first.Updated != 2 || first.Done || first.Skipped {
+		t.Fatalf("first backfill result = %+v, want scanned=2 updated=2 done=false", first)
+	}
+	second, errBackfill := runUsageDerivedColumnBackfillBatch(ctx, db, 2)
+	if errBackfill != nil {
+		t.Fatalf("runUsageDerivedColumnBackfillBatch(second) error = %v", errBackfill)
+	}
+	if second.Scanned != 1 || second.Updated != 1 || !second.Done || second.Skipped {
+		t.Fatalf("second backfill result = %+v, want scanned=1 updated=1 done=true", second)
+	}
+
+	var stateRecord KVRecord
+	if errState := db.First(&stateRecord, "key = ?", usageDerivedColumnBackfillStateKey).Error; errState != nil {
+		t.Fatalf("First(derived-column backfill state) error = %v", errState)
+	}
+	state := usageDerivedColumnBackfillState{}
+	if errDecode := json.Unmarshal(stateRecord.Value, &state); errDecode != nil {
+		t.Fatalf("decode derived-column backfill state: %v", errDecode)
+	}
+	if !state.Done || state.LastScannedID != state.HighWaterID {
+		t.Fatalf("derived-column backfill state = %+v, want complete high-water cursor", state)
+	}
+
+	var records []UsageRecord
+	if errFind := db.Order("id ASC").Find(&records).Error; errFind != nil {
+		t.Fatalf("Find(usage) error = %v", errFind)
+	}
+	for index := range records {
+		if records[index].EventType != "completion" {
+			t.Fatalf("usage %d event_type = %q, want completion", index, records[index].EventType)
+		}
+	}
+}
+
+func TestUsageDerivedColumnBackfillBatchCatchesLateLegacyRowsBelowHighWater(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	now := time.Date(2026, time.July, 9, 1, 2, 3, 0, time.UTC)
+	initial := UsageRecord{
+		ID:          20,
+		Timestamp:   now,
+		PayloadJSON: JSONB(`{"timestamp":"2026-07-09T01:02:03Z","endpoint":"/v1/chat/completions"}`),
+		CreatedAt:   now,
+	}
+	if errCreate := db.Create(&initial).Error; errCreate != nil {
+		t.Fatalf("Create(initial usage) error = %v", errCreate)
+	}
+	first, errBackfill := repo.RunUsageDerivedColumnBackfillBatch(ctx)
+	if errBackfill != nil {
+		t.Fatalf("RunUsageDerivedColumnBackfillBatch(initial) error = %v", errBackfill)
+	}
+	if first.Scanned != 1 || first.Updated != 1 || !first.Done {
+		t.Fatalf("initial backfill result = %+v, want scanned=1 updated=1 done=true", first)
+	}
+
+	latePayload := `{"timestamp":"2026-07-09T01:03:03Z","event_type":"stream","upstream_request_id":"upstream-late","upstream_status_code":202,"home_port":8328,"cpa_node_id":"node-late","cpa_ip":"10.0.0.8","cpa_port":8317}`
+	late := UsageRecord{
+		ID:          10,
+		Timestamp:   now.Add(time.Minute),
+		PayloadJSON: JSONB(latePayload),
+		CreatedAt:   now.Add(time.Minute),
+	}
+	if errCreate := db.Create(&late).Error; errCreate != nil {
+		t.Fatalf("Create(late usage) error = %v", errCreate)
+	}
+	second, errBackfill := repo.RunUsageDerivedColumnBackfillBatch(ctx)
+	if errBackfill != nil {
+		t.Fatalf("RunUsageDerivedColumnBackfillBatch(late) error = %v", errBackfill)
+	}
+	if second.Scanned != 1 || second.Updated != 1 || !second.Done {
+		t.Fatalf("late backfill result = %+v, want scanned=1 updated=1 done=true", second)
+	}
+
+	var updated UsageRecord
+	if errFind := db.First(&updated, "id = ?", late.ID).Error; errFind != nil {
+		t.Fatalf("First(late usage) error = %v", errFind)
+	}
+	if updated.EventType != "stream" || updated.UpstreamRequestID != "upstream-late" || updated.UpstreamStatusCode != 202 {
+		t.Fatalf("late usage metadata = event:%q upstream:%q/%d", updated.EventType, updated.UpstreamRequestID, updated.UpstreamStatusCode)
+	}
+	if updated.HomePort != 8328 || updated.CPANodeID != "node-late" || updated.CPAIP != "10.0.0.8" || updated.CPAPort != 8317 || updated.CPALabel != "node-late" {
+		t.Fatalf("late usage runtime = home_port:%d node:%q ip:%q port:%d label:%q", updated.HomePort, updated.CPANodeID, updated.CPAIP, updated.CPAPort, updated.CPALabel)
 	}
 }
 
@@ -331,7 +462,7 @@ func TestUsageCacheReadBackfillSkipsCanonicalZeroRead(t *testing.T) {
 	}
 }
 
-func TestAutoMigrateDoesNotRunUsageCacheReadBackfill(t *testing.T) {
+func TestAutoMigrateDoesNotRunUsageBackfills(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -342,7 +473,13 @@ func TestAutoMigrateDoesNotRunUsageCacheReadBackfill(t *testing.T) {
 		t.Fatalf("database() error = %v", errDB)
 	}
 	now := time.Date(2026, time.July, 12, 1, 2, 3, 0, time.UTC)
-	record := &UsageRecord{Timestamp: now, Provider: "openai", CachedTokens: 100, PayloadJSON: JSONB(`{}`), CreatedAt: now}
+	record := &UsageRecord{
+		Timestamp:    now,
+		Provider:     "openai",
+		CachedTokens: 100,
+		PayloadJSON:  JSONB(`{"timestamp":"2026-07-12T01:02:03Z","endpoint":"/v1/chat/completions"}`),
+		CreatedAt:    now,
+	}
 	if errCreate := db.Create(record).Error; errCreate != nil {
 		t.Fatalf("Create(usage) error = %v", errCreate)
 	}
@@ -356,8 +493,13 @@ func TestAutoMigrateDoesNotRunUsageCacheReadBackfill(t *testing.T) {
 	if stored.CacheReadTokens != 0 {
 		t.Fatalf("AutoMigrate cache read tokens = %d, want deferred backfill", stored.CacheReadTokens)
 	}
-	if errState := db.First(&KVRecord{}, "key = ?", usageCacheReadBackfillStateKey).Error; errState == nil {
-		t.Fatal("AutoMigrate unexpectedly created usage cache-read backfill state")
+	if stored.EventType != "" {
+		t.Fatalf("AutoMigrate event type = %q, want deferred backfill", stored.EventType)
+	}
+	for _, stateKey := range []string{usageCacheReadBackfillStateKey, usageDerivedColumnBackfillStateKey} {
+		if errState := db.First(&KVRecord{}, "key = ?", stateKey).Error; errState == nil {
+			t.Fatalf("AutoMigrate unexpectedly created usage backfill state %q", stateKey)
+		}
 	}
 }
 
