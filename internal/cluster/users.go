@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ErrUserNotFound indicates that the referenced user record does not exist.
@@ -29,9 +31,25 @@ func IsUserConflictError(err error) bool {
 	return strings.Contains(message, "duplicate key") && strings.Contains(message, "username")
 }
 
+// IsUserEmailConflictError reports whether an error is a verified active-email ownership conflict.
+func IsUserEmailConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "idx_user_email_verified_active_unique") || strings.Contains(message, "idx_user_email_active_unique") {
+		return true
+	}
+	if strings.Contains(message, "unique constraint") && strings.Contains(message, "user") && strings.Contains(message, "email") {
+		return true
+	}
+	return strings.Contains(message, "duplicate key") && strings.Contains(message, "email")
+}
+
 type UserUpdate struct {
 	Username         *string
 	Password         *string
+	Email            *string
 	Credits          *float64
 	CreditsUnlimited *bool
 	MFA              *JSONB
@@ -99,6 +117,24 @@ func (r *Repository) GetUserByUsername(ctx context.Context, username string) (*U
 	return record, nil
 }
 
+// GetUserByEmail returns the active user that owns a verified normalized email.
+func (r *Repository) GetUserByEmail(ctx context.Context, email string) (*UserRecord, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return nil, fmt.Errorf("email is required")
+	}
+
+	record := &UserRecord{}
+	if errFirst := db.WithContext(contextOrBackground(ctx)).Where("email = ? AND email_verified_at IS NOT NULL", email).Order("id").First(record).Error; errFirst != nil {
+		return nil, errFirst
+	}
+	return record, nil
+}
+
 // CreateUser creates a user.
 func (r *Repository) CreateUser(ctx context.Context, update UserUpdate) (*UserRecord, error) {
 	db, errDB := r.database()
@@ -119,6 +155,13 @@ func (r *Repository) CreateUser(ctx context.Context, update UserUpdate) (*UserRe
 	defaultUserPeriodLimitFields(record)
 	if update.Password != nil {
 		record.Password = *update.Password
+	}
+	if update.Email != nil {
+		email := strings.TrimSpace(*update.Email)
+		if email != "" {
+			record.Email = &email
+			record.EmailVersion = 1
+		}
 	}
 	if update.Credits != nil {
 		record.Credits = *update.Credits
@@ -154,7 +197,7 @@ func (r *Repository) UpdateUser(ctx context.Context, id uint, update UserUpdate)
 	record := &UserRecord{}
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if errFirst := tx.Where("id = ?", id).First(record).Error; errFirst != nil {
+		if errFirst := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(record).Error; errFirst != nil {
 			return errFirst
 		}
 		if update.Username != nil {
@@ -166,6 +209,29 @@ func (r *Repository) UpdateUser(ctx context.Context, id uint, update UserUpdate)
 		}
 		if update.Password != nil {
 			record.Password = *update.Password
+			record.SessionVersion++
+			if errInvalidate := invalidateUserPasswordSecurityTx(tx, record.ID, time.Now().UTC()); errInvalidate != nil {
+				return errInvalidate
+			}
+		}
+		if update.Email != nil {
+			email := strings.TrimSpace(*update.Email)
+			currentEmail := ""
+			if record.Email != nil {
+				currentEmail = strings.TrimSpace(*record.Email)
+			}
+			if email != currentEmail {
+				if email == "" {
+					record.Email = nil
+				} else {
+					record.Email = &email
+				}
+				record.EmailVerifiedAt = nil
+				record.EmailVersion++
+				if errInvalidate := invalidateUserEmailSecurityTx(tx, record.ID, time.Now().UTC()); errInvalidate != nil {
+					return errInvalidate
+				}
+			}
 		}
 		if update.Credits != nil {
 			record.Credits = *update.Credits

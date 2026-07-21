@@ -540,7 +540,20 @@ func Build(configFilePath string, opts ...RouteOption) (*BuildResult, error) {
 	handler.SetLogDirectory("logs")
 
 	engine := gin.New()
-	_ = engine.SetTrustedProxies(nil)
+	var trustedProxies []string
+	if clusterEnabled {
+		if current := clusterOpt.Runtime.Config(); current != nil {
+			proxyConfig := &appconfig.Config{TrustedProxies: append([]string(nil), current.TrustedProxies...)}
+			proxyConfig.NormalizeTrustedProxies()
+			if errValidate := appconfig.ValidateTrustedProxies(proxyConfig.TrustedProxies); errValidate != nil {
+				return nil, fmt.Errorf("management http: configure trusted proxies: %w", errValidate)
+			}
+			trustedProxies = proxyConfig.TrustedProxies
+		}
+	}
+	if errTrustedProxies := engine.SetTrustedProxies(trustedProxies); errTrustedProxies != nil {
+		return nil, fmt.Errorf("management http: configure trusted proxies: %w", errTrustedProxies)
+	}
 	engine.Use(gin.Recovery())
 	engine.Use(corsMiddleware())
 

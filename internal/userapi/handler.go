@@ -14,12 +14,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
+const maxUserJSONBodyBytes int64 = 1 << 20
+
 type Handler struct {
-	repo    *cluster.Repository
-	runtime *home.Runtime
+	repo                        *cluster.Repository
+	runtime                     *home.Runtime
+	forgotPasswordResponseFloor time.Duration
 }
 
 type authFields struct {
@@ -35,6 +39,7 @@ type authFields struct {
 
 type loginRequest struct {
 	authFields
+	Email string `json:"email"`
 }
 
 type passwordRequest struct {
@@ -83,8 +88,9 @@ type passkeyRequest struct {
 // NewHandler creates a user API handler.
 func NewHandler(repo *cluster.Repository, runtime *home.Runtime) *Handler {
 	return &Handler{
-		repo:    repo,
-		runtime: runtime,
+		repo:                        repo,
+		runtime:                     runtime,
+		forgotPasswordResponseFloor: 150 * time.Millisecond,
 	}
 }
 
@@ -93,6 +99,7 @@ func Register(group *gin.RouterGroup, handler *Handler) {
 	if group == nil || handler == nil {
 		return
 	}
+	group.GET("/capabilities", handler.GetCapabilities)
 	group.POST("/register", handler.RegisterUser)
 	group.POST("/login", handler.Login)
 	group.POST("/login/passkey/begin", handler.BeginPasskeyLogin)
@@ -106,6 +113,13 @@ func Register(group *gin.RouterGroup, handler *Handler) {
 
 	group.POST("/password", handler.ChangePassword)
 	group.PATCH("/password", handler.ChangePassword)
+	group.POST("/password/forgot", handler.ForgotPassword)
+	group.POST("/password/reset", handler.ResetPassword)
+
+	group.PUT("/email", handler.UpdateEmail)
+	group.DELETE("/email", handler.ClearEmail)
+	group.POST("/email/verification", handler.RequestEmailVerification)
+	group.POST("/email/verify", handler.VerifyEmail)
 
 	group.GET("/totp", handler.ShowTOTP)
 	group.POST("/totp/show", handler.ShowTOTP)
@@ -145,6 +159,7 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 	}
 	username := body.username()
 	password := body.Password
+	email := ""
 	if username == "" {
 		respondError(c, http.StatusBadRequest, "invalid_body", fmt.Errorf("username is required"))
 		return
@@ -153,9 +168,35 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid_body", fmt.Errorf("password is required"))
 		return
 	}
+	if strings.TrimSpace(body.Email) != "" {
+		if !h.userEmailEnabled() {
+			respondError(c, http.StatusConflict, "email_feature_unavailable", fmt.Errorf("email feature is unavailable"))
+			return
+		}
+		var errEmail error
+		email, errEmail = normalizeUserEmail(body.Email)
+		if errEmail != nil {
+			respondError(c, http.StatusBadRequest, "invalid_email", fmt.Errorf("email is invalid"))
+			return
+		}
+	}
 
 	ctx, cancel := requestContext(c)
 	defer cancel()
+	registrationLimits := []userSecurityActionLimit{
+		{action: "user_registration_ip", scope: "ip:" + c.ClientIP(), limit: registrationIPLimit, window: registrationIPWindow},
+		{action: "user_registration_global", scope: "global", limit: registrationGlobalLimit, window: registrationGlobalWindow},
+	}
+	allowed, retryAfter, errAllowed := h.allowUserSecurityActions(ctx, time.Now().UTC(), registrationLimits)
+	if errAllowed != nil {
+		respondError(c, http.StatusInternalServerError, "user_create_failed", errAllowed)
+		return
+	}
+	if !allowed {
+		c.Header("Retry-After", retryAfterHeaderValue(retryAfter))
+		respondError(c, http.StatusTooManyRequests, "registration_rate_limited", fmt.Errorf("registration rate limit exceeded"))
+		return
+	}
 	if _, errExisting := h.repo.GetUserByUsername(ctx, username); errExisting == nil {
 		respondError(c, http.StatusConflict, "user_exists", fmt.Errorf("user already exists"))
 		return
@@ -165,13 +206,17 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 	}
 	hashed, errHash := hashPassword(password)
 	if errHash != nil {
-		respondError(c, http.StatusInternalServerError, "password_hash_failed", errHash)
+		respondPasswordHashError(c, errHash)
 		return
 	}
-	record, errCreate := h.repo.CreateUser(ctx, cluster.UserUpdate{
+	update := cluster.UserUpdate{
 		Username: &username,
 		Password: &hashed,
-	})
+	}
+	if email != "" {
+		update.Email = &email
+	}
+	record, errCreate := h.repo.CreateUser(ctx, update)
 	if errCreate != nil {
 		if cluster.IsUserConflictError(errCreate) {
 			respondError(c, http.StatusConflict, "user_exists", fmt.Errorf("user already exists"))
@@ -179,6 +224,15 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 		}
 		respondError(c, http.StatusInternalServerError, "user_create_failed", errCreate)
 		return
+	}
+	if email != "" {
+		if _, _, errEnqueue := h.enqueueEmailVerification(ctx, record, c.ClientIP(), time.Now().UTC()); errEnqueue != nil {
+			log.WithFields(log.Fields{
+				"user_id":    record.ID,
+				"purpose":    cluster.UserSecurityTokenPurposeEmailVerification,
+				"error_type": fmt.Sprintf("%T", errEnqueue),
+			}).Warn("user mail enqueue failed")
+		}
 	}
 	h.respondLogin(c, ctx, record)
 }
@@ -269,7 +323,7 @@ func (h *Handler) CurrentUser(c *gin.Context) {
 	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"user": userResponseWithPasskeys(record), "status": "ok"})
+	c.JSON(http.StatusOK, gin.H{"user": h.userResponseWithPasskeys(record), "status": "ok"})
 }
 
 // ChangePassword updates the authenticated user's password.
@@ -291,7 +345,7 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	}
 	hashed, errHash := hashPassword(newPassword)
 	if errHash != nil {
-		respondError(c, http.StatusInternalServerError, "password_hash_failed", errHash)
+		respondPasswordHashError(c, errHash)
 		return
 	}
 	update := cluster.UserUpdate{Password: &hashed}
@@ -300,7 +354,7 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		respondUserError(c, "password_update_failed", errUpdate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"user": userResponse(updated), "status": "ok"})
+	h.respondLogin(c, ctx, updated)
 }
 
 // ShowTOTP returns a TOTP setup secret and otpauth URL.
@@ -378,7 +432,7 @@ func (h *Handler) BindTOTP(c *gin.Context) {
 		respondUserError(c, "totp_bind_failed", errUpdate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"user": userResponse(updated), "status": "ok"})
+	c.JSON(http.StatusOK, gin.H{"user": h.userResponse(updated), "status": "ok"})
 }
 
 // DeleteTOTP removes the authenticated user's TOTP configuration.
@@ -395,7 +449,7 @@ func (h *Handler) DeleteTOTP(c *gin.Context) {
 		respondUserError(c, "totp_delete_failed", errUpdate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"user": userResponse(updated), "status": "ok"})
+	c.JSON(http.StatusOK, gin.H{"user": h.userResponse(updated), "status": "ok"})
 }
 
 // ListAPIKeys lists API keys owned by the authenticated user.
@@ -662,14 +716,18 @@ func (h *Handler) authenticatedUser(c *gin.Context, ctx context.Context, fields 
 		respondError(c, http.StatusUnauthorized, "bearer_token_required", fmt.Errorf("bearer token is required"))
 		return nil, false
 	}
-	userID, errToken := h.bearerTokenUserID(ctx, token)
+	claims, errToken := h.bearerTokenClaims(ctx, token)
 	if errToken != nil {
 		respondError(c, http.StatusUnauthorized, "invalid_token", fmt.Errorf("invalid token"))
 		return nil, false
 	}
-	record, errUser := h.repo.GetUser(ctx, userID)
+	record, errUser := h.repo.GetUser(ctx, claims.UserID)
 	if errUser != nil {
 		respondAuthError(c, errUser)
+		return nil, false
+	}
+	if claims.SessionVersion != record.SessionVersion {
+		respondError(c, http.StatusUnauthorized, "invalid_token", fmt.Errorf("invalid token"))
 		return nil, false
 	}
 	return record, true
@@ -708,7 +766,7 @@ func (h *Handler) requirePasskeyLogin(c *gin.Context, record *cluster.UserRecord
 }
 
 func (h *Handler) respondLogin(c *gin.Context, ctx context.Context, record *cluster.UserRecord) {
-	token, expiresAt, errToken := h.createBearerToken(ctx, record.ID, defaultSessionTTL)
+	token, expiresAt, errToken := h.createBearerToken(ctx, record.ID, record.SessionVersion, defaultSessionTTL)
 	if errToken != nil {
 		respondError(c, http.StatusInternalServerError, "token_create_failed", errToken)
 		return
@@ -716,7 +774,7 @@ func (h *Handler) respondLogin(c *gin.Context, ctx context.Context, record *clus
 	c.JSON(http.StatusOK, gin.H{
 		"token":      token,
 		"expires_at": expiresAt,
-		"user":       userResponse(record),
+		"user":       h.userResponse(record),
 	})
 }
 
@@ -735,7 +793,7 @@ func (h *Handler) refreshConfig(ctx context.Context) error {
 	return nil
 }
 
-func userResponse(record *cluster.UserRecord) gin.H {
+func (h *Handler) userResponse(record *cluster.UserRecord) gin.H {
 	if record == nil {
 		return gin.H{}
 	}
@@ -747,13 +805,14 @@ func userResponse(record *cluster.UserRecord) gin.H {
 		"credits":       record.Credits,
 		"totp_enabled":  totpEnabled,
 		"passkey_count": len(passkeys),
+		"email_status":  userEmailStatusResponse(record, h.userEmailEnabled()),
 		"created_at":    record.CreatedAt,
 		"updated_at":    record.UpdatedAt,
 	}
 }
 
-func userResponseWithPasskeys(record *cluster.UserRecord) gin.H {
-	out := userResponse(record)
+func (h *Handler) userResponseWithPasskeys(record *cluster.UserRecord) gin.H {
+	out := h.userResponse(record)
 	if record == nil {
 		return out
 	}
@@ -812,8 +871,13 @@ func decodeJSONBodyWithRaw(c *gin.Context, out any) ([]byte, bool) {
 	if c == nil || c.Request == nil || c.Request.Body == nil {
 		return nil, true
 	}
-	data, errRead := io.ReadAll(c.Request.Body)
+	data, errRead := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxUserJSONBodyBytes))
 	if errRead != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(errRead, &maxBytesError) {
+			respondError(c, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Errorf("request body exceeds %d bytes", maxUserJSONBodyBytes))
+			return nil, false
+		}
 		respondError(c, http.StatusBadRequest, "invalid_body", errRead)
 		return nil, false
 	}
@@ -837,10 +901,29 @@ func requestContext(c *gin.Context) (context.Context, context.CancelFunc) {
 
 func respondError(c *gin.Context, status int, code string, err error) {
 	message := strings.TrimSpace(code)
-	if err != nil && strings.TrimSpace(err.Error()) != "" {
+	if status >= http.StatusInternalServerError {
+		message = strings.ToLower(http.StatusText(http.StatusInternalServerError))
+		fields := log.Fields{"error_code": code}
+		if err != nil {
+			fields["error_type"] = fmt.Sprintf("%T", err)
+		}
+		if c != nil && c.Request != nil {
+			fields["method"] = c.Request.Method
+			fields["path"] = c.FullPath()
+		}
+		log.WithFields(fields).Error("user API request failed")
+	} else if err != nil && strings.TrimSpace(err.Error()) != "" {
 		message = err.Error()
 	}
 	c.JSON(status, gin.H{"error": code, "message": message})
+}
+
+func respondPasswordHashError(c *gin.Context, err error) {
+	if errors.Is(err, errPasswordTooLong) {
+		respondError(c, http.StatusBadRequest, "invalid_password", err)
+		return
+	}
+	respondError(c, http.StatusInternalServerError, "password_hash_failed", err)
 }
 
 func respondOK(c *gin.Context) {

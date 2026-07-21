@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/protocolmux"
 	quotacollector "github.com/router-for-me/CLIProxyAPIHome/internal/quota"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/usermail"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gorm.io/gorm"
@@ -286,6 +287,8 @@ func run() int {
 		log.Errorf("failed to start runtime: %v", errStart)
 		return 1
 	}
+	userMailService := usermail.NewService(repo, func() *config.Config { return rt.Config() })
+	userMailService.Start(runCtx)
 	quotaHomeID := net.JoinHostPort(clusterClientAddr, strconv.Itoa(clusterAdvertisedPort))
 	quotaCollector := quotacollector.NewCollector(repo, quotacollector.Options{
 		HomeID: quotaHomeID,

@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,10 +21,13 @@ import (
 const (
 	defaultSessionTTL = 24 * time.Hour
 	randomTokenBytes  = 32
+	maxPasswordBytes  = 72
 	userJWTAlgorithm  = "RS256"
 	userJWTType       = "JWT"
 	userJWTClaimType  = "user"
 )
+
+var errPasswordTooLong = errors.New("password exceeds the 72-byte bcrypt limit")
 
 type userJWTHeader struct {
 	Algorithm string `json:"alg"`
@@ -31,14 +35,15 @@ type userJWTHeader struct {
 }
 
 type userJWTClaims struct {
-	Subject   string `json:"sub,omitempty"`
-	UserID    uint   `json:"user_id"`
-	IssuedAt  int64  `json:"iat"`
-	ExpiresAt int64  `json:"exp"`
-	TokenType string `json:"typ"`
+	Subject        string `json:"sub,omitempty"`
+	UserID         uint   `json:"user_id"`
+	SessionVersion uint64 `json:"session_version,omitempty"`
+	IssuedAt       int64  `json:"iat"`
+	ExpiresAt      int64  `json:"exp"`
+	TokenType      string `json:"typ"`
 }
 
-func (h *Handler) createBearerToken(ctx context.Context, userID uint, ttl time.Duration) (string, time.Time, error) {
+func (h *Handler) createBearerToken(ctx context.Context, userID uint, sessionVersion uint64, ttl time.Duration) (string, time.Time, error) {
 	if userID == 0 {
 		return "", time.Time{}, fmt.Errorf("user id is required")
 	}
@@ -52,11 +57,12 @@ func (h *Handler) createBearerToken(ctx context.Context, userID uint, ttl time.D
 	now := time.Now().UTC()
 	expiresAt := now.Add(ttl)
 	claims := userJWTClaims{
-		Subject:   strconv.FormatUint(uint64(userID), 10),
-		UserID:    userID,
-		IssuedAt:  now.Unix(),
-		ExpiresAt: expiresAt.Unix(),
-		TokenType: userJWTClaimType,
+		Subject:        strconv.FormatUint(uint64(userID), 10),
+		UserID:         userID,
+		SessionVersion: sessionVersion,
+		IssuedAt:       now.Unix(),
+		ExpiresAt:      expiresAt.Unix(),
+		TokenType:      userJWTClaimType,
 	}
 	token, errToken := signUserJWT(key, claims)
 	if errToken != nil {
@@ -65,10 +71,10 @@ func (h *Handler) createBearerToken(ctx context.Context, userID uint, ttl time.D
 	return token, expiresAt, nil
 }
 
-func (h *Handler) bearerTokenUserID(ctx context.Context, token string) (uint, error) {
+func (h *Handler) bearerTokenClaims(ctx context.Context, token string) (userJWTClaims, error) {
 	key, errKey := h.userJWTPublicKey(ctx)
 	if errKey != nil {
-		return 0, errKey
+		return userJWTClaims{}, errKey
 	}
 	return verifyUserJWT(key, token)
 }
@@ -127,67 +133,68 @@ func signUserJWT(key *rsa.PrivateKey, claims userJWTClaims) (string, error) {
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
-func verifyUserJWT(key *rsa.PublicKey, token string) (uint, error) {
+func verifyUserJWT(key *rsa.PublicKey, token string) (userJWTClaims, error) {
 	if key == nil {
-		return 0, fmt.Errorf("jwt public key is required")
+		return userJWTClaims{}, fmt.Errorf("jwt public key is required")
 	}
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return 0, fmt.Errorf("jwt token is required")
+		return userJWTClaims{}, fmt.Errorf("jwt token is required")
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return 0, fmt.Errorf("invalid jwt token")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt token")
 	}
 	headerData, errHeader := base64.RawURLEncoding.DecodeString(parts[0])
 	if errHeader != nil {
-		return 0, fmt.Errorf("invalid jwt header")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt header")
 	}
 	var header userJWTHeader
 	if errUnmarshalHeader := json.Unmarshal(headerData, &header); errUnmarshalHeader != nil {
-		return 0, fmt.Errorf("invalid jwt header")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt header")
 	}
 	if header.Algorithm != userJWTAlgorithm || header.Type != userJWTType {
-		return 0, fmt.Errorf("invalid jwt header")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt header")
 	}
 	signature, errDecodeSignature := base64.RawURLEncoding.DecodeString(parts[2])
 	if errDecodeSignature != nil {
-		return 0, fmt.Errorf("invalid jwt signature")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt signature")
 	}
 	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if errVerifySignature := rsa.VerifyPKCS1v15(key, crypto.SHA256, sum[:], signature); errVerifySignature != nil {
-		return 0, fmt.Errorf("invalid jwt signature")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt signature")
 	}
 	claimsData, errClaims := base64.RawURLEncoding.DecodeString(parts[1])
 	if errClaims != nil {
-		return 0, fmt.Errorf("invalid jwt claims")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt claims")
 	}
 	var claims userJWTClaims
 	if errUnmarshalClaims := json.Unmarshal(claimsData, &claims); errUnmarshalClaims != nil {
-		return 0, fmt.Errorf("invalid jwt claims")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt claims")
 	}
 	if claims.TokenType != userJWTClaimType {
-		return 0, fmt.Errorf("invalid jwt claims")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt claims")
 	}
 	now := time.Now().UTC()
 	if claims.ExpiresAt <= 0 || !time.Unix(claims.ExpiresAt, 0).After(now) {
-		return 0, fmt.Errorf("jwt token is expired")
+		return userJWTClaims{}, fmt.Errorf("jwt token is expired")
 	}
 	if claims.IssuedAt > now.Add(time.Minute).Unix() {
-		return 0, fmt.Errorf("invalid jwt claims")
+		return userJWTClaims{}, fmt.Errorf("invalid jwt claims")
 	}
 	userID := claims.UserID
 	if userID == 0 && strings.TrimSpace(claims.Subject) != "" {
 		parsed, errParse := strconv.ParseUint(strings.TrimSpace(claims.Subject), 10, 64)
 		if errParse != nil {
-			return 0, fmt.Errorf("invalid jwt subject")
+			return userJWTClaims{}, fmt.Errorf("invalid jwt subject")
 		}
 		userID = uint(parsed)
 	}
 	if userID == 0 {
-		return 0, fmt.Errorf("user id is required")
+		return userJWTClaims{}, fmt.Errorf("user id is required")
 	}
-	return userID, nil
+	claims.UserID = userID
+	return claims, nil
 }
 
 func randomToken(size int) (string, error) {
@@ -204,6 +211,9 @@ func randomToken(size int) (string, error) {
 func hashPassword(password string) (string, error) {
 	if password == "" {
 		return "", fmt.Errorf("password is required")
+	}
+	if len([]byte(password)) > maxPasswordBytes {
+		return "", errPasswordTooLong
 	}
 	hashed, errHash := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if errHash != nil {

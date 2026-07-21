@@ -523,7 +523,7 @@ func createUserBillingBearerToken(t *testing.T, handler *Handler, userID uint) s
 	if _, _, errKey := handler.repo.ClusterCAKeyPair(ctx); errKey != nil {
 		t.Fatalf("ClusterCAKeyPair() error = %v", errKey)
 	}
-	token, _, errToken := handler.createBearerToken(ctx, userID, time.Hour)
+	token, _, errToken := handler.createBearerToken(ctx, userID, 0, time.Hour)
 	if errToken != nil {
 		t.Fatalf("createBearerToken() error = %v", errToken)
 	}

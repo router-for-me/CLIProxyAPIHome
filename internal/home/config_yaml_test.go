@@ -16,6 +16,17 @@ tls:
   enable: false
 remote-management:
   allow-remote: false
+trusted-proxies:
+  - "127.0.0.1"
+user-email:
+  enabled: true
+  public-user-url: "https://home.example.com/user.html"
+  from-address: "no-reply@example.com"
+  sender:
+    type: smtp
+    smtp:
+      host: "smtp.example.com"
+      password-env: "HOME_USER_EMAIL_SMTP_PASSWORD"
 auth-dir: "~/.cli-proxy-api-home"
 api-keys:
   - "k1"
@@ -81,6 +92,9 @@ plugins:
 
 	assertNotContains("tls:")
 	assertNotContains("remote-management:")
+	assertNotContains("trusted-proxies:")
+	assertNotContains("user-email:")
+	assertNotContains("HOME_USER_EMAIL_SMTP_PASSWORD")
 	assertNotContains("auth-dir:")
 	assertNotContains("api-keys:")
 	assertNotContains("gemini-api-key:")

@@ -12,9 +12,42 @@ Home 示例端口通常为 `8327`。实际监听地址来自 runtime config、`c
 
 ## Runtime 模型
 
-用户记录、API key、TOTP 配置和 passkey entries 存储在 database-backed cluster repository 中。`/user/*` route group 只会在 Home 使用 database-backed runtime route set 时注册。
+用户记录、可选邮箱状态、一次性安全 token、邮件任务、API key、TOTP 配置和 passkey entries 存储在 database-backed cluster repository 中。`/user/*` route group 只会在 Home 使用 database-backed runtime route set 时注册。
 
 通过 User API 修改 API key 会更新 Home dispatch 使用的同一张 `api_key` 表，并发布 config refresh event。
+
+## 用户邮箱配置
+
+邮箱验证与密码找回是可选能力，默认关闭。只有配置完整且可用时，`GET /capabilities` 返回的三个 capability flag 才会启用。
+
+```yaml
+user-email:
+  enabled: true
+  public-user-url: "https://home.example.com/user.html"
+  from-address: "no-reply@example.com"
+  from-name: "CLIProxyAPIHome"
+  sender:
+    type: "smtp"
+    smtp:
+      host: "smtp.example.com"
+      port: 587
+      username: "smtp-user"
+      password-env: "HOME_USER_EMAIL_SMTP_PASSWORD"
+      starttls: true
+  verification-token-ttl: "24h"
+  reset-token-ttl: "30m"
+```
+
+配置规则：
+
+- `public-user-url` 必须是绝对 HTTPS URL；只有 `localhost` 或回环 IP 可以使用明文 HTTP。
+- `from-address` 必须是单个邮箱地址，不能带 display name。
+- 首个 sender 实现为 SMTP。所有非回环 SMTP host 都必须配置 `starttls: true`；Home 要求 TLS 1.2 或更高版本，暂不支持 465 端口的 implicit TLS。配置 `username` 时，`password-env` 必须指向非空环境变量；密码不会写入 `config.yaml`。
+- `verification-token-ttl` 与 `reset-token-ttl` 必须是正数 Go duration 字符串。
+- 配置缺失或无效时，邮箱 capability 保持关闭，但不会阻止 Home 启动。
+- `user-email` 只属于 Home，不会下发到 CPA 节点。
+- Home 默认忽略转发的客户端 IP header。若 Home 前面有明确的反向代理，只在顶层 `trusted-proxies` 中填写该 Nginx/Caddy/负载均衡器的精确 IP 或 CIDR；系统拒绝 trust-all 网段，修改后需要重启。这样既能让注册与找回限流识别真实来源，又不会允许直连客户端伪造地址。
+- 关闭功能会保留数据库中的邮箱状态，但停止新的邮箱修改、验证请求和找回请求。此前签发的 verify/reset token 在过期或被撤销前仍可消费。
 
 ## 认证
 
@@ -22,14 +55,20 @@ Home 示例端口通常为 `8327`。实际监听地址来自 runtime config、`c
 
 | Method | Path | 说明 |
 | --- | --- | --- |
+| `GET` | `/capabilities` | 返回可选 User API capability。 |
 | `POST` | `/register` | 创建用户并返回 bearer token。 |
 | `POST` | `/login` | 用户未启用 passkey 和 TOTP 时的密码登录。 |
 | `POST` | `/login/totp` | 用户启用 TOTP 时的密码 + TOTP 登录。 |
 | `POST` | `/login/passkey` | Passkey 登录。 |
+| `POST` | `/email/verify` | 消费邮箱验证 token。 |
+| `POST` | `/password/forgot` | 接收通用密码找回请求。 |
+| `POST` | `/password/reset` | 消费重置 token 并设置新密码。 |
 
 其他所有 `/user/*` route 都需要注册或登录成功后返回的 bearer token。
 Bearer token 是使用集群根 CA 私钥签名、并使用集群根 CA 公钥验证的 RS256 JWT。替换集群根 CA 后，之前签发的 User API token 会失效。
-密码会按照原始输入值进行 hash 和校验，不会去除首尾空白字符。
+Bearer token 还包含用户当前 session version。密码修改、密码重置或 Management API 管理员更新密码成功后都会递增该版本，使旧 bearer token 失效。已认证修改密码会为当前客户端返回替换 session；密码重置不会自动登录。
+密码会按照原始输入值进行 hash 和校验，不会去除首尾空白字符。新 bcrypt 密码最多为 72 个 UTF-8 字节。
+User API JSON 请求体最大为 1 MiB。
 
 支持的请求头：
 
@@ -74,6 +113,12 @@ Home User API 会额外写入以下响应头：
     "credits": 0,
     "totp_enabled": false,
     "passkey_count": 0,
+    "email_status": {
+      "configured": true,
+      "verified": false,
+      "masked": "a***@example.com",
+      "recovery_ready": false
+    },
     "created_at": "2026-06-02T10:00:00Z",
     "updated_at": "2026-06-02T10:00:00Z"
   }
@@ -85,6 +130,8 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 ```json
 { "error": "invalid_credentials", "message": "invalid credentials" }
 ```
+
+校验与认证失败会保留具体且安全的提示；服务端 `5xx` 错误仍保留机器可读 code，但统一使用 `internal server error`，避免向公网暴露数据库或实现细节。
 
 常见错误：
 
@@ -102,6 +149,7 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 | Method | Path |
 | --- | --- |
+| `GET` | `/capabilities` |
 | `POST` | `/register` |
 | `POST` | `/login` |
 | `POST` | `/login/passkey/begin` |
@@ -111,6 +159,12 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/me` |
 | `PATCH` | `/password` |
 | `POST` | `/password` |
+| `POST` | `/password/forgot` |
+| `POST` | `/password/reset` |
+| `PUT` | `/email` |
+| `DELETE` | `/email` |
+| `POST` | `/email/verification` |
+| `POST` | `/email/verify` |
 | `GET` | `/totp` |
 | `POST` | `/totp` |
 | `POST` | `/totp/show` |
@@ -142,6 +196,29 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 ## 账号
 
+### GET `/capabilities`
+
+返回当前 Home 配置是否支持可选邮箱注册、邮箱验证与密码找回。该 route 不暴露 SMTP 配置或用户数据。
+
+响应示例：
+
+```json
+{
+  "capabilities": {
+    "email_registration": true,
+    "email_verification": true,
+    "password_recovery": true
+  },
+  "server_info": {
+    "home_version": "v1.2.3",
+    "home_commit": "abcdef0",
+    "home_build_date": "2026-07-20"
+  }
+}
+```
+
+当 `user-email.enabled` 为 false，或邮件配置不完整/无效时，三个 flag 都为 `false`。旧版 Home 可能因没有该 route 而返回 `404`。
+
 ### POST `/register`
 
 创建用户账号，保存 bcrypt password hash，并返回 bearer token。
@@ -151,7 +228,8 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 ```json
 {
   "username": "alice",
-  "password": "secret"
+  "password": "secret",
+  "email": "alice@example.com"
 }
 ```
 
@@ -161,14 +239,22 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 | --- | --- | --- | --- |
 | `username` | string | yes | 用户名。Aliases: `user_name`, `user-name`。 |
 | `password` | string | yes | 用于生成存储密码 hash 的明文密码。 |
+| `email` | string | no | 可选邮箱。仅在 `email_registration` 为 true 时接受；会先归一化并以未验证状态保存，验证成功前不会占用唯一所有权。 |
 
-响应：登录响应结构。
+响应：登录响应结构。提供邮箱时，Home 会先执行验证投递限流，再尝试异步排队；地址已被拥有或请求已受限时仍接受注册，但不会发送邮件。注册成功不代表邮箱已验证或已可用于找回。
+
+所有注册尝试（包括不带邮箱的 username-only 注册）都会按来源 IP 和全局维度限流；验证邮件投递另有目标邮箱维度限制。被限制时返回 `429 registration_rate_limited` 与 `Retry-After`。
 
 常见错误：
 
 ```json
 { "error": "user_exists", "message": "user already exists" }
+{ "error": "email_feature_unavailable", "message": "email feature is unavailable" }
+{ "error": "invalid_email", "message": "email is invalid" }
 { "error": "invalid_body", "message": "password is required" }
+{ "error": "invalid_password", "message": "password exceeds the 72-byte bcrypt limit" }
+{ "error": "request_too_large", "message": "request body exceeds 1048576 bytes" }
+{ "error": "registration_rate_limited", "message": "registration rate limit exceeded" }
 ```
 
 ### POST `/login`
@@ -281,6 +367,12 @@ Authorization: Bearer user.jwt.token
     "credits": 0,
     "totp_enabled": false,
     "passkey_count": 1,
+    "email_status": {
+      "configured": true,
+      "verified": true,
+      "masked": "a***@example.com",
+      "recovery_ready": true
+    },
     "passkeys": [
       {
         "id": "passkey-1",
@@ -326,20 +418,124 @@ Authorization: Bearer user.jwt.token
 | --- | --- | --- | --- |
 | `new_password` | string | yes | 新明文密码。Alias: `new-password`。 |
 
-示例响应：
+响应：登录响应结构，包含新的 `token` 与 `expires_at`。密码更新会递增用户 session version，因此本次请求使用的 bearer token 和其他所有旧 bearer token 都会失效；客户端必须原子替换为返回的新 session。
+
+TOTP 与 passkey 数据不会被修改。
+
+## 邮箱验证与密码找回
+
+邮箱是可选字段。Home 保存归一化后的小写地址，但 User API 响应只暴露 `email_status`：
+
+只有已验证邮箱才构成唯一所有权声明。多个 active account 可以暂时保存同一个未验证地址，因此匿名注册不能永久抢占他人的邮箱，注册/更新响应也不会泄露该地址是否已被其他账号拥有。若地址已由其他 active account 拥有，Home 仍返回正常 accepted 结果，但不会发送验证邮件。首个成功验证尚未被占用地址的账号会原子取得所有权；之后发生冲突的验证链接统一返回“无效或已过期”。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `configured` | boolean | 当前是否已保存邮箱。 |
+| `verified` | boolean | 当前 email version 是否已完成所有权验证。 |
+| `masked` | string | 例如 `a***@example.com` 的隐私安全展示值；未配置时为空。 |
+| `recovery_ready` | boolean | 邮箱已验证且当前邮件配置可用。 |
+
+修改邮箱会立即清除验证状态、递增 email version、撤销未完成的 verify/reset token，并将待处理邮件任务标记为 superseded。提交完全相同的归一化地址是幂等操作，不会清除验证状态。
+
+### PUT `/email`
+
+添加或替换当前认证用户的邮箱。需要 bearer token，并要求邮箱 capability 已启用。
+
+```json
+{ "email": "new@example.com" }
+```
+
+成功返回 `200` 和 `{ "status": "ok", "user": ... }`。返回用户中的新邮箱状态为未验证。该 route 只保存地址，不直接排队发送邮件；随后调用 `/email/verification`。
+
+常见错误：
+
+```json
+{ "error": "invalid_email", "message": "email is invalid" }
+{ "error": "email_feature_unavailable", "message": "email feature is unavailable" }
+{ "error": "email_update_rate_limited", "message": "email update rate limit exceeded" }
+```
+
+### DELETE `/email`
+
+删除当前认证用户保存的邮箱。即使邮箱 capability 已关闭，该 route 仍保持可用，确保用户始终可以删除可选个人信息。删除邮箱会递增 email version、撤销未完成的 verify/reset token、将待处理邮件任务标记为 superseded，并释放该地址供其他 active user 使用。
+
+成功返回 `200 { "status": "ok", "user": ... }`。未配置邮箱时重复调用是幂等操作。
+
+### POST `/email/verification`
+
+为当前认证用户的未验证邮箱排队发送验证邮件。无需请求体。
+
+成功：
+
+```http
+HTTP/1.1 202 Accepted
+```
+
+```json
+{ "status": "accepted" }
+```
+
+邮箱已经验证时，幂等返回 `200 { "status": "ok" }`。注册时的首次验证邮件与手动重发共用同一组限流：严格 60 秒冷却，并同时按 user、目标邮箱、来源 IP 和全局维度限制。手动重发被限制时返回 `429 verification_rate_limited`，`Retry-After` 为实际剩余秒数。
+
+```json
+{ "error": "email_not_configured", "message": "email is not configured" }
+{ "error": "verification_rate_limited", "message": "verification request rate limit exceeded" }
+```
+
+### POST `/email/verify`
+
+消费短时、单次使用的邮箱验证 token。邮件中的 UI 链接应先展示明确确认页面，只有用户确认后才调用此 POST，避免邮件安全扫描器直接消费 token。
+
+```json
+{ "token": "base64url-token" }
+```
+
+成功：`200 { "status": "ok" }`。
+
+过期、已用、未知、已被替代、email version 不匹配，或目标邮箱已由其他账号拥有的 token 都统一返回：
+
+```json
+{ "error": "invalid_or_expired_token", "message": "verification link is invalid or expired" }
+```
+
+### POST `/password/forgot`
+
+接收邮箱地址；如果存在符合条件且已验证的账号，则排队发送重置邮件。邮箱 capability 启用后，所有可解析请求都返回完全相同的状态与响应体，无论邮箱缺失、非法、未知、未验证、已限流，还是邮件暂时无法入队。
+
+```json
+{ "email": "alice@example.com" }
+```
+
+```http
+HTTP/1.1 202 Accepted
+```
 
 ```json
 {
-  "status": "ok",
-  "user": {
-    "id": 1,
-    "username": "alice",
-    "totp_enabled": false,
-    "passkey_count": 0,
-    "created_at": "2026-06-02T10:00:00Z",
-    "updated_at": "2026-06-02T10:10:00Z"
-  }
+  "status": "accepted",
+  "message": "If an eligible account matches, password reset instructions will be sent."
 }
+```
+
+Home 会在入队前执行目标邮箱五分钟冷却，以及 IP、邮箱小时级和全局限流；同时将 accepted 响应补齐到最短处理时长，以降低符合条件与不符合条件账号之间的耗时差异。客户端仍必须对所有 accepted 响应展示同一确认 UI。全局邮箱 capability 关闭时，该 route 返回 `404 email_feature_unavailable`。
+
+### POST `/password/reset`
+
+消费短时、单次使用的 reset token 并设置新密码。
+
+```json
+{
+  "token": "base64url-token",
+  "new_password": "new-secret"
+}
+```
+
+也接受 `new-password` alias。成功返回 `200 { "status": "ok" }`，递增 session version，并撤销所有旧 User API bearer token、其他未使用 reset token 与排队中的密码重置邮件任务。认证用户修改密码或 Management API 管理员更新密码时也会执行相同的 reset token 与队列任务撤销。密码重置不会返回登录 session。TOTP 与 passkey 保持不变，下次登录时仍继续生效。
+
+无效、过期、已用、已被替代或 email version 不匹配统一返回：
+
+```json
+{ "error": "invalid_or_expired_token", "message": "password reset link is invalid or expired" }
 ```
 
 ## TOTP
