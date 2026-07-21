@@ -573,3 +573,47 @@ func TestResetUserPeriodLimitsAttachesFieldAndCode(t *testing.T) {
 		t.Fatal("ResetUserPeriodLimits() error = nil, want unknown window error")
 	}
 }
+
+func TestResetUserPeriodLimitsEmptyWindowsTargetsAllWindows(t *testing.T) {
+	t.Parallel()
+	repo, ctx, closeRepo := newPeriodLimitTestRepo(t)
+	defer closeRepo()
+
+	user := createPeriodLimitUser(t, repo, ctx, "u-reset-all-windows", 100)
+	limit := 5.0
+	if _, errUpdate := repo.UpdateUser(ctx, user.ID, UserUpdate{
+		Limit5hCredits: OptionalFloatUpdate{Set: true, Value: limit},
+	}); errUpdate != nil {
+		t.Fatalf("UpdateUser() error = %v", errUpdate)
+	}
+
+	now := time.Now().UTC()
+	result, errReset := repo.ResetUserPeriodLimits(ctx, user.ID, nil, PeriodResetModeCounter, now)
+	if errReset != nil {
+		t.Fatalf("ResetUserPeriodLimits() error = %v", errReset)
+	}
+	wantWindows := []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d}
+	if len(result.Windows) != len(wantWindows) {
+		t.Fatalf("reset windows = %v, want %v", result.Windows, wantWindows)
+	}
+	for index, want := range wantWindows {
+		if result.Windows[index] != want {
+			t.Fatalf("reset windows = %v, want %v", result.Windows, wantWindows)
+		}
+	}
+
+	reloaded, errGet := repo.GetUser(ctx, user.ID)
+	if errGet != nil {
+		t.Fatalf("GetUser() error = %v", errGet)
+	}
+	for field, epoch := range map[string]*time.Time{
+		"usage_epoch_5h":  reloaded.UsageEpoch5h,
+		"usage_epoch_1d":  reloaded.UsageEpoch1d,
+		"usage_epoch_7d":  reloaded.UsageEpoch7d,
+		"usage_epoch_30d": reloaded.UsageEpoch30d,
+	} {
+		if epoch == nil || !epoch.Equal(now) {
+			t.Fatalf("%s = %v, want %v", field, epoch, now)
+		}
+	}
+}

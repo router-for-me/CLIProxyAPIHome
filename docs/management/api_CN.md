@@ -1121,7 +1121,7 @@ Path 参数：
 
 输出：与 `GET /users/:id` 相同。
 
-校验失败返回 HTTP `400`，并携带结构化的 `field_errors` 数组，客户端无需解析 message 字符串即可本地化并定位字段：
+语义校验失败，以及结构合法 JSON 中可定位的字段类型错误，会返回 HTTP `400` 并携带结构化的 `field_errors` 数组，客户端无需解析 message 字符串即可本地化并定位字段：
 
 ```json
 {
@@ -1134,11 +1134,14 @@ Path 参数：
 | `field_errors[].code` | `field_errors[].field` | 含义 |
 | --- | --- | --- |
 | `required` | `username` | 用户名缺失或为空。 |
-| `invalid_timezone` | `timezone` | 不是合法的 IANA 时区。 |
-| `invalid_limit` | `limit_5h_credits`、`limit_1d_credits`、`limit_7d_credits`、`limit_30d_credits` | 限额为负数或不是有限数字。 |
-| `invalid_window_mode` | `window_mode_5h`、`window_mode_1d`、`window_mode_7d`、`window_mode_30d` | 不支持的窗口模式（`5h` 拒绝 `calendar`）。 |
-| `invalid_week_reset_day` | `week_reset_day` | 超出 `1`–`7`。 |
-| `invalid_week_reset_hour` | `week_reset_hour` | 超出 `0`–`23`。 |
+| `invalid_type` | `credits_unlimited` | 值不是 boolean 或 `null`。 |
+| `invalid_timezone` | `timezone` | IANA 时区无效，或值的类型不是 string/`null`。 |
+| `invalid_limit` | `limit_5h_credits`、`limit_1d_credits`、`limit_7d_credits`、`limit_30d_credits` | 限额为负数、不是有限数字，或不是 number/`null`。 |
+| `invalid_window_mode` | `window_mode_5h`、`window_mode_1d`、`window_mode_7d`、`window_mode_30d` | 模式不受支持，或值不是 string/`null`（`5h` 拒绝 `calendar`）。 |
+| `invalid_week_reset_day` | `week_reset_day` | 超出 `1`–`7`，或不是 integer/`null`。 |
+| `invalid_week_reset_hour` | `week_reset_hour` | 超出 `0`–`23`，或不是 integer/`null`。 |
+
+JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时，仍返回 `400` 和 `error: "invalid body"`，但可能不包含 `field_errors`。
 
 ### PUT/PATCH `/users/:id`
 
@@ -1205,6 +1208,8 @@ Path 参数：
 | `windows` | string[] | 否 | `5h`/`1d`/`7d`/`30d` 子集。空/省略表示全部。 |
 | `mode` | string | 否 | `counter`（默认）：对选中窗口设置 `usage_epoch_* = now` 并清除对应 `period_window_start_*`。`window_only`：清除 `period_window_start_*`；对 `sliding`/`calendar` 窗口同时写 `usage_epoch_*`（否则无法真正清零 used）。 |
 
+空请求体、省略 `windows`、`windows: []` 或 `windows: null` 都固定重置四个窗口，并按稳定顺序返回 `5h`、`1d`、`7d`、`30d`；即使某个窗口当前未启用或未激活，也会包含在目标集合中。
+
 响应：
 
 ```json
@@ -1238,7 +1243,7 @@ Path 参数：
 
 `limits` 是重置后的完整状态（在同一事务内重建），结构与 `GET /users/:id/period-limits` 完全一致；客户端可直接用响应更新本地状态，无需额外读取。
 
-校验失败返回 HTTP `400`，携带用户写入章节描述的 `field_errors` 契约，错误码为 `invalid_reset_mode`（字段 `mode`）与 `invalid_reset_windows`（字段 `windows`）。
+校验失败和可定位的 JSON 类型错误返回 HTTP `400`，携带用户写入章节描述的 `field_errors` 契约，错误码为 `invalid_reset_mode`（字段 `mode`）与 `invalid_reset_windows`（字段 `windows`）。JSON 语法错误可能不包含 `field_errors`。
 
 周期限额在派发时对用户名下所有 API key 生效（`user_credits_insufficient` 与 `user_period_limit_exceeded`）。当 `credits_unlimited=true` 时跳过总余额检查，但已启用的周期窗口仍会拦截。
 

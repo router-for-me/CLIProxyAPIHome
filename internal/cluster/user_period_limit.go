@@ -750,14 +750,7 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 
 		target := normalized
 		if len(target) == 0 {
-			for _, id := range []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d} {
-				if userLimitForWindow(user, id) != nil || userWindowStart(user, id) != nil {
-					target = append(target, id)
-				}
-			}
-			if len(target) == 0 {
-				target = []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d}
-			}
+			target = []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d}
 		}
 
 		updates := map[string]any{}
@@ -786,6 +779,9 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 				return errUpdate
 			}
 		}
+		// Reload into a zero-value record so database NULLs clear pointer fields
+		// retained in the locked pre-update snapshot.
+		user = &UserRecord{}
 		if errReload := tx.Where("id = ?", userID).First(user).Error; errReload != nil {
 			return errReload
 		}
@@ -806,24 +802,6 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 		return UserPeriodLimitResetResult{}, errTx
 	}
 	return result, nil
-}
-
-func userLimitForWindow(user *UserRecord, id string) *float64 {
-	if user == nil {
-		return nil
-	}
-	switch id {
-	case PeriodWindow5h:
-		return user.Limit5hCredits
-	case PeriodWindow1d:
-		return user.Limit1dCredits
-	case PeriodWindow7d:
-		return user.Limit7dCredits
-	case PeriodWindow30d:
-		return user.Limit30dCredits
-	default:
-		return nil
-	}
 }
 
 func normalizeResetWindows(windows []string) ([]string, error) {

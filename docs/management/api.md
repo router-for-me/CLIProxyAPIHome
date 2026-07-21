@@ -1121,7 +1121,7 @@ Example request:
 
 Response: same shape as `GET /users/:id`.
 
-Validation failures return HTTP `400` with a structured `field_errors` array so clients can localize and anchor errors without parsing message strings:
+Semantic validation failures and identifiable type mismatches in structurally valid JSON return HTTP `400` with a structured `field_errors` array so clients can localize and anchor errors without parsing message strings:
 
 ```json
 {
@@ -1134,11 +1134,14 @@ Validation failures return HTTP `400` with a structured `field_errors` array so 
 | `field_errors[].code` | `field_errors[].field` | Meaning |
 | --- | --- | --- |
 | `required` | `username` | Username is missing or empty. |
-| `invalid_timezone` | `timezone` | Not a valid IANA timezone. |
-| `invalid_limit` | `limit_5h_credits`, `limit_1d_credits`, `limit_7d_credits`, `limit_30d_credits` | Limit is negative or not a finite number. |
-| `invalid_window_mode` | `window_mode_5h`, `window_mode_1d`, `window_mode_7d`, `window_mode_30d` | Unsupported window mode (`calendar` is rejected for `5h`). |
-| `invalid_week_reset_day` | `week_reset_day` | Outside `1`–`7`. |
-| `invalid_week_reset_hour` | `week_reset_hour` | Outside `0`–`23`. |
+| `invalid_type` | `credits_unlimited` | Value is not a boolean or `null`. |
+| `invalid_timezone` | `timezone` | Invalid IANA timezone, or a value whose type is not string/`null`. |
+| `invalid_limit` | `limit_5h_credits`, `limit_1d_credits`, `limit_7d_credits`, `limit_30d_credits` | Limit is negative, not finite, or not a number/`null`. |
+| `invalid_window_mode` | `window_mode_5h`, `window_mode_1d`, `window_mode_7d`, `window_mode_30d` | Unsupported mode or a value other than a string/`null` (`calendar` is rejected for `5h`). |
+| `invalid_week_reset_day` | `week_reset_day` | Outside `1`–`7` or not an integer/`null`. |
+| `invalid_week_reset_hour` | `week_reset_hour` | Outside `0`–`23` or not an integer/`null`. |
+
+Malformed JSON, or JSON that cannot be decoded far enough to identify a specific field, still returns `400` with `error: "invalid body"` but may omit `field_errors`.
 
 ### PUT/PATCH `/users/:id`
 
@@ -1205,6 +1208,8 @@ Request body:
 | `windows` | string[] | no | Subset of `5h`/`1d`/`7d`/`30d`. Empty/omitted resets all windows. |
 | `mode` | string | no | `counter` (default): for each selected window set `usage_epoch_* = now` and clear the matching `period_window_start_*`. `window_only`: clear `period_window_start_*`; for `sliding`/`calendar` also set `usage_epoch_*` so used actually resets. |
 
+An empty request body, omitted `windows`, `windows: []`, or `windows: null` always targets all four windows in stable order (`5h`, `1d`, `7d`, `30d`), including windows that are currently disabled or inactive.
+
 Response:
 
 ```json
@@ -1238,7 +1243,7 @@ Response:
 
 `limits` is the complete post-reset status, rebuilt inside the same transaction; it is identical in shape to `GET /users/:id/period-limits`, so clients can update their local state directly from the response without an extra read.
 
-Validation failures return HTTP `400` with the `field_errors` contract described in the user write sections, using codes `invalid_reset_mode` (field `mode`) and `invalid_reset_windows` (field `windows`).
+Validation and identifiable JSON type failures return HTTP `400` with the `field_errors` contract described in the user write sections, using codes `invalid_reset_mode` (field `mode`) and `invalid_reset_windows` (field `windows`). Malformed JSON may omit `field_errors`.
 
 Period limits are enforced at dispatch for every API key owned by the user (`user_credits_insufficient` and `user_period_limit_exceeded`). When `credits_unlimited=true`, the total-balance check is skipped, but enabled period windows are still enforced.
 
