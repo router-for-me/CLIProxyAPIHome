@@ -200,6 +200,15 @@ func TestAllowedDispatchIDsForAPIKeyModelIntersectsModelChannels(t *testing.T) {
 	if errCreateLegacy := db.Create(legacyDetail).Error; errCreateLegacy != nil {
 		t.Fatalf("create legacy suffixed detail: %v", errCreateLegacy)
 	}
+	for _, filterModelID := range []string{"gpt-legacy", "gpt-legacy(high)"} {
+		filteredDetails, errFilteredDetails := repo.ListModelGroupDetails(ctx, ModelGroupDetailFilter{ModelID: filterModelID})
+		if errFilteredDetails != nil {
+			t.Fatalf("ListModelGroupDetails(%q) error = %v", filterModelID, errFilteredDetails)
+		}
+		if len(filteredDetails) != 1 || filteredDetails[0].ID != legacyDetail.ID {
+			t.Fatalf("ListModelGroupDetails(%q) = %#v, want legacy detail %d", filterModelID, filteredDetails, legacyDetail.ID)
+		}
+	}
 
 	clientKey := "client-key"
 	keyChannels := []uint{allChannel.ID}

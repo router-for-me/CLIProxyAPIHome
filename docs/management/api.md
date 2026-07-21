@@ -3579,7 +3579,7 @@ Query parameters:
 | Query | Type | Description |
 | --- | --- | --- |
 | `model_group_id` | integer | Filter by model group ID. Aliases: `model-group-id`, `group_id`, `group-id`. |
-| `model_id` | string | Filter by model ID. Alias: `model-id`. |
+| `model_id` | string | Filter by canonical model ID. Alias: `model-id`. Matching is case-insensitive and ignores a trailing request-option suffix on either the query or a legacy stored record. |
 
 Example response:
 

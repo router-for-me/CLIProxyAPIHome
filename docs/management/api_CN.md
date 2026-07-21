@@ -3549,7 +3549,7 @@ Query 参数：
 | Query | 类型 | 说明 |
 | --- | --- | --- |
 | `model_group_id` | integer | 按 model group ID 过滤；也接受 `model-group-id`、`group_id`、`group-id`。 |
-| `model_id` | string | 按 model ID 过滤；也接受 `model-id`。 |
+| `model_id` | string | 按 canonical model ID 过滤；也接受 `model-id`。匹配不区分大小写，并忽略查询值或旧存量记录末尾的请求选项 suffix。 |
 
 输出示例：
 

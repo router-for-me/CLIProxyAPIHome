@@ -150,15 +150,26 @@ func (r *Repository) ListModelGroupDetails(ctx context.Context, filter ModelGrou
 	if filter.ModelGroupID != nil {
 		query = query.Where("model_group_id = ?", *filter.ModelGroupID)
 	}
-	if modelID := strings.TrimSpace(filter.ModelID); modelID != "" {
-		query = query.Where("model_id = ?", modelID)
-	}
 
 	var records []ModelGroupDetailRecord
 	if errFind := query.Find(&records).Error; errFind != nil {
 		return nil, errFind
 	}
-	return records, nil
+	rawModelID := strings.TrimSpace(filter.ModelID)
+	if rawModelID == "" {
+		return records, nil
+	}
+	modelID := canonicalModelGroupModelID(rawModelID)
+	if modelID == "" {
+		return []ModelGroupDetailRecord{}, nil
+	}
+	filtered := make([]ModelGroupDetailRecord, 0, len(records))
+	for i := range records {
+		if strings.EqualFold(canonicalModelGroupModelID(records[i].ModelID), modelID) {
+			filtered = append(filtered, records[i])
+		}
+	}
+	return filtered, nil
 }
 
 // GetModelGroupDetail returns a model group detail by ID.

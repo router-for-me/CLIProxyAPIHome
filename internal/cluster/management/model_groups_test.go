@@ -29,6 +29,7 @@ func TestModelGroupDetailRoutesCreateAndClearChannels(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
+	engine.GET("/model-group-details", handler.ListModelGroupDetails)
 	engine.POST("/model-group-details", handler.CreateModelGroupDetail)
 	engine.PATCH("/model-group-details/:id", handler.UpdateModelGroupDetail)
 
@@ -74,6 +75,25 @@ func TestModelGroupDetailRoutesCreateAndClearChannels(t *testing.T) {
 	}
 	if createPayload.Detail.ID == 0 || !reflect.DeepEqual(createPayload.Detail.Channels, []uint{channel.ID}) {
 		t.Fatalf("created detail = %#v", createPayload.Detail)
+	}
+
+	filterResponse := httptest.NewRecorder()
+	filterRequest := httptest.NewRequest(http.MethodGet, "/model-group-details?model_id=gpt-5.4(high)", nil)
+	engine.ServeHTTP(filterResponse, filterRequest)
+	if filterResponse.Code != http.StatusOK {
+		t.Fatalf("filter status = %d body=%s", filterResponse.Code, filterResponse.Body.String())
+	}
+	var filterPayload struct {
+		Details []struct {
+			ID      uint   `json:"id"`
+			ModelID string `json:"model_id"`
+		} `json:"model_group_details"`
+	}
+	if errDecode := json.Unmarshal(filterResponse.Body.Bytes(), &filterPayload); errDecode != nil {
+		t.Fatalf("decode filter response: %v", errDecode)
+	}
+	if len(filterPayload.Details) != 1 || filterPayload.Details[0].ID != createPayload.Detail.ID || filterPayload.Details[0].ModelID != "gpt-5.4" {
+		t.Fatalf("filtered details = %#v, want canonical created detail", filterPayload.Details)
 	}
 
 	invalidPatchResponse := httptest.NewRecorder()
