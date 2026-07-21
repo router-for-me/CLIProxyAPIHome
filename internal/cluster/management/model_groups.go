@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"gorm.io/gorm"
 )
@@ -362,7 +363,7 @@ func modelGroupDetailRecordToMap(record *cluster.ModelGroupDetailRecord) (gin.H,
 	return gin.H{
 		"id":             record.ID,
 		"model_group_id": record.ModelGroupID,
-		"model_id":       record.ModelID,
+		"model_id":       coreauth.CanonicalModelID(record.ModelID),
 		"channels":       channels,
 		"created_at":     record.CreatedAt,
 		"updated_at":     record.UpdatedAt,

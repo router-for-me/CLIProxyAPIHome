@@ -3604,7 +3604,7 @@ Query 参数：
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `model_group_id` | integer | 是 | 已存在的 model group ID。 |
-| `model_id` | string | 是 | 该 group 允许的模型 ID。 |
+| `model_id` | string | 是 | 该 group 允许的 canonical 模型 ID。写入时会移除末尾的 `(high)` 等请求选项 suffix；suffix 不属于模型身份。 |
 | `channels` | array of integer | 否 | 允许执行该模型的 channel group IDs；为空或省略时继承 API key 的凭证范围。 |
 
 输出：`{ "model_group_detail": ... }`。

@@ -49,9 +49,12 @@ func TestModelGroupDetailChannelsCreateAndUpdate(t *testing.T) {
 		t.Fatalf("CreateModelGroup() error = %v", errModelGroup)
 	}
 
-	detail, errCreate := repo.CreateModelGroupDetail(ctx, modelGroup.ID, "gpt-5.4", []uint{secondChannel.ID, firstChannel.ID, secondChannel.ID})
+	detail, errCreate := repo.CreateModelGroupDetail(ctx, modelGroup.ID, "gpt-5.4(high)", []uint{secondChannel.ID, firstChannel.ID, secondChannel.ID})
 	if errCreate != nil {
 		t.Fatalf("CreateModelGroupDetail() error = %v", errCreate)
+	}
+	if detail.ModelID != "gpt-5.4" {
+		t.Fatalf("created model ID = %q, want canonical gpt-5.4", detail.ModelID)
 	}
 	channels, errChannels := ModelGroupDetailChannelIDs(detail)
 	if errChannels != nil {
@@ -62,9 +65,13 @@ func TestModelGroupDetailChannelsCreateAndUpdate(t *testing.T) {
 	}
 
 	updatedChannels := []uint{secondChannel.ID}
-	updated, errUpdate := repo.UpdateModelGroupDetail(ctx, detail.ID, ModelGroupDetailUpdate{Channels: &updatedChannels})
+	updatedModelID := "gpt-5.5(low)"
+	updated, errUpdate := repo.UpdateModelGroupDetail(ctx, detail.ID, ModelGroupDetailUpdate{ModelID: &updatedModelID, Channels: &updatedChannels})
 	if errUpdate != nil {
 		t.Fatalf("UpdateModelGroupDetail() error = %v", errUpdate)
+	}
+	if updated.ModelID != "gpt-5.5" {
+		t.Fatalf("updated model ID = %q, want canonical gpt-5.5", updated.ModelID)
 	}
 	channels, errChannels = ModelGroupDetailChannelIDs(updated)
 	if errChannels != nil {
@@ -164,6 +171,14 @@ func TestAllowedDispatchIDsForAPIKeyModelIntersectsModelChannels(t *testing.T) {
 	if _, errDetail := repo.CreateModelGroupDetail(ctx, explicitGroup.ID, "gpt-empty", []uint{emptyChannel.ID}); errDetail != nil {
 		t.Fatalf("CreateModelGroupDetail(empty) error = %v", errDetail)
 	}
+	legacyChannels, errLegacyChannels := modelGroupDetailChannelsJSON([]uint{subsetChannel.ID})
+	if errLegacyChannels != nil {
+		t.Fatalf("modelGroupDetailChannelsJSON(legacy) error = %v", errLegacyChannels)
+	}
+	legacyDetail := &ModelGroupDetailRecord{ModelGroupID: explicitGroup.ID, ModelID: "gpt-legacy(high)", Channels: legacyChannels}
+	if errCreateLegacy := db.Create(legacyDetail).Error; errCreateLegacy != nil {
+		t.Fatalf("create legacy suffixed detail: %v", errCreateLegacy)
+	}
 
 	clientKey := "client-key"
 	keyChannels := []uint{allChannel.ID}
@@ -172,15 +187,38 @@ func TestAllowedDispatchIDsForAPIKeyModelIntersectsModelChannels(t *testing.T) {
 		t.Fatalf("CreateAPIKey() error = %v", errCreateKey)
 	}
 
+	modelDetailQueries := 0
+	callbackName := "test:count-model-group-detail-queries"
+	if errCallback := db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx != nil && tx.Statement != nil && tx.Statement.Table == "model_group_detail" {
+			modelDetailQueries++
+		}
+	}); errCallback != nil {
+		t.Fatalf("register query callback: %v", errCallback)
+	}
 	authIDs, modelIDs, errAllowed := repo.AllowedDispatchIDsForAPIKeyModel(ctx, clientKey, "GPT-5.4")
+	if errRemove := db.Callback().Query().Remove(callbackName); errRemove != nil {
+		t.Fatalf("remove query callback: %v", errRemove)
+	}
 	if errAllowed != nil {
 		t.Fatalf("AllowedDispatchIDsForAPIKeyModel(explicit) error = %v", errAllowed)
+	}
+	if modelDetailQueries != 1 {
+		t.Fatalf("model detail query count = %d, want one coherent load", modelDetailQueries)
 	}
 	if want := []string{"auth-b"}; !reflect.DeepEqual(authIDs, want) {
 		t.Fatalf("explicit auth IDs = %v, want %v", authIDs, want)
 	}
-	if want := []string{"gpt-5.4", "gpt-empty", "gpt-5.5"}; !reflect.DeepEqual(modelIDs, want) {
+	if want := []string{"gpt-5.4", "gpt-empty", "gpt-legacy", "gpt-5.5"}; !reflect.DeepEqual(modelIDs, want) {
 		t.Fatalf("model IDs = %v, want %v", modelIDs, want)
+	}
+
+	authIDs, _, errAllowed = repo.AllowedDispatchIDsForAPIKeyModel(ctx, clientKey, "gpt-legacy")
+	if errAllowed != nil {
+		t.Fatalf("AllowedDispatchIDsForAPIKeyModel(legacy suffix) error = %v", errAllowed)
+	}
+	if want := []string{"auth-b"}; !reflect.DeepEqual(authIDs, want) {
+		t.Fatalf("legacy suffix auth IDs = %v, want %v", authIDs, want)
 	}
 
 	authIDs, _, errAllowed = repo.AllowedDispatchIDsForAPIKeyModel(ctx, clientKey, "gpt-5.5")

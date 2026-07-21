@@ -90,11 +90,14 @@ func TestModelGroupDetailRecordToMapIncludesChannels(t *testing.T) {
 	item, errItem := modelGroupDetailRecordToMap(&cluster.ModelGroupDetailRecord{
 		ID:           10,
 		ModelGroupID: 2,
-		ModelID:      "gpt-5.4",
+		ModelID:      "gpt-5.4(high)",
 		Channels:     cluster.JSONB(`[4,2,4]`),
 	})
 	if errItem != nil {
 		t.Fatalf("modelGroupDetailRecordToMap() error = %v", errItem)
+	}
+	if item["model_id"] != "gpt-5.4" {
+		t.Fatalf("model_id = %v, want canonical gpt-5.4", item["model_id"])
 	}
 	channels, ok := item["channels"].([]uint)
 	if !ok {

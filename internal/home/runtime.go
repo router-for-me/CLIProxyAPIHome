@@ -812,7 +812,7 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 	if apiKey == "" || r == nil || r.clusterAdapter == nil {
 		return nil, nil, nil
 	}
-	modelID = strings.TrimSpace(stripModelSuffix(modelID))
+	modelID = coreauth.CanonicalModelID(modelID)
 	if store, ok := r.clusterAdapter.(apiKeyModelScopedDispatchStore); ok && store != nil {
 		return store.AllowedDispatchIDsForAPIKeyModel(ctx, apiKey, modelID)
 	}
@@ -844,23 +844,11 @@ func (r *Runtime) supportsRequestedModel(model string) bool {
 	if trimmedModel == "" {
 		return false
 	}
-	modelKey := strings.TrimSpace(stripModelSuffix(trimmedModel))
+	modelKey := coreauth.CanonicalModelID(trimmedModel)
 	if modelKey == "" {
 		modelKey = trimmedModel
 	}
 	return registry.LookupModelInfo(modelKey) != nil
-}
-
-// stripModelSuffix handles a strip model suffix.
-func stripModelSuffix(model string) string {
-	lastOpen := strings.LastIndex(model, "(")
-	if lastOpen == -1 {
-		return model
-	}
-	if !strings.HasSuffix(model, ")") {
-		return model
-	}
-	return model[:lastOpen]
 }
 
 // AddToken stores a credential JSON blob into the auth directory and schedules it for use.

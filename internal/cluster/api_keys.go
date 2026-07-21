@@ -689,15 +689,16 @@ func (r *Repository) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKe
 	if errAuthIDs != nil {
 		return nil, nil, errAuthIDs
 	}
-	modelIDs, errModelIDs := allowedModelIDsForAPIKeyRecord(ctx, db, &record)
-	if errModelIDs != nil {
-		return nil, nil, errModelIDs
+	modelDetails, modelGroupsRestricted, errModelDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, &record)
+	if errModelDetails != nil {
+		return nil, nil, errModelDetails
 	}
+	modelIDs := allowedModelIDsFromDetails(modelDetails, modelGroupsRestricted)
 	if modelID == "" {
 		return authIDs, modelIDs, nil
 	}
 
-	channelIDs, restricted, errChannels := modelChannelGroupIDsForAPIKeyRecord(ctx, db, &record, modelID)
+	channelIDs, restricted, errChannels := modelChannelGroupIDsFromDetails(modelDetails, modelID)
 	if errChannels != nil {
 		return nil, nil, errChannels
 	}
@@ -711,38 +712,18 @@ func (r *Repository) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKe
 	return intersectAllowedAuthIDs(authIDs, modelAuthIDs), modelIDs, nil
 }
 
-func modelChannelGroupIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord, modelID string) ([]uint, bool, error) {
-	if db == nil {
-		return nil, false, fmt.Errorf("database connection is nil")
-	}
-	if record == nil {
-		return nil, false, fmt.Errorf("api key record is nil")
-	}
-	modelGroupIDs, errModelGroups := apiKeyModelGroupsFromJSON(record.ModelGroups)
-	if errModelGroups != nil {
-		return nil, false, errModelGroups
-	}
-	modelID = strings.ToLower(strings.TrimSpace(modelID))
-	if len(modelGroupIDs) == 0 || modelID == "" {
+func modelChannelGroupIDsFromDetails(details []ModelGroupDetailRecord, modelID string) ([]uint, bool, error) {
+	modelKey := strings.ToLower(canonicalModelGroupModelID(modelID))
+	if modelKey == "" {
 		return nil, false, nil
-	}
-
-	var details []ModelGroupDetailRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).
-		Model(&ModelGroupDetailRecord{}).
-		Joins("JOIN model_group ON model_group.id = model_group_detail.model_group_id").
-		Where("model_group.deleted_at IS NULL").
-		Where("model_group.disabled = ?", false).
-		Where("model_group_detail.model_group_id IN ?", modelGroupIDs).
-		Where("LOWER(model_group_detail.model_id) = ?", modelID).
-		Order("model_group_detail.model_group_id ASC, model_group_detail.id ASC").
-		Find(&details).Error; errFind != nil {
-		return nil, false, errFind
 	}
 
 	channelIDs := make([]uint, 0)
 	restricted := false
 	for i := range details {
+		if strings.ToLower(canonicalModelGroupModelID(details[i].ModelID)) != modelKey {
+			continue
+		}
 		detailChannels, errDetailChannels := ModelGroupDetailChannelIDs(&details[i])
 		if errDetailChannels != nil {
 			return nil, false, errDetailChannels
@@ -883,18 +864,26 @@ func allowedAuthIDsForChannelGroups(ctx context.Context, db *gorm.DB, channelIDs
 }
 
 func allowedModelIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord) ([]string, error) {
+	details, restricted, errDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, record)
+	if errDetails != nil {
+		return nil, errDetails
+	}
+	return allowedModelIDsFromDetails(details, restricted), nil
+}
+
+func allowedModelGroupDetailsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord) ([]ModelGroupDetailRecord, bool, error) {
 	if db == nil {
-		return nil, fmt.Errorf("database connection is nil")
+		return nil, false, fmt.Errorf("database connection is nil")
 	}
 	if record == nil {
-		return nil, fmt.Errorf("api key record is nil")
+		return nil, false, fmt.Errorf("api key record is nil")
 	}
 	modelGroupIDs, errModelGroups := apiKeyModelGroupsFromJSON(record.ModelGroups)
 	if errModelGroups != nil {
-		return nil, errModelGroups
+		return nil, false, errModelGroups
 	}
 	if len(modelGroupIDs) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var details []ModelGroupDetailRecord
@@ -906,13 +895,19 @@ func allowedModelIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *AP
 		Where("model_group_detail.model_group_id IN ?", modelGroupIDs).
 		Order("model_group_detail.model_group_id ASC, model_group_detail.id ASC").
 		Find(&details).Error; errFind != nil {
-		return nil, errFind
+		return nil, false, errFind
 	}
+	return details, true, nil
+}
 
+func allowedModelIDsFromDetails(details []ModelGroupDetailRecord, restricted bool) []string {
+	if !restricted {
+		return nil
+	}
 	allowed := make([]string, 0, len(details))
 	seen := make(map[string]struct{}, len(details))
-	for _, detail := range details {
-		modelID := strings.TrimSpace(detail.ModelID)
+	for i := range details {
+		modelID := canonicalModelGroupModelID(details[i].ModelID)
 		if modelID == "" {
 			continue
 		}
@@ -923,7 +918,7 @@ func allowedModelIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *AP
 		seen[modelKey] = struct{}{}
 		allowed = append(allowed, modelID)
 	}
-	return allowed, nil
+	return allowed
 }
 
 func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries []APIKeyEntryUpdate) (APIKeyUpsertStats, error) {

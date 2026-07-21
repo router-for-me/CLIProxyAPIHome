@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"gorm.io/gorm"
 )
 
@@ -180,7 +181,7 @@ func (r *Repository) CreateModelGroupDetail(ctx context.Context, modelGroupID ui
 	if errDB != nil {
 		return nil, errDB
 	}
-	modelID = strings.TrimSpace(modelID)
+	modelID = canonicalModelGroupModelID(modelID)
 	if modelGroupID == 0 {
 		return nil, fmt.Errorf("model group id is required")
 	}
@@ -239,7 +240,7 @@ func (r *Repository) UpdateModelGroupDetail(ctx context.Context, id uint, update
 			record.ModelGroupID = *update.ModelGroupID
 		}
 		if update.ModelID != nil {
-			modelID := strings.TrimSpace(*update.ModelID)
+			modelID := canonicalModelGroupModelID(*update.ModelID)
 			if modelID == "" {
 				return fmt.Errorf("model id is required")
 			}
@@ -295,6 +296,10 @@ func ParseModelRecordID(value string) (uint, error) {
 		return 0, fmt.Errorf("record id is required")
 	}
 	return uint(parsed), nil
+}
+
+func canonicalModelGroupModelID(modelID string) string {
+	return coreauth.CanonicalModelID(modelID)
 }
 
 func ensureModelGroupExists(ctx context.Context, tx *gorm.DB, id uint) error {
