@@ -82,7 +82,7 @@ type DatabaseSnapshotImportResult struct {
 	Tables []DatabaseSnapshotImportTableResult
 }
 
-// ValidatedDatabaseSnapshot owns an open, fully validated snapshot archive.
+// ValidatedDatabaseSnapshot owns an open, structurally validated snapshot archive.
 // Keeping the file open prevents a path replacement race between validation
 // and import on Windows.
 type ValidatedDatabaseSnapshot struct {
@@ -305,8 +305,9 @@ func exportDatabaseSnapshotTable(ctx context.Context, tx *gorm.DB, model databas
 	return count, nil
 }
 
-// OpenDatabaseSnapshot opens and fully validates a snapshot before any target
-// database connection is required.
+// OpenDatabaseSnapshot validates the archive and individual records before any
+// target database connection is required. Cross-record constraints are checked
+// later inside the target import transaction.
 func OpenDatabaseSnapshot(ctx context.Context, path string) (*ValidatedDatabaseSnapshot, error) {
 	ctx = contextOrBackground(ctx)
 	path = strings.TrimSpace(path)
@@ -342,10 +343,9 @@ func OpenDatabaseSnapshot(ctx context.Context, path string) (*ValidatedDatabaseS
 	if errManifest := validateDatabaseSnapshotManifest(manifest, entries); errManifest != nil {
 		return nil, errManifest
 	}
-	state := newDatabaseSnapshotValidationState()
 	for index, table := range manifest.Tables {
 		model := homeDatabaseModels[index]
-		if errTable := validateDatabaseSnapshotTable(ctx, entries[databaseSnapshotTableEntryName(table.Name)], model, table, state); errTable != nil {
+		if errTable := validateDatabaseSnapshotTable(ctx, entries[databaseSnapshotTableEntryName(table.Name)], model, table); errTable != nil {
 			return nil, errTable
 		}
 	}
@@ -464,37 +464,7 @@ func validateDatabaseSnapshotManifest(manifest DatabaseSnapshotManifest, entries
 	return nil
 }
 
-type databaseSnapshotValidationState struct {
-	primaryKeys        map[string]map[string]struct{}
-	uniqueKeys         map[string]map[string]struct{}
-	authIdentifiers    map[string]struct{}
-	pluginKeyVersions  map[int]struct{}
-	userIDs            map[uint]struct{}
-	activeUsernames    map[string]struct{}
-	apiKeyIDs          map[uint]struct{}
-	channelGroupIDs    map[uint]struct{}
-	modelGroupIDs      map[uint]struct{}
-	usageIDs           map[uint]struct{}
-	quotaCredentialIDs map[string]struct{}
-}
-
-func newDatabaseSnapshotValidationState() *databaseSnapshotValidationState {
-	return &databaseSnapshotValidationState{
-		primaryKeys:        make(map[string]map[string]struct{}),
-		uniqueKeys:         make(map[string]map[string]struct{}),
-		authIdentifiers:    make(map[string]struct{}),
-		pluginKeyVersions:  make(map[int]struct{}),
-		userIDs:            make(map[uint]struct{}),
-		activeUsernames:    make(map[string]struct{}),
-		apiKeyIDs:          make(map[uint]struct{}),
-		channelGroupIDs:    make(map[uint]struct{}),
-		modelGroupIDs:      make(map[uint]struct{}),
-		usageIDs:           make(map[uint]struct{}),
-		quotaCredentialIDs: make(map[string]struct{}),
-	}
-}
-
-func validateDatabaseSnapshotTable(ctx context.Context, entry *zip.File, model databaseModel, manifest DatabaseSnapshotManifestTable, state *databaseSnapshotValidationState) error {
+func validateDatabaseSnapshotTable(ctx context.Context, entry *zip.File, model databaseModel, manifest DatabaseSnapshotManifestTable) error {
 	reader, errOpen := entry.Open()
 	if errOpen != nil {
 		return fmt.Errorf("open database snapshot table %s: %w", model.name, errOpen)
@@ -506,7 +476,6 @@ func validateDatabaseSnapshotTable(ctx context.Context, entry *zip.File, model d
 	if errSchema != nil {
 		return fmt.Errorf("parse database snapshot model %s: %w", model.name, errSchema)
 	}
-	uniqueIndexes := modelSchema.ParseIndexes()
 	var rows int64
 	for {
 		if errContext := ctx.Err(); errContext != nil {
@@ -527,7 +496,7 @@ func validateDatabaseSnapshotTable(ctx context.Context, entry *zip.File, model d
 				return fmt.Errorf("database snapshot table %s row %d is invalid: %w", model.name, rows, errDecode)
 			}
 			normalizeSnapshotTimes(record)
-			if errRecord := validateDatabaseSnapshotRecord(ctx, model, modelSchema, uniqueIndexes, line, record, state); errRecord != nil {
+			if errRecord := validateDatabaseSnapshotRecord(ctx, model, modelSchema, line, record); errRecord != nil {
 				return errRecord
 			}
 		}
@@ -548,7 +517,7 @@ func validateDatabaseSnapshotTable(ctx context.Context, entry *zip.File, model d
 	return nil
 }
 
-func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, modelSchema *schema.Schema, uniqueIndexes []*schema.Index, raw []byte, record any, state *databaseSnapshotValidationState) error {
+func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, modelSchema *schema.Schema, raw []byte, record any) error {
 	value := reflect.ValueOf(record)
 	if value.Kind() != reflect.Ptr || value.IsNil() {
 		return fmt.Errorf("database snapshot table %s record factory returned an invalid value", model.name)
@@ -582,35 +551,17 @@ func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, mo
 			}
 		}
 	}
-	primaryKey := databaseSnapshotKey(ctx, modelSchema.PrimaryFields, value)
-	if errDuplicate := addDatabaseSnapshotUniqueKey(state.primaryKeys, model.name+":primary", primaryKey); errDuplicate != nil {
-		return fmt.Errorf("database snapshot table %s record %s has a duplicate primary key", model.name, primaryLabel)
-	}
-	for _, field := range modelSchema.Fields {
-		if !field.Unique {
-			continue
+	switch typed := record.(type) {
+	case *ChannelGroupDetailRecord:
+		if strings.TrimSpace(typed.AuthID) == "" {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "auth_id", "must not be blank")
 		}
-		key := databaseSnapshotKey(ctx, []*schema.Field{field}, value)
-		if errDuplicate := addDatabaseSnapshotUniqueKey(state.uniqueKeys, model.name+":field:"+field.DBName, key); errDuplicate != nil {
-			return databaseSnapshotFieldError(model.name, primaryLabel, field.DBName, "duplicates a unique value")
+	case *QuotaSnapshotRecord:
+		if strings.TrimSpace(typed.CredentialID) == "" {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "credential_id", "must not be blank")
 		}
 	}
-	for _, index := range uniqueIndexes {
-		if index.Class != "UNIQUE" || index.Where != "" {
-			continue
-		}
-		indexFields := make([]*schema.Field, 0, len(index.Fields))
-		for _, field := range index.Fields {
-			if field.Field != nil {
-				indexFields = append(indexFields, field.Field)
-			}
-		}
-		key := databaseSnapshotKey(ctx, indexFields, value)
-		if errDuplicate := addDatabaseSnapshotUniqueKey(state.uniqueKeys, model.name+":index:"+index.Name, key); errDuplicate != nil {
-			return fmt.Errorf("database snapshot table %s record %s duplicates unique index %s", model.name, primaryLabel, index.Name)
-		}
-	}
-	return validateDatabaseSnapshotRelationships(model.name, primaryLabel, record, state)
+	return nil
 }
 
 func (s *ValidatedDatabaseSnapshot) validatePostgresFields(ctx context.Context) error {
@@ -703,101 +654,6 @@ func snapshotUnsignedValueExceedsPostgres(value any) bool {
 	}
 }
 
-func validateDatabaseSnapshotRelationships(table string, primary string, record any, state *databaseSnapshotValidationState) error {
-	switch typed := record.(type) {
-	case *AuthRecord:
-		for _, value := range []string{typed.UUID, typed.ID, typed.Index} {
-			if strings.TrimSpace(value) != "" {
-				state.authIdentifiers[value] = struct{}{}
-			}
-		}
-	case *PluginStoreAuthKeyRecord:
-		state.pluginKeyVersions[typed.KeyVersion] = struct{}{}
-	case *PluginStoreAuthRecord:
-		if _, okKey := state.pluginKeyVersions[typed.KeyVersion]; !okKey {
-			return databaseSnapshotFieldError(table, primary, "key_version", "references a missing plugin store auth key")
-		}
-	case *UserRecord:
-		state.userIDs[typed.ID] = struct{}{}
-		if !typed.DeletedAt.Valid {
-			if _, duplicate := state.activeUsernames[typed.Username]; duplicate {
-				return databaseSnapshotFieldError(table, primary, "username", "duplicates an active username")
-			}
-			state.activeUsernames[typed.Username] = struct{}{}
-		}
-	case *ChannelGroupRecord:
-		state.channelGroupIDs[typed.ID] = struct{}{}
-	case *ModelGroupRecord:
-		state.modelGroupIDs[typed.ID] = struct{}{}
-	case *APIKeyRecord:
-		state.apiKeyIDs[typed.ID] = struct{}{}
-		if typed.UserID != nil {
-			if _, okUser := state.userIDs[*typed.UserID]; !okUser {
-				return databaseSnapshotFieldError(table, primary, "user_id", "references a missing user")
-			}
-		}
-		channels, errChannels := apiKeyChannelsFromJSON(typed.Channels)
-		if errChannels != nil {
-			return databaseSnapshotFieldError(table, primary, "channels", "is not a valid channel group id list")
-		}
-		for _, id := range channels {
-			if _, okGroup := state.channelGroupIDs[id]; !okGroup {
-				return databaseSnapshotFieldError(table, primary, "channels", "references a missing channel group")
-			}
-		}
-		modelGroups, errGroups := apiKeyModelGroupsFromJSON(typed.ModelGroups)
-		if errGroups != nil {
-			return databaseSnapshotFieldError(table, primary, "model_groups", "is not a valid model group id list")
-		}
-		for _, id := range modelGroups {
-			if _, okGroup := state.modelGroupIDs[id]; !okGroup {
-				return databaseSnapshotFieldError(table, primary, "model_groups", "references a missing model group")
-			}
-		}
-	case *ChannelGroupDetailRecord:
-		if _, okGroup := state.channelGroupIDs[typed.ChannelGroupID]; !okGroup {
-			return databaseSnapshotFieldError(table, primary, "channel_group_id", "references a missing channel group")
-		}
-		if _, okAuth := state.authIdentifiers[typed.AuthID]; !okAuth {
-			return databaseSnapshotFieldError(table, primary, "auth_id", "references a missing auth record")
-		}
-	case *ModelGroupDetailRecord:
-		if _, okGroup := state.modelGroupIDs[typed.ModelGroupID]; !okGroup {
-			return databaseSnapshotFieldError(table, primary, "model_group_id", "references a missing model group")
-		}
-	case *UsageRecord:
-		state.usageIDs[typed.ID] = struct{}{}
-	case *QuotaSnapshotRecord:
-		if _, okAuth := state.authIdentifiers[typed.CredentialID]; !okAuth {
-			return databaseSnapshotFieldError(table, primary, "credential_id", "references a missing auth record")
-		}
-		state.quotaCredentialIDs[typed.CredentialID] = struct{}{}
-	case *QuotaWindowRecord:
-		if _, okSnapshot := state.quotaCredentialIDs[typed.CredentialID]; !okSnapshot {
-			return databaseSnapshotFieldError(table, primary, "credential_id", "references a missing quota snapshot")
-		}
-	case *BillingBalanceRecord:
-		if _, okUser := state.userIDs[typed.UserID]; !okUser {
-			return databaseSnapshotFieldError(table, primary, "user_id", "references a missing user")
-		}
-	case *BillingChargeRecord:
-		if _, okUsage := state.usageIDs[typed.UsageID]; !okUsage {
-			return databaseSnapshotFieldError(table, primary, "usage_id", "references a missing usage record")
-		}
-		if typed.UserID != nil {
-			if _, okUser := state.userIDs[*typed.UserID]; !okUser {
-				return databaseSnapshotFieldError(table, primary, "user_id", "references a missing user")
-			}
-		}
-		if typed.APIKeyID != nil {
-			if _, okAPIKey := state.apiKeyIDs[*typed.APIKeyID]; !okAPIKey {
-				return databaseSnapshotFieldError(table, primary, "api_key_id", "references a missing api key")
-			}
-		}
-	}
-	return nil
-}
-
 func databaseSnapshotFieldError(table string, primary string, field string, reason string) error {
 	return fmt.Errorf("database snapshot table %s record %s field %s %s", table, primary, field, reason)
 }
@@ -821,19 +677,6 @@ func databaseSnapshotKey(ctx context.Context, fields []*schema.Field, value refl
 		return fmt.Sprintf("%v", values)
 	}
 	return string(raw)
-}
-
-func addDatabaseSnapshotUniqueKey(sets map[string]map[string]struct{}, name string, key string) error {
-	set := sets[name]
-	if set == nil {
-		set = make(map[string]struct{})
-		sets[name] = set
-	}
-	if _, exists := set[key]; exists {
-		return fmt.Errorf("duplicate key")
-	}
-	set[key] = struct{}{}
-	return nil
 }
 
 func snapshotFiniteValue(value reflect.Value) bool {
@@ -979,10 +822,13 @@ func ImportDatabaseSnapshot(ctx context.Context, db *gorm.DB, snapshot *Validate
 		if errRelationships := validateImportedDatabaseSnapshotRelationships(tx); errRelationships != nil {
 			return errRelationships
 		}
+		if errCounts := validateDatabaseSnapshotImportCounts(tx, result); errCounts != nil {
+			return errCounts
+		}
 		if errSequences := resetDatabaseSnapshotSequences(tx, backend); errSequences != nil {
 			return errSequences
 		}
-		return validateDatabaseSnapshotImportCounts(tx, result)
+		return nil
 	})
 	if errTransaction != nil {
 		return DatabaseSnapshotImportResult{}, fmt.Errorf("import database snapshot: %w", errTransaction)
@@ -1132,6 +978,7 @@ func validateImportedDatabaseSnapshotRelationships(tx *gorm.DB) error {
 		name  string
 		query string
 	}{
+		{name: "plugin_store_auth.key_version", query: `SELECT COUNT(*) FROM "plugin_store_auth" AS child WHERE NOT EXISTS (SELECT 1 FROM "plugin_store_auth_key" AS parent WHERE parent."key_version" = child."key_version")`},
 		{name: "api_key.user_id", query: `SELECT COUNT(*) FROM "api_key" AS child WHERE child."user_id" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "user" AS parent WHERE parent."id" = child."user_id")`},
 		{name: "channel_group_detail.channel_group_id", query: `SELECT COUNT(*) FROM "channel_group_detail" AS child WHERE NOT EXISTS (SELECT 1 FROM "channel_group" AS parent WHERE parent."id" = child."channel_group_id")`},
 		{name: "channel_group_detail.auth_id", query: `SELECT COUNT(*) FROM "channel_group_detail" AS child WHERE NOT EXISTS (SELECT 1 FROM "auth" AS parent WHERE parent."uuid" = child."auth_id" OR parent."id" = child."auth_id" OR parent."index" = child."auth_id")`},
@@ -1152,7 +999,68 @@ func validateImportedDatabaseSnapshotRelationships(tx *gorm.DB) error {
 			return fmt.Errorf("verify imported database snapshot relationship %s: found %d orphaned records", check.name, count)
 		}
 	}
+	return validateImportedDatabaseSnapshotAPIKeyGroups(tx)
+}
+
+func validateImportedDatabaseSnapshotAPIKeyGroups(tx *gorm.DB) error {
+	channelGroupIDs, errChannels := loadImportedDatabaseSnapshotUintIDs(tx, &ChannelGroupRecord{}, "channel_group")
+	if errChannels != nil {
+		return errChannels
+	}
+	modelGroupIDs, errModels := loadImportedDatabaseSnapshotUintIDs(tx, &ModelGroupRecord{}, "model_group")
+	if errModels != nil {
+		return errModels
+	}
+	rows, errRows := tx.Raw(`SELECT "id", "channels", "model_groups" FROM "api_key"`).Rows()
+	if errRows != nil {
+		return fmt.Errorf("query imported database snapshot api key groups: %w", errRows)
+	}
+	defer closeDatabaseSnapshotResource(rows, "api key group validation rows")
+	for rows.Next() {
+		var id uint
+		var channels JSONB
+		var modelGroups JSONB
+		if errScan := rows.Scan(&id, &channels, &modelGroups); errScan != nil {
+			return fmt.Errorf("scan imported database snapshot api key groups: %w", errScan)
+		}
+		channelIDs, errParseChannels := apiKeyChannelsFromJSON(channels)
+		if errParseChannels != nil {
+			return databaseSnapshotFieldError("api_key", fmt.Sprintf("[%d]", id), "channels", "is not a valid channel group id list")
+		}
+		for _, channelID := range channelIDs {
+			if _, okChannel := channelGroupIDs[channelID]; !okChannel {
+				return databaseSnapshotFieldError("api_key", fmt.Sprintf("[%d]", id), "channels", fmt.Sprintf("references missing channel group %d", channelID))
+			}
+		}
+		modelGroupIDList, errParseModels := apiKeyModelGroupsFromJSON(modelGroups)
+		if errParseModels != nil {
+			return databaseSnapshotFieldError("api_key", fmt.Sprintf("[%d]", id), "model_groups", "is not a valid model group id list")
+		}
+		for _, modelGroupID := range modelGroupIDList {
+			if _, okModel := modelGroupIDs[modelGroupID]; !okModel {
+				return databaseSnapshotFieldError("api_key", fmt.Sprintf("[%d]", id), "model_groups", fmt.Sprintf("references missing model group %d", modelGroupID))
+			}
+		}
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return fmt.Errorf("iterate imported database snapshot api key groups: %w", errRows)
+	}
+	if errClose := rows.Close(); errClose != nil {
+		return fmt.Errorf("close imported database snapshot api key groups: %w", errClose)
+	}
 	return nil
+}
+
+func loadImportedDatabaseSnapshotUintIDs(tx *gorm.DB, model any, table string) (map[uint]struct{}, error) {
+	var values []uint
+	if errLoad := tx.Unscoped().Model(model).Pluck("id", &values).Error; errLoad != nil {
+		return nil, fmt.Errorf("load imported database snapshot %s ids: %w", table, errLoad)
+	}
+	ids := make(map[uint]struct{}, len(values))
+	for _, value := range values {
+		ids[value] = struct{}{}
+	}
+	return ids, nil
 }
 
 func resetDatabaseSnapshotSequences(tx *gorm.DB, backend DatabaseBackend) error {

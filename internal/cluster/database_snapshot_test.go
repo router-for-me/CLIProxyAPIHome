@@ -428,15 +428,7 @@ func TestDatabaseSnapshotValidationRejectsInvalidRecords(t *testing.T) {
 			wantError: "field value must not be null",
 		},
 		{
-			name:  "duplicate primary key",
-			table: "auth",
-			mutate: func(_ *testing.T, raw []byte) []byte {
-				return append(append([]byte(nil), raw...), raw...)
-			},
-			wantError: "duplicate primary key",
-		},
-		{
-			name:  "missing relationship",
+			name:  "blank channel auth id",
 			table: "channel_group_detail",
 			mutate: func(t *testing.T, raw []byte) []byte {
 				t.Helper()
@@ -444,14 +436,32 @@ func TestDatabaseSnapshotValidationRejectsInvalidRecords(t *testing.T) {
 				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
 					t.Fatalf("decode channel detail row: %v", errDecode)
 				}
-				record.AuthID = "missing-auth"
+				record.AuthID = ""
 				updated, errMarshal := json.Marshal(record)
 				if errMarshal != nil {
 					t.Fatalf("encode channel detail row: %v", errMarshal)
 				}
 				return append(updated, '\n')
 			},
-			wantError: "field auth_id references a missing auth record",
+			wantError: "field auth_id must not be blank",
+		},
+		{
+			name:  "whitespace quota credential id",
+			table: "quota_snapshot",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := QuotaSnapshotRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode quota snapshot row: %v", errDecode)
+				}
+				record.CredentialID = " \t "
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode quota snapshot row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "field credential_id must not be blank",
 		},
 	}
 	for _, test := range tests {
@@ -472,6 +482,101 @@ func TestDatabaseSnapshotValidationRejectsInvalidRecords(t *testing.T) {
 	}
 }
 
+func TestDatabaseSnapshotImportRejectsCrossRecordViolations(t *testing.T) {
+	t.Parallel()
+
+	source := createDatabaseSnapshotValidationFixture(t)
+	tests := []struct {
+		name      string
+		table     string
+		mutate    func(t *testing.T, raw []byte) []byte
+		wantError string
+	}{
+		{
+			name:  "duplicate primary key",
+			table: "auth",
+			mutate: func(_ *testing.T, raw []byte) []byte {
+				return append(append([]byte(nil), raw...), raw...)
+			},
+			wantError: "insert database snapshot table auth",
+		},
+		{
+			name:  "missing auth relationship",
+			table: "channel_group_detail",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := ChannelGroupDetailRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode channel detail row: %v", errDecode)
+				}
+				record.AuthID = "missing-auth"
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode channel detail row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "relationship channel_group_detail.auth_id",
+		},
+		{
+			name:  "missing plugin auth key",
+			table: "plugin_store_auth",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := PluginStoreAuthRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode plugin auth row: %v", errDecode)
+				}
+				record.KeyVersion++
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode plugin auth row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "relationship plugin_store_auth.key_version",
+		},
+		{
+			name:  "missing api key channel group",
+			table: "api_key",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := APIKeyRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode api key row: %v", errDecode)
+				}
+				record.Channels = JSONB(`[999999]`)
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode api key row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "field channels references missing channel group 999999",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "invalid-cross-record.zip")
+			rewriteDatabaseSnapshotTable(t, source, path, test.table, func(raw []byte) []byte {
+				return test.mutate(t, raw)
+			})
+			snapshot, errOpen := OpenDatabaseSnapshot(context.Background(), path)
+			if errOpen != nil {
+				t.Fatalf("OpenDatabaseSnapshot() error = %v, want transaction-time validation", errOpen)
+			}
+			t.Cleanup(func() { _ = snapshot.Close() })
+			target := openDatabaseSnapshotSQLiteTestDB(t, filepath.Join(t.TempDir(), "target.db"))
+			_, errImport := ImportDatabaseSnapshot(context.Background(), target, snapshot, nil)
+			if errImport == nil || !strings.Contains(errImport.Error(), test.wantError) {
+				t.Fatalf("ImportDatabaseSnapshot() error = %v, want %q", errImport, test.wantError)
+			}
+			assertDatabaseSnapshotBusinessTablesEmpty(t, target)
+		})
+	}
+}
+
 func TestDatabaseSnapshotImportRollsBackOnInsertFailure(t *testing.T) {
 	t.Parallel()
 
@@ -484,18 +589,7 @@ func TestDatabaseSnapshotImportRollsBackOnInsertFailure(t *testing.T) {
 	if errImport == nil || !strings.Contains(errImport.Error(), "forced snapshot import failure") {
 		t.Fatalf("ImportDatabaseSnapshot() error = %v, want forced insert failure", errImport)
 	}
-	for _, model := range homeDatabaseModels {
-		if !model.restore {
-			continue
-		}
-		var count int64
-		if errCount := target.Unscoped().Model(model.newRecord()).Count(&count).Error; errCount != nil {
-			t.Fatalf("count table %s after rollback: %v", model.name, errCount)
-		}
-		if count != 0 {
-			t.Fatalf("table %s count after rollback = %d, want 0", model.name, count)
-		}
-	}
+	assertDatabaseSnapshotBusinessTablesEmpty(t, target)
 }
 
 func TestDatabaseSnapshotPostgresCrossBackendRoundTrips(t *testing.T) {
@@ -735,6 +829,22 @@ func assertDatabaseSnapshotRuntimeTablesEmpty(t *testing.T, db *gorm.DB) {
 		}
 		if count != 0 {
 			t.Errorf("runtime table %s count = %d, want 0", model.name, count)
+		}
+	}
+}
+
+func assertDatabaseSnapshotBusinessTablesEmpty(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, model := range homeDatabaseModels {
+		if !model.restore {
+			continue
+		}
+		var count int64
+		if errCount := db.Unscoped().Model(model.newRecord()).Count(&count).Error; errCount != nil {
+			t.Fatalf("count business table %s after rollback: %v", model.name, errCount)
+		}
+		if count != 0 {
+			t.Fatalf("business table %s count after rollback = %d, want 0", model.name, count)
 		}
 	}
 }
