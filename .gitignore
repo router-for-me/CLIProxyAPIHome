@@ -14,6 +14,9 @@ test-output
 CLIProxyAPIHome
 config.yaml
 cluster.yaml
+home.db
+home.db-*
+.DS_Store
 .env
 AGENTS.md
 plugins

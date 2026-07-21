@@ -141,6 +141,47 @@ func resolveKimiDeviceID(auth *Auth) string {
 	return ""
 }
 
+type oauthRefreshErrorResponse struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
+// antigravityOAuthRefreshError classifies terminal OAuth failures without retaining
+// the upstream response body, which may contain credential material.
+func antigravityOAuthRefreshError(statusCode int, body []byte) error {
+	var oauthErr oauthRefreshErrorResponse
+	if errUnmarshal := json.Unmarshal(body, &oauthErr); errUnmarshal == nil &&
+		(strings.EqualFold(strings.TrimSpace(oauthErr.Error), "invalid_grant") || isTerminalOAuthRefreshDescription(oauthErr.ErrorDescription)) {
+		return newUnauthorizedRefreshError()
+	}
+	return fmt.Errorf("antigravity refresh: oauth refresh failed with status %d", statusCode)
+}
+
+// isTerminalOAuthRefreshDescription recognizes explicit expired or revoked
+// refresh-token descriptions returned by OAuth providers.
+func isTerminalOAuthRefreshDescription(description string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(description))
+	normalized = strings.NewReplacer("_", " ", "-", " ").Replace(normalized)
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	if normalized == "" {
+		return false
+	}
+	for _, signal := range []string{
+		"token has been expired or revoked",
+		"refresh token has expired",
+		"refresh token is expired",
+		"refresh token expired",
+		"refresh token has been revoked",
+		"refresh token is revoked",
+		"refresh token revoked",
+	} {
+		if strings.Contains(normalized, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 // refreshAntigravity refreshes an antigravity.
 func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt http.RoundTripper) (*Auth, error) {
 	// Resolve credential context before calling upstream OAuth services.
@@ -182,7 +223,7 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 		return nil, errRead
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("antigravity refresh: oauth refresh failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, antigravityOAuthRefreshError(resp.StatusCode, body)
 	}
 
 	var tokenResp struct {

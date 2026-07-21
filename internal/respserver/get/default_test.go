@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
@@ -75,6 +76,28 @@ func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
 	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"refresh","auth_index":"auth-1"}`})
 	if reply.Kind != dispatch.ReplyKindBulkString || string(reply.BulkString) != `{"ok":true}` {
 		t.Fatalf("handleDefault(refresh) = %#v, want refresh payload", reply)
+	}
+}
+
+func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
+	rt := newGetTestRuntime(t)
+	rt.SetClusterRefreshHandler(func(context.Context, string) ([]byte, error) {
+		return nil, &coreauth.Error{
+			Code:       "authentication_error",
+			Message:    "credential unauthorized",
+			HTTPStatus: 401,
+		}
+	})
+
+	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"refresh","auth_index":"auth-1"}`})
+	if reply.Kind != dispatch.ReplyKindBulkString {
+		t.Fatalf("reply kind = %v, want bulk string", reply.Kind)
+	}
+	if got := gjson.GetBytes(reply.BulkString, "error.type").String(); got != "authentication_error" {
+		t.Fatalf("error.type = %q, want authentication_error; body=%s", got, string(reply.BulkString))
+	}
+	if got := gjson.GetBytes(reply.BulkString, "error.message").String(); got != "credential unauthorized" {
+		t.Fatalf("error.message = %q, want redacted authentication message; body=%s", got, string(reply.BulkString))
 	}
 }
 

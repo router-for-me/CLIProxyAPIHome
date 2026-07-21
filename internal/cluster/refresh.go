@@ -3,8 +3,11 @@ package cluster
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
@@ -16,6 +19,7 @@ type RefreshController struct {
 	runtime          *home.Runtime
 	repo             *Repository
 	forwardTLSConfig *tls.Config
+	forwardRefresh   func(context.Context, *ClusterNodeRecord, string, string, *tls.Config) ([]byte, error)
 }
 
 // NewRefreshController creates a new refresh controller.
@@ -25,6 +29,7 @@ func NewRefreshController(coordinator *Coordinator, runtime *home.Runtime, repo 
 		runtime:          runtime,
 		repo:             repo,
 		forwardTLSConfig: forwardTLSConfig,
+		forwardRefresh:   ForwardRefreshToMaster,
 	}
 }
 
@@ -82,10 +87,26 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 			log.Warnf("cluster refresh node secret missing, falling back to local refresh")
 			return c.refreshLocalWithLock(ctx, authIndex)
 		}
-		if payload, errForward := ForwardRefreshToMaster(ctx, master, forwardAuthUUID, nodeSecret, c.forwardTLSConfig); errForward == nil {
+		forwardRefresh := c.forwardRefresh
+		if forwardRefresh == nil {
+			forwardRefresh = ForwardRefreshToMaster
+		}
+		if payload, errForward := forwardRefresh(ctx, master, forwardAuthUUID, nodeSecret, c.forwardTLSConfig); errForward == nil {
 			return payload, nil
 		} else {
-			log.Warnf("cluster refresh forward failed, falling back to local refresh: %v", errForward)
+			var authErr *coreauth.Error
+			if errors.As(errForward, &authErr) && authErr != nil && strings.TrimSpace(authErr.Code) != "" {
+				if errSync := c.syncForwardedAuth(ctx, forwardAuthUUID); errSync != nil {
+					log.Warnf("cluster refresh forwarded auth sync failed | auth=%s err=%v", forwardAuthUUID, errSync)
+					if strings.EqualFold(strings.TrimSpace(authErr.Code), "authentication_error") {
+						if errDisable := c.disableForwardedAuthInMemory(ctx, forwardAuthUUID, authErr); errDisable != nil {
+							log.Warnf("cluster refresh forwarded auth fail-closed update failed | auth=%s err=%v", forwardAuthUUID, errDisable)
+						}
+					}
+				}
+				return nil, errForward
+			}
+			log.Warn("cluster refresh forward failed, falling back to local refresh")
 		}
 	} else if errMaster != nil {
 		log.Warnf("cluster refresh master lookup failed, falling back to local refresh: %v", errMaster)
@@ -94,6 +115,73 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 	}
 
 	return c.refreshLocalWithLock(ctx, authIndex)
+}
+
+// syncForwardedAuth applies the state already persisted by the master without
+// retrying the provider refresh on the standby.
+func (c *RefreshController) syncForwardedAuth(ctx context.Context, authUUID string) error {
+	if c == nil || c.runtime == nil || c.repo == nil {
+		return fmt.Errorf("cluster refresh: controller is not ready")
+	}
+	authUUID = strings.TrimSpace(authUUID)
+	if authUUID == "" {
+		return fmt.Errorf("cluster auth uuid is required")
+	}
+	auth, _, errAuth := c.repo.GetAuth(ctx, authUUID)
+	if errAuth != nil {
+		return errAuth
+	}
+	if errIndex := c.runtime.RefreshClusterAuthIndex(ctx, authUUID); errIndex != nil {
+		return errIndex
+	}
+	_, errUpdate := c.runtime.UpdateAuthInMemory(ctx, auth)
+	return errUpdate
+}
+
+// disableForwardedAuthInMemory fails closed when the master persisted a
+// terminal authentication failure but the standby cannot reload that state.
+func (c *RefreshController) disableForwardedAuthInMemory(ctx context.Context, authUUID string, authErr *coreauth.Error) error {
+	if c == nil || c.runtime == nil {
+		return fmt.Errorf("cluster refresh: runtime is nil")
+	}
+	core := c.runtime.CoreManager()
+	if core == nil {
+		return fmt.Errorf("cluster refresh: core manager is nil")
+	}
+	auth, ok := core.GetByIndex(authUUID)
+	if !ok || auth == nil {
+		auth, ok = core.GetByID(authUUID)
+	}
+	if !ok || auth == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	auth.Disabled = true
+	auth.Unavailable = true
+	auth.Status = coreauth.StatusDisabled
+	auth.StatusMessage = "unauthorized"
+	auth.NextRetryAfter = time.Time{}
+	auth.NextRefreshAfter = time.Time{}
+	auth.Quota = coreauth.QuotaState{}
+	auth.UpdatedAt = now
+	auth.LastError = &coreauth.Error{
+		Code:       "authentication_error",
+		Message:    "credential unauthorized",
+		HTTPStatus: http.StatusUnauthorized,
+	}
+	if authErr != nil {
+		if code := strings.TrimSpace(authErr.Code); code != "" {
+			auth.LastError.Code = code
+		}
+		if message := strings.TrimSpace(authErr.Message); message != "" {
+			auth.LastError.Message = message
+		}
+		if authErr.HTTPStatus > 0 {
+			auth.LastError.HTTPStatus = authErr.HTTPStatus
+		}
+	}
+	_, errUpdate := c.runtime.UpdateAuthInMemory(ctx, auth)
+	return errUpdate
 }
 
 // isSelf reports whether self.
@@ -143,9 +231,20 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex 
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
 	if errIndex := c.runtime.RefreshClusterAuthIndex(ctx, targetUUID); errIndex != nil {
+		if refreshErr != nil {
+			log.Warnf("cluster refresh index sync failed after persisted refresh failure | auth=%s err=%v", targetUUID, errIndex)
+			if _, errFailClosed := c.runtime.UpdateAuthInMemory(ctx, updated); errFailClosed != nil {
+				log.Warnf("cluster refresh fail-closed memory update failed | auth=%s err=%v", targetUUID, errFailClosed)
+			}
+			return nil, refreshErr
+		}
 		return nil, errIndex
 	}
 	if _, errUpdate := c.runtime.UpdateAuthInMemory(ctx, updated); errUpdate != nil {
+		if refreshErr != nil {
+			log.Warnf("cluster refresh memory sync failed after persisted refresh failure | auth=%s err=%v", targetUUID, errUpdate)
+			return nil, refreshErr
+		}
 		return nil, errUpdate
 	}
 	if refreshErr != nil {

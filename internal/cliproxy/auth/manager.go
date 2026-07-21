@@ -947,13 +947,14 @@ func authRefreshDisabled(auth *Auth) bool {
 	return auth == nil || auth.Disabled || auth.Status == StatusDisabled
 }
 
-// applyRefreshFailureState records refresh failure without retrying 401 credentials.
+// applyRefreshFailureState records refresh failures and permanently disables
+// credentials whose refresh token can no longer authenticate.
 func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 	if auth == nil || errRefresh == nil {
 		return
 	}
-	if isUnauthorizedRefreshError(errRefresh) {
-		disableAuthAfterUnauthorized(auth, nil, &Error{Message: errRefresh.Error(), HTTPStatus: http.StatusUnauthorized}, now)
+	if isTerminalRefreshAuthError(errRefresh) {
+		disableAuthAfterUnauthorized(auth, nil, newUnauthorizedRefreshError(), now)
 		return
 	}
 	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
@@ -961,7 +962,7 @@ func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 }
 
 // newUnauthorizedRefreshError returns the fixed wire error for failed forced refresh.
-func newUnauthorizedRefreshError() error {
+func newUnauthorizedRefreshError() *Error {
 	return &Error{
 		Code:       refreshAuthErrorCode,
 		Message:    refreshAuthErrorMsg,
@@ -969,17 +970,27 @@ func newUnauthorizedRefreshError() error {
 	}
 }
 
-// isUnauthorizedRefreshError reports whether a refresh error came from HTTP 401.
-func isUnauthorizedRefreshError(errRefresh error) bool {
+// isTerminalRefreshAuthError reports whether retrying the same refresh token
+// cannot restore the credential.
+func isTerminalRefreshAuthError(errRefresh error) bool {
 	if errRefresh == nil {
 		return false
+	}
+	var authErr *Error
+	if errors.As(errRefresh, &authErr) && authErr != nil {
+		code := strings.ToLower(strings.TrimSpace(authErr.Code))
+		if authErr.HTTPStatus == http.StatusUnauthorized || code == refreshAuthErrorCode || code == "unauthorized" {
+			return true
+		}
 	}
 	raw := strings.ToLower(errRefresh.Error())
 	return strings.Contains(raw, "status 401") ||
 		strings.Contains(raw, "status: 401") ||
 		strings.Contains(raw, "status code 401") ||
 		strings.Contains(raw, "http 401") ||
-		strings.Contains(raw, "401 unauthorized")
+		strings.Contains(raw, "401 unauthorized") ||
+		strings.Contains(raw, "invalid_grant") ||
+		isTerminalOAuthRefreshDescription(raw)
 }
 
 // markRefreshPending handles a mark refresh pending.
@@ -1287,10 +1298,12 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 	now := time.Now().UTC()
 	if errRefresh != nil {
 		snapshot := target.Clone()
-		unauthorized := isUnauthorizedRefreshError(errRefresh)
+		terminalAuthFailure := isTerminalRefreshAuthError(errRefresh)
 		applyRefreshFailureState(snapshot, errRefresh, now)
-		_, _ = m.Update(ctx, snapshot)
-		if unauthorized {
+		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
+			return nil, errUpdate
+		}
+		if terminalAuthFailure {
 			return nil, newUnauthorizedRefreshError()
 		}
 		return nil, errRefresh
@@ -1349,9 +1362,9 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	now := time.Now().UTC()
 	if errRefresh != nil {
 		snapshot := target.Clone()
-		unauthorized := isUnauthorizedRefreshError(errRefresh)
+		terminalAuthFailure := isTerminalRefreshAuthError(errRefresh)
 		applyRefreshFailureState(snapshot, errRefresh, now)
-		if unauthorized {
+		if terminalAuthFailure {
 			return snapshot, newUnauthorizedRefreshError()
 		}
 		return snapshot, errRefresh
@@ -1419,10 +1432,16 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 		return
 	}
 	if errRefresh != nil {
-		logEntryWithRequestID(ctx).Warnf("auth refresh failed | auth=%s provider=%s err=%v", authID, current.Provider, errRefresh)
+		if isTerminalRefreshAuthError(errRefresh) {
+			logEntryWithRequestID(ctx).Warnf("auth refresh disabled terminal credential | auth=%s provider=%s", authID, current.Provider)
+		} else {
+			logEntryWithRequestID(ctx).Warnf("auth refresh failed | auth=%s provider=%s err=%v", authID, current.Provider, errRefresh)
+		}
 		snapshot := current.Clone()
 		applyRefreshFailureState(snapshot, errRefresh, now)
-		_, _ = m.Update(ctx, snapshot)
+		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
+			logEntryWithRequestID(ctx).Warnf("auth refresh failure state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
+		}
 		return
 	}
 	if updated == nil {

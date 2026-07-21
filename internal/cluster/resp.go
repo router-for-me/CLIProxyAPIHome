@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 )
 
 const clusterRESPTimeout = 30 * time.Second
@@ -370,8 +374,31 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 		if errLine != nil {
 			return nil, errLine
 		}
-		return nil, fmt.Errorf("%s", strings.TrimSpace(line))
+		return nil, parseClusterRESPError(line)
 	default:
 		return nil, fmt.Errorf("cluster resp: unsupported response prefix %q", prefix)
+	}
+}
+
+// parseClusterRESPError restores structured application errors sent by another
+// Home node while leaving transport and protocol failures as ordinary errors.
+func parseClusterRESPError(line string) error {
+	message := strings.TrimSpace(line)
+	if len(message) > 4 && strings.EqualFold(message[:4], "ERR ") {
+		message = strings.TrimSpace(message[4:])
+	}
+	errorType, errorMessage := homeerrors.SplitRedisErrorMessage(message)
+	if errorType == homeerrors.TypeError {
+		return fmt.Errorf("%s", message)
+	}
+
+	statusCode := 0
+	if errorType == "authentication_error" || errorType == "unauthorized" {
+		statusCode = http.StatusUnauthorized
+	}
+	return &coreauth.Error{
+		Code:       errorType,
+		Message:    errorMessage,
+		HTTPStatus: statusCode,
 	}
 }
