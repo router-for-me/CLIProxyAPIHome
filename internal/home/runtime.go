@@ -157,6 +157,10 @@ type apiKeyScopedDispatchStore interface {
 	AllowedDispatchIDsForAPIKey(ctx context.Context, apiKey string) ([]string, []string, error)
 }
 
+type apiKeyModelScopedDispatchStore interface {
+	AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error)
+}
+
 // NewRuntime creates a new runtime.
 func NewRuntime(cfg *config.Config) (*Runtime, error) {
 	// Keep validation before state changes so failures leave existing data intact.
@@ -714,7 +718,7 @@ func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, header
 	if headers != nil {
 		opts.Headers = headers.Clone()
 	}
-	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey)
+	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey, reqModel)
 	if errAllowed != nil {
 		return nil, errAllowed
 	}
@@ -803,10 +807,14 @@ func (r *Runtime) allowedAuthIDsForAPIKey(ctx context.Context, apiKey string) ([
 	return store.AllowedAuthIDsForAPIKey(ctx, apiKey)
 }
 
-func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string) ([]string, []string, error) {
+func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string, modelID string) ([]string, []string, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" || r == nil || r.clusterAdapter == nil {
 		return nil, nil, nil
+	}
+	modelID = strings.TrimSpace(stripModelSuffix(modelID))
+	if store, ok := r.clusterAdapter.(apiKeyModelScopedDispatchStore); ok && store != nil {
+		return store.AllowedDispatchIDsForAPIKeyModel(ctx, apiKey, modelID)
 	}
 	if store, ok := r.clusterAdapter.(apiKeyScopedDispatchStore); ok && store != nil {
 		return store.AllowedDispatchIDsForAPIKey(ctx, apiKey)
