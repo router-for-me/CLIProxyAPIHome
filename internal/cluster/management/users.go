@@ -63,6 +63,45 @@ type userPeriodLimitResetRequest struct {
 	Mode    string   `json:"mode"`
 }
 
+type userJSONFieldType uint8
+
+const userJSONFieldErrInvalidType = "invalid_type"
+
+const (
+	userJSONFieldBoolean userJSONFieldType = iota
+	userJSONFieldString
+	userJSONFieldNumber
+	userJSONFieldInteger
+	userJSONFieldStringArray
+)
+
+type userJSONFieldSpec struct {
+	Field    string
+	Code     string
+	Expected string
+	Type     userJSONFieldType
+}
+
+var userWriteJSONFieldSpecs = []userJSONFieldSpec{
+	{Field: "credits_unlimited", Code: userJSONFieldErrInvalidType, Expected: "a boolean or null", Type: userJSONFieldBoolean},
+	{Field: "timezone", Code: cluster.PeriodLimitErrInvalidTimezone, Expected: "a string or null", Type: userJSONFieldString},
+	{Field: "limit_5h_credits", Code: cluster.PeriodLimitErrInvalidLimit, Expected: "a number or null", Type: userJSONFieldNumber},
+	{Field: "window_mode_5h", Code: cluster.PeriodLimitErrInvalidWindowMode, Expected: "a string or null", Type: userJSONFieldString},
+	{Field: "limit_1d_credits", Code: cluster.PeriodLimitErrInvalidLimit, Expected: "a number or null", Type: userJSONFieldNumber},
+	{Field: "window_mode_1d", Code: cluster.PeriodLimitErrInvalidWindowMode, Expected: "a string or null", Type: userJSONFieldString},
+	{Field: "limit_7d_credits", Code: cluster.PeriodLimitErrInvalidLimit, Expected: "a number or null", Type: userJSONFieldNumber},
+	{Field: "window_mode_7d", Code: cluster.PeriodLimitErrInvalidWindowMode, Expected: "a string or null", Type: userJSONFieldString},
+	{Field: "week_reset_day", Code: cluster.PeriodLimitErrInvalidWeekResetDay, Expected: "an integer or null", Type: userJSONFieldInteger},
+	{Field: "week_reset_hour", Code: cluster.PeriodLimitErrInvalidWeekResetHour, Expected: "an integer or null", Type: userJSONFieldInteger},
+	{Field: "limit_30d_credits", Code: cluster.PeriodLimitErrInvalidLimit, Expected: "a number or null", Type: userJSONFieldNumber},
+	{Field: "window_mode_30d", Code: cluster.PeriodLimitErrInvalidWindowMode, Expected: "a string or null", Type: userJSONFieldString},
+}
+
+var userPeriodLimitResetJSONFieldSpecs = []userJSONFieldSpec{
+	{Field: "windows", Code: cluster.PeriodLimitErrInvalidResetWindows, Expected: "an array of strings or null", Type: userJSONFieldStringArray},
+	{Field: "mode", Code: cluster.PeriodLimitErrInvalidResetMode, Expected: "a string or null", Type: userJSONFieldString},
+}
+
 // ListUsers returns users.
 func (h *Handler) ListUsers(c *gin.Context) {
 	ctx, cancel := h.requestContext(c)
@@ -100,8 +139,8 @@ func (h *Handler) GetUser(c *gin.Context) {
 // CreateUser creates a user.
 func (h *Handler) CreateUser(c *gin.Context) {
 	var body userWriteRequest
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
-		respondError(c, http.StatusBadRequest, "invalid body", errBindJSON)
+	if errBindJSON := c.ShouldBindBodyWithJSON(&body); errBindJSON != nil {
+		respondUserJSONBindError(c, errBindJSON, userWriteJSONFieldSpecs)
 		return
 	}
 	update, ok := userUpdateFromRequest(c, body, true)
@@ -117,8 +156,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 			respondError(c, http.StatusConflict, "user_exists", errCreate)
 			return
 		}
-		if isUserPeriodLimitValidationError(errCreate) {
-			respondError(c, http.StatusBadRequest, "invalid body", errCreate)
+		if respondUserPeriodLimitValidationError(c, errCreate) {
 			return
 		}
 		respondError(c, http.StatusInternalServerError, "user_create_failed", errCreate)
@@ -134,8 +172,8 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 		return
 	}
 	var body userWriteRequest
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
-		respondError(c, http.StatusBadRequest, "invalid body", errBindJSON)
+	if errBindJSON := c.ShouldBindBodyWithJSON(&body); errBindJSON != nil {
+		respondUserJSONBindError(c, errBindJSON, userWriteJSONFieldSpecs)
 		return
 	}
 	update, ok := userUpdateFromRequest(c, body, false)
@@ -147,8 +185,7 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 	defer cancel()
 	record, errUpdate := h.repo.UpdateUser(ctx, id, update)
 	if errUpdate != nil {
-		if isUserPeriodLimitValidationError(errUpdate) {
-			respondError(c, http.StatusBadRequest, "invalid body", errUpdate)
+		if respondUserPeriodLimitValidationError(c, errUpdate) {
 			return
 		}
 		respondUserRecordError(c, "user_update_failed", errUpdate)
@@ -196,19 +233,15 @@ func (h *Handler) ResetUserPeriodLimits(c *gin.Context) {
 		return
 	}
 	var body userPeriodLimitResetRequest
-	if c.Request != nil && c.Request.Body != nil {
-		decoder := json.NewDecoder(c.Request.Body)
-		if errDecode := decoder.Decode(&body); errDecode != nil && !errors.Is(errDecode, io.EOF) {
-			respondError(c, http.StatusBadRequest, "invalid body", errDecode)
-			return
-		}
+	if errBindJSON := c.ShouldBindBodyWithJSON(&body); errBindJSON != nil && !errors.Is(errBindJSON, io.EOF) {
+		respondUserJSONBindError(c, errBindJSON, userPeriodLimitResetJSONFieldSpecs)
+		return
 	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	result, errReset := h.repo.ResetUserPeriodLimits(ctx, id, body.Windows, body.Mode, time.Now().UTC())
 	if errReset != nil {
-		if isUserPeriodLimitValidationError(errReset) {
-			respondError(c, http.StatusBadRequest, "invalid body", errReset)
+		if respondUserPeriodLimitValidationError(c, errReset) {
 			return
 		}
 		respondUserRecordError(c, "user_period_limits_reset_failed", errReset)
@@ -226,17 +259,77 @@ func (h *Handler) ResetUserPeriodLimits(c *gin.Context) {
 	})
 }
 
+func respondUserJSONBindError(c *gin.Context, err error, specs []userJSONFieldSpec) {
+	if item, message, ok := userJSONTypeFieldError(c, specs); ok {
+		respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", errors.New(message), []fieldErrorItem{item})
+		return
+	}
+	respondError(c, http.StatusBadRequest, "invalid body", err)
+}
+
+func userJSONTypeFieldError(c *gin.Context, specs []userJSONFieldSpec) (fieldErrorItem, string, bool) {
+	if c == nil {
+		return fieldErrorItem{}, "", false
+	}
+	rawBody, okBody := c.Get(gin.BodyBytesKey)
+	if !okBody {
+		return fieldErrorItem{}, "", false
+	}
+	body, okBytes := rawBody.([]byte)
+	if !okBytes || len(body) == 0 {
+		return fieldErrorItem{}, "", false
+	}
+	fields := map[string]json.RawMessage{}
+	if errUnmarshal := json.Unmarshal(body, &fields); errUnmarshal != nil {
+		return fieldErrorItem{}, "", false
+	}
+	for _, spec := range specs {
+		raw, exists := fields[spec.Field]
+		if !exists || userJSONFieldTypeMatches(raw, spec.Type) {
+			continue
+		}
+		return fieldErrorItem{Field: spec.Field, Code: spec.Code}, fmt.Sprintf("%s must be %s", spec.Field, spec.Expected), true
+	}
+	return fieldErrorItem{}, "", false
+}
+
+func userJSONFieldTypeMatches(raw json.RawMessage, expected userJSONFieldType) bool {
+	switch expected {
+	case userJSONFieldBoolean:
+		var value *bool
+		return json.Unmarshal(raw, &value) == nil
+	case userJSONFieldString:
+		var value *string
+		return json.Unmarshal(raw, &value) == nil
+	case userJSONFieldNumber:
+		var value *float64
+		return json.Unmarshal(raw, &value) == nil
+	case userJSONFieldInteger:
+		var value *int
+		return json.Unmarshal(raw, &value) == nil
+	case userJSONFieldStringArray:
+		var value []string
+		return json.Unmarshal(raw, &value) == nil
+	default:
+		return false
+	}
+}
+
 func userUpdateFromRequest(c *gin.Context, body userWriteRequest, requireUsername bool) (cluster.UserUpdate, bool) {
 	update := cluster.UserUpdate{}
 	username := body.username()
 	if username != nil {
 		if strings.TrimSpace(*username) == "" {
-			respondError(c, http.StatusBadRequest, "invalid body", errRequired("username"))
+			respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", errRequired("username"), []fieldErrorItem{
+				{Field: "username", Code: "required"},
+			})
 			return update, false
 		}
 		update.Username = username
 	} else if requireUsername {
-		respondError(c, http.StatusBadRequest, "invalid body", errRequired("username"))
+		respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", errRequired("username"), []fieldErrorItem{
+			{Field: "username", Code: "required"},
+		})
 		return update, false
 	}
 	password, errPassword := managementPasswordValue(body.Password)
@@ -348,24 +441,25 @@ func isUserPeriodLimitValidationError(err error) bool {
 		return false
 	}
 	var configErr cluster.PeriodLimitConfigError
-	if errors.As(err, &configErr) {
-		return true
-	}
-	// Fallback for wrapped field-prefix errors from applyUserPeriodLimitUpdate.
-	message := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(message, "limit_"),
-		strings.Contains(message, "window mode"),
-		strings.Contains(message, "window_mode"),
-		strings.Contains(message, "timezone"),
-		strings.Contains(message, "week_reset"),
-		strings.Contains(message, "period window"),
-		strings.Contains(message, "reset mode"),
-		strings.Contains(message, "non-negative"):
-		return true
-	default:
+	return errors.As(err, &configErr)
+}
+
+// respondUserPeriodLimitValidationError writes a 400 response carrying the
+// stable field_errors contract for period-limit validation failures. It
+// reports whether err was a validation error (and the response was written).
+func respondUserPeriodLimitValidationError(c *gin.Context, err error) bool {
+	if !isUserPeriodLimitValidationError(err) {
 		return false
 	}
+	var configErr cluster.PeriodLimitConfigError
+	if errors.As(err, &configErr) && configErr.Code != "" {
+		respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", err, []fieldErrorItem{
+			{Field: configErr.Field, Code: configErr.Code},
+		})
+		return true
+	}
+	respondError(c, http.StatusBadRequest, "invalid body", err)
+	return true
 }
 
 func userRecordToMap(record *cluster.UserRecord) gin.H {
@@ -401,6 +495,7 @@ func userRecordToMap(record *cluster.UserRecord) gin.H {
 		"week_reset_hour":         record.WeekResetHour,
 		"limit_30d_credits":       record.Limit30dCredits,
 		"window_mode_30d":         windowMode30d,
+		"period_limits_summary":   userPeriodLimitsSummary(record),
 		"period_window_start_5h":  record.PeriodWindowStart5h,
 		"period_window_start_1d":  record.PeriodWindowStart1d,
 		"period_window_start_7d":  record.PeriodWindowStart7d,
@@ -414,5 +509,35 @@ func userRecordToMap(record *cluster.UserRecord) gin.H {
 		"created_at":              record.CreatedAt,
 		"updated_at":              record.UpdatedAt,
 		"deleted_at":              deletedAtValue(record.DeletedAt),
+	}
+}
+
+// userPeriodLimitsSummary derives a lightweight period-limit overview from the
+// user record alone (no billing queries), so list views can flag configured
+// and hard-blocked windows without per-user status calls.
+func userPeriodLimitsSummary(record *cluster.UserRecord) gin.H {
+	windows := []struct {
+		id    string
+		limit *float64
+	}{
+		{"5h", record.Limit5hCredits},
+		{"1d", record.Limit1dCredits},
+		{"7d", record.Limit7dCredits},
+		{"30d", record.Limit30dCredits},
+	}
+	enabled := make([]string, 0, len(windows))
+	zeroLimited := make([]string, 0, len(windows))
+	for _, window := range windows {
+		if window.limit == nil {
+			continue
+		}
+		enabled = append(enabled, window.id)
+		if *window.limit == 0 {
+			zeroLimited = append(zeroLimited, window.id)
+		}
+	}
+	return gin.H{
+		"enabled_windows":    enabled,
+		"zero_limit_windows": zeroLimited,
 	}
 }

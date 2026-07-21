@@ -344,61 +344,61 @@ func applyUserPeriodLimitUpdate(record *UserRecord, update UserUpdate) error {
 	if update.Timezone != nil {
 		timezone, errTZ := normalizeUserTimezone(*update.Timezone)
 		if errTZ != nil {
-			return errTZ
+			return periodLimitFieldError("timezone", PeriodLimitErrInvalidTimezone, errTZ.Error())
 		}
 		record.Timezone = timezone
 	}
 	if errLimit := applyOptionalFloat(update.Limit5hCredits, &record.Limit5hCredits); errLimit != nil {
-		return fmt.Errorf("limit_5h_credits: %w", errLimit)
+		return periodLimitFieldError("limit_5h_credits", PeriodLimitErrInvalidLimit, fmt.Sprintf("limit_5h_credits: %s", errLimit.Error()))
 	}
 	if update.WindowMode5h != nil {
 		mode, errMode := normalizePeriodWindowMode(*update.WindowMode5h, false)
 		if errMode != nil {
-			return fmt.Errorf("window_mode_5h: %w", errMode)
+			return periodLimitFieldError("window_mode_5h", PeriodLimitErrInvalidWindowMode, fmt.Sprintf("window_mode_5h: %s", errMode.Error()))
 		}
 		record.WindowMode5h = mode
 	}
 	if errLimit := applyOptionalFloat(update.Limit1dCredits, &record.Limit1dCredits); errLimit != nil {
-		return fmt.Errorf("limit_1d_credits: %w", errLimit)
+		return periodLimitFieldError("limit_1d_credits", PeriodLimitErrInvalidLimit, fmt.Sprintf("limit_1d_credits: %s", errLimit.Error()))
 	}
 	if update.WindowMode1d != nil {
 		mode, errMode := normalizePeriodWindowMode(*update.WindowMode1d, true)
 		if errMode != nil {
-			return fmt.Errorf("window_mode_1d: %w", errMode)
+			return periodLimitFieldError("window_mode_1d", PeriodLimitErrInvalidWindowMode, fmt.Sprintf("window_mode_1d: %s", errMode.Error()))
 		}
 		record.WindowMode1d = mode
 	}
 	if errLimit := applyOptionalFloat(update.Limit7dCredits, &record.Limit7dCredits); errLimit != nil {
-		return fmt.Errorf("limit_7d_credits: %w", errLimit)
+		return periodLimitFieldError("limit_7d_credits", PeriodLimitErrInvalidLimit, fmt.Sprintf("limit_7d_credits: %s", errLimit.Error()))
 	}
 	if update.WindowMode7d != nil {
 		mode, errMode := normalizePeriodWindowMode(*update.WindowMode7d, true)
 		if errMode != nil {
-			return fmt.Errorf("window_mode_7d: %w", errMode)
+			return periodLimitFieldError("window_mode_7d", PeriodLimitErrInvalidWindowMode, fmt.Sprintf("window_mode_7d: %s", errMode.Error()))
 		}
 		record.WindowMode7d = mode
 	}
 	if update.WeekResetDay != nil {
 		day, errDay := normalizeWeekResetDay(*update.WeekResetDay)
 		if errDay != nil {
-			return errDay
+			return periodLimitFieldError("week_reset_day", PeriodLimitErrInvalidWeekResetDay, errDay.Error())
 		}
 		record.WeekResetDay = day
 	}
 	if update.WeekResetHour != nil {
 		hour, errHour := normalizeWeekResetHour(*update.WeekResetHour)
 		if errHour != nil {
-			return errHour
+			return periodLimitFieldError("week_reset_hour", PeriodLimitErrInvalidWeekResetHour, errHour.Error())
 		}
 		record.WeekResetHour = hour
 	}
 	if errLimit := applyOptionalFloat(update.Limit30dCredits, &record.Limit30dCredits); errLimit != nil {
-		return fmt.Errorf("limit_30d_credits: %w", errLimit)
+		return periodLimitFieldError("limit_30d_credits", PeriodLimitErrInvalidLimit, fmt.Sprintf("limit_30d_credits: %s", errLimit.Error()))
 	}
 	if update.WindowMode30d != nil {
 		mode, errMode := normalizePeriodWindowMode(*update.WindowMode30d, true)
 		if errMode != nil {
-			return fmt.Errorf("window_mode_30d: %w", errMode)
+			return periodLimitFieldError("window_mode_30d", PeriodLimitErrInvalidWindowMode, fmt.Sprintf("window_mode_30d: %s", errMode.Error()))
 		}
 		record.WindowMode30d = mode
 	}

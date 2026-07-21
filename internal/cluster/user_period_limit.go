@@ -47,9 +47,27 @@ const (
 
 // OptionalFloatUpdate captures a three-state float patch: absent / null / value.
 
+// Stable machine-readable codes for period-limit validation failures. The
+// Management API surfaces them in field_errors so clients can localize and
+// anchor errors without parsing message strings.
+const (
+	PeriodLimitErrInvalidLimit         = "invalid_limit"
+	PeriodLimitErrInvalidWindowMode    = "invalid_window_mode"
+	PeriodLimitErrInvalidTimezone      = "invalid_timezone"
+	PeriodLimitErrInvalidWeekResetDay  = "invalid_week_reset_day"
+	PeriodLimitErrInvalidWeekResetHour = "invalid_week_reset_hour"
+	PeriodLimitErrInvalidResetMode     = "invalid_reset_mode"
+	PeriodLimitErrInvalidResetWindows  = "invalid_reset_windows"
+)
+
 // PeriodLimitConfigError is returned for invalid period-limit configuration inputs.
 type PeriodLimitConfigError struct {
 	Message string
+	// Field is the Management API field that failed validation (for example
+	// "limit_5h_credits" or "timezone"). Empty when not field-specific.
+	Field string
+	// Code is one of the PeriodLimitErr* constants. Empty for legacy errors.
+	Code string
 }
 
 func (e PeriodLimitConfigError) Error() string {
@@ -61,6 +79,12 @@ func (e PeriodLimitConfigError) Error() string {
 
 func periodLimitConfigErrorf(format string, args ...any) error {
 	return PeriodLimitConfigError{Message: fmt.Sprintf(format, args...)}
+}
+
+// periodLimitFieldError keeps the historic message text while attaching the
+// stable field/code pair exposed through the Management API.
+func periodLimitFieldError(field, code, message string) error {
+	return PeriodLimitConfigError{Message: message, Field: field, Code: code}
 }
 
 type OptionalFloatUpdate struct {
@@ -707,7 +731,7 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 		mode = PeriodResetModeCounter
 	}
 	if mode != PeriodResetModeCounter && mode != PeriodResetModeWindowOnly {
-		return UserPeriodLimitResetResult{}, periodLimitConfigErrorf("reset mode must be %q or %q", PeriodResetModeCounter, PeriodResetModeWindowOnly)
+		return UserPeriodLimitResetResult{}, periodLimitFieldError("mode", PeriodLimitErrInvalidResetMode, fmt.Sprintf("reset mode must be %q or %q", PeriodResetModeCounter, PeriodResetModeWindowOnly))
 	}
 	now = now.UTC()
 
@@ -726,14 +750,7 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 
 		target := normalized
 		if len(target) == 0 {
-			for _, id := range []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d} {
-				if userLimitForWindow(user, id) != nil || userWindowStart(user, id) != nil {
-					target = append(target, id)
-				}
-			}
-			if len(target) == 0 {
-				target = []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d}
-			}
+			target = []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d}
 		}
 
 		updates := map[string]any{}
@@ -762,6 +779,9 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 				return errUpdate
 			}
 		}
+		// Reload into a zero-value record so database NULLs clear pointer fields
+		// retained in the locked pre-update snapshot.
+		user = &UserRecord{}
 		if errReload := tx.Where("id = ?", userID).First(user).Error; errReload != nil {
 			return errReload
 		}
@@ -784,24 +804,6 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 	return result, nil
 }
 
-func userLimitForWindow(user *UserRecord, id string) *float64 {
-	if user == nil {
-		return nil
-	}
-	switch id {
-	case PeriodWindow5h:
-		return user.Limit5hCredits
-	case PeriodWindow1d:
-		return user.Limit1dCredits
-	case PeriodWindow7d:
-		return user.Limit7dCredits
-	case PeriodWindow30d:
-		return user.Limit30dCredits
-	default:
-		return nil
-	}
-}
-
 func normalizeResetWindows(windows []string) ([]string, error) {
 	if len(windows) == 0 {
 		return nil, nil
@@ -820,7 +822,7 @@ func normalizeResetWindows(windows []string) ([]string, error) {
 		case "":
 			continue
 		default:
-			return nil, periodLimitConfigErrorf("unknown period window %q", raw)
+			return nil, periodLimitFieldError("windows", PeriodLimitErrInvalidResetWindows, fmt.Sprintf("unknown period window %q", raw))
 		}
 	}
 	return out, nil

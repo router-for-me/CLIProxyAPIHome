@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -482,5 +483,137 @@ func TestWindowOnlyResetClearsSlidingUsage(t *testing.T) {
 	}
 	if _, _, errDispatch := repo.AllowedDispatchIDsForAPIKey(ctx, key); errDispatch != nil {
 		t.Fatalf("dispatch after window_only sliding reset error = %v", errDispatch)
+	}
+}
+
+func TestApplyUserPeriodLimitUpdateAttachesFieldAndCode(t *testing.T) {
+	t.Parallel()
+
+	badTimezone := "Mars/Olympus"
+	badMode := "calendar"
+	badHour := 24
+	tests := []struct {
+		name      string
+		update    UserUpdate
+		wantField string
+		wantCode  string
+	}{
+		{
+			name:      "timezone",
+			update:    UserUpdate{Timezone: &badTimezone},
+			wantField: "timezone",
+			wantCode:  PeriodLimitErrInvalidTimezone,
+		},
+		{
+			name:      "calendar rejected for 5h window",
+			update:    UserUpdate{WindowMode5h: &badMode},
+			wantField: "window_mode_5h",
+			wantCode:  PeriodLimitErrInvalidWindowMode,
+		},
+		{
+			name:      "negative limit",
+			update:    UserUpdate{Limit1dCredits: OptionalFloatUpdate{Set: true, Value: -1}},
+			wantField: "limit_1d_credits",
+			wantCode:  PeriodLimitErrInvalidLimit,
+		},
+		{
+			name:      "week reset hour out of range",
+			update:    UserUpdate{WeekResetHour: &badHour},
+			wantField: "week_reset_hour",
+			wantCode:  PeriodLimitErrInvalidWeekResetHour,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			record := &UserRecord{}
+			err := applyUserPeriodLimitUpdate(record, tc.update)
+			if err == nil {
+				t.Fatal("applyUserPeriodLimitUpdate() error = nil, want validation error")
+			}
+			var configErr PeriodLimitConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("error type = %T, want PeriodLimitConfigError", err)
+			}
+			if configErr.Field != tc.wantField || configErr.Code != tc.wantCode {
+				t.Fatalf("field/code = %q/%q, want %q/%q", configErr.Field, configErr.Code, tc.wantField, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestResetUserPeriodLimitsAttachesFieldAndCode(t *testing.T) {
+	t.Parallel()
+	repo, ctx, closeRepo := newPeriodLimitTestRepo(t)
+	defer closeRepo()
+
+	user := createPeriodLimitUser(t, repo, ctx, "u-reset-field-errors", 100)
+
+	if _, err := repo.ResetUserPeriodLimits(ctx, user.ID, nil, "bogus", time.Now().UTC()); err != nil {
+		var configErr PeriodLimitConfigError
+		if !errors.As(err, &configErr) {
+			t.Fatalf("reset mode error type = %T, want PeriodLimitConfigError", err)
+		}
+		if configErr.Field != "mode" || configErr.Code != PeriodLimitErrInvalidResetMode {
+			t.Fatalf("field/code = %q/%q, want mode/%q", configErr.Field, configErr.Code, PeriodLimitErrInvalidResetMode)
+		}
+	} else {
+		t.Fatal("ResetUserPeriodLimits() error = nil, want invalid mode error")
+	}
+
+	if _, err := repo.ResetUserPeriodLimits(ctx, user.ID, []string{"2h"}, PeriodResetModeCounter, time.Now().UTC()); err != nil {
+		var configErr PeriodLimitConfigError
+		if !errors.As(err, &configErr) {
+			t.Fatalf("reset windows error type = %T, want PeriodLimitConfigError", err)
+		}
+		if configErr.Field != "windows" || configErr.Code != PeriodLimitErrInvalidResetWindows {
+			t.Fatalf("field/code = %q/%q, want windows/%q", configErr.Field, configErr.Code, PeriodLimitErrInvalidResetWindows)
+		}
+	} else {
+		t.Fatal("ResetUserPeriodLimits() error = nil, want unknown window error")
+	}
+}
+
+func TestResetUserPeriodLimitsEmptyWindowsTargetsAllWindows(t *testing.T) {
+	t.Parallel()
+	repo, ctx, closeRepo := newPeriodLimitTestRepo(t)
+	defer closeRepo()
+
+	user := createPeriodLimitUser(t, repo, ctx, "u-reset-all-windows", 100)
+	limit := 5.0
+	if _, errUpdate := repo.UpdateUser(ctx, user.ID, UserUpdate{
+		Limit5hCredits: OptionalFloatUpdate{Set: true, Value: limit},
+	}); errUpdate != nil {
+		t.Fatalf("UpdateUser() error = %v", errUpdate)
+	}
+
+	now := time.Now().UTC()
+	result, errReset := repo.ResetUserPeriodLimits(ctx, user.ID, nil, PeriodResetModeCounter, now)
+	if errReset != nil {
+		t.Fatalf("ResetUserPeriodLimits() error = %v", errReset)
+	}
+	wantWindows := []string{PeriodWindow5h, PeriodWindow1d, PeriodWindow7d, PeriodWindow30d}
+	if len(result.Windows) != len(wantWindows) {
+		t.Fatalf("reset windows = %v, want %v", result.Windows, wantWindows)
+	}
+	for index, want := range wantWindows {
+		if result.Windows[index] != want {
+			t.Fatalf("reset windows = %v, want %v", result.Windows, wantWindows)
+		}
+	}
+
+	reloaded, errGet := repo.GetUser(ctx, user.ID)
+	if errGet != nil {
+		t.Fatalf("GetUser() error = %v", errGet)
+	}
+	for field, epoch := range map[string]*time.Time{
+		"usage_epoch_5h":  reloaded.UsageEpoch5h,
+		"usage_epoch_1d":  reloaded.UsageEpoch1d,
+		"usage_epoch_7d":  reloaded.UsageEpoch7d,
+		"usage_epoch_30d": reloaded.UsageEpoch30d,
+	} {
+		if epoch == nil || !epoch.Equal(now) {
+			t.Fatalf("%s = %v, want %v", field, epoch, now)
+		}
 	}
 }

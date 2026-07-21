@@ -2,8 +2,12 @@ package management
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -115,5 +119,105 @@ func TestUserRecordToMapIncludesPeriodLimitFields(t *testing.T) {
 	}
 	if item["credits_unlimited"] != true {
 		t.Fatalf("credits_unlimited = %v, want true", item["credits_unlimited"])
+	}
+}
+
+func TestUserRecordToMapIncludesPeriodLimitsSummary(t *testing.T) {
+	t.Parallel()
+
+	limit5h := 0.0
+	limit1d := 25.5
+	item := userRecordToMap(&cluster.UserRecord{
+		Username:       "alice",
+		Limit5hCredits: &limit5h,
+		Limit1dCredits: &limit1d,
+	})
+	summary, ok := item["period_limits_summary"].(gin.H)
+	if !ok {
+		t.Fatalf("period_limits_summary missing or wrong type: %#v", item["period_limits_summary"])
+	}
+	enabled, ok := summary["enabled_windows"].([]string)
+	if !ok || len(enabled) != 2 || enabled[0] != "5h" || enabled[1] != "1d" {
+		t.Fatalf("enabled_windows = %#v, want [5h 1d]", summary["enabled_windows"])
+	}
+	zero, ok := summary["zero_limit_windows"].([]string)
+	if !ok || len(zero) != 1 || zero[0] != "5h" {
+		t.Fatalf("zero_limit_windows = %#v, want [5h]", summary["zero_limit_windows"])
+	}
+
+	empty := userRecordToMap(&cluster.UserRecord{Username: "bob"})["period_limits_summary"].(gin.H)
+	if got := len(empty["enabled_windows"].([]string)); got != 0 {
+		t.Fatalf("enabled_windows = %d entries, want 0", got)
+	}
+	if got := len(empty["zero_limit_windows"].([]string)); got != 0 {
+		t.Fatalf("zero_limit_windows = %d entries, want 0", got)
+	}
+}
+
+func TestRespondUserPeriodLimitValidationErrorWritesFieldErrors(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/users", nil)
+
+	validationErr := cluster.PeriodLimitConfigError{
+		Message: "timezone: invalid timezone \"Mars/Olympus\"",
+		Field:   "timezone",
+		Code:    cluster.PeriodLimitErrInvalidTimezone,
+	}
+	if !respondUserPeriodLimitValidationError(ginCtx, validationErr) {
+		t.Fatal("respondUserPeriodLimitValidationError() = false, want true")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if payload["error"] != "invalid body" {
+		t.Fatalf("error = %v, want invalid body", payload["error"])
+	}
+	fieldErrors, ok := payload["field_errors"].([]any)
+	if !ok || len(fieldErrors) != 1 {
+		t.Fatalf("field_errors = %#v, want one entry", payload["field_errors"])
+	}
+	entry, ok := fieldErrors[0].(map[string]any)
+	if !ok {
+		t.Fatalf("field_errors[0] = %#v, want object", fieldErrors[0])
+	}
+	if entry["field"] != "timezone" || entry["code"] != cluster.PeriodLimitErrInvalidTimezone {
+		t.Fatalf("field_errors[0] = %#v", entry)
+	}
+
+	if respondUserPeriodLimitValidationError(ginCtx, errors.New("boom")) {
+		t.Fatal("respondUserPeriodLimitValidationError() = true for non-validation error")
+	}
+}
+
+func TestGetCapabilitiesDeclaresUserDomain(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/capabilities", nil)
+
+	handler := &Handler{}
+	handler.GetCapabilities(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var payload struct {
+		Capabilities map[string]bool `json:"capabilities"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	for _, key := range []string{"users", "access_groups", "user_period_limits"} {
+		if !payload.Capabilities[key] {
+			t.Fatalf("capabilities[%q] missing or false", key)
+		}
 	}
 }

@@ -56,6 +56,9 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			"logs":                    true,
 			"request_error_logs":      true,
 			"topology":                true,
+			"users":                   true,
+			"access_groups":           true,
+			"user_period_limits":      true,
 		},
 		"server_info": gin.H{
 			"home_version":    buildinfo.Version,
