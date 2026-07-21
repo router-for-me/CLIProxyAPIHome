@@ -56,6 +56,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			"oauth_usage":             true,
 			"logs":                    true,
 			"request_error_logs":      true,
+			"model_channel_bindings":  true,
 			"topology":                true,
 			"users":                   true,
 			"access_groups":           true,

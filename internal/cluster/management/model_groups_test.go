@@ -1,11 +1,88 @@
 package management
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 )
+
+func TestModelGroupDetailRoutesCreateAndClearChannels(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+
+	ctx := t.Context()
+	channel, errChannel := handler.repo.CreateChannelGroup(ctx, "codex-subset", false)
+	if errChannel != nil {
+		t.Fatalf("CreateChannelGroup() error = %v", errChannel)
+	}
+	modelGroup, errModelGroup := handler.repo.CreateModelGroup(ctx, "codex-models", false)
+	if errModelGroup != nil {
+		t.Fatalf("CreateModelGroup() error = %v", errModelGroup)
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.POST("/model-group-details", handler.CreateModelGroupDetail)
+	engine.PATCH("/model-group-details/:id", handler.UpdateModelGroupDetail)
+
+	createBody, errCreateBody := json.Marshal(map[string]any{
+		"model_group_id": modelGroup.ID,
+		"model_id":       "gpt-5.4",
+		"channels":       []uint{channel.ID},
+	})
+	if errCreateBody != nil {
+		t.Fatalf("marshal create body: %v", errCreateBody)
+	}
+	createResponse := httptest.NewRecorder()
+	createRequest := httptest.NewRequest(http.MethodPost, "/model-group-details", bytes.NewReader(createBody))
+	createRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+	var createPayload struct {
+		Detail struct {
+			ID       uint   `json:"id"`
+			Channels []uint `json:"channels"`
+		} `json:"model_group_detail"`
+	}
+	if errDecode := json.Unmarshal(createResponse.Body.Bytes(), &createPayload); errDecode != nil {
+		t.Fatalf("decode create response: %v", errDecode)
+	}
+	if createPayload.Detail.ID == 0 || !reflect.DeepEqual(createPayload.Detail.Channels, []uint{channel.ID}) {
+		t.Fatalf("created detail = %#v", createPayload.Detail)
+	}
+
+	patchResponse := httptest.NewRecorder()
+	patchRequest := httptest.NewRequest(http.MethodPatch, "/model-group-details/"+modelRecordID(createPayload.Detail.ID), bytes.NewBufferString(`{"channels":[]}`))
+	patchRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(patchResponse, patchRequest)
+	if patchResponse.Code != http.StatusOK {
+		t.Fatalf("patch status = %d body=%s", patchResponse.Code, patchResponse.Body.String())
+	}
+	var patchPayload struct {
+		Detail struct {
+			Channels []uint `json:"channels"`
+		} `json:"model_group_detail"`
+	}
+	if errDecode := json.Unmarshal(patchResponse.Body.Bytes(), &patchPayload); errDecode != nil {
+		t.Fatalf("decode patch response: %v", errDecode)
+	}
+	if patchPayload.Detail.Channels == nil || len(patchPayload.Detail.Channels) != 0 {
+		t.Fatalf("patched channels = %#v, want empty array", patchPayload.Detail.Channels)
+	}
+}
+
+func modelRecordID(id uint) string {
+	return strconv.FormatUint(uint64(id), 10)
+}
 
 func TestModelGroupDetailRecordToMapIncludesChannels(t *testing.T) {
 	t.Parallel()

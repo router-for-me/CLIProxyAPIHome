@@ -2598,6 +2598,7 @@ Response fields:
 | `capabilities.oauth_usage` | boolean | Whether OAuth/file-backed credential usage attribution is reliable. |
 | `capabilities.logs` | boolean | Whether application log APIs are available. |
 | `capabilities.request_error_logs` | boolean | Whether request error log file list/download APIs are available. |
+| `capabilities.model_channel_bindings` | boolean | Whether model group details support model-specific channel group bindings through `channels`. |
 | `capabilities.topology` | boolean | Whether `GET /topology` is available for Home + CPA cluster topology. |
 | `capabilities.users` | boolean | Whether the `/users` user-management routes are available. |
 | `capabilities.access_groups` | boolean | Whether the `/channel-groups` and `/model-groups` access-scope routes are available. |
@@ -3490,6 +3491,10 @@ Response:
 
 Model groups restrict which model IDs a client API key may use. If a client API key has an empty `model_groups` array, model filtering is not applied.
 
+Each model group detail may also contain `channels`, an array of channel group IDs that limits which credentials can execute that model. Empty or omitted `channels` inherits the client API key's existing credential scope and preserves legacy behavior. A non-empty value resolves the enabled credentials in those channel groups and intersects them by auth ID with the API key's own `channels` scope. If the API key does not restrict channels, the model-specific scope applies directly. If the resulting credential set is empty, dispatch fails closed rather than falling back to unrestricted credentials.
+
+When the same model occurs in multiple model groups selected by an API key, Home unions all non-empty model-specific `channels` bindings. Duplicate details with empty `channels` do not cancel an explicit restriction. Disabled or deleted model/channel groups do not contribute eligible credentials.
+
 ### GET `/model-groups`
 
 Example response:
@@ -3585,6 +3590,7 @@ Example response:
       "id": 10,
       "model_group_id": 1,
       "model_id": "gpt-5.5",
+      "channels": [2, 3],
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "deleted_at": null
@@ -3603,6 +3609,7 @@ Returns one detail row:
     "id": 10,
     "model_group_id": 1,
     "model_id": "gpt-5.5",
+    "channels": [2, 3],
     "created_at": "2026-05-27T10:00:00Z",
     "updated_at": "2026-05-27T10:00:00Z",
     "deleted_at": null
@@ -3619,7 +3626,8 @@ Example request:
 ```json
 {
   "model_group_id": 1,
-  "model_id": "gpt-5.5"
+  "model_id": "gpt-5.5",
+  "channels": [2, 3]
 }
 ```
 
@@ -3627,6 +3635,7 @@ Example request:
 | --- | --- | --- | --- |
 | `model_group_id` | integer | yes | Existing model group ID. |
 | `model_id` | string | yes | Model ID allowed by this group. |
+| `channels` | array of integer | no | Channel group IDs allowed to execute this model. Empty or omitted inherits the API key credential scope. |
 
 Response: `{ "model_group_detail": ... }`.
 
@@ -3639,11 +3648,12 @@ Example request:
 ```json
 {
   "model_group_id": 2,
-  "model_id": "gpt-5.5-mini"
+  "model_id": "gpt-5.5-mini",
+  "channels": [4]
 }
 ```
 
-All fields are optional, but a supplied `model_group_id` must be greater than `0`.
+All fields are optional, but a supplied `model_group_id` must be greater than `0`. Supplying `channels: []` removes the model-specific credential restriction and restores inherited behavior.
 
 Response: `{ "model_group_detail": ... }`.
 
