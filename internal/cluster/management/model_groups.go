@@ -20,6 +20,7 @@ type modelGroupWriteRequest struct {
 type modelGroupDetailWriteRequest struct {
 	ModelGroupID *uint   `json:"model_group_id"`
 	ModelID      *string `json:"model_id"`
+	Channels     *[]uint `json:"channels"`
 }
 
 // ListModelGroups returns model groups.
@@ -151,7 +152,12 @@ func (h *Handler) ListModelGroupDetails(c *gin.Context) {
 	}
 	items := make([]gin.H, 0, len(records))
 	for _, record := range records {
-		items = append(items, modelGroupDetailRecordToMap(&record))
+		item, errItem := modelGroupDetailRecordToMap(&record)
+		if errItem != nil {
+			respondError(c, http.StatusInternalServerError, "model_group_detail_load_failed", errItem)
+			return
+		}
+		items = append(items, item)
 	}
 	c.JSON(http.StatusOK, gin.H{"model_group_details": items})
 }
@@ -170,7 +176,12 @@ func (h *Handler) GetModelGroupDetail(c *gin.Context) {
 		respondModelRecordError(c, "model_group_detail_load_failed", errRecord)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"model_group_detail": modelGroupDetailRecordToMap(record)})
+	item, errItem := modelGroupDetailRecordToMap(record)
+	if errItem != nil {
+		respondError(c, http.StatusInternalServerError, "model_group_detail_load_failed", errItem)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"model_group_detail": item})
 }
 
 // CreateModelGroupDetail creates a model group detail.
@@ -195,12 +206,21 @@ func (h *Handler) CreateModelGroupDetail(c *gin.Context) {
 
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
-	record, errCreate := h.repo.CreateModelGroupDetail(ctx, *body.ModelGroupID, modelID)
+	channels := []uint(nil)
+	if body.Channels != nil {
+		channels = *body.Channels
+	}
+	record, errCreate := h.repo.CreateModelGroupDetail(ctx, *body.ModelGroupID, modelID, channels)
 	if errCreate != nil {
 		respondModelRecordError(c, "model_group_detail_create_failed", errCreate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"model_group_detail": modelGroupDetailRecordToMap(record)})
+	item, errItem := modelGroupDetailRecordToMap(record)
+	if errItem != nil {
+		respondError(c, http.StatusInternalServerError, "model_group_detail_create_failed", errItem)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"model_group_detail": item})
 }
 
 // UpdateModelGroupDetail updates a model group detail.
@@ -216,6 +236,7 @@ func (h *Handler) UpdateModelGroupDetail(c *gin.Context) {
 	}
 	update := cluster.ModelGroupDetailUpdate{
 		ModelGroupID: body.ModelGroupID,
+		Channels:     body.Channels,
 	}
 	if body.ModelID != nil {
 		modelID := strings.TrimSpace(*body.ModelID)
@@ -229,7 +250,12 @@ func (h *Handler) UpdateModelGroupDetail(c *gin.Context) {
 		respondModelRecordError(c, "model_group_detail_update_failed", errUpdate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"model_group_detail": modelGroupDetailRecordToMap(record)})
+	item, errItem := modelGroupDetailRecordToMap(record)
+	if errItem != nil {
+		respondError(c, http.StatusInternalServerError, "model_group_detail_update_failed", errItem)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"model_group_detail": item})
 }
 
 // DeleteModelGroupDetail deletes a model group detail.
@@ -322,16 +348,24 @@ func modelGroupRecordToMap(record *cluster.ModelGroupRecord) gin.H {
 	}
 }
 
-func modelGroupDetailRecordToMap(record *cluster.ModelGroupDetailRecord) gin.H {
+func modelGroupDetailRecordToMap(record *cluster.ModelGroupDetailRecord) (gin.H, error) {
 	if record == nil {
-		return gin.H{}
+		return gin.H{}, nil
+	}
+	channels, errChannels := cluster.ModelGroupDetailChannelIDs(record)
+	if errChannels != nil {
+		return nil, errChannels
+	}
+	if channels == nil {
+		channels = []uint{}
 	}
 	return gin.H{
 		"id":             record.ID,
 		"model_group_id": record.ModelGroupID,
 		"model_id":       record.ModelID,
+		"channels":       channels,
 		"created_at":     record.CreatedAt,
 		"updated_at":     record.UpdatedAt,
 		"deleted_at":     deletedAtValue(record.DeletedAt),
-	}
+	}, nil
 }

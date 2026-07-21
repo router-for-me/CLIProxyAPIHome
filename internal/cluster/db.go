@@ -141,6 +141,9 @@ func autoMigrate(db *gorm.DB) error {
 	if errMigrate := migrateAPIKeyModelGroups(db); errMigrate != nil {
 		return errMigrate
 	}
+	if errMigrate := migrateModelGroupDetailChannels(db); errMigrate != nil {
+		return errMigrate
+	}
 	if errMigrate := migrateUserUniqueUsername(db); errMigrate != nil {
 		return errMigrate
 	}

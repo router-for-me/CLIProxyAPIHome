@@ -18,6 +18,7 @@ type ModelGroupUpdate struct {
 type ModelGroupDetailUpdate struct {
 	ModelGroupID *uint
 	ModelID      *string
+	Channels     *[]uint
 }
 
 type ModelGroupDetailFilter struct {
@@ -174,7 +175,7 @@ func (r *Repository) GetModelGroupDetail(ctx context.Context, id uint) (*ModelGr
 }
 
 // CreateModelGroupDetail creates a model group detail.
-func (r *Repository) CreateModelGroupDetail(ctx context.Context, modelGroupID uint, modelID string) (*ModelGroupDetailRecord, error) {
+func (r *Repository) CreateModelGroupDetail(ctx context.Context, modelGroupID uint, modelID string, channels []uint) (*ModelGroupDetailRecord, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
@@ -186,15 +187,23 @@ func (r *Repository) CreateModelGroupDetail(ctx context.Context, modelGroupID ui
 	if modelID == "" {
 		return nil, fmt.Errorf("model id is required")
 	}
+	channelsJSON, errChannels := modelGroupDetailChannelsJSON(channels)
+	if errChannels != nil {
+		return nil, errChannels
+	}
 
 	record := &ModelGroupDetailRecord{
 		ModelGroupID: modelGroupID,
 		ModelID:      modelID,
+		Channels:     channelsJSON,
 	}
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if errGroup := ensureModelGroupExists(ctx, tx, modelGroupID); errGroup != nil {
 			return errGroup
+		}
+		if errChannelGroups := ensureChannelGroupsExist(ctx, tx, channels); errChannelGroups != nil {
+			return errChannelGroups
 		}
 		return tx.Create(record).Error
 	})
@@ -235,6 +244,16 @@ func (r *Repository) UpdateModelGroupDetail(ctx context.Context, id uint, update
 				return fmt.Errorf("model id is required")
 			}
 			record.ModelID = modelID
+		}
+		if update.Channels != nil {
+			if errChannelGroups := ensureChannelGroupsExist(ctx, tx, *update.Channels); errChannelGroups != nil {
+				return errChannelGroups
+			}
+			channelsJSON, errChannels := modelGroupDetailChannelsJSON(*update.Channels)
+			if errChannels != nil {
+				return errChannels
+			}
+			record.Channels = channelsJSON
 		}
 		return tx.Save(record).Error
 	})
@@ -288,4 +307,38 @@ func ensureModelGroupExists(ctx context.Context, tx *gorm.DB, id uint) error {
 		return fmt.Errorf("model group not found: %w", errFirst)
 	}
 	return errFirst
+}
+
+func ensureChannelGroupsExist(ctx context.Context, tx *gorm.DB, ids []uint) error {
+	for _, id := range normalizeChannelGroupIDs(ids) {
+		if errGroup := ensureChannelGroupExists(ctx, tx, id); errGroup != nil {
+			return errGroup
+		}
+	}
+	return nil
+}
+
+func modelGroupDetailChannelsJSON(channels []uint) (JSONB, error) {
+	return apiKeyChannelsJSON(channels)
+}
+
+func modelGroupDetailChannelsFromJSON(raw JSONB) ([]uint, error) {
+	return apiKeyChannelsFromJSON(raw)
+}
+
+// ModelGroupDetailChannelIDs returns the channel group IDs bound to a model detail.
+func ModelGroupDetailChannelIDs(record *ModelGroupDetailRecord) ([]uint, error) {
+	if record == nil {
+		return nil, fmt.Errorf("model group detail record is nil")
+	}
+	return modelGroupDetailChannelsFromJSON(record.Channels)
+}
+
+func migrateModelGroupDetailChannels(db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	return db.Model(&ModelGroupDetailRecord{}).
+		Where("channels IS NULL").
+		Update("channels", emptyAPIKeyChannelsJSON()).Error
 }
