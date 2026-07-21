@@ -205,10 +205,17 @@ func TestAllowedDispatchIDsForAPIKeyModelIntersectsModelChannels(t *testing.T) {
 	}
 
 	modelDetailQueries := 0
-	callbackName := "test:count-model-group-detail-queries"
+	channelDetailQueries := 0
+	callbackName := "test:count-policy-detail-queries"
 	if errCallback := db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-		if tx != nil && tx.Statement != nil && tx.Statement.Table == "model_group_detail" {
+		if tx == nil || tx.Statement == nil {
+			return
+		}
+		switch tx.Statement.Table {
+		case "model_group_detail":
 			modelDetailQueries++
+		case "channel_group_detail":
+			channelDetailQueries++
 		}
 	}); errCallback != nil {
 		t.Fatalf("register query callback: %v", errCallback)
@@ -222,6 +229,9 @@ func TestAllowedDispatchIDsForAPIKeyModelIntersectsModelChannels(t *testing.T) {
 	}
 	if modelDetailQueries != 1 {
 		t.Fatalf("model detail query count = %d, want one coherent load", modelDetailQueries)
+	}
+	if channelDetailQueries != 1 {
+		t.Fatalf("channel detail query count = %d, want one coherent load", channelDetailQueries)
 	}
 	if want := []string{"auth-b"}; !reflect.DeepEqual(authIDs, want) {
 		t.Fatalf("explicit auth IDs = %v, want %v", authIDs, want)
