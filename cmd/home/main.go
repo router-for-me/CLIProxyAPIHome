@@ -61,6 +61,8 @@ func run() int {
 	var sqlitePath string
 	var importState bool
 	var exportState bool
+	var databaseImportPath string
+	var databaseExportPath string
 	var exportDir string
 	var authDir string
 	flag.StringVar(&configPath, "config", "config.yaml", "Config file path")
@@ -68,11 +70,15 @@ func run() int {
 	flag.StringVar(&sqlitePath, "sqlite-path", "", "SQLite database path")
 	flag.BoolVar(&importState, "import", false, "Import config and auth files into database, then exit")
 	flag.BoolVar(&exportState, "export", false, "Export config and auth files from database, then exit")
+	flag.StringVar(&databaseImportPath, "db-import", "", "Import a portable Home database snapshot, then exit")
+	flag.StringVar(&databaseExportPath, "db-export", "", "Export a portable Home database snapshot, then exit")
 	flag.StringVar(&exportDir, "export-dir", "", "Override output directory used by export")
 	flag.StringVar(&authDir, "auth-dir", "", "Override auth directory used by import")
 	flag.Parse()
-	if importState && exportState {
-		log.Errorf("only one of -import or -export can be used")
+	databaseImportPath = strings.TrimSpace(databaseImportPath)
+	databaseExportPath = strings.TrimSpace(databaseExportPath)
+	if oneTimeModeCount(importState, exportState, databaseImportPath, databaseExportPath) > 1 {
+		log.Errorf("only one of -import, -export, -db-import, or -db-export can be used")
 		return 1
 	}
 
@@ -81,11 +87,33 @@ func run() int {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	startedAt := time.Now().UTC()
+	var databaseSnapshot *cluster.ValidatedDatabaseSnapshot
+	if databaseImportPath != "" {
+		var errSnapshot error
+		databaseSnapshot, errSnapshot = cluster.OpenDatabaseSnapshot(runCtx, databaseImportPath)
+		if errSnapshot != nil {
+			log.Errorf("failed to validate database snapshot: %v", errSnapshot)
+			return 1
+		}
+		defer func() {
+			if errCloseSnapshot := databaseSnapshot.Close(); errCloseSnapshot != nil {
+				log.Warnf("failed to close database snapshot: %v", errCloseSnapshot)
+			}
+		}()
+		manifest := databaseSnapshot.Manifest()
+		log.Infof("database snapshot validation completed source_backend=%s tables=%d", manifest.SourceBackend, len(manifest.Tables))
+	}
 
 	clusterCfg, clusterExists, errClusterCfg := cluster.LoadConfigOptional("")
 	if errClusterCfg != nil {
 		log.Errorf("failed to load cluster config: %v", errClusterCfg)
 		return 1
+	}
+	if databaseSnapshot != nil {
+		if errPreflight := databaseSnapshot.ValidateForBackend(runCtx, resolveRuntimeDatabaseBackend(clusterCfg, clusterExists)); errPreflight != nil {
+			log.Errorf("failed to validate database snapshot for target backend: %v", errPreflight)
+			return 1
+		}
 	}
 
 	var cfg *config.Config
@@ -114,9 +142,37 @@ func run() int {
 			log.Warnf("failed to close sql db: %v", errCloseSQL)
 		}
 	}()
+	if databaseSnapshot != nil {
+		result, errImport := cluster.ImportDatabaseSnapshot(runCtx, clusterDB, databaseSnapshot, nil)
+		if errImport != nil {
+			log.Errorf("failed to import database snapshot: %v", errImport)
+			return 1
+		}
+		for _, table := range result.Tables {
+			log.Infof("database snapshot table import completed table=%s imported=%d skipped=%d", table.Name, table.Imported, table.Skipped)
+		}
+		log.Infof("database snapshot import completed target_backend=%s tables=%d", dbBackend, len(result.Tables))
+		return 0
+	}
 	if errMigrate := cluster.AutoMigrate(clusterDB); errMigrate != nil {
 		log.Errorf("failed to migrate database: %v", errMigrate)
 		return 1
+	}
+	if databaseExportPath != "" {
+		manifest, errExport := cluster.ExportDatabaseSnapshot(runCtx, clusterDB, cluster.DatabaseSnapshotExportOptions{
+			Path:        databaseExportPath,
+			HomeVersion: Version,
+			HomeCommit:  Commit,
+			Progress: func(progress cluster.DatabaseSnapshotProgress) {
+				log.Infof("database snapshot table export completed table=%s rows=%d", progress.Table, progress.Rows)
+			},
+		})
+		if errExport != nil {
+			log.Errorf("failed to export database snapshot: %v", errExport)
+			return 1
+		}
+		log.Infof("database snapshot export completed source_backend=%s tables=%d path=%s", manifest.SourceBackend, len(manifest.Tables), databaseExportPath)
+		return 0
 	}
 	repo := cluster.NewRepository(clusterDB)
 	clusterRepo = repo
@@ -515,6 +571,30 @@ func resolveSQLitePath(flagPath string, configPath string) string {
 		return configPath
 	}
 	return "home.db"
+}
+
+func oneTimeModeCount(importState bool, exportState bool, databaseImportPath string, databaseExportPath string) int {
+	count := 0
+	if importState {
+		count++
+	}
+	if exportState {
+		count++
+	}
+	if strings.TrimSpace(databaseImportPath) != "" {
+		count++
+	}
+	if strings.TrimSpace(databaseExportPath) != "" {
+		count++
+	}
+	return count
+}
+
+func resolveRuntimeDatabaseBackend(clusterCfg *cluster.Config, clusterExists bool) cluster.DatabaseBackend {
+	if clusterExists && clusterCfg != nil {
+		return clusterCfg.DatabaseBackend()
+	}
+	return cluster.DatabaseBackendSQLite
 }
 
 // openRuntimeDatabase opens the database used by the DB-backed runtime.

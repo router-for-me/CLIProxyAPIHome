@@ -110,6 +110,47 @@ func TestResolveSQLitePath_UsesDefault(t *testing.T) {
 	}
 }
 
+func TestDatabaseSnapshotOneTimeModeCount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name               string
+		importState        bool
+		exportState        bool
+		databaseImportPath string
+		databaseExportPath string
+		want               int
+	}{
+		{name: "none", want: 0},
+		{name: "local import", importState: true, want: 1},
+		{name: "local export", exportState: true, want: 1},
+		{name: "database import", databaseImportPath: "snapshot.zip", want: 1},
+		{name: "database export", databaseExportPath: "snapshot.zip", want: 1},
+		{name: "all", importState: true, exportState: true, databaseImportPath: "in.zip", databaseExportPath: "out.zip", want: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := oneTimeModeCount(test.importState, test.exportState, test.databaseImportPath, test.databaseExportPath)
+			if got != test.want {
+				t.Fatalf("oneTimeModeCount() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDatabaseSnapshotResolveRuntimeDatabaseBackend(t *testing.T) {
+	t.Parallel()
+
+	if got := resolveRuntimeDatabaseBackend(nil, false); got != cluster.DatabaseBackendSQLite {
+		t.Fatalf("non-cluster backend = %q, want sqlite", got)
+	}
+	postgresConfig := &cluster.Config{PGSQL: cluster.PGSQLConfig{Host: "postgres"}}
+	if got := resolveRuntimeDatabaseBackend(postgresConfig, true); got != cluster.DatabaseBackendPostgres {
+		t.Fatalf("cluster backend = %q, want postgres", got)
+	}
+}
+
 func TestExportOptionsForDir_UsesDefaultAuthDirWithoutOutputDir(t *testing.T) {
 	t.Parallel()
 
