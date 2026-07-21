@@ -1,6 +1,7 @@
 package quota
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -84,16 +85,25 @@ func (c *Collector) probeKimi(ctx context.Context, auth *coreauth.Auth) ([]clust
 	return windows, nil
 }
 
-func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *probeError) {
-	payload, _, errRequest := c.probeRequest(ctx, auth, http.MethodGet, c.options.XAIBillingURL, nil, nil)
+func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *cluster.QuotaPlan, *probeError) {
+	headers := http.Header{
+		"Accept":               []string{"*/*"},
+		"User-Agent":           []string{xaiGrokUserAgent},
+		xaiTokenAuthHeader:     []string{xaiTokenAuthValue},
+		xaiClientVersionHeader: []string{xaiClientVersionValue},
+	}
+	if userID := quotaMetadataString(auth.Metadata, "sub", "subject", "user_id", "userId"); userID != "" {
+		headers.Set("x-userid", userID)
+	}
+	payload, _, errRequest := c.probeRequest(ctx, auth, http.MethodGet, c.options.XAIBillingURL, nil, headers)
 	if errRequest != nil {
-		return nil, errRequest
+		return nil, nil, errRequest
 	}
-	windows, errParse := parseXAIUsageWindows(payload, c.options.Now().UTC())
+	windows, plan, errParse := parseXAIUsageWindows(payload, c.options.Now().UTC())
 	if errParse != nil || len(windows) == 0 {
-		return nil, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI billing response did not contain usable quota.", retryable: true}
+		return nil, nil, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI billing response did not contain usable quota.", retryable: true}
 	}
-	return windows, nil
+	return windows, plan, nil
 }
 
 func probeCollectionError(failure *probeError, occurredAt time.Time) *cluster.QuotaCollectionError {
@@ -258,6 +268,19 @@ type flexFloat struct {
 
 func (f *flexFloat) UnmarshalJSON(data []byte) error {
 	*f = flexFloat{}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var wrapped struct {
+			Val json.RawMessage `json:"val"`
+		}
+		if errDecode := json.Unmarshal(trimmed, &wrapped); errDecode != nil {
+			return nil
+		}
+		if len(wrapped.Val) == 0 {
+			return nil
+		}
+		data = wrapped.Val
+	}
 	raw, ok := flexibleNumberText(data)
 	if !ok {
 		return nil
@@ -367,13 +390,15 @@ func parseKimiUsageWindows(body []byte, observedAt time.Time) ([]cluster.QuotaWi
 	}
 	windows := make([]cluster.QuotaWindow, 0, len(payload.Limits)+1)
 	if window, ok := kimiSummaryWindow(payload.Usage, observedAt); ok {
+		// Keep the aggregate summary in detail responses without allowing it to
+		// displace provider-specific duration limits from primary_windows.
+		window.Priority = len(payload.Limits) + 1
 		windows = append(windows, window)
 	}
-	priorityOffset := len(windows)
 	for index, limit := range payload.Limits {
 		window, ok := kimiLimitWindow(limit, index, observedAt)
 		if ok {
-			window.Priority = priorityOffset + index
+			window.Priority = index
 			windows = append(windows, window)
 		}
 	}
@@ -429,35 +454,90 @@ func kimiSummaryWindow(input *kimiUsageDetail, observedAt time.Time) (cluster.Qu
 }
 
 type xaiBillingPayload struct {
-	Config *struct {
-		MonthlyLimit struct {
-			Val *float64 `json:"val"`
-		} `json:"monthlyLimit"`
-		Used struct {
-			Val *float64 `json:"val"`
-		} `json:"used"`
-		BillingPeriodEnd string `json:"billingPeriodEnd"`
-	} `json:"config"`
+	Config *xaiBillingConfig `json:"config"`
 }
 
-func parseXAIUsageWindows(body []byte, observedAt time.Time) ([]cluster.QuotaWindow, error) {
+type xaiBillingConfig struct {
+	MonthlyLimit      flexFloat `json:"monthlyLimit"`
+	MonthlyLimitSnake flexFloat `json:"monthly_limit"`
+	Used              flexFloat `json:"used"`
+	OnDemandCap       flexFloat `json:"onDemandCap"`
+	OnDemandCapSnake  flexFloat `json:"on_demand_cap"`
+	OnDemandUsed      flexFloat `json:"onDemandUsed"`
+	OnDemandUsedSnake flexFloat `json:"on_demand_used"`
+	BillingPeriodEnd  string    `json:"billingPeriodEnd"`
+	BillingEndSnake   string    `json:"billing_period_end"`
+}
+
+const (
+	xaiSuperGrokMonthlyLimitCents      = 15_000
+	xaiSuperGrokHeavyMonthlyLimitCents = 150_000
+)
+
+func xaiPlanFromMonthlyLimit(monthlyLimitCents *float64) *cluster.QuotaPlan {
+	if monthlyLimitCents == nil {
+		return nil
+	}
+	switch *monthlyLimitCents {
+	case xaiSuperGrokMonthlyLimitCents:
+		return &cluster.QuotaPlan{Name: "SuperGrok", Premium: false}
+	case xaiSuperGrokHeavyMonthlyLimitCents:
+		return &cluster.QuotaPlan{Name: "SuperGrok Heavy", Premium: true}
+	default:
+		return nil
+	}
+}
+
+func parseXAIUsageWindows(body []byte, observedAt time.Time) ([]cluster.QuotaWindow, *cluster.QuotaPlan, error) {
 	var payload xaiBillingPayload
 	if errDecode := json.Unmarshal(body, &payload); errDecode != nil {
-		return nil, fmt.Errorf("decode xai billing response: %w", errDecode)
+		return nil, nil, fmt.Errorf("decode xai billing response: %w", errDecode)
 	}
-	if payload.Config == nil || payload.Config.MonthlyLimit.Val == nil {
-		return nil, nil
+	if payload.Config == nil {
+		return nil, nil, nil
 	}
-	limit := math.Max(0, *payload.Config.MonthlyLimit.Val/100)
-	used := 0.0
-	if payload.Config.Used.Val != nil {
-		used = math.Max(0, *payload.Config.Used.Val/100)
+	config := payload.Config
+	monthlyLimitCents := firstFloat(flexFloatValue(config.MonthlyLimit), flexFloatValue(config.MonthlyLimitSnake))
+	usedCents := flexFloatValue(config.Used)
+	onDemandCapCents := firstFloat(flexFloatValue(config.OnDemandCap), flexFloatValue(config.OnDemandCapSnake))
+	onDemandUsedCents := firstFloat(flexFloatValue(config.OnDemandUsed), flexFloatValue(config.OnDemandUsedSnake))
+	billingPeriodEnd := firstNonEmptyString(config.BillingPeriodEnd, config.BillingEndSnake)
+
+	windows := make([]cluster.QuotaWindow, 0, 2)
+	if monthlyLimitCents != nil {
+		limit := math.Max(0, *monthlyLimitCents/100)
+		var used *float64
+		if usedCents != nil {
+			value := math.Min(limit, math.Max(0, *usedCents/100))
+			used = &value
+		}
+		window := cluster.QuotaWindow{ID: "xai-monthly-spend", Label: quotaStringPtr("Monthly Spend"), Scope: "account", Mode: "fixed", Status: "unknown", Unit: "currency", Currency: quotaStringPtr("USD"), Used: used, Limit: &limit, PeriodUnit: "month", PeriodValue: quotaFloatPtr(1), Source: "active_probe", ObservedAt: observedAt}
+		window.ResetAt = parseProviderTime(billingPeriodEnd)
+		normalizeWindowValues(&window)
+		windows = append(windows, window)
 	}
-	remaining := math.Max(0, limit-used)
-	window := cluster.QuotaWindow{ID: "xai-monthly-spend", Label: quotaStringPtr("Monthly Spend"), Scope: "account", Mode: "fixed", Status: "unknown", Unit: "currency", Currency: quotaStringPtr("USD"), Used: &used, Remaining: &remaining, Limit: &limit, PeriodUnit: "month", PeriodValue: quotaFloatPtr(1), Source: "active_probe", ObservedAt: observedAt}
-	window.ResetAt = parseProviderTime(payload.Config.BillingPeriodEnd)
-	normalizeWindowValues(&window)
-	return []cluster.QuotaWindow{window}, nil
+
+	if onDemandCapCents != nil && *onDemandCapCents > 0 {
+		limit := math.Max(0, *onDemandCapCents/100)
+		var used *float64
+		if onDemandUsedCents != nil {
+			value := math.Max(0, *onDemandUsedCents/100)
+			used = &value
+		} else if usedCents != nil && monthlyLimitCents != nil {
+			value := math.Max(0, (*usedCents-*monthlyLimitCents)/100)
+			used = &value
+		}
+		if used != nil {
+			value := math.Min(limit, *used)
+			used = &value
+		}
+		onDemandWindow := cluster.QuotaWindow{ID: "xai-on-demand", Label: quotaStringPtr("On-Demand"), Scope: "account", Mode: "balance", Status: "unknown", Unit: "currency", Currency: quotaStringPtr("USD"), Used: used, Limit: &limit, PeriodUnit: "month", PeriodValue: quotaFloatPtr(1), Source: "active_probe", ObservedAt: observedAt, Priority: 10}
+		onDemandWindow.ResetAt = parseProviderTime(billingPeriodEnd)
+		normalizeWindowValues(&onDemandWindow)
+		windows = append(windows, onDemandWindow)
+	}
+
+	return windows, xaiPlanFromMonthlyLimit(monthlyLimitCents), nil
 }
 
 func normalizedProviderRatio(value float64) float64 {

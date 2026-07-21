@@ -107,6 +107,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/capabilities` |
 | `GET` | `/quota/credentials` |
 | `GET` | `/quota/credentials/:credential_id` |
+| `POST` | `/quota/collect` |
 | `DELETE` | `/api-keys` |
 | `GET` | `/api-keys` |
 | `PATCH` | `/api-keys` |
@@ -2580,6 +2581,7 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 | `capabilities.usage` | boolean | 是否支持旧版 `GET /api-key-usage` 能力。 |
 | `capabilities.quota_snapshots` | boolean | 是否支持 DB-backed `GET /quota/credentials` 额度快照列表。 |
 | `capabilities.quota_snapshot_details` | boolean | 是否支持 `GET /quota/credentials/:credential_id`。 |
+| `capabilities.quota_recollect` | boolean | 是否支持 `POST /quota/collect` 按需额度采集。 |
 | `capabilities.usage_overview` | boolean | 是否支持 `GET /usage/overview`。 |
 | `capabilities.usage_records` | boolean | 是否支持 `GET /usage/records`。 |
 | `capabilities.usage_record_details` | boolean | 是否支持 `GET /usage/records/:id`。 |
@@ -2612,7 +2614,7 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 
 当前被动采集从 CPA usage 事件的 `response_headers` 中提取受限 `quota_headers`。Home 只保留 Codex `X-Codex-*` 额度 Header allowlist，以及通过语法校验且不具有 secret 特征的 upstream request ID，并在 usage payload 入库前删除 raw `response_headers`。入库前会按 active auth UUID、runtime index、ID 依次解析上报的 `auth_index`，快照始终使用稳定 UUID。Codex Header 观测与 usage record 在同一事务中归一化并 upsert；非法额度元数据会被隔离，不能回滚核心 usage 或 billing 写入。比 Home 接收时间超前五分钟以上的时间戳会归一化为接收时间。迟到事件不能覆盖更新快照，首次并发写入也遵守该规则。更新的 Header 观测会使正在运行的主动探测租约失效；部分 Header 更新只保留仍有效的旧窗口，已过期窗口不会参与新快照状态汇总。
 
-Home 同时为 Claude、Antigravity、Codex、Kimi、xAI 的 OAuth/file credential 运行固定目标主动 collector。Codex 读取官方 usage endpoint；Claude 查询 usage 和 profile，额度成功但 profile 元数据失败时返回 `partial`；Antigravity 携带 credential `project_id` 按固定候选端点顺序尝试；Kimi 查询 coding usage，保留账号 usage 汇总和每个 limit 窗口，并兼容数字或字符串形式的数值字段；xAI 查询 billing，并把 Provider cents 转成显式 USD currency 数值。无法使用这些 OAuth collector 的 Provider API-key credential 返回 `unsupported`。
+Home 同时为 Claude、Antigravity、Codex、Kimi、xAI 的 OAuth/file credential 运行固定目标主动 collector。Codex 读取官方 usage endpoint；Claude 查询 usage 和 profile，额度成功但 profile 元数据失败时返回 `partial`；Antigravity 携带 credential `project_id` 按固定候选端点顺序尝试；Kimi 查询 coding usage，保留账号 usage 汇总和每个 limit 窗口，并兼容数字或字符串形式的数值字段。Kimi 的 Provider limit 优先进入 `primary_windows`，避免聚合 summary 挤掉周限额或 duration 限额。xAI 使用 Grok CLI token-auth、client-version、user-agent 及可选 user-ID Header 请求 billing endpoint；支持 camelCase/snake_case 字段，以及 `{ "val": ... }`、数字或字符串 cents。`monthlyLimit=15000` 推导为 SuperGrok，`monthlyLimit=150000` 推导为 SuperGrok Heavy；正数 `onDemandCap` 配合显式或推导出的 `onDemandUsed` 生成 `xai-on-demand` 月度 USD 窗口，cap 缺失或为 0 表示未启用按量付费，不输出该窗口。无法使用这些 OAuth collector 的 Provider API-key credential 返回 `unsupported`。
 
 collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新解析最新 DB 凭证，并在 runtime 刷新策略判定到期时刷新 OAuth 状态；全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及 retry deadline 仍在未来的凭证不会被主动探测；deadline 过期后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
 
@@ -2639,6 +2641,7 @@ collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新
 | `window_count` | integer | 全部当前窗口数。 |
 | `error` | object/null | 已脱敏采集错误，message 最多 500 bytes。 |
 | `runtime` | object/null | Home 和 CPA 归属元数据。 |
+| `plan` | object/null | collector 推导的 Provider 订阅套餐元数据(如 xAI 月度 billing limit)。形状:`{"name": "SuperGrok", "premium": false}`。权威主动探测成功后，如果当前 payload 不再映射到套餐，会清除旧值。 |
 
 额度窗口包含稳定 `id`、可选 `label/scope_id/currency`、`scope`、`mode`、窗口 `status`、显式 `unit`、可空 `used/remaining/limit`、`[0,1]` 比例、`is_unlimited`、可空 `reset_at/window_seconds`、结构化 `period_unit/period_value`、`source` 和实际 `observed_at`。`period_unit` 可为 `minute`、`hour`、`day`、`week`、`month` 或 `unknown`；已知周期的 `period_value` 必须为正数，`unknown` 时为 `null`。
 
@@ -2651,6 +2654,7 @@ collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新
 | `limit` | integer | `50` | 1 到 200。 |
 | `offset` | integer | `0` | 非负偏移。 |
 | `search` | string | 无 | 对 label、account、project、auth index 和 provider 做不区分大小写包含匹配。 |
+| `ids` | string/CSV | 无 | 一个或多个大小写敏感的精确 credential ID，用于直接批量 join。带 IDs 的读取只加载目标凭证的 quota windows，`global_summary` 仍保持全局未筛选语义。 |
 | `provider` | string/CSV | 无 | 一个或多个 Provider。 |
 | `quota_status` | string/CSV | 无 | 一个或多个额度状态。 |
 | `freshness` | string/CSV | 无 | `fresh`、`stale`、`never`。 |
@@ -2738,6 +2742,29 @@ collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新
   "generated_at": "2026-07-16T01:01:00Z"
 }
 ```
+
+### POST `/quota/collect`
+
+启动一轮异步按需额度采集，返回进入本地 collector 队列的凭证数量。这是唯一非只读的额度端点。按需任务与定时采集共享进程级 Provider 并发限制；同一凭证在本地排队或执行期间会去重。
+
+请求体(所有字段可选;空 body 采集全部符合条件的凭证):
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `credential_ids` | string array | 仅采集这些 credential ID。 |
+| `providers` | string array | 仅采集这些 provider：`claude`、`antigravity`、`codex`、`kimi`、`xai`；`grok` 作为 `xai` alias 接受。其他值返回 `400`。两个过滤条件按 AND 语义组合。 |
+
+响应 `202`:
+
+```json
+{
+  "accepted": 2,
+  "running": true
+}
+```
+
+`accepted` 统计本次新进入队列的符合条件凭证数。disabled、执行 cooldown、collector 不支持，以及已在本地排队/执行的凭证会跳过。任务取得并发槽后会强制申请 DB probe lease：已有未过期 lease 仍优先，但 snapshot freshness、`next_probe_at` 和额度 retry backoff 不会阻止这次人工请求。采集在后台运行；完成后通过 `GET /quota/credentials` 读取更新快照。运行时未接入 quota collector 时，该路由返回 `404`（`QUOTA_RECOLLECT_UNSUPPORTED`），且 `capabilities.quota_recollect` 为 `false`。
+
 
 非法筛选、排序或分页返回 `400`，错误体为 `{"error":{"code":"INVALID_FILTER","message":"...","request_id":"","retryable":false}}`；凭证不存在返回 `404`；临时数据库/上下文不可用返回 `503`，其他数据库读取失败返回 `500`。
 

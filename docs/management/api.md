@@ -107,6 +107,7 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/capabilities` |
 | `GET` | `/quota/credentials` |
 | `GET` | `/quota/credentials/:credential_id` |
+| `POST` | `/quota/collect` |
 | `DELETE` | `/api-keys` |
 | `GET` | `/api-keys` |
 | `PATCH` | `/api-keys` |
@@ -2580,6 +2581,7 @@ Response fields:
 | `capabilities.usage` | boolean | Whether the legacy `GET /api-key-usage` capability is available. |
 | `capabilities.quota_snapshots` | boolean | Whether the DB-backed `GET /quota/credentials` snapshot list is available. |
 | `capabilities.quota_snapshot_details` | boolean | Whether `GET /quota/credentials/:credential_id` is available. |
+| `capabilities.quota_recollect` | boolean | Whether `POST /quota/collect` on-demand collection is available. |
 | `capabilities.usage_overview` | boolean | Whether `GET /usage/overview` is available. |
 | `capabilities.usage_records` | boolean | Whether `GET /usage/records` is available. |
 | `capabilities.usage_record_details` | boolean | Whether `GET /usage/records/:id` is available. |
@@ -2612,7 +2614,7 @@ All timestamps are RFC3339 UTC values or `null`. Ratios are numbers in `[0,1]`. 
 
 Current passive collection extracts a bounded `quota_headers` object from the CPA usage event `response_headers`. Home preserves only the Codex `X-Codex-*` quota allowlist plus a syntax-validated, non-secret-like upstream request ID, and removes the raw `response_headers` object before writing the usage payload. The reported `auth_index` is resolved against the active auth UUID, runtime index, and ID before the snapshot is stored under the stable UUID. Codex Header observations are normalized and upserted in the same database transaction as the usage record; invalid quota metadata is isolated so it cannot roll back the core usage or billing write. Timestamps more than five minutes ahead of Home's receive time are normalized to the receive time. Older observations cannot replace a newer snapshot or window, including concurrent first writes. A newer Header observation invalidates an in-flight active-probe lease. Partial Header updates retain only still-valid older windows; expired windows cannot make a new snapshot appear healthy or exhausted.
 
-Home also runs fixed-target active collectors for Claude, Antigravity, Codex, Kimi, and xAI OAuth/file credentials. Codex reads the official usage endpoint; Claude reads usage and profile, reporting `partial` when quota succeeds but profile metadata fails; Antigravity tries its fixed backend candidates with the credential `project_id`; Kimi reads coding usage and preserves both the account usage summary and each returned limit window while accepting numeric fields encoded as numbers or strings; xAI reads billing and converts provider cents into explicit USD currency values. Provider API-key credentials that cannot use these OAuth collectors are returned as `unsupported`.
+Home also runs fixed-target active collectors for Claude, Antigravity, Codex, Kimi, and xAI OAuth/file credentials. Codex reads the official usage endpoint; Claude reads usage and profile, reporting `partial` when quota succeeds but profile metadata fails; Antigravity tries its fixed backend candidates with the credential `project_id`; Kimi reads coding usage and preserves both the account usage summary and each returned limit window while accepting numeric fields encoded as numbers or strings. Kimi provider limits take primary-window priority over its aggregate summary so weekly and duration limits remain visible in list views. xAI calls the Grok CLI billing endpoint with the CLI token-auth, client-version, user-agent, and optional user-ID headers. It accepts camelCase or snake_case billing fields and `{ "val": ... }`, numeric, or string cent values. `monthlyLimit=15000` maps to SuperGrok and `monthlyLimit=150000` maps to SuperGrok Heavy. Positive `onDemandCap` plus explicit or derived `onDemandUsed` values produce the `xai-on-demand` monthly USD window; a missing or zero cap means pay-as-you-go is disabled and no such window is emitted. Provider API-key credentials that cannot use these OAuth collectors are returned as `unsupported`.
 
 Collectors read DB credentials directly and never accept a URL from HMC. Before probing, they resolve the latest DB credential and refresh OAuth state when the runtime refresh policy says it is due. They use the current hot-reloaded global proxy unless the credential has its own proxy. They use a 20-second request timeout, a per-provider concurrency limit of 3 on PostgreSQL and a global limit of 1 on SQLite, a per-credential DB lease, and a five-minute exponential retry backoff with per-credential jitter capped near one hour. `Retry-After` can extend the next attempt. Disabled credentials and credentials whose retry deadline is still in the future are not actively probed; persisted unavailable/error state no longer blocks recovery after that deadline. Successful snapshots are fresh for 30 minutes. Failures preserve last-known windows and store only structured, redacted error metadata.
 
@@ -2639,6 +2641,7 @@ Credential fields:
 | `window_count` | integer | Number of all current windows. |
 | `error` | object/null | Redacted collection error. Messages are capped at 500 bytes. |
 | `runtime` | object/null | Home and CPA ownership metadata. |
+| `plan` | object/null | Provider subscription plan metadata derived by the collector (for example xAI monthly billing limits). Shape: `{"name": "SuperGrok", "premium": false}`. A successful authoritative probe clears an older plan when the current payload no longer maps to one. |
 
 Quota window fields:
 
@@ -2668,6 +2671,7 @@ Returns filtered, paginated current credential snapshots.
 | `limit` | integer | `50` | Page size from 1 to 200. |
 | `offset` | integer | `0` | Non-negative result offset. |
 | `search` | string | none | Case-insensitive contains match over label, account, project, auth index, and provider. |
+| `ids` | string/CSV | none | One or more exact, case-sensitive credential IDs for direct batch joins. ID-filtered reads load quota windows only for the requested credentials while `global_summary` remains unfiltered. |
 | `provider` | string/CSV | none | One or more provider IDs. |
 | `quota_status` | string/CSV | none | One or more quota statuses. |
 | `freshness` | string/CSV | none | `fresh`, `stale`, or `never`. |
@@ -2755,6 +2759,29 @@ Returns the same credential core object, every current window in stable order, c
   "generated_at": "2026-07-16T01:01:00Z"
 }
 ```
+
+### POST `/quota/collect`
+
+Starts an asynchronous on-demand quota collection round and returns how many credentials were accepted into the local collector queue. This is the only quota endpoint that is not read-only. On-demand jobs share the same process-wide provider concurrency controls as scheduled collection and are deduplicated per credential while queued or running.
+
+Request body (all fields optional; an empty body collects every eligible credential):
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `credential_ids` | string array | Only these credential IDs are collected. |
+| `providers` | string array | Only these providers are collected: `claude`, `antigravity`, `codex`, `kimi`, `xai`; `grok` is accepted as an alias for `xai`. Other values return `400`. Both filters combine with AND semantics. |
+
+Response `202`:
+
+```json
+{
+  "accepted": 2,
+  "running": true
+}
+```
+
+`accepted` counts eligible credentials newly queued by this request. Disabled, execution-cooldown, collector-unsupported, and already queued/running local credentials are skipped. When a queued job reaches a concurrency slot it force-claims the DB probe lease: an active lease is still respected, but snapshot freshness, `next_probe_at`, and quota retry backoff do not suppress the requested attempt. The collection round runs in the background; read updated snapshots through `GET /quota/credentials` after it finishes. When the runtime has no quota collector wired, the route returns `404` with `QUOTA_RECOLLECT_UNSUPPORTED` and `capabilities.quota_recollect` is `false`.
+
 
 Quota endpoint validation errors use:
 

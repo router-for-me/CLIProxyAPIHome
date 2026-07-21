@@ -395,6 +395,7 @@ func run() int {
 			NodePort:         clusterAdvertisedPort,
 			HeartbeatTimeout: nodeCfg.HeartbeatTimeout,
 			ForwardTLSConfig: clusterTLSConfig,
+			QuotaRecollect:   quotaCollector,
 		}))
 	}
 	mgmtBuild, errMgmt := managementhttp.Build(cfgPath, mgmtOpts...)

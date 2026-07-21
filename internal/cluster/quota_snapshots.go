@@ -58,6 +58,8 @@ type QuotaSnapshotRecord struct {
 	HomeLabel           string     `gorm:"column:home_label;size:256"`
 	CPANodeID           string     `gorm:"column:cpa_node_id;size:256"`
 	CPANodeLabel        string     `gorm:"column:cpa_node_label;size:256"`
+	PlanName            string     `gorm:"column:plan_name;size:64"`
+	PlanPremium         *bool      `gorm:"column:plan_premium"`
 	ProbeLeaseOwner     string     `gorm:"column:probe_lease_owner;size:256"`
 	ProbeLeaseExpiresAt *time.Time `gorm:"column:probe_lease_expires_at;index"`
 	ParserVersion       int        `gorm:"column:parser_version;not null;default:1"`
@@ -139,6 +141,13 @@ type QuotaRuntime struct {
 	CPANodeLabel string `json:"cpa_node_label"`
 }
 
+// QuotaPlan carries subscription plan metadata derived from a provider's quota
+// response (for example xAI SuperGrok / SuperGrok Heavy).
+type QuotaPlan struct {
+	Name    string `json:"name"`
+	Premium bool   `json:"premium"`
+}
+
 type QuotaCredentialSnapshot struct {
 	CredentialID       string                `json:"credential_id"`
 	AuthIndex          *string               `json:"auth_index"`
@@ -163,6 +172,7 @@ type QuotaCredentialSnapshot struct {
 	WindowCount        int                   `json:"window_count"`
 	Error              *QuotaCollectionError `json:"error"`
 	Runtime            *QuotaRuntime         `json:"runtime"`
+	Plan               *QuotaPlan            `json:"plan,omitempty"`
 	Windows            []QuotaWindow         `json:"-"`
 }
 
@@ -180,6 +190,8 @@ type QuotaSnapshotWrite struct {
 	ConsecutiveFailure    int
 	Error                 *QuotaCollectionError
 	Runtime               *QuotaRuntime
+	Plan                  *QuotaPlan
+	ReplacePlan           bool
 	ParserVersion         int
 	CollectorVersion      int
 	ExpectedProbeOwner    string
@@ -192,6 +204,7 @@ type QuotaListQuery struct {
 	Limit              int
 	Offset             int
 	Search             string
+	IDs                map[string]struct{}
 	Providers          map[string]struct{}
 	QuotaStatuses      map[string]struct{}
 	Freshness          map[string]struct{}
@@ -286,6 +299,10 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			}
 			if record.CPANodeLabel == "" {
 				record.CPANodeLabel = existing.CPANodeLabel
+			}
+			if input.Plan == nil && !input.ReplacePlan {
+				record.PlanName = existing.PlanName
+				record.PlanPremium = existing.PlanPremium
 			}
 			if !input.ClearProbeLease {
 				record.ProbeLeaseOwner = existing.ProbeLeaseOwner
@@ -448,15 +465,21 @@ func quotaWindowRecordAggregateSource(windows []QuotaWindowRecord) string {
 }
 
 func (r *Repository) ClaimQuotaProbe(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration) (bool, error) {
-	return r.claimQuotaProbe(ctx, credentialID, owner, now, leaseDuration, false)
+	return r.claimQuotaProbe(ctx, credentialID, owner, now, leaseDuration, false, false)
 }
 
 // ClaimEligibleQuotaProbe claims a lease only while the current DB credential remains eligible.
 func (r *Repository) ClaimEligibleQuotaProbe(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration) (bool, error) {
-	return r.claimQuotaProbe(ctx, credentialID, owner, now, leaseDuration, true)
+	return r.claimQuotaProbe(ctx, credentialID, owner, now, leaseDuration, true, false)
 }
 
-func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration, requireEligible bool) (bool, error) {
+// ForceClaimEligibleQuotaProbe claims an eligible credential while ignoring its
+// snapshot freshness and retry schedule. An unexpired probe lease still wins.
+func (r *Repository) ForceClaimEligibleQuotaProbe(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration) (bool, error) {
+	return r.claimQuotaProbe(ctx, credentialID, owner, now, leaseDuration, true, true)
+}
+
+func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, owner string, now time.Time, leaseDuration time.Duration, requireEligible bool, force bool) (bool, error) {
 	credentialID = strings.TrimSpace(credentialID)
 	owner = strings.TrimSpace(owner)
 	if credentialID == "" || owner == "" {
@@ -505,7 +528,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 				return nil
 			}
 			observationInFuture = record.ObservedAt != nil && record.ObservedAt.After(now.Add(quotaMaxFutureObservationSkew))
-			if !observationInFuture {
+			if !force && !observationInFuture {
 				if record.NextProbeAt != nil && record.NextProbeAt.After(now) {
 					return nil
 				}
@@ -604,12 +627,19 @@ func (r *Repository) FailQuotaProbeAt(ctx context.Context, credentialID string, 
 }
 
 func (r *Repository) ListQuotaCredentials(ctx context.Context, query QuotaListQuery) (QuotaListResult, error) {
-	all, errList := r.loadQuotaCredentials(ctx, query.Now)
+	all, errList := r.loadQuotaCredentials(ctx, query.Now, nil, len(query.IDs) == 0)
 	if errList != nil {
 		return QuotaListResult{}, errList
 	}
-	filtered := make([]QuotaCredentialSnapshot, 0, len(all))
-	for _, item := range all {
+	candidates := all
+	if len(query.IDs) > 0 {
+		candidates, errList = r.loadQuotaCredentials(ctx, query.Now, query.IDs, true)
+		if errList != nil {
+			return QuotaListResult{}, errList
+		}
+	}
+	filtered := make([]QuotaCredentialSnapshot, 0, len(candidates))
+	for _, item := range candidates {
 		if quotaCredentialMatches(item, query) {
 			filtered = append(filtered, item)
 		}
@@ -679,7 +709,7 @@ func (r *Repository) GetQuotaCredential(ctx context.Context, credentialID string
 	return &item, nil
 }
 
-func (r *Repository) loadQuotaCredentials(ctx context.Context, now time.Time) ([]QuotaCredentialSnapshot, error) {
+func (r *Repository) loadQuotaCredentials(ctx context.Context, now time.Time, ids map[string]struct{}, includeWindows bool) ([]QuotaCredentialSnapshot, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
@@ -690,17 +720,32 @@ func (r *Repository) loadQuotaCredentials(ctx context.Context, now time.Time) ([
 		now = now.UTC()
 	}
 	ctx = contextOrBackground(ctx)
+	idValues := quotaExactSetValues(ids)
 	var authRecords []AuthRecord
-	if errFind := db.WithContext(ctx).Order("uuid ASC").Find(&authRecords).Error; errFind != nil {
+	authQuery := db.WithContext(ctx).Order("uuid ASC")
+	if len(idValues) > 0 {
+		authQuery = authQuery.Where("uuid IN ?", idValues)
+	}
+	if errFind := authQuery.Find(&authRecords).Error; errFind != nil {
 		return nil, errFind
 	}
 	var snapshots []QuotaSnapshotRecord
-	if errFind := db.WithContext(ctx).Find(&snapshots).Error; errFind != nil {
+	snapshotQuery := db.WithContext(ctx)
+	if len(idValues) > 0 {
+		snapshotQuery = snapshotQuery.Where("credential_id IN ?", idValues)
+	}
+	if errFind := snapshotQuery.Find(&snapshots).Error; errFind != nil {
 		return nil, errFind
 	}
 	var windowRecords []QuotaWindowRecord
-	if errFind := db.WithContext(ctx).Order("credential_id ASC, priority ASC, window_id ASC").Find(&windowRecords).Error; errFind != nil {
-		return nil, errFind
+	if includeWindows {
+		windowQuery := db.WithContext(ctx).Order("credential_id ASC, priority ASC, window_id ASC")
+		if len(idValues) > 0 {
+			windowQuery = windowQuery.Where("credential_id IN ?", idValues)
+		}
+		if errFind := windowQuery.Find(&windowRecords).Error; errFind != nil {
+			return nil, errFind
+		}
 	}
 	snapshotByCredential := make(map[string]QuotaSnapshotRecord, len(snapshots))
 	for _, snapshot := range snapshots {
@@ -812,6 +857,9 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 	item.Error = quotaCollectionErrorFromRecord(snapshot)
 	if snapshot.HomeID != "" || snapshot.CPANodeID != "" || snapshot.HomeLabel != "" || snapshot.CPANodeLabel != "" {
 		item.Runtime = &QuotaRuntime{HomeID: snapshot.HomeID, HomeLabel: snapshot.HomeLabel, CPANodeID: snapshot.CPANodeID, CPANodeLabel: snapshot.CPANodeLabel}
+	}
+	if snapshot.PlanName != "" {
+		item.Plan = &QuotaPlan{Name: snapshot.PlanName, Premium: snapshot.PlanPremium != nil && *snapshot.PlanPremium}
 	}
 	item.PrimaryWindows = quotaPrimaryWindows(displayWindows)
 	return item
@@ -979,6 +1027,11 @@ func quotaSnapshotRecordFromWrite(input QuotaSnapshotWrite) QuotaSnapshotRecord 
 		record.CPANodeID = quotaBoundedText(input.Runtime.CPANodeID, quotaWindowTextMaxLength)
 		record.CPANodeLabel = quotaBoundedText(input.Runtime.CPANodeLabel, quotaWindowTextMaxLength)
 	}
+	if input.Plan != nil {
+		record.PlanName = quotaBoundedText(input.Plan.Name, 64)
+		premium := input.Plan.Premium
+		record.PlanPremium = &premium
+	}
 	if input.Error != nil {
 		record.ErrorCode = strings.TrimSpace(input.Error.Code)
 		record.ErrorMessage = quotaSafeErrorMessage(input.Error.Message)
@@ -1017,7 +1070,7 @@ func quotaWindowDTO(record QuotaWindowRecord) QuotaWindow {
 }
 
 func quotaCredentialMatches(item QuotaCredentialSnapshot, query QuotaListQuery) bool {
-	if !quotaSetMatches(query.Providers, item.Provider) || !quotaSetMatches(query.QuotaStatuses, item.QuotaStatus) ||
+	if !quotaExactSetMatches(query.IDs, item.CredentialID) || !quotaSetMatches(query.Providers, item.Provider) || !quotaSetMatches(query.QuotaStatuses, item.QuotaStatus) ||
 		!quotaSetMatches(query.Freshness, item.Freshness) || !quotaSetMatches(query.Sources, quotaSourceValue(item.Source)) ||
 		!quotaSetMatches(query.CredentialStatuses, item.CredentialStatus) || !quotaSetMatches(query.CollectionStatuses, item.CollectionStatus) {
 		return false
@@ -1322,6 +1375,25 @@ func quotaSetMatches(values map[string]struct{}, value string) bool {
 	}
 	_, ok := values[strings.ToLower(strings.TrimSpace(value))]
 	return ok
+}
+
+func quotaExactSetMatches(values map[string]struct{}, value string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	_, ok := values[strings.TrimSpace(value)]
+	return ok
+}
+
+func quotaExactSetValues(values map[string]struct{}) []string {
+	items := make([]string, 0, len(values))
+	for value := range values {
+		if normalized := strings.TrimSpace(value); normalized != "" {
+			items = append(items, normalized)
+		}
+	}
+	sort.Strings(items)
+	return items
 }
 func quotaAllowed(value string, allowed ...string) bool {
 	value = strings.TrimSpace(value)
