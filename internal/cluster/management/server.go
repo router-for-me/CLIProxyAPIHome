@@ -25,6 +25,7 @@ type Handler struct {
 	pluginStoreHTTPClient pluginstore.HTTPDoer
 	modelsDevHTTPClient   *http.Client
 	pluginStoreAuth       *pluginauth.Service
+	quotaRecollect        QuotaRecollectTrigger
 }
 
 // NewHandler creates a new handler.

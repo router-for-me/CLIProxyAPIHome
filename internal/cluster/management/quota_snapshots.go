@@ -94,6 +94,7 @@ func parseQuotaListQuery(c *gin.Context) (cluster.QuotaListQuery, *quotaHTTPErro
 		query.Offset = offset
 	}
 	query.Search = strings.TrimSpace(c.Query("search"))
+	query.IDs = quotaExactCSVSet(c.Query("ids"))
 	query.Providers = quotaCSVSet(c.Query("provider"))
 	var errFilter *quotaHTTPError
 	if query.QuotaStatuses, errFilter = quotaEnumCSVSet(c.Query("quota_status"), "quota_status", "healthy", "low", "exhausted", "unknown", "error", "unsupported"); errFilter != nil {
@@ -118,6 +119,20 @@ func parseQuotaListQuery(c *gin.Context) (cluster.QuotaListQuery, *quotaHTTPErro
 		query.Sort = rawSort
 	}
 	return query, nil
+}
+
+func quotaExactCSVSet(raw string) map[string]struct{} {
+	values := make(map[string]struct{})
+	for _, candidate := range strings.Split(raw, ",") {
+		value := strings.TrimSpace(candidate)
+		if value != "" {
+			values[value] = struct{}{}
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 func quotaCSVSet(raw string) map[string]struct{} {

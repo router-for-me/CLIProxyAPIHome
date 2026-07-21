@@ -272,6 +272,33 @@ func TestClaimQuotaProbeUsesExpiringLease(t *testing.T) {
 	}
 }
 
+func TestForceClaimEligibleQuotaProbeBypassesFreshnessButNotLease(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	now := time.Date(2026, 7, 16, 6, 30, 0, 0, time.UTC)
+	seedQuotaSnapshotAuth(t, repo, "force-fresh-auth", "codex", "Force Fresh", map[string]any{"type": "codex"})
+	expiresAt := now.Add(30 * time.Minute)
+	if _, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "force-fresh-auth", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &now, ExpiresAt: &expiresAt, NextProbeAt: &expiresAt, LastSuccessAt: &now,
+	}); errSeed != nil {
+		t.Fatalf("UpsertQuotaSnapshot() error = %v", errSeed)
+	}
+	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "force-fresh-auth", "home-a", now, time.Minute)
+	if errClaim != nil || claimed {
+		t.Fatalf("normal fresh claim = %v, %v, want false, nil", claimed, errClaim)
+	}
+	claimed, errClaim = repo.ForceClaimEligibleQuotaProbe(ctx, "force-fresh-auth", "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("forced fresh claim = %v, %v, want true, nil", claimed, errClaim)
+	}
+	claimed, errClaim = repo.ForceClaimEligibleQuotaProbe(ctx, "force-fresh-auth", "home-b", now.Add(30*time.Second), time.Minute)
+	if errClaim != nil || claimed {
+		t.Fatalf("forced leased claim = %v, %v, want false, nil", claimed, errClaim)
+	}
+}
+
 func TestQuotaProbeCompletionRequiresCurrentLeaseOwner(t *testing.T) {
 	ctx := context.Background()
 	repo, closeRepo := newBillingTestRepository(t, ctx)

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,14 +176,24 @@ func TestCollectorSupportsClaudeAntigravityKimiAndXAI(t *testing.T) {
 		{id: "claude-probe", provider: "claude", status: "healthy", windows: 3},
 		{id: "antigravity-probe", provider: "antigravity", status: "healthy", windows: 1},
 		{id: "kimi-probe", provider: "kimi", status: "healthy", windows: 2, assert: func(t *testing.T, item *cluster.QuotaCredentialSnapshot) {
-			summary := item.Windows[0]
+			var summary, limit *cluster.QuotaWindow
+			for index := range item.Windows {
+				switch item.Windows[index].ID {
+				case "kimi-usage":
+					summary = &item.Windows[index]
+				case "kimi-limit-1":
+					limit = &item.Windows[index]
+				}
+			}
+			if summary == nil || limit == nil {
+				t.Fatalf("missing Kimi windows: %+v", item.Windows)
+			}
 			if summary.ID != "kimi-usage" || summary.Used == nil || *summary.Used != 44 || summary.Limit == nil || *summary.Limit != 100 || summary.Remaining == nil || *summary.Remaining != 56 {
 				t.Fatalf("unexpected kimi summary window: %+v", summary)
 			}
 			if summary.ResetAt == nil || !summary.ResetAt.Equal(time.Date(2026, 7, 21, 13, 9, 11, 0, time.UTC)) {
 				t.Fatalf("unexpected kimi summary reset time: %+v", summary.ResetAt)
 			}
-			limit := item.Windows[1]
 			if limit.ID != "kimi-limit-1" || limit.Used == nil || *limit.Used != 10 || limit.Limit == nil || *limit.Limit != 100 || limit.Remaining == nil || *limit.Remaining != 90 {
 				t.Fatalf("unexpected kimi limit window: %+v", limit)
 			}
@@ -377,7 +388,7 @@ func TestCollectorSkipsStaleCandidateWhenDBCredentialBecameAPIKey(t *testing.T) 
 			return current, errGet
 		},
 	})
-	collector.collectCredential(context.Background(), candidate)
+	collector.collectCredential(context.Background(), candidate, false)
 	if resolved.Load() != 0 {
 		t.Fatalf("ResolveAuth calls = %d, want 0", resolved.Load())
 	}
@@ -502,7 +513,7 @@ func TestCollectorProbeTimeoutBecomesRetryableFailure(t *testing.T) {
 	}
 }
 
-func TestCollectorEnforcesProviderConcurrencyLimit(t *testing.T) {
+func TestCollectorEnforcesSQLiteSingleWriter(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 16, 11, 0, 0, 0, time.UTC)
 	for index := 0; index < 4; index++ {
@@ -510,6 +521,9 @@ func TestCollectorEnforcesProviderConcurrencyLimit(t *testing.T) {
 	}
 
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseProbes := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseProbes()
 	started := make(chan struct{}, 4)
 	var current atomic.Int32
 	var maximum atomic.Int32
@@ -542,26 +556,24 @@ func TestCollectorEnforcesProviderConcurrencyLimit(t *testing.T) {
 		close(done)
 	}()
 
-	for index := 0; index < 2; index++ {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			t.Fatal("collector did not start the expected concurrent probes")
-		}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("collector did not start a probe")
 	}
 	select {
 	case <-started:
 		t.Fatal("collector exceeded the configured concurrency limit before a slot was released")
 	case <-time.After(50 * time.Millisecond):
 	}
-	close(release)
+	releaseProbes()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("collector did not complete after releasing probe slots")
 	}
-	if maximum.Load() != 2 {
-		t.Fatalf("maximum concurrent probes = %d, want 2", maximum.Load())
+	if maximum.Load() != 1 {
+		t.Fatalf("maximum concurrent probes = %d, want 1", maximum.Load())
 	}
 }
 
