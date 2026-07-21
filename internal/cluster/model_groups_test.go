@@ -8,6 +8,9 @@ import (
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"gorm.io/gorm"
 )
 
@@ -219,6 +222,78 @@ func TestAllowedDispatchIDsForAPIKeyModelIntersectsModelChannels(t *testing.T) {
 	}
 	if authIDs == nil || len(authIDs) != 0 {
 		t.Fatalf("disabled model channel auth IDs = %#v, want non-nil empty list", authIDs)
+	}
+}
+
+func TestRuntimeAdapterEnforcesModelChannelBindingsInHomeDispatch(t *testing.T) {
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+
+	modelID := "adapter-model"
+	auths := []*coreauth.Auth{
+		{ID: "adapter-auth-wide", Index: "adapter-auth-wide", Provider: "codex", Status: coreauth.StatusActive},
+		{ID: "adapter-auth-subset", Index: "adapter-auth-subset", Provider: "codex", Status: coreauth.StatusActive},
+	}
+	for _, auth := range auths {
+		if _, errUpsert := repo.UpsertAuth(ctx, auth, "test"); errUpsert != nil {
+			t.Fatalf("UpsertAuth(%s) error = %v", auth.ID, errUpsert)
+		}
+	}
+
+	allChannel, errAllChannel := repo.CreateChannelGroup(ctx, "adapter-all", false)
+	if errAllChannel != nil {
+		t.Fatalf("CreateChannelGroup(all) error = %v", errAllChannel)
+	}
+	subsetChannel, errSubsetChannel := repo.CreateChannelGroup(ctx, "adapter-subset", false)
+	if errSubsetChannel != nil {
+		t.Fatalf("CreateChannelGroup(subset) error = %v", errSubsetChannel)
+	}
+	for _, auth := range auths {
+		if _, errDetail := repo.CreateChannelGroupDetail(ctx, allChannel.ID, auth.ID); errDetail != nil {
+			t.Fatalf("CreateChannelGroupDetail(all, %s) error = %v", auth.ID, errDetail)
+		}
+	}
+	if _, errDetail := repo.CreateChannelGroupDetail(ctx, subsetChannel.ID, auths[1].ID); errDetail != nil {
+		t.Fatalf("CreateChannelGroupDetail(subset) error = %v", errDetail)
+	}
+
+	modelGroup, errModelGroup := repo.CreateModelGroup(ctx, "adapter-models", false)
+	if errModelGroup != nil {
+		t.Fatalf("CreateModelGroup() error = %v", errModelGroup)
+	}
+	if _, errDetail := repo.CreateModelGroupDetail(ctx, modelGroup.ID, modelID, []uint{subsetChannel.ID}); errDetail != nil {
+		t.Fatalf("CreateModelGroupDetail() error = %v", errDetail)
+	}
+	clientKey := "adapter-client-key"
+	keyChannels := []uint{allChannel.ID}
+	keyModelGroups := []uint{modelGroup.ID}
+	if _, errKey := repo.CreateAPIKey(ctx, APIKeyEntryUpdate{APIKey: clientKey, Channels: &keyChannels, ModelGroups: &keyModelGroups}); errKey != nil {
+		t.Fatalf("CreateAPIKey() error = %v", errKey)
+	}
+
+	runtime, errRuntime := home.NewRuntime(&config.Config{})
+	if errRuntime != nil {
+		t.Fatalf("home.NewRuntime() error = %v", errRuntime)
+	}
+	runtime.SetClusterAdapter(NewRuntimeAdapter(repo, ""))
+	t.Cleanup(runtime.Stop)
+	for _, auth := range auths {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: modelID, Object: "model", Type: "openai"}})
+		if _, errRegister := runtime.CoreManager().Register(coreauth.WithSkipPersist(ctx), auth.Clone()); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+		authID := auth.ID
+		t.Cleanup(func() {
+			registry.GetGlobalRegistry().UnregisterClient(authID)
+		})
+	}
+
+	result, errDispatch := runtime.DispatchForAPIKey(ctx, modelID, nil, clientKey)
+	if errDispatch != nil {
+		t.Fatalf("DispatchForAPIKey() error = %v", errDispatch)
+	}
+	if result == nil || result.AuthID != auths[1].ID {
+		t.Fatalf("DispatchForAPIKey() result = %#v, want auth %q", result, auths[1].ID)
 	}
 }
 
