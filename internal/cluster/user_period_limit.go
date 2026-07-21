@@ -47,9 +47,27 @@ const (
 
 // OptionalFloatUpdate captures a three-state float patch: absent / null / value.
 
+// Stable machine-readable codes for period-limit validation failures. The
+// Management API surfaces them in field_errors so clients can localize and
+// anchor errors without parsing message strings.
+const (
+	PeriodLimitErrInvalidLimit         = "invalid_limit"
+	PeriodLimitErrInvalidWindowMode    = "invalid_window_mode"
+	PeriodLimitErrInvalidTimezone      = "invalid_timezone"
+	PeriodLimitErrInvalidWeekResetDay  = "invalid_week_reset_day"
+	PeriodLimitErrInvalidWeekResetHour = "invalid_week_reset_hour"
+	PeriodLimitErrInvalidResetMode     = "invalid_reset_mode"
+	PeriodLimitErrInvalidResetWindows  = "invalid_reset_windows"
+)
+
 // PeriodLimitConfigError is returned for invalid period-limit configuration inputs.
 type PeriodLimitConfigError struct {
 	Message string
+	// Field is the Management API field that failed validation (for example
+	// "limit_5h_credits" or "timezone"). Empty when not field-specific.
+	Field string
+	// Code is one of the PeriodLimitErr* constants. Empty for legacy errors.
+	Code string
 }
 
 func (e PeriodLimitConfigError) Error() string {
@@ -61,6 +79,12 @@ func (e PeriodLimitConfigError) Error() string {
 
 func periodLimitConfigErrorf(format string, args ...any) error {
 	return PeriodLimitConfigError{Message: fmt.Sprintf(format, args...)}
+}
+
+// periodLimitFieldError keeps the historic message text while attaching the
+// stable field/code pair exposed through the Management API.
+func periodLimitFieldError(field, code, message string) error {
+	return PeriodLimitConfigError{Message: message, Field: field, Code: code}
 }
 
 type OptionalFloatUpdate struct {
@@ -707,7 +731,7 @@ func (r *Repository) ResetUserPeriodLimits(ctx context.Context, userID uint, win
 		mode = PeriodResetModeCounter
 	}
 	if mode != PeriodResetModeCounter && mode != PeriodResetModeWindowOnly {
-		return UserPeriodLimitResetResult{}, periodLimitConfigErrorf("reset mode must be %q or %q", PeriodResetModeCounter, PeriodResetModeWindowOnly)
+		return UserPeriodLimitResetResult{}, periodLimitFieldError("mode", PeriodLimitErrInvalidResetMode, fmt.Sprintf("reset mode must be %q or %q", PeriodResetModeCounter, PeriodResetModeWindowOnly))
 	}
 	now = now.UTC()
 
@@ -820,7 +844,7 @@ func normalizeResetWindows(windows []string) ([]string, error) {
 		case "":
 			continue
 		default:
-			return nil, periodLimitConfigErrorf("unknown period window %q", raw)
+			return nil, periodLimitFieldError("windows", PeriodLimitErrInvalidResetWindows, fmt.Sprintf("unknown period window %q", raw))
 		}
 	}
 	return out, nil

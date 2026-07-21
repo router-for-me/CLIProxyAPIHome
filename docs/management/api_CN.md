@@ -1068,6 +1068,10 @@ Path 参数：
     "password_set": true,
     "credits": 10.5,
     "credits_unlimited": false,
+    "period_limits_summary": {
+      "enabled_windows": ["5h", "1d"],
+      "zero_limit_windows": []
+    },
     "mfa": { "enabled": true },
     "passkey": [{ "id": "credential-id" }],
     "created_at": "2026-05-27T10:00:00Z",
@@ -1076,6 +1080,8 @@ Path 参数：
   }
 }
 ```
+
+用户记录包含 `period_limits_summary`：由记录本身推导的轻量概览（不查询用量）。`enabled_windows` 列出已配置限额的窗口（`5h`/`1d`/`7d`/`30d`），`zero_limit_windows` 列出限额为 `0`（立即阻断）的窗口。实时 used/remaining 请使用 `GET /users/:id/period-limits`。
 
 ### POST `/users`
 
@@ -1115,6 +1121,25 @@ Path 参数：
 
 输出：与 `GET /users/:id` 相同。
 
+校验失败返回 HTTP `400`，并携带结构化的 `field_errors` 数组，客户端无需解析 message 字符串即可本地化并定位字段：
+
+```json
+{
+  "error": "invalid body",
+  "message": "window_mode_5h: window mode must be \"first_use\" or \"sliding\"",
+  "field_errors": [{ "field": "window_mode_5h", "code": "invalid_window_mode" }]
+}
+```
+
+| `field_errors[].code` | `field_errors[].field` | 含义 |
+| --- | --- | --- |
+| `required` | `username` | 用户名缺失或为空。 |
+| `invalid_timezone` | `timezone` | 不是合法的 IANA 时区。 |
+| `invalid_limit` | `limit_5h_credits`、`limit_1d_credits`、`limit_7d_credits`、`limit_30d_credits` | 限额为负数或不是有限数字。 |
+| `invalid_window_mode` | `window_mode_5h`、`window_mode_1d`、`window_mode_7d`、`window_mode_30d` | 不支持的窗口模式（`5h` 拒绝 `calendar`）。 |
+| `invalid_week_reset_day` | `week_reset_day` | 超出 `1`–`7`。 |
+| `invalid_week_reset_hour` | `week_reset_hour` | 超出 `0`–`23`。 |
+
 ### PUT/PATCH `/users/:id`
 
 更新用户。`PUT` 和 `PATCH` 当前都是局部更新语义：只修改请求体中出现的字段。
@@ -1134,6 +1159,8 @@ Path 参数：
 所有字段均可选；如果出现 `username`，则不能为空。`credits` 如果出现，会替换用户当前点数余额。对于计费工作流，优先使用 `/billing/balance-records/recharge` 和 `/billing/balance-records/deduct`，以便余额变更拥有分类账记录。
 当用户需要无限总余额、但仍受独立周期限额约束时，将 `credits_unlimited` 设为 `true`。
 请求中出现 `password` 且更新成功时，会递增用户 session version，使此前签发的所有 User API bearer token 失效。Management API 不会签发替换用户 session。
+
+校验失败使用与 `POST /users` 相同的 `field_errors` 契约。
 
 输出：与 `GET /users/:id` 相同。
 
@@ -1185,9 +1212,33 @@ Path 参数：
   "status": "ok",
   "user_id": 1,
   "reset": { "mode": "counter", "windows": ["5h", "1d"], "at": "2026-07-09T12:00:00Z" },
-  "limits": { "user_id": 1, "windows": [] }
+  "limits": {
+    "user_id": 1,
+    "timezone": "Asia/Shanghai",
+    "credits": 10.5,
+    "credits_unlimited": false,
+    "windows": [
+      {
+        "id": "5h",
+        "enabled": true,
+        "limit": 5,
+        "used": 0,
+        "remaining": 5,
+        "mode": "first_use",
+        "active": false,
+        "window_start": null,
+        "window_end": null,
+        "reset_at": null,
+        "usage_epoch": "2026-07-09T12:00:00Z"
+      }
+    ]
+  }
 }
 ```
+
+`limits` 是重置后的完整状态（在同一事务内重建），结构与 `GET /users/:id/period-limits` 完全一致；客户端可直接用响应更新本地状态，无需额外读取。
+
+校验失败返回 HTTP `400`，携带用户写入章节描述的 `field_errors` 契约，错误码为 `invalid_reset_mode`（字段 `mode`）与 `invalid_reset_windows`（字段 `windows`）。
 
 周期限额在派发时对用户名下所有 API key 生效（`user_credits_insufficient` 与 `user_period_limit_exceeded`）。当 `credits_unlimited=true` 时跳过总余额检查，但已启用的周期窗口仍会拦截。
 
@@ -2541,6 +2592,9 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 | `capabilities.logs` | boolean | 是否支持应用日志接口。 |
 | `capabilities.request_error_logs` | boolean | 是否支持 request error log file list/download。 |
 | `capabilities.topology` | boolean | 是否支持 `GET /topology` Home + CPA 集群拓扑接口。 |
+| `capabilities.users` | boolean | 是否支持 `/users` 用户管理路由。 |
+| `capabilities.access_groups` | boolean | 是否支持 `/channel-groups` 与 `/model-groups` 访问范围路由。 |
+| `capabilities.user_period_limits` | boolean | 是否支持用户周期限额配置字段，以及 `GET /users/:id/period-limits` 和 `POST /users/:id/period-limits/reset`。 |
 | `server_info.home_version` | string | Home 构建版本。 |
 | `server_info.home_commit` | string | Home 构建 commit。 |
 | `server_info.home_build_date` | string | Home 构建时间。 |

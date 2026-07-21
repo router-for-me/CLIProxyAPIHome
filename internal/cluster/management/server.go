@@ -130,6 +130,24 @@ func respondError(c *gin.Context, status int, code string, err error) {
 	c.JSON(status, gin.H{"error": code, "message": message})
 }
 
+// fieldErrorItem identifies one request field that failed validation together
+// with a stable machine-readable code clients can localize.
+type fieldErrorItem struct {
+	Field string `json:"field"`
+	Code  string `json:"code"`
+}
+
+// respondErrorWithFieldErrors writes the same envelope as respondError plus a
+// field_errors array so clients can anchor and localize validation failures
+// without parsing message strings.
+func respondErrorWithFieldErrors(c *gin.Context, status int, code string, err error, fieldErrors []fieldErrorItem) {
+	message := strings.TrimSpace(code)
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		message = err.Error()
+	}
+	c.JSON(status, gin.H{"error": code, "message": message, "field_errors": fieldErrors})
+}
+
 // respondOK handles a respond ok.
 func respondOK(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})

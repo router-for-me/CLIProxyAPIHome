@@ -1068,6 +1068,10 @@ Example response:
     "password_set": true,
     "credits": 10.5,
     "credits_unlimited": false,
+    "period_limits_summary": {
+      "enabled_windows": ["5h", "1d"],
+      "zero_limit_windows": []
+    },
     "mfa": { "enabled": true },
     "passkey": [{ "id": "credential-id" }],
     "created_at": "2026-05-27T10:00:00Z",
@@ -1076,6 +1080,8 @@ Example response:
   }
 }
 ```
+
+User records include `period_limits_summary`, a lightweight overview derived from the record itself (no usage queries): `enabled_windows` lists the windows whose limit is configured (`5h`/`1d`/`7d`/`30d`), and `zero_limit_windows` lists enabled windows with a `0` limit (immediately blocking). Use `GET /users/:id/period-limits` for live used/remaining data.
 
 ### POST `/users`
 
@@ -1115,6 +1121,25 @@ Example request:
 
 Response: same shape as `GET /users/:id`.
 
+Validation failures return HTTP `400` with a structured `field_errors` array so clients can localize and anchor errors without parsing message strings:
+
+```json
+{
+  "error": "invalid body",
+  "message": "window_mode_5h: window mode must be \"first_use\" or \"sliding\"",
+  "field_errors": [{ "field": "window_mode_5h", "code": "invalid_window_mode" }]
+}
+```
+
+| `field_errors[].code` | `field_errors[].field` | Meaning |
+| --- | --- | --- |
+| `required` | `username` | Username is missing or empty. |
+| `invalid_timezone` | `timezone` | Not a valid IANA timezone. |
+| `invalid_limit` | `limit_5h_credits`, `limit_1d_credits`, `limit_7d_credits`, `limit_30d_credits` | Limit is negative or not a finite number. |
+| `invalid_window_mode` | `window_mode_5h`, `window_mode_1d`, `window_mode_7d`, `window_mode_30d` | Unsupported window mode (`calendar` is rejected for `5h`). |
+| `invalid_week_reset_day` | `week_reset_day` | Outside `1`–`7`. |
+| `invalid_week_reset_hour` | `week_reset_hour` | Outside `0`–`23`. |
+
 ### PUT/PATCH `/users/:id`
 
 Updates a user. `PUT` and `PATCH` currently have the same partial-update behavior: only fields present in the body are modified.
@@ -1134,6 +1159,8 @@ Example request:
 All request fields are optional, but `username`, if present, must not be empty. `credits`, if present, replaces the user's current credit balance. For billing workflows, prefer `/billing/balance-records/recharge` and `/billing/balance-records/deduct` so balance changes have ledger records.
 Set `credits_unlimited` to `true` when the user should have unlimited total balance but still be constrained by configured period limits.
 When `password` is present, a successful update increments the user's session version and invalidates all previously issued User API bearer tokens. The Management API does not issue a replacement user session.
+
+Validation failures use the same `field_errors` contract as `POST /users`.
 
 Response: same shape as `GET /users/:id`.
 
@@ -1185,9 +1212,33 @@ Response:
   "status": "ok",
   "user_id": 1,
   "reset": { "mode": "counter", "windows": ["5h", "1d"], "at": "2026-07-09T12:00:00Z" },
-  "limits": { "user_id": 1, "windows": [] }
+  "limits": {
+    "user_id": 1,
+    "timezone": "Asia/Shanghai",
+    "credits": 10.5,
+    "credits_unlimited": false,
+    "windows": [
+      {
+        "id": "5h",
+        "enabled": true,
+        "limit": 5,
+        "used": 0,
+        "remaining": 5,
+        "mode": "first_use",
+        "active": false,
+        "window_start": null,
+        "window_end": null,
+        "reset_at": null,
+        "usage_epoch": "2026-07-09T12:00:00Z"
+      }
+    ]
+  }
 }
 ```
+
+`limits` is the complete post-reset status, rebuilt inside the same transaction; it is identical in shape to `GET /users/:id/period-limits`, so clients can update their local state directly from the response without an extra read.
+
+Validation failures return HTTP `400` with the `field_errors` contract described in the user write sections, using codes `invalid_reset_mode` (field `mode`) and `invalid_reset_windows` (field `windows`).
 
 Period limits are enforced at dispatch for every API key owned by the user (`user_credits_insufficient` and `user_period_limit_exceeded`). When `credits_unlimited=true`, the total-balance check is skipped, but enabled period windows are still enforced.
 
@@ -2541,6 +2592,9 @@ Response fields:
 | `capabilities.logs` | boolean | Whether application log APIs are available. |
 | `capabilities.request_error_logs` | boolean | Whether request error log file list/download APIs are available. |
 | `capabilities.topology` | boolean | Whether `GET /topology` is available for Home + CPA cluster topology. |
+| `capabilities.users` | boolean | Whether the `/users` user-management routes are available. |
+| `capabilities.access_groups` | boolean | Whether the `/channel-groups` and `/model-groups` access-scope routes are available. |
+| `capabilities.user_period_limits` | boolean | Whether user period-limit configuration fields plus `GET /users/:id/period-limits` and `POST /users/:id/period-limits/reset` are available. |
 | `server_info.home_version` | string | Home build version. |
 | `server_info.home_commit` | string | Home build commit. |
 | `server_info.home_build_date` | string | Home build time. |

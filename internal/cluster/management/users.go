@@ -117,8 +117,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 			respondError(c, http.StatusConflict, "user_exists", errCreate)
 			return
 		}
-		if isUserPeriodLimitValidationError(errCreate) {
-			respondError(c, http.StatusBadRequest, "invalid body", errCreate)
+		if respondUserPeriodLimitValidationError(c, errCreate) {
 			return
 		}
 		respondError(c, http.StatusInternalServerError, "user_create_failed", errCreate)
@@ -147,8 +146,7 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 	defer cancel()
 	record, errUpdate := h.repo.UpdateUser(ctx, id, update)
 	if errUpdate != nil {
-		if isUserPeriodLimitValidationError(errUpdate) {
-			respondError(c, http.StatusBadRequest, "invalid body", errUpdate)
+		if respondUserPeriodLimitValidationError(c, errUpdate) {
 			return
 		}
 		respondUserRecordError(c, "user_update_failed", errUpdate)
@@ -207,8 +205,7 @@ func (h *Handler) ResetUserPeriodLimits(c *gin.Context) {
 	defer cancel()
 	result, errReset := h.repo.ResetUserPeriodLimits(ctx, id, body.Windows, body.Mode, time.Now().UTC())
 	if errReset != nil {
-		if isUserPeriodLimitValidationError(errReset) {
-			respondError(c, http.StatusBadRequest, "invalid body", errReset)
+		if respondUserPeriodLimitValidationError(c, errReset) {
 			return
 		}
 		respondUserRecordError(c, "user_period_limits_reset_failed", errReset)
@@ -231,12 +228,16 @@ func userUpdateFromRequest(c *gin.Context, body userWriteRequest, requireUsernam
 	username := body.username()
 	if username != nil {
 		if strings.TrimSpace(*username) == "" {
-			respondError(c, http.StatusBadRequest, "invalid body", errRequired("username"))
+			respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", errRequired("username"), []fieldErrorItem{
+				{Field: "username", Code: "required"},
+			})
 			return update, false
 		}
 		update.Username = username
 	} else if requireUsername {
-		respondError(c, http.StatusBadRequest, "invalid body", errRequired("username"))
+		respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", errRequired("username"), []fieldErrorItem{
+			{Field: "username", Code: "required"},
+		})
 		return update, false
 	}
 	password, errPassword := managementPasswordValue(body.Password)
@@ -348,24 +349,25 @@ func isUserPeriodLimitValidationError(err error) bool {
 		return false
 	}
 	var configErr cluster.PeriodLimitConfigError
-	if errors.As(err, &configErr) {
-		return true
-	}
-	// Fallback for wrapped field-prefix errors from applyUserPeriodLimitUpdate.
-	message := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(message, "limit_"),
-		strings.Contains(message, "window mode"),
-		strings.Contains(message, "window_mode"),
-		strings.Contains(message, "timezone"),
-		strings.Contains(message, "week_reset"),
-		strings.Contains(message, "period window"),
-		strings.Contains(message, "reset mode"),
-		strings.Contains(message, "non-negative"):
-		return true
-	default:
+	return errors.As(err, &configErr)
+}
+
+// respondUserPeriodLimitValidationError writes a 400 response carrying the
+// stable field_errors contract for period-limit validation failures. It
+// reports whether err was a validation error (and the response was written).
+func respondUserPeriodLimitValidationError(c *gin.Context, err error) bool {
+	if !isUserPeriodLimitValidationError(err) {
 		return false
 	}
+	var configErr cluster.PeriodLimitConfigError
+	if errors.As(err, &configErr) && configErr.Code != "" {
+		respondErrorWithFieldErrors(c, http.StatusBadRequest, "invalid body", err, []fieldErrorItem{
+			{Field: configErr.Field, Code: configErr.Code},
+		})
+		return true
+	}
+	respondError(c, http.StatusBadRequest, "invalid body", err)
+	return true
 }
 
 func userRecordToMap(record *cluster.UserRecord) gin.H {
@@ -401,6 +403,7 @@ func userRecordToMap(record *cluster.UserRecord) gin.H {
 		"week_reset_hour":         record.WeekResetHour,
 		"limit_30d_credits":       record.Limit30dCredits,
 		"window_mode_30d":         windowMode30d,
+		"period_limits_summary":   userPeriodLimitsSummary(record),
 		"period_window_start_5h":  record.PeriodWindowStart5h,
 		"period_window_start_1d":  record.PeriodWindowStart1d,
 		"period_window_start_7d":  record.PeriodWindowStart7d,
@@ -414,5 +417,35 @@ func userRecordToMap(record *cluster.UserRecord) gin.H {
 		"created_at":              record.CreatedAt,
 		"updated_at":              record.UpdatedAt,
 		"deleted_at":              deletedAtValue(record.DeletedAt),
+	}
+}
+
+// userPeriodLimitsSummary derives a lightweight period-limit overview from the
+// user record alone (no billing queries), so list views can flag configured
+// and hard-blocked windows without per-user status calls.
+func userPeriodLimitsSummary(record *cluster.UserRecord) gin.H {
+	windows := []struct {
+		id    string
+		limit *float64
+	}{
+		{"5h", record.Limit5hCredits},
+		{"1d", record.Limit1dCredits},
+		{"7d", record.Limit7dCredits},
+		{"30d", record.Limit30dCredits},
+	}
+	enabled := make([]string, 0, len(windows))
+	zeroLimited := make([]string, 0, len(windows))
+	for _, window := range windows {
+		if window.limit == nil {
+			continue
+		}
+		enabled = append(enabled, window.id)
+		if *window.limit == 0 {
+			zeroLimited = append(zeroLimited, window.id)
+		}
+	}
+	return gin.H{
+		"enabled_windows":    enabled,
+		"zero_limit_windows": zeroLimited,
 	}
 }
