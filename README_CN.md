@@ -23,7 +23,7 @@ Home 是一个为 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) �
 
 Home 现在始终使用数据库驱动的运行时。没有 `cluster.yaml` 时，Home 使用本地 SQLite 数据库运行同一套调度、节点发现、选主、事件监听、Management 和 RESP 逻辑。默认 SQLite 路径是 `home.db`，可以通过 `-sqlite-path` 覆盖。
 
-存在 `cluster.yaml` 时，Home 启用集群模式，并使用该文件中声明的数据库后端。多节点部署推荐使用 PostgreSQL；SQLite 也可以作为集群后端，但必须配置 `node.external-ip`，否则其他 Home 节点和 CPA 客户端无法稳定发现这个节点。
+存在 `cluster.yaml` 时，Home 启用集群模式，并使用该文件中声明的数据库后端。可以复制 `cluster.sqlite.example.yaml` 或 `cluster.pgsql.example.yaml` 为 `cluster.yaml` 后再修改。多节点部署推荐使用 PostgreSQL；SQLite 也可以作为集群后端，但必须配置 `node.external-ip`，否则其他 Home 节点和 CPA 客户端无法稳定发现这个节点。
 
 `config.yaml` 和 `auth-dir` 不再是运行时存储，只作为导入/导出的交换格式。迁移已有本地配置时，先运行：
 
@@ -33,7 +33,7 @@ Home 现在始终使用数据库驱动的运行时。没有 `cluster.yaml` 时�
 
 导入默认读取当前目录的 `config.yaml`，再根据该配置里的 `auth-dir` 查找凭证。可以通过 `-config <path>` 指定配置文件，通过 `-auth-dir <path>` 覆盖凭证目录，通过 `-sqlite-path <path>` 导入到非默认 SQLite 数据库。导入是幂等的，同一批文件重复导入不会产生重复记录。
 
-需要从数据库导出为文件时，运行：
+需要将配置和凭证导出为本地文件时，运行：
 
 ```bash
 ./CLIProxyAPIHome -export
@@ -45,16 +45,16 @@ Home 现在始终使用数据库驱动的运行时。没有 `cluster.yaml` 时�
 
 RESP 密码认证已经移除。Home RESP 只接受通过 mTLS 认证的客户端；CPA 应使用 `-home-jwt` 或配置好的 TLS 材料连接。`allow-host` 只是 IP 允许列表，不是密码机制。
 
-使用 Docker Compose 时，需要先显式运行导入命令，再启动常驻服务。compose 文件只持久化数据库和日志目录，不再自动复制或删除 `config.yaml`。
+Docker Compose 使用 `docker-compose.sqlite.yml` 或 `docker-compose.pgsql.yml`。将对应的 `cluster.sqlite.example.yaml` 或 `cluster.pgsql.example.yaml` 复制为 `cluster.yaml` 后，SQLite 路径使用 `/CLIProxyAPIHome/data/home.db`，PostgreSQL 主机使用 `postgres`。导入已有本地配置时二选一：
 
 ```bash
-docker compose -f docker-compose.single.yml run --rm \
+COMPOSE_FILE=docker-compose.sqlite.yml
+# PostgreSQL: COMPOSE_FILE=docker-compose.pgsql.yml
+docker compose -f "$COMPOSE_FILE" run --rm \
   -v "$PWD/config.yaml:/CLIProxyAPIHome/config.yaml:ro" \
   -v "$PWD/auths:/root/.cli-proxy-api" \
-  home ./CLIProxyAPIHome -sqlite-path /CLIProxyAPIHome/data/home.db -import
+  home ./CLIProxyAPIHome -import
 ```
-
-PostgreSQL 集群 compose 使用 `docker-compose.pgsql.yml`，并省略 `-sqlite-path`。
 
 ## 贡献
 

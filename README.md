@@ -23,7 +23,7 @@ It serves as a centralized hub for managing and scheduling API credentials in la
 
 Home now always runs from a database-backed runtime. When `cluster.yaml` is absent, Home runs the same scheduler, node discovery, leader election, event watcher, management, and RESP logic on a local SQLite database. The default SQLite path is `home.db`; use `-sqlite-path` to override it.
 
-When `cluster.yaml` exists, Home enables cluster mode and uses the database backend declared in that file. PostgreSQL is recommended for multi-node deployments. SQLite is also supported, but cluster SQLite requires `node.external-ip` so other nodes and CPA clients can reach this node.
+When `cluster.yaml` exists, Home enables cluster mode and uses the database backend declared in that file. Copy `cluster.sqlite.example.yaml` or `cluster.pgsql.example.yaml` to `cluster.yaml` as a starting point. PostgreSQL is recommended for multi-node deployments. SQLite is also supported, but cluster SQLite requires `node.external-ip` so other nodes and CPA clients can reach this node.
 
 `config.yaml` and `auth-dir` are no longer runtime storage. They are import/export exchange formats only. To migrate an existing local setup into the database, run:
 
@@ -33,7 +33,7 @@ When `cluster.yaml` exists, Home enables cluster mode and uses the database back
 
 By default, import reads `./config.yaml` and then resolves credentials from the `auth-dir` value inside that config. Use `-config <path>` to select another config file, `-auth-dir <path>` to override credential discovery, and `-sqlite-path <path>` when importing into a non-default SQLite database. Import is idempotent, so rerunning it with the same files does not duplicate records.
 
-To export database state back to files, run:
+To export config and credentials back to local files, run:
 
 ```bash
 ./CLIProxyAPIHome -export
@@ -45,16 +45,16 @@ In cluster mode, the Management API operates directly on database data. The defa
 
 RESP password authentication has been removed. Home RESP access only accepts mTLS-authenticated clients; CPA should connect with `-home-jwt` or configured TLS material. `allow-host` is only an IP allowlist and is not a password mechanism.
 
-For Docker Compose deployments, run the import command explicitly before normal startup. The compose files persist the database/log directories and no longer copy or delete `config.yaml` automatically.
+Docker Compose uses `docker-compose.sqlite.yml` or `docker-compose.pgsql.yml`. Copy the matching `cluster.sqlite.example.yaml` or `cluster.pgsql.example.yaml` to `cluster.yaml`, then use `/CLIProxyAPIHome/data/home.db` for SQLite or `postgres` as the PostgreSQL host. Select either database type when importing existing local state:
 
 ```bash
-docker compose -f docker-compose.single.yml run --rm \
+COMPOSE_FILE=docker-compose.sqlite.yml
+# PostgreSQL: COMPOSE_FILE=docker-compose.pgsql.yml
+docker compose -f "$COMPOSE_FILE" run --rm \
   -v "$PWD/config.yaml:/CLIProxyAPIHome/config.yaml:ro" \
   -v "$PWD/auths:/root/.cli-proxy-api" \
-  home ./CLIProxyAPIHome -sqlite-path /CLIProxyAPIHome/data/home.db -import
+  home ./CLIProxyAPIHome -import
 ```
-
-For PostgreSQL cluster compose, use `docker-compose.pgsql.yml` and omit `-sqlite-path`.
 
 ## Contributing
 

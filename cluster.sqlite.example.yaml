@@ -1,0 +1,17 @@
+# CLIProxyAPIHome SQLite cluster mode configuration.
+# Copy this file to cluster.yaml to enable cluster behavior.
+sqlite:
+  # Relative paths are resolved from the Home process working directory.
+  path: "home.db"
+  # When running SQLite in Docker Compose, use the persisted Home data volume.
+  # path: "/CLIProxyAPIHome/data/home.db"
+
+node:
+  # Public address advertised to other Home nodes and CPA clients. Required for multi-node SQLite deployments.
+  # external-ip: "203.0.113.10"
+  # Optional public port advertised to other Home nodes and CPA clients when a reverse proxy changes the reachable port.
+  # external-port: 443
+  port: 8327
+  heartbeat-interval: "5s"
+  heartbeat-timeout: "20s"
+  event-poll-interval: "3s"
