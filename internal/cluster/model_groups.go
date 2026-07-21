@@ -11,6 +11,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// ErrInvalidModelChannelGroupID indicates that a model detail channel binding contains ID zero.
+var ErrInvalidModelChannelGroupID = errors.New("model channel group id must be greater than zero")
+
 type ModelGroupUpdate struct {
 	GroupName *string
 	Disabled  *bool
@@ -188,6 +191,9 @@ func (r *Repository) CreateModelGroupDetail(ctx context.Context, modelGroupID ui
 	if modelID == "" {
 		return nil, fmt.Errorf("model id is required")
 	}
+	if errChannels := validateModelGroupDetailChannelIDs(channels); errChannels != nil {
+		return nil, errChannels
+	}
 	channelsJSON, errChannels := modelGroupDetailChannelsJSON(channels)
 	if errChannels != nil {
 		return nil, errChannels
@@ -314,7 +320,19 @@ func ensureModelGroupExists(ctx context.Context, tx *gorm.DB, id uint) error {
 	return errFirst
 }
 
+func validateModelGroupDetailChannelIDs(ids []uint) error {
+	for _, id := range ids {
+		if id == 0 {
+			return ErrInvalidModelChannelGroupID
+		}
+	}
+	return nil
+}
+
 func ensureChannelGroupsExist(ctx context.Context, tx *gorm.DB, ids []uint) error {
+	if errIDs := validateModelGroupDetailChannelIDs(ids); errIDs != nil {
+		return errIDs
+	}
 	for _, id := range normalizeChannelGroupIDs(ids) {
 		if errGroup := ensureChannelGroupExists(ctx, tx, id); errGroup != nil {
 			return errGroup

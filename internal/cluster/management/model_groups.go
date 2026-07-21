@@ -327,6 +327,10 @@ func modelGroupDetailFilterFromRequest(c *gin.Context) (cluster.ModelGroupDetail
 }
 
 func respondModelRecordError(c *gin.Context, code string, err error) {
+	if errors.Is(err, cluster.ErrInvalidModelChannelGroupID) {
+		respondError(c, http.StatusBadRequest, "invalid body", err)
+		return
+	}
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		respondError(c, http.StatusNotFound, "not_found", err)
 		return

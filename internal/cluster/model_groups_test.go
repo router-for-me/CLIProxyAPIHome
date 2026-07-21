@@ -49,6 +49,18 @@ func TestModelGroupDetailChannelsCreateAndUpdate(t *testing.T) {
 		t.Fatalf("CreateModelGroup() error = %v", errModelGroup)
 	}
 
+	_, errZeroCreate := repo.CreateModelGroupDetail(ctx, modelGroup.ID, "gpt-invalid", []uint{firstChannel.ID, 0})
+	if !errors.Is(errZeroCreate, ErrInvalidModelChannelGroupID) {
+		t.Fatalf("CreateModelGroupDetail(zero channel) error = %v, want ErrInvalidModelChannelGroupID", errZeroCreate)
+	}
+	invalidDetails, errInvalidDetails := repo.ListModelGroupDetails(ctx, ModelGroupDetailFilter{ModelID: "gpt-invalid"})
+	if errInvalidDetails != nil {
+		t.Fatalf("ListModelGroupDetails(invalid) error = %v", errInvalidDetails)
+	}
+	if len(invalidDetails) != 0 {
+		t.Fatalf("invalid model details = %#v, want none", invalidDetails)
+	}
+
 	detail, errCreate := repo.CreateModelGroupDetail(ctx, modelGroup.ID, "gpt-5.4(high)", []uint{secondChannel.ID, firstChannel.ID, secondChannel.ID})
 	if errCreate != nil {
 		t.Fatalf("CreateModelGroupDetail() error = %v", errCreate)
@@ -85,6 +97,11 @@ func TestModelGroupDetailChannelsCreateAndUpdate(t *testing.T) {
 	_, errMissing := repo.UpdateModelGroupDetail(ctx, detail.ID, ModelGroupDetailUpdate{Channels: &missingChannels})
 	if !errors.Is(errMissing, gorm.ErrRecordNotFound) {
 		t.Fatalf("UpdateModelGroupDetail(missing channel) error = %v, want record not found", errMissing)
+	}
+	zeroChannels := []uint{secondChannel.ID, 0}
+	_, errZeroUpdate := repo.UpdateModelGroupDetail(ctx, detail.ID, ModelGroupDetailUpdate{Channels: &zeroChannels})
+	if !errors.Is(errZeroUpdate, ErrInvalidModelChannelGroupID) {
+		t.Fatalf("UpdateModelGroupDetail(zero channel) error = %v, want ErrInvalidModelChannelGroupID", errZeroUpdate)
 	}
 
 	reloaded, errReload := repo.GetModelGroupDetail(ctx, detail.ID)

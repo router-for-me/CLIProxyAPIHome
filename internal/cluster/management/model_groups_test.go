@@ -32,6 +32,22 @@ func TestModelGroupDetailRoutesCreateAndClearChannels(t *testing.T) {
 	engine.POST("/model-group-details", handler.CreateModelGroupDetail)
 	engine.PATCH("/model-group-details/:id", handler.UpdateModelGroupDetail)
 
+	invalidBody, errInvalidBody := json.Marshal(map[string]any{
+		"model_group_id": modelGroup.ID,
+		"model_id":       "gpt-invalid",
+		"channels":       []uint{channel.ID, 0},
+	})
+	if errInvalidBody != nil {
+		t.Fatalf("marshal invalid body: %v", errInvalidBody)
+	}
+	invalidResponse := httptest.NewRecorder()
+	invalidRequest := httptest.NewRequest(http.MethodPost, "/model-group-details", bytes.NewReader(invalidBody))
+	invalidRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status = %d body=%s, want %d", invalidResponse.Code, invalidResponse.Body.String(), http.StatusBadRequest)
+	}
+
 	createBody, errCreateBody := json.Marshal(map[string]any{
 		"model_group_id": modelGroup.ID,
 		"model_id":       "gpt-5.4",
@@ -58,6 +74,14 @@ func TestModelGroupDetailRoutesCreateAndClearChannels(t *testing.T) {
 	}
 	if createPayload.Detail.ID == 0 || !reflect.DeepEqual(createPayload.Detail.Channels, []uint{channel.ID}) {
 		t.Fatalf("created detail = %#v", createPayload.Detail)
+	}
+
+	invalidPatchResponse := httptest.NewRecorder()
+	invalidPatchRequest := httptest.NewRequest(http.MethodPatch, "/model-group-details/"+modelRecordID(createPayload.Detail.ID), bytes.NewBufferString(`{"channels":[0]}`))
+	invalidPatchRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(invalidPatchResponse, invalidPatchRequest)
+	if invalidPatchResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid patch status = %d body=%s, want %d", invalidPatchResponse.Code, invalidPatchResponse.Body.String(), http.StatusBadRequest)
 	}
 
 	patchResponse := httptest.NewRecorder()

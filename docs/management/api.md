@@ -3635,7 +3635,7 @@ Example request:
 | --- | --- | --- | --- |
 | `model_group_id` | integer | yes | Existing model group ID. |
 | `model_id` | string | yes | Canonical model ID allowed by this group. A trailing request-option suffix such as `(high)` is stripped on write and is not part of the model identity. |
-| `channels` | array of integer | no | Channel group IDs allowed to execute this model. Empty or omitted inherits the API key credential scope. |
+| `channels` | array of positive integer | no | Channel group IDs allowed to execute this model. ID `0` is rejected with HTTP `400`. Empty or omitted inherits the API key credential scope. |
 
 Response: `{ "model_group_detail": ... }`.
 
