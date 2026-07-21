@@ -29,11 +29,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      DEPLOY: ${DEPLOY:-}
     ports:
       - "8327:8327"
     volumes:
       - ${CLI_PROXY_HOME_CLUSTER_PATH:-./cluster.yaml}:/CLIProxyAPIHome/cluster.yaml:ro
+      - ${CLI_PROXY_HOME_DATA_PATH:-./data}:/CLIProxyAPIHome/data
       - ${CLI_PROXY_HOME_LOG_PATH:-./logs}:/CLIProxyAPIHome/logs
+      - ${CLI_PROXY_HOME_PLUGIN_PATH:-./plugins}:/CLIProxyAPIHome/plugins
     restart: unless-stopped
