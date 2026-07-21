@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -194,6 +196,79 @@ func TestDatabaseSnapshotExportRejectsExistingFile(t *testing.T) {
 	}
 	raw, errRead := os.ReadFile(path)
 	if errRead != nil || string(raw) != "keep" {
+		t.Fatalf("existing target changed: data=%q error=%v", raw, errRead)
+	}
+}
+
+func TestPublishDatabaseSnapshotAllowsOnlyOneConcurrentPublisher(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "snapshot.zip")
+	paths := []string{
+		filepath.Join(dir, "first.tmp"),
+		filepath.Join(dir, "second.tmp"),
+	}
+	for index, path := range paths {
+		if errWrite := os.WriteFile(path, []byte(fmt.Sprintf("snapshot-%d", index)), 0o600); errWrite != nil {
+			t.Fatalf("write temporary snapshot %d: %v", index, errWrite)
+		}
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, len(paths))
+	for _, path := range paths {
+		go func(temporaryPath string) {
+			<-start
+			results <- publishDatabaseSnapshot(temporaryPath, targetPath)
+		}(path)
+	}
+	close(start)
+
+	successes := 0
+	for range paths {
+		errPublish := <-results
+		if errPublish == nil {
+			successes++
+			continue
+		}
+		if !strings.Contains(errPublish.Error(), "already exists") {
+			t.Fatalf("publishDatabaseSnapshot() error = %v, want existing target error", errPublish)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("publishDatabaseSnapshot() successes = %d, want 1", successes)
+	}
+	raw, errRead := os.ReadFile(targetPath)
+	if errRead != nil || (string(raw) != "snapshot-0" && string(raw) != "snapshot-1") {
+		t.Fatalf("published target = %q, error = %v", raw, errRead)
+	}
+}
+
+func TestCopyDatabaseSnapshotToNewFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	temporaryPath := filepath.Join(dir, "snapshot.tmp")
+	if errWrite := os.WriteFile(temporaryPath, []byte("new snapshot"), 0o600); errWrite != nil {
+		t.Fatalf("write temporary snapshot: %v", errWrite)
+	}
+
+	targetPath := filepath.Join(dir, "snapshot.zip")
+	if errCopy := copyDatabaseSnapshotToNewFile(temporaryPath, targetPath); errCopy != nil {
+		t.Fatalf("copyDatabaseSnapshotToNewFile() error = %v", errCopy)
+	}
+	raw, errRead := os.ReadFile(targetPath)
+	if errRead != nil || string(raw) != "new snapshot" {
+		t.Fatalf("published target = %q, error = %v", raw, errRead)
+	}
+
+	errCopy := copyDatabaseSnapshotToNewFile(temporaryPath, targetPath)
+	if errCopy == nil || !errors.Is(errCopy, os.ErrExist) {
+		t.Fatalf("copyDatabaseSnapshotToNewFile() error = %v, want existing target error", errCopy)
+	}
+	raw, errRead = os.ReadFile(targetPath)
+	if errRead != nil || string(raw) != "new snapshot" {
 		t.Fatalf("existing target changed: data=%q error=%v", raw, errRead)
 	}
 }

@@ -224,16 +224,65 @@ func ExportDatabaseSnapshot(ctx context.Context, db *gorm.DB, opts DatabaseSnaps
 	if errClose := tempFile.Close(); errClose != nil {
 		return DatabaseSnapshotManifest{}, fmt.Errorf("close database snapshot temporary file: %w", errClose)
 	}
-	if _, errStat := os.Stat(path); errStat == nil {
-		return DatabaseSnapshotManifest{}, fmt.Errorf("database snapshot export target already exists: %s", path)
-	} else if !errors.Is(errStat, os.ErrNotExist) {
-		return DatabaseSnapshotManifest{}, fmt.Errorf("reinspect database snapshot export target: %w", errStat)
-	}
-	if errRename := os.Rename(tempPath, path); errRename != nil {
-		return DatabaseSnapshotManifest{}, fmt.Errorf("publish database snapshot: %w", errRename)
+	if errPublish := publishDatabaseSnapshot(tempPath, path); errPublish != nil {
+		return DatabaseSnapshotManifest{}, errPublish
 	}
 	published = true
+	if errRemove := os.Remove(tempPath); errRemove != nil {
+		log.WithError(errRemove).Warn("failed to remove published database snapshot temporary file")
+	}
 	return manifest, nil
+}
+
+// publishDatabaseSnapshot creates the destination as a hard link so an export
+// never replaces a file another process created after the initial path check.
+// Filesystems without hard link support fall back to an exclusive copy.
+func publishDatabaseSnapshot(tempPath string, path string) error {
+	if errLink := os.Link(tempPath, path); errLink == nil {
+		return nil
+	} else if errors.Is(errLink, os.ErrExist) {
+		return fmt.Errorf("database snapshot export target already exists: %s", path)
+	} else if errCopy := copyDatabaseSnapshotToNewFile(tempPath, path); errCopy != nil {
+		if errors.Is(errCopy, os.ErrExist) {
+			return fmt.Errorf("database snapshot export target already exists: %s", path)
+		}
+		return fmt.Errorf("publish database snapshot after hard link failure: %w", errCopy)
+	}
+	return nil
+}
+
+func copyDatabaseSnapshotToNewFile(tempPath string, path string) (err error) {
+	source, errOpen := os.Open(tempPath)
+	if errOpen != nil {
+		return fmt.Errorf("open database snapshot temporary file: %w", errOpen)
+	}
+	defer closeDatabaseSnapshotResource(source, "published database snapshot temporary file")
+
+	destination, errCreate := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errCreate != nil {
+		return errCreate
+	}
+	removeDestination := true
+	defer func() {
+		closeDatabaseSnapshotResource(destination, "published database snapshot destination file")
+		if removeDestination {
+			if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+				log.WithError(errRemove).Warn("failed to remove incomplete database snapshot destination file")
+			}
+		}
+	}()
+
+	if _, errCopy := io.Copy(destination, source); errCopy != nil {
+		return fmt.Errorf("copy database snapshot to destination: %w", errCopy)
+	}
+	if errSync := destination.Sync(); errSync != nil {
+		return fmt.Errorf("sync database snapshot destination file: %w", errSync)
+	}
+	if errClose := destination.Close(); errClose != nil {
+		return fmt.Errorf("close database snapshot destination file: %w", errClose)
+	}
+	removeDestination = false
+	return nil
 }
 
 func exportDatabaseSnapshotTransaction(ctx context.Context, db *gorm.DB, backend DatabaseBackend, zipWriter *zip.Writer, manifest *DatabaseSnapshotManifest, progress func(DatabaseSnapshotProgress)) error {
