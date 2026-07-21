@@ -14,6 +14,10 @@ import (
 	"gorm.io/gorm"
 )
 
+var _ interface {
+	AllowedDispatchIDsForAPIKeyModel(context.Context, string, string) ([]string, []string, error)
+} = (*RuntimeAdapter)(nil)
+
 func TestModelGroupDetailChannelsCreateAndUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -296,8 +300,8 @@ func TestRuntimeAdapterEnforcesModelChannelBindingsInHomeDispatch(t *testing.T) 
 
 	modelID := "adapter-model"
 	auths := []*coreauth.Auth{
-		{ID: "adapter-auth-wide", Index: "adapter-auth-wide", Provider: "codex", Status: coreauth.StatusActive},
-		{ID: "adapter-auth-subset", Index: "adapter-auth-subset", Provider: "codex", Status: coreauth.StatusActive},
+		{ID: "adapter-auth-a-wide", Index: "adapter-auth-a-wide", Provider: "codex", Status: coreauth.StatusActive},
+		{ID: "adapter-auth-z-subset", Index: "adapter-auth-z-subset", Provider: "codex", Status: coreauth.StatusActive},
 	}
 	for _, auth := range auths {
 		if _, errUpsert := repo.UpsertAuth(ctx, auth, "test"); errUpsert != nil {
@@ -353,12 +357,14 @@ func TestRuntimeAdapterEnforcesModelChannelBindingsInHomeDispatch(t *testing.T) 
 		})
 	}
 
-	result, errDispatch := runtime.DispatchForAPIKey(ctx, modelID, nil, clientKey)
-	if errDispatch != nil {
-		t.Fatalf("DispatchForAPIKey() error = %v", errDispatch)
-	}
-	if result == nil || result.AuthID != auths[1].ID {
-		t.Fatalf("DispatchForAPIKey() result = %#v, want auth %q", result, auths[1].ID)
+	for attempt := 1; attempt <= 2; attempt++ {
+		result, errDispatch := runtime.DispatchForAPIKey(ctx, modelID, nil, clientKey)
+		if errDispatch != nil {
+			t.Fatalf("DispatchForAPIKey(attempt %d) error = %v", attempt, errDispatch)
+		}
+		if result == nil || result.AuthID != auths[1].ID {
+			t.Fatalf("DispatchForAPIKey(attempt %d) result = %#v, want auth %q", attempt, result, auths[1].ID)
+		}
 	}
 }
 
