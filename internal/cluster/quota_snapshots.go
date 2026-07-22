@@ -22,9 +22,11 @@ const quotaSnapshotSchemaVersion = 1
 const quotaSnapshotFallbackFreshness = 30 * time.Minute
 
 const (
-	quotaCredentialIDMaxLength = 128
-	quotaWindowTextMaxLength   = 256
-	quotaCurrencyMaxLength     = 16
+	quotaCredentialIDMaxLength  = 128
+	quotaWindowTextMaxLength    = 256
+	quotaCurrencyMaxLength      = 16
+	quotaResetCreditMaxItems    = 100
+	quotaResetCreditIDMaxLength = 128
 )
 
 // ErrQuotaProbeLeaseLost reports that an in-flight probe no longer owns its completion lease.
@@ -60,6 +62,7 @@ type QuotaSnapshotRecord struct {
 	CPANodeLabel        string     `gorm:"column:cpa_node_label;size:256"`
 	PlanName            string     `gorm:"column:plan_name;size:64"`
 	PlanPremium         *bool      `gorm:"column:plan_premium"`
+	ResetCredits        JSONB      `gorm:"column:reset_credits"`
 	ProbeLeaseOwner     string     `gorm:"column:probe_lease_owner;size:256"`
 	ProbeLeaseExpiresAt *time.Time `gorm:"column:probe_lease_expires_at;index"`
 	ParserVersion       int        `gorm:"column:parser_version;not null;default:1"`
@@ -142,10 +145,25 @@ type QuotaRuntime struct {
 }
 
 // QuotaPlan carries subscription plan metadata derived from a provider's quota
-// response (for example xAI SuperGrok / SuperGrok Heavy).
+// response (for example Codex Pro 20x or xAI SuperGrok Heavy).
 type QuotaPlan struct {
 	Name    string `json:"name"`
 	Premium bool   `json:"premium"`
+}
+
+// QuotaResetCredit describes one available provider-issued quota reset credit.
+type QuotaResetCredit struct {
+	ID        string     `json:"id"`
+	Status    string     `json:"status"`
+	GrantedAt time.Time  `json:"granted_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+// QuotaResetCredits carries the latest normalized reset-credit observation.
+type QuotaResetCredits struct {
+	AvailableCount *int               `json:"available_count"`
+	ObservedAt     time.Time          `json:"observed_at"`
+	Credits        []QuotaResetCredit `json:"credits"`
 }
 
 type QuotaCredentialSnapshot struct {
@@ -173,6 +191,7 @@ type QuotaCredentialSnapshot struct {
 	Error              *QuotaCollectionError `json:"error"`
 	Runtime            *QuotaRuntime         `json:"runtime"`
 	Plan               *QuotaPlan            `json:"plan,omitempty"`
+	ResetCredits       *QuotaResetCredits    `json:"-"`
 	Windows            []QuotaWindow         `json:"-"`
 }
 
@@ -182,6 +201,7 @@ type QuotaSnapshotWrite struct {
 	CollectionStatus      string
 	Source                string
 	ObservedAt            *time.Time
+	ReceivedAt            *time.Time
 	MaxAcceptedObservedAt *time.Time
 	ExpiresAt             *time.Time
 	LastAttemptAt         *time.Time
@@ -192,6 +212,8 @@ type QuotaSnapshotWrite struct {
 	Runtime               *QuotaRuntime
 	Plan                  *QuotaPlan
 	ReplacePlan           bool
+	ResetCredits          *QuotaResetCredits
+	ReplaceResetCredits   bool
 	ParserVersion         int
 	CollectorVersion      int
 	ExpectedProbeOwner    string
@@ -285,7 +307,10 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			return nil
 		}
 
-		record := quotaSnapshotRecordFromWrite(input)
+		record, errRecord := quotaSnapshotRecordFromWrite(input)
+		if errRecord != nil {
+			return errRecord
+		}
 		if errExisting == nil {
 			record.CreatedAt = existing.CreatedAt
 			if record.HomeID == "" {
@@ -303,6 +328,12 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			if input.Plan == nil && !input.ReplacePlan {
 				record.PlanName = existing.PlanName
 				record.PlanPremium = existing.PlanPremium
+			}
+			if !input.ReplaceResetCredits && len(existing.ResetCredits) > 0 {
+				record.ResetCredits = append(JSONB(nil), existing.ResetCredits...)
+			}
+			if input.Source == "response_header" {
+				preserveQuotaProbeSchedule(&record, existing, input.ObservedAt, input.ReceivedAt)
 			}
 			if !input.ClearProbeLease {
 				record.ProbeLeaseOwner = existing.ProbeLeaseOwner
@@ -423,6 +454,63 @@ func createQuotaSnapshotRecord(tx *gorm.DB, record *QuotaSnapshotRecord, input Q
 		return false, resultSave.Error
 	}
 	return resultSave.RowsAffected > 0, nil
+}
+
+func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnapshotRecord, observedAt *time.Time, receivedAt *time.Time) {
+	if record == nil {
+		return
+	}
+	leaseReferenceAt := observedAt
+	if receivedAt != nil {
+		leaseReferenceAt = receivedAt
+	}
+	leaseActive := existing.ProbeLeaseOwner != "" && existing.ProbeLeaseExpiresAt != nil && leaseReferenceAt != nil && existing.ProbeLeaseExpiresAt.After(leaseReferenceAt.UTC())
+	authoritativeSource := quotaAllowed(strings.TrimSpace(existing.Source), "active_probe", "mixed")
+	if existing.NextProbeAt != nil && (leaseActive || authoritativeSource || existing.CollectionStatus == "failed") {
+		record.NextProbeAt = quotaUTC(existing.NextProbeAt)
+	}
+	if authoritativeSource || leaseActive || existing.CollectionStatus == "failed" {
+		record.LastAttemptAt = quotaUTC(existing.LastAttemptAt)
+		record.LastSuccessAt = quotaUTC(existing.LastSuccessAt)
+	}
+	if leaseActive || existing.CollectionStatus == "failed" || authoritativeSource && existing.CollectionStatus == "partial" {
+		preserveQuotaProbeResult(record, existing)
+		return
+	}
+	if !quotaAuthoritativeSnapshotFreshAndComplete(existing, observedAt) {
+		return
+	}
+	record.CollectionStatus = existing.CollectionStatus
+	record.ExpiresAt = quotaUTC(existing.ExpiresAt)
+}
+
+func preserveQuotaProbeResult(record *QuotaSnapshotRecord, existing QuotaSnapshotRecord) {
+	record.CollectionStatus = existing.CollectionStatus
+	if existing.ExpiresAt != nil {
+		record.ExpiresAt = quotaUTC(existing.ExpiresAt)
+	}
+	record.ConsecutiveFailure = existing.ConsecutiveFailure
+	record.ErrorCode = existing.ErrorCode
+	record.ErrorMessage = existing.ErrorMessage
+	record.ErrorRetryable = existing.ErrorRetryable
+	record.ErrorOccurredAt = quotaUTC(existing.ErrorOccurredAt)
+	record.ErrorStatusCode = existing.ErrorStatusCode
+	record.ErrorRequestID = existing.ErrorRequestID
+}
+
+func quotaAuthoritativeSnapshotFreshAndComplete(existing QuotaSnapshotRecord, observedAt *time.Time) bool {
+	if observedAt == nil || existing.ExpiresAt == nil || !existing.ExpiresAt.After(observedAt.UTC()) {
+		return false
+	}
+	if existing.CollectionStatus != "success" {
+		return false
+	}
+	switch strings.TrimSpace(existing.Source) {
+	case "active_probe", "mixed":
+		return true
+	default:
+		return false
+	}
 }
 
 func quotaWindowRecordAggregateStatus(windows []QuotaWindowRecord) string {
@@ -861,6 +949,7 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 	if snapshot.PlanName != "" {
 		item.Plan = &QuotaPlan{Name: snapshot.PlanName, Premium: snapshot.PlanPremium != nil && *snapshot.PlanPremium}
 	}
+	item.ResetCredits = quotaResetCreditsFromJSON(snapshot.ResetCredits)
 	item.PrimaryWindows = quotaPrimaryWindows(displayWindows)
 	return item
 }
@@ -936,8 +1025,18 @@ func validateQuotaSnapshotWrite(input *QuotaSnapshotWrite) error {
 	if !quotaAllowed(input.CollectionStatus, "idle", "collecting", "success", "partial", "failed", "unsupported") {
 		return fmt.Errorf("unsupported quota collection status %q", input.CollectionStatus)
 	}
-	if strings.TrimSpace(input.Source) != "" && !quotaAllowed(input.Source, "response_header", "active_probe", "mixed") {
+	input.Source = strings.TrimSpace(input.Source)
+	if input.Source != "" && !quotaAllowed(input.Source, "response_header", "active_probe", "mixed") {
 		return fmt.Errorf("unsupported quota source %q", input.Source)
+	}
+	if input.Plan != nil {
+		input.Plan.Name = quotaBoundedText(input.Plan.Name, 64)
+		if input.Plan.Name == "" {
+			return fmt.Errorf("quota plan name is required")
+		}
+	}
+	if errResetCredits := normalizeQuotaResetCredits(input.ResetCredits); errResetCredits != nil {
+		return errResetCredits
 	}
 	if input.ConsecutiveFailure < 0 {
 		return fmt.Errorf("quota consecutive failures must be non-negative")
@@ -945,6 +1044,13 @@ func validateQuotaSnapshotWrite(input *QuotaSnapshotWrite) error {
 	if input.MaxAcceptedObservedAt != nil {
 		maxAcceptedObservedAt := input.MaxAcceptedObservedAt.UTC()
 		input.MaxAcceptedObservedAt = &maxAcceptedObservedAt
+	}
+	if input.ReceivedAt != nil {
+		if input.ReceivedAt.IsZero() {
+			return fmt.Errorf("quota received_at is required when provided")
+		}
+		receivedAt := input.ReceivedAt.UTC()
+		input.ReceivedAt = &receivedAt
 	}
 	if input.ObservedAt != nil {
 		observedAt := input.ObservedAt.UTC()
@@ -1012,7 +1118,7 @@ func validateQuotaSnapshotWrite(input *QuotaSnapshotWrite) error {
 	return nil
 }
 
-func quotaSnapshotRecordFromWrite(input QuotaSnapshotWrite) QuotaSnapshotRecord {
+func quotaSnapshotRecordFromWrite(input QuotaSnapshotWrite) (QuotaSnapshotRecord, error) {
 	now := time.Now().UTC()
 	record := QuotaSnapshotRecord{
 		CredentialID: input.CredentialID, QuotaStatus: input.QuotaStatus, CollectionStatus: input.CollectionStatus,
@@ -1032,6 +1138,13 @@ func quotaSnapshotRecordFromWrite(input QuotaSnapshotWrite) QuotaSnapshotRecord 
 		premium := input.Plan.Premium
 		record.PlanPremium = &premium
 	}
+	if input.ResetCredits != nil {
+		resetCredits, errResetCredits := quotaResetCreditsJSON(input.ResetCredits)
+		if errResetCredits != nil {
+			return QuotaSnapshotRecord{}, errResetCredits
+		}
+		record.ResetCredits = resetCredits
+	}
 	if input.Error != nil {
 		record.ErrorCode = strings.TrimSpace(input.Error.Code)
 		record.ErrorMessage = quotaSafeErrorMessage(input.Error.Message)
@@ -1044,7 +1157,92 @@ func quotaSnapshotRecordFromWrite(input QuotaSnapshotWrite) QuotaSnapshotRecord 
 			record.ErrorRequestID = quotaBoundedRequestID(*input.Error.RequestID)
 		}
 	}
-	return record
+	return record, nil
+}
+
+func normalizeQuotaResetCredits(value *QuotaResetCredits) error {
+	if value == nil {
+		return nil
+	}
+	if value.ObservedAt.IsZero() {
+		return fmt.Errorf("quota reset credits observed_at is required")
+	}
+	value.ObservedAt = value.ObservedAt.UTC()
+	if value.AvailableCount != nil && (*value.AvailableCount < 0 || *value.AvailableCount > 1_000_000) {
+		return fmt.Errorf("quota reset credits available_count is out of range")
+	}
+	if len(value.Credits) > quotaResetCreditMaxItems {
+		return fmt.Errorf("quota reset credits exceed %d items", quotaResetCreditMaxItems)
+	}
+	seen := make(map[string]struct{}, len(value.Credits))
+	for index := range value.Credits {
+		credit := &value.Credits[index]
+		credit.ID = quotaBoundedIdentifier(credit.ID, quotaResetCreditIDMaxLength)
+		if credit.ID == "" {
+			return fmt.Errorf("quota reset credit id is required")
+		}
+		if _, exists := seen[credit.ID]; exists {
+			return fmt.Errorf("duplicate quota reset credit id %q", credit.ID)
+		}
+		seen[credit.ID] = struct{}{}
+		credit.Status = strings.ToLower(strings.TrimSpace(credit.Status))
+		if credit.Status != "available" {
+			return fmt.Errorf("quota reset credit %q has unsupported status %q", credit.ID, credit.Status)
+		}
+		if credit.GrantedAt.IsZero() {
+			return fmt.Errorf("quota reset credit %q granted_at is required", credit.ID)
+		}
+		credit.GrantedAt = credit.GrantedAt.UTC()
+		credit.ExpiresAt = quotaUTC(credit.ExpiresAt)
+	}
+	sort.SliceStable(value.Credits, func(i, j int) bool {
+		leftExpiry := value.Credits[i].ExpiresAt
+		rightExpiry := value.Credits[j].ExpiresAt
+		if leftExpiry == nil || rightExpiry == nil {
+			if leftExpiry != nil {
+				return true
+			}
+			if rightExpiry != nil {
+				return false
+			}
+		} else if !leftExpiry.Equal(*rightExpiry) {
+			return leftExpiry.Before(*rightExpiry)
+		}
+		return value.Credits[i].ID < value.Credits[j].ID
+	})
+	if value.Credits == nil {
+		value.Credits = []QuotaResetCredit{}
+	}
+	if value.AvailableCount == nil || *value.AvailableCount < len(value.Credits) {
+		availableCount := len(value.Credits)
+		value.AvailableCount = &availableCount
+	}
+	return nil
+}
+
+func quotaResetCreditsJSON(value *QuotaResetCredits) (JSONB, error) {
+	if value == nil {
+		return nil, nil
+	}
+	raw, errMarshal := json.Marshal(value)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("encode quota reset credits: %w", errMarshal)
+	}
+	return JSONB(raw), nil
+}
+
+func quotaResetCreditsFromJSON(raw JSONB) *QuotaResetCredits {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var value QuotaResetCredits
+	if errUnmarshal := json.Unmarshal(raw, &value); errUnmarshal != nil {
+		return nil
+	}
+	if errNormalize := normalizeQuotaResetCredits(&value); errNormalize != nil {
+		return nil
+	}
+	return &value
 }
 
 func quotaWindowRecordFromDTO(credentialID string, window QuotaWindow) QuotaWindowRecord {

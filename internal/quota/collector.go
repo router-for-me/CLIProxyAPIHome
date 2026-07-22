@@ -30,6 +30,7 @@ const (
 	defaultProviderConcurrency = 3
 	maxProbeResponseBytes      = 1 << 20
 	codexUsageURL              = "https://chatgpt.com/backend-api/wham/usage"
+	codexResetCreditsURL       = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 	claudeUsageURL             = "https://api.anthropic.com/api/oauth/usage"
 	claudeProfileURL           = "https://api.anthropic.com/api/oauth/profile"
 	kimiUsageURL               = "https://api.kimi.com/coding/v1/usages"
@@ -60,6 +61,7 @@ type Options struct {
 	SnapshotFreshness      time.Duration
 	ProviderConcurrency    int
 	CodexUsageURL          string
+	CodexResetCreditsURL   string
 	ClaudeUsageURL         string
 	ClaudeProfileURL       string
 	KimiUsageURL           string
@@ -108,6 +110,9 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 	}
 	if strings.TrimSpace(options.CodexUsageURL) == "" {
 		options.CodexUsageURL = codexUsageURL
+	}
+	if strings.TrimSpace(options.CodexResetCreditsURL) == "" {
+		options.CodexResetCreditsURL = codexResetCreditsURL
 	}
 	if strings.TrimSpace(options.ClaudeUsageURL) == "" {
 		options.ClaudeUsageURL = claudeUsageURL
@@ -335,6 +340,7 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 		CredentialID: auth.ID, QuotaStatus: status, CollectionStatus: collectionStatus, Source: "active_probe",
 		ObservedAt: &observedAt, MaxAcceptedObservedAt: &observedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
 		NextProbeAt: &expiresAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: true, ParserVersion: 1, CollectorVersion: 1,
+		ResetCredits: result.resetCredits, ReplaceResetCredits: result.replaceResetCredits,
 		ExpectedProbeOwner: c.options.Owner, ClearProbeLease: true, ReplaceWindows: result.replaceWindows, Windows: result.windows,
 	}
 	if strings.TrimSpace(c.options.HomeID) != "" {
@@ -362,18 +368,19 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 }
 
 type probeResult struct {
-	windows         []cluster.QuotaWindow
-	plan            *cluster.QuotaPlan
-	partial         bool
-	replaceWindows  bool
-	collectionError *cluster.QuotaCollectionError
+	windows             []cluster.QuotaWindow
+	plan                *cluster.QuotaPlan
+	resetCredits        *cluster.QuotaResetCredits
+	partial             bool
+	replaceWindows      bool
+	replaceResetCredits bool
+	collectionError     *cluster.QuotaCollectionError
 }
 
 func (c *Collector) probeCredential(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
 	switch normalizedQuotaProvider(auth.Provider) {
 	case "codex":
-		windows, errProbe := c.probeCodex(ctx, auth)
-		return probeResult{windows: windows, replaceWindows: true}, errProbe
+		return c.probeCodex(ctx, auth)
 	case "claude":
 		return c.probeClaude(ctx, auth)
 	case "antigravity":
@@ -390,20 +397,74 @@ func (c *Collector) probeCredential(ctx context.Context, auth *coreauth.Auth) (p
 	}
 }
 
-func (c *Collector) probeCodex(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *probeError) {
+func (c *Collector) probeCodex(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
 	headers := http.Header{"Content-Type": []string{"application/json"}, "User-Agent": []string{codexUserAgent}}
 	if accountID := quotaMetadataString(auth.Metadata, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"); accountID != "" {
 		headers.Set("Chatgpt-Account-Id", accountID)
 	}
 	body, _, errRequest := c.probeRequest(ctx, auth, http.MethodGet, c.options.CodexUsageURL, nil, headers)
 	if errRequest != nil {
-		return nil, errRequest
+		return probeResult{}, errRequest
 	}
-	windows, errParse := parseCodexUsageWindows(body, c.options.Now().UTC())
-	if errParse != nil || len(windows) == 0 {
-		return nil, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Upstream quota response did not contain usable windows.", retryable: true}
+	observedAt := c.options.Now().UTC()
+	usage, errParse := parseCodexUsage(body, observedAt)
+	if errParse != nil || len(usage.windows) == 0 {
+		return probeResult{}, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Upstream quota response did not contain usable windows.", retryable: true}
 	}
-	return windows, nil
+	if usage.plan == nil {
+		usage.plan = codexPlanFromAuth(auth)
+	}
+	result := probeResult{
+		windows:        usage.windows,
+		plan:           usage.plan,
+		resetCredits:   codexResetCreditsCountFallback(usage.resetCreditsAvailableCount, observedAt),
+		replaceWindows: true,
+	}
+	if usage.resetCreditsAvailableCount == nil {
+		return result, nil
+	}
+	if *usage.resetCreditsAvailableCount == 0 {
+		result.replaceResetCredits = true
+		return result, nil
+	}
+	resetHeaders := headers.Clone()
+	resetHeaders.Set("Accept", "application/json")
+	resetBody, _, errResetRequest := c.probeRequest(ctx, auth, http.MethodGet, c.options.CodexResetCreditsURL, nil, resetHeaders)
+	if errResetRequest != nil {
+		result.partial = true
+		result.collectionError = probeCollectionError(errResetRequest, observedAt)
+		return result, nil
+	}
+	resetCredits, errResetParse := parseCodexResetCredits(resetBody, observedAt, usage.resetCreditsAvailableCount)
+	if errResetParse != nil {
+		resetError := &probeError{code: "RESET_CREDITS_RESPONSE_INVALID", message: "Codex reset credits response could not be parsed.", retryable: true}
+		result.partial = true
+		result.collectionError = probeCollectionError(resetError, observedAt)
+		return result, nil
+	}
+	result.resetCredits = resetCredits
+	result.replaceResetCredits = true
+	return result, nil
+}
+
+func codexPlanFromAuth(auth *coreauth.Auth) *cluster.QuotaPlan {
+	if auth == nil {
+		return nil
+	}
+	if auth.Attributes != nil {
+		if plan := codexPlan(auth.Attributes["plan_type"]); plan != nil {
+			return plan
+		}
+	}
+	return codexPlan(quotaMetadataString(auth.Metadata, "plan_type", "planType"))
+}
+
+func codexResetCreditsCountFallback(availableCount *int, observedAt time.Time) *cluster.QuotaResetCredits {
+	if availableCount == nil {
+		return nil
+	}
+	count := *availableCount
+	return &cluster.QuotaResetCredits{AvailableCount: &count, ObservedAt: observedAt.UTC(), Credits: []cluster.QuotaResetCredit{}}
 }
 
 func (c *Collector) probeRequest(ctx context.Context, auth *coreauth.Auth, method string, targetURL string, body []byte, headers http.Header) ([]byte, http.Header, *probeError) {
