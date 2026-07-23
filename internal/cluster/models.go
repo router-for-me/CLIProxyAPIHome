@@ -475,6 +475,7 @@ type ModelGroupDetailRecord struct {
 	ID           uint           `gorm:"column:id;primaryKey;autoIncrement;index:idx_model_group_detail_group_active_order,priority:3;index:idx_model_group_detail_model_active_order,priority:4;index:idx_model_group_detail_active_order,priority:3"`
 	ModelGroupID uint           `gorm:"column:model_group_id;not null;index:idx_model_group_detail_group_active_order,priority:1;index:idx_model_group_detail_model_active_order,priority:3;index:idx_model_group_detail_active_order,priority:2"`
 	ModelID      string         `gorm:"column:model_id;not null;index:idx_model_group_detail_model_active_order,priority:1"`
+	Channels     JSONB          `gorm:"column:channels"`
 	CreatedAt    time.Time      `gorm:"column:created_at"`
 	UpdatedAt    time.Time      `gorm:"column:updated_at"`
 	DeletedAt    gorm.DeletedAt `gorm:"column:deleted_at;index;index:idx_model_group_detail_group_active_order,priority:2;index:idx_model_group_detail_model_active_order,priority:2;index:idx_model_group_detail_active_order,priority:1"`

@@ -2674,6 +2674,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-
 | `capabilities.oauth_usage` | boolean | OAuth/file-backed credential usage 归因是否可靠。 |
 | `capabilities.logs` | boolean | 是否支持应用日志接口。 |
 | `capabilities.request_error_logs` | boolean | 是否支持 request error log file list/download。 |
+| `capabilities.model_channel_bindings` | boolean | model group detail 是否支持通过 `channels` 配置模型级 channel group 绑定。 |
 | `capabilities.topology` | boolean | 是否支持 `GET /topology` Home + CPA 集群拓扑接口。 |
 | `capabilities.users` | boolean | 是否支持 `/users` 用户管理路由。 |
 | `capabilities.access_groups` | boolean | 是否支持 `/channel-groups` 与 `/model-groups` 访问范围路由。 |
@@ -3552,6 +3553,10 @@ Query 参数：
 
 Model groups 限制某个客户端 API key 可以使用哪些模型 ID。如果客户端 API key 的 `model_groups` 是空数组，则不应用模型过滤。
 
+每条 model group detail 还可以通过 `channels` 指定允许执行该模型的 channel group IDs。`channels` 为空或省略时继承客户端 API key 原有的凭证范围，保持旧行为不变。非空时，Home 会解析这些 channel groups 中已启用的凭证，并按 auth ID 与 API key 自身的 `channels` 凭证范围取交集；如果 API key 不限制凭证，则直接应用模型级范围。最终凭证集合为空时调度会 fail closed，不会回退为无限制凭证。
+
+同一模型出现在一个 API key 选中的多个 model groups 中时，Home 会合并所有非空的模型级 `channels`；空绑定不会取消显式限制。禁用或删除的 model/channel group 不会贡献可用凭证。
+
 ### GET `/model-groups`
 
 输出示例：
@@ -3636,7 +3641,7 @@ Query 参数：
 | Query | 类型 | 说明 |
 | --- | --- | --- |
 | `model_group_id` | integer | 按 model group ID 过滤；也接受 `model-group-id`、`group_id`、`group-id`。 |
-| `model_id` | string | 按 model ID 过滤；也接受 `model-id`。 |
+| `model_id` | string | 按 canonical model ID 过滤；也接受 `model-id`。匹配不区分大小写，并忽略查询值或旧存量记录末尾的请求选项 suffix。 |
 
 输出示例：
 
@@ -3647,6 +3652,7 @@ Query 参数：
       "id": 10,
       "model_group_id": 1,
       "model_id": "gpt-5.5",
+      "channels": [2, 3],
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "deleted_at": null
@@ -3665,6 +3671,7 @@ Query 参数：
     "id": 10,
     "model_group_id": 1,
     "model_id": "gpt-5.5",
+    "channels": [2, 3],
     "created_at": "2026-05-27T10:00:00Z",
     "updated_at": "2026-05-27T10:00:00Z",
     "deleted_at": null
@@ -3681,14 +3688,16 @@ Query 参数：
 ```json
 {
   "model_group_id": 1,
-  "model_id": "gpt-5.5"
+  "model_id": "gpt-5.5",
+  "channels": [2, 3]
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `model_group_id` | integer | 是 | 已存在的 model group ID。 |
-| `model_id` | string | 是 | 该 group 允许的模型 ID。 |
+| `model_id` | string | 是 | 该 group 允许的 canonical 模型 ID。写入时会移除末尾的 `(high)` 等请求选项 suffix；suffix 不属于模型身份。 |
+| `channels` | array of positive integer | 否 | 允许执行该模型的 channel group IDs；ID `0` 会返回 HTTP `400`；为空或省略时继承 API key 的凭证范围。 |
 
 输出：`{ "model_group_detail": ... }`。
 
@@ -3701,11 +3710,12 @@ Query 参数：
 ```json
 {
   "model_group_id": 2,
-  "model_id": "gpt-5.5-mini"
+  "model_id": "gpt-5.5-mini",
+  "channels": [4]
 }
 ```
 
-所有字段均可选；如果传入 `model_group_id`，必须大于 `0`。
+所有字段均可选；如果传入 `model_group_id`，必须大于 `0`。传入 `channels: []` 会移除模型级凭证限制，恢复继承行为。
 
 输出：`{ "model_group_detail": ... }`。
 

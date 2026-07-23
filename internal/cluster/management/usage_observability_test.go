@@ -118,7 +118,7 @@ func TestGetCapabilitiesReturnsUsageObservabilityFlags(t *testing.T) {
 	if !ok {
 		t.Fatalf("capabilities = %T, want object", payload["capabilities"])
 	}
-	for _, key := range []string{"quota_snapshots", "quota_snapshot_details", "usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs", "topology"} {
+	for _, key := range []string{"quota_snapshots", "quota_snapshot_details", "usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs", "model_channel_bindings", "topology"} {
 		if capabilities[key] != true {
 			t.Fatalf("capabilities[%s] = %v, want true", key, capabilities[key])
 		}

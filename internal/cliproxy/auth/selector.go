@@ -131,6 +131,11 @@ func authPriority(auth *Auth) int {
 	return parsed
 }
 
+// CanonicalModelID removes a request-option suffix and surrounding whitespace from a model ID.
+func CanonicalModelID(model string) string {
+	return canonicalModelKey(model)
+}
+
 // canonicalModelKey handles a canonical model key.
 func canonicalModelKey(model string) string {
 	model = strings.TrimSpace(model)

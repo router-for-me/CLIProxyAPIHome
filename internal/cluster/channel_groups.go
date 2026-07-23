@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type ChannelGroupUpdate struct {
@@ -306,7 +307,11 @@ func ensureAuthExists(ctx context.Context, tx *gorm.DB, authID string) error {
 	}
 	record := AuthRecord{}
 	errFirst := tx.WithContext(contextOrBackground(ctx)).
-		Where("uuid = ? OR id = ? OR index = ?", authID, authID, authID).
+		Where(clause.Or(
+			clause.Eq{Column: clause.Column{Name: "uuid"}, Value: authID},
+			clause.Eq{Column: clause.Column{Name: "id"}, Value: authID},
+			clause.Eq{Column: clause.Column{Name: "index"}, Value: authID},
+		)).
 		First(&record).Error
 	if errors.Is(errFirst, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("auth not found: %w", errFirst)

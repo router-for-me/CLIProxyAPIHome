@@ -242,6 +242,14 @@ func (a *RuntimeAdapter) AllowedDispatchIDsForAPIKey(ctx context.Context, apiKey
 	return a.repo.AllowedDispatchIDsForAPIKey(ctx, apiKey)
 }
 
+// AllowedDispatchIDsForAPIKeyModel returns auth and model IDs after applying model-specific channel bindings.
+func (a *RuntimeAdapter) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error) {
+	if !a.Enabled() {
+		return nil, nil, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.AllowedDispatchIDsForAPIKeyModel(ctx, apiKey, modelID)
+}
+
 // AllowedModelIDsForAPIKey returns model IDs allowed by API-key model group bindings.
 func (a *RuntimeAdapter) AllowedModelIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
 	if !a.Enabled() {

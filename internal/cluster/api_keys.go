@@ -665,6 +665,117 @@ func ensureAPIKeyUserCreditsAvailable(ctx context.Context, db *gorm.DB, record *
 	return ensureAPIKeyUserBillingAllowed(ctx, db, record)
 }
 
+// AllowedDispatchIDsForAPIKeyModel returns auth and model IDs after applying model-specific channel bindings.
+func (r *Repository) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, nil, errDB
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	modelID = strings.TrimSpace(modelID)
+	if apiKey == "" {
+		return nil, nil, nil
+	}
+
+	record := APIKeyRecord{}
+	if errFirst := db.WithContext(contextOrBackground(ctx)).Where("api_key = ?", apiKey).First(&record).Error; errFirst != nil {
+		return nil, nil, errFirst
+	}
+	if errBilling := ensureAPIKeyUserBillingAllowed(ctx, db, &record); errBilling != nil {
+		return nil, nil, errBilling
+	}
+
+	baseChannelIDs, errBaseChannels := apiKeyChannelsFromJSON(record.Channels)
+	if errBaseChannels != nil {
+		return nil, nil, errBaseChannels
+	}
+	modelDetails, modelGroupsRestricted, errModelDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, &record)
+	if errModelDetails != nil {
+		return nil, nil, errModelDetails
+	}
+	modelIDs := allowedModelIDsFromDetails(modelDetails, modelGroupsRestricted)
+	modelChannelIDs, modelChannelsRestricted, errModelChannels := modelChannelGroupIDsFromDetails(modelDetails, modelID)
+	if errModelChannels != nil {
+		return nil, nil, errModelChannels
+	}
+
+	allChannelIDs := append([]uint(nil), baseChannelIDs...)
+	if modelChannelsRestricted {
+		allChannelIDs = append(allChannelIDs, modelChannelIDs...)
+	}
+	channelDetails, errChannelDetails := channelGroupDetailsForGroups(ctx, db, allChannelIDs)
+	if errChannelDetails != nil {
+		return nil, nil, errChannelDetails
+	}
+
+	var authIDs []string
+	if len(baseChannelIDs) > 0 {
+		authIDs = allowedAuthIDsFromChannelGroupDetails(channelDetails, baseChannelIDs)
+	}
+	if !modelChannelsRestricted {
+		return authIDs, modelIDs, nil
+	}
+	modelAuthIDs := allowedAuthIDsFromChannelGroupDetails(channelDetails, modelChannelIDs)
+	return intersectAllowedAuthIDs(authIDs, modelAuthIDs), modelIDs, nil
+}
+
+func modelChannelGroupIDsFromDetails(details []ModelGroupDetailRecord, modelID string) ([]uint, bool, error) {
+	modelKey := strings.ToLower(canonicalModelGroupModelID(modelID))
+	if modelKey == "" {
+		return nil, false, nil
+	}
+
+	channelIDs := make([]uint, 0)
+	restricted := false
+	for i := range details {
+		if strings.ToLower(canonicalModelGroupModelID(details[i].ModelID)) != modelKey {
+			continue
+		}
+		detailChannels, errDetailChannels := ModelGroupDetailChannelIDs(&details[i])
+		if errDetailChannels != nil {
+			return nil, false, errDetailChannels
+		}
+		if len(detailChannels) == 0 {
+			continue
+		}
+		restricted = true
+		channelIDs = append(channelIDs, detailChannels...)
+	}
+	return normalizeChannelGroupIDs(channelIDs), restricted, nil
+}
+
+func intersectAllowedAuthIDs(base []string, modelSpecific []string) []string {
+	if base == nil {
+		allowed := make([]string, len(modelSpecific))
+		copy(allowed, modelSpecific)
+		return allowed
+	}
+	modelSet := make(map[string]struct{}, len(modelSpecific))
+	for _, authID := range modelSpecific {
+		authID = strings.TrimSpace(authID)
+		if authID != "" {
+			modelSet[authID] = struct{}{}
+		}
+	}
+	allowed := make([]string, 0, len(base))
+	seen := make(map[string]struct{}, len(base))
+	for _, authID := range base {
+		authID = strings.TrimSpace(authID)
+		if authID == "" {
+			continue
+		}
+		if _, ok := modelSet[authID]; !ok {
+			continue
+		}
+		if _, ok := seen[authID]; ok {
+			continue
+		}
+		seen[authID] = struct{}{}
+		allowed = append(allowed, authID)
+	}
+	return allowed
+}
+
 // AllowedAuthIDsForAPIKey returns auth IDs allowed by the API key channel bindings.
 func (r *Repository) AllowedAuthIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
 	db, errDB := r.database()
@@ -719,6 +830,25 @@ func allowedAuthIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *API
 	if len(channelIDs) == 0 {
 		return nil, nil
 	}
+	return allowedAuthIDsForChannelGroups(ctx, db, channelIDs)
+}
+
+func allowedAuthIDsForChannelGroups(ctx context.Context, db *gorm.DB, channelIDs []uint) ([]string, error) {
+	details, errDetails := channelGroupDetailsForGroups(ctx, db, channelIDs)
+	if errDetails != nil {
+		return nil, errDetails
+	}
+	return allowedAuthIDsFromChannelGroupDetails(details, channelIDs), nil
+}
+
+func channelGroupDetailsForGroups(ctx context.Context, db *gorm.DB, channelIDs []uint) ([]ChannelGroupDetailRecord, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database connection is nil")
+	}
+	channelIDs = normalizeChannelGroupIDs(channelIDs)
+	if len(channelIDs) == 0 {
+		return []ChannelGroupDetailRecord{}, nil
+	}
 
 	var details []ChannelGroupDetailRecord
 	if errFind := db.WithContext(contextOrBackground(ctx)).
@@ -731,10 +861,22 @@ func allowedAuthIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *API
 		Find(&details).Error; errFind != nil {
 		return nil, errFind
 	}
+	return details, nil
+}
+
+func allowedAuthIDsFromChannelGroupDetails(details []ChannelGroupDetailRecord, channelIDs []uint) []string {
+	channelIDs = normalizeChannelGroupIDs(channelIDs)
+	channelSet := make(map[uint]struct{}, len(channelIDs))
+	for _, channelID := range channelIDs {
+		channelSet[channelID] = struct{}{}
+	}
 
 	allowed := make([]string, 0, len(details))
 	seen := make(map[string]struct{}, len(details))
 	for _, detail := range details {
+		if _, ok := channelSet[detail.ChannelGroupID]; !ok {
+			continue
+		}
 		authID := strings.TrimSpace(detail.AuthID)
 		if authID == "" {
 			continue
@@ -745,22 +887,30 @@ func allowedAuthIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *API
 		seen[authID] = struct{}{}
 		allowed = append(allowed, authID)
 	}
-	return allowed, nil
+	return allowed
 }
 
 func allowedModelIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord) ([]string, error) {
+	details, restricted, errDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, record)
+	if errDetails != nil {
+		return nil, errDetails
+	}
+	return allowedModelIDsFromDetails(details, restricted), nil
+}
+
+func allowedModelGroupDetailsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord) ([]ModelGroupDetailRecord, bool, error) {
 	if db == nil {
-		return nil, fmt.Errorf("database connection is nil")
+		return nil, false, fmt.Errorf("database connection is nil")
 	}
 	if record == nil {
-		return nil, fmt.Errorf("api key record is nil")
+		return nil, false, fmt.Errorf("api key record is nil")
 	}
 	modelGroupIDs, errModelGroups := apiKeyModelGroupsFromJSON(record.ModelGroups)
 	if errModelGroups != nil {
-		return nil, errModelGroups
+		return nil, false, errModelGroups
 	}
 	if len(modelGroupIDs) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var details []ModelGroupDetailRecord
@@ -772,13 +922,19 @@ func allowedModelIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *AP
 		Where("model_group_detail.model_group_id IN ?", modelGroupIDs).
 		Order("model_group_detail.model_group_id ASC, model_group_detail.id ASC").
 		Find(&details).Error; errFind != nil {
-		return nil, errFind
+		return nil, false, errFind
 	}
+	return details, true, nil
+}
 
+func allowedModelIDsFromDetails(details []ModelGroupDetailRecord, restricted bool) []string {
+	if !restricted {
+		return nil
+	}
 	allowed := make([]string, 0, len(details))
 	seen := make(map[string]struct{}, len(details))
-	for _, detail := range details {
-		modelID := strings.TrimSpace(detail.ModelID)
+	for i := range details {
+		modelID := canonicalModelGroupModelID(details[i].ModelID)
 		if modelID == "" {
 			continue
 		}
@@ -789,7 +945,7 @@ func allowedModelIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *AP
 		seen[modelKey] = struct{}{}
 		allowed = append(allowed, modelID)
 	}
-	return allowed, nil
+	return allowed
 }
 
 func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries []APIKeyEntryUpdate) (APIKeyUpsertStats, error) {
