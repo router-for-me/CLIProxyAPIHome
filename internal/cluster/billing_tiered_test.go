@@ -271,6 +271,60 @@ func TestBillingResponseTierModeUsesReportedResponseTier(t *testing.T) {
 	}
 }
 
+func TestBillingChargeAmountFallsBackForNonCanonicalLegacyUsage(t *testing.T) {
+	t.Parallel()
+
+	snapshot := BillingPriceSnapshot{InputPricePerMillion: 10, OutputPricePerMillion: 20}
+	for _, usage := range []*UsageRecord{
+		{Provider: "plugin-provider", InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+		{Provider: "openai", InputTokens: 100, OutputTokens: 50, TotalTokens: 200},
+	} {
+		if got, want := billingChargeAmount(usage, snapshot), 0.002; math.Abs(got-want) > 1e-12 {
+			t.Fatalf("billingChargeAmount(%s) = %.9f, want %.9f", usage.Provider, got, want)
+		}
+	}
+}
+
+func TestBillingChargeAmountFallbackPreservesLegacyCacheBilling(t *testing.T) {
+	t.Parallel()
+
+	openAI := &UsageRecord{
+		Provider:               "openai",
+		InputTokens:            100,
+		OutputTokens:           10,
+		CacheReadTokens:        30,
+		CacheReadTokensPresent: true,
+		CacheCreationTokens:    20,
+		TotalTokens:            999,
+	}
+	snapshot := BillingPriceSnapshot{
+		InputPricePerMillion:      10,
+		OutputPricePerMillion:     20,
+		CacheReadPricePerMillion:  2,
+		CacheWritePricePerMillion: 12.5,
+	}
+	if got, want := billingChargeAmount(openAI, snapshot), 0.00101; math.Abs(got-want) > 1e-12 {
+		t.Fatalf("billingChargeAmount(OpenAI fallback) = %.9f, want %.9f", got, want)
+	}
+	snapshot.CacheWritePricePerMillion = 0
+	if got, want := billingChargeAmount(openAI, snapshot), 0.00096; math.Abs(got-want) > 1e-12 {
+		t.Fatalf("billingChargeAmount(OpenAI fallback without write price) = %.9f, want %.9f", got, want)
+	}
+	if got, want := billingCacheTokens(openAI), int64(50); got != want {
+		t.Fatalf("billingCacheTokens(OpenAI fallback) = %d, want %d", got, want)
+	}
+
+	anthropic := *openAI
+	anthropic.Provider = "anthropic"
+	snapshot.CacheWritePricePerMillion = 12.5
+	if got, want := billingChargeAmount(&anthropic, snapshot), 0.00151; math.Abs(got-want) > 1e-12 {
+		t.Fatalf("billingChargeAmount(Anthropic fallback) = %.9f, want %.9f", got, want)
+	}
+	if got, want := billingCacheTokens(&anthropic), int64(50); got != want {
+		t.Fatalf("billingCacheTokens(Anthropic fallback) = %d, want %d", got, want)
+	}
+}
+
 func TestBillingChargeAmountSeparatesOpenAICacheReadAndWrite(t *testing.T) {
 	t.Parallel()
 

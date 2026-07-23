@@ -774,6 +774,178 @@ func TestUsageObservabilityAggregateNormalizesMixedLegacyCacheHistory(t *testing
 	}
 }
 
+func TestUsageObservabilityLegacyTotalFallbackPreservesOpenAICompatibilityOverride(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	now := time.Now().UTC()
+	record := UsageRecord{
+		Timestamp:           now,
+		Provider:            "openai-compatible-anthropic",
+		ExecutorType:        "OpenAICompatExecutor",
+		InputTokens:         80,
+		OutputTokens:        20,
+		ReasoningTokens:     10,
+		CacheReadTokens:     30,
+		CacheCreationTokens: 10,
+		PayloadJSON:         JSONB(`{}`),
+		CreatedAt:           now,
+	}
+	if errCreate := db.Create(&record).Error; errCreate != nil {
+		t.Fatalf("Create(usage) error = %v", errCreate)
+	}
+
+	totals, _, errTotals := usageObservabilityTotalsSQL(db, UsageObservabilityRecordQuery{Provider: record.Provider})
+	if errTotals != nil {
+		t.Fatalf("usageObservabilityTotalsSQL() error = %v", errTotals)
+	}
+	if totals.TokenBreakdown.TotalTokens != 100 {
+		t.Fatalf("accounting total tokens = %d, want 100", totals.TokenBreakdown.TotalTokens)
+	}
+}
+
+func TestUsageObservabilityMetricsFallbackWhileTokenBackfillIsPending(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	records := []UsageRecord{
+		{
+			Timestamp:           now,
+			Provider:            "openai",
+			Model:               "shared",
+			InputTokens:         80,
+			OutputTokens:        20,
+			CachedTokens:        20,
+			CacheCreationTokens: 10,
+			PayloadJSON:         JSONB(`{}`),
+			CreatedAt:           now,
+		},
+		{
+			Timestamp:                 now,
+			Provider:                  "codex",
+			Model:                     "shared",
+			InputTokens:               200,
+			OutputTokens:              100,
+			TotalTokens:               300,
+			TokenAccountingVersion:    UsageTokenAccountingSchemaVersion,
+			TokenAccountingQuality:    UsageTokenAccountingQualityComplete,
+			AccountingTotalTokens:     300,
+			AccountingInputTokens:     200,
+			UncachedInputTokens:       140,
+			AccountingCacheReadTokens: 60,
+			AccountingOutputTokens:    100,
+			NonReasoningOutputTokens:  100,
+			PayloadJSON:               JSONB(`{}`),
+			CreatedAt:                 now,
+		},
+	}
+	if errCreate := db.Create(&records).Error; errCreate != nil {
+		t.Fatalf("Create(usage) error = %v", errCreate)
+	}
+	for index := range records {
+		charge := BillingChargeRecord{
+			ID:            "charge-backfill-" + records[index].Provider,
+			UsageID:       records[index].ID,
+			PayloadHash:   "hash-backfill-" + records[index].Provider,
+			Provider:      records[index].Provider,
+			Model:         records[index].Model,
+			Amount:        float64(index + 1),
+			PriceSnapshot: JSONB(`{}`),
+			CreatedAt:     now,
+		}
+		if errCreate := db.Create(&charge).Error; errCreate != nil {
+			t.Fatalf("Create(billing charge) error = %v", errCreate)
+		}
+	}
+
+	from := now.Add(-time.Second)
+	to := now.Add(time.Minute)
+	overview, errOverview := repo.UsageObservabilityOverview(ctx, UsageObservabilityOverviewQuery{
+		From:     &from,
+		To:       &to,
+		Interval: "minute",
+		Timezone: "UTC",
+	})
+	if errOverview != nil {
+		t.Fatalf("UsageObservabilityOverview() error = %v", errOverview)
+	}
+	if overview.Totals.TokenBreakdown.TotalTokens != 400 || overview.Live.TPM != 80 {
+		t.Fatalf("overview tokens = total:%d live_tpm:%v, want 400/80", overview.Totals.TokenBreakdown.TotalTokens, overview.Live.TPM)
+	}
+	if overview.Totals.BlendedCostPer1M == nil || *overview.Totals.BlendedCostPer1M != 7500 {
+		t.Fatalf("blended cost = %v, want 7500", overview.Totals.BlendedCostPer1M)
+	}
+
+	list, errList := repo.ListUsageObservabilityRecords(ctx, UsageObservabilityRecordQuery{From: &from, To: &to, Sort: "tokens_desc", Limit: 10})
+	if errList != nil {
+		t.Fatalf("ListUsageObservabilityRecords() error = %v", errList)
+	}
+	if len(list.Records) != 2 || list.Records[0].Provider != "codex" {
+		t.Fatalf("records = %+v, want codex first", list.Records)
+	}
+
+	aggregates, errAggregates := repo.ListUsageObservabilityAggregates(ctx, UsageObservabilityAggregateQuery{
+		From:      &from,
+		To:        &to,
+		GroupBy:   "provider",
+		Metric:    "total_tokens",
+		Direction: "desc",
+		Limit:     10,
+	})
+	if errAggregates != nil {
+		t.Fatalf("ListUsageObservabilityAggregates() error = %v", errAggregates)
+	}
+	if len(aggregates.Items) != 2 || aggregates.Items[0].ID != "codex" || aggregates.Items[0].TokenBreakdown.TotalTokens != 300 {
+		t.Fatalf("aggregates = %+v, want codex with 300 tokens first", aggregates.Items)
+	}
+	if aggregates.Items[1].CacheRate != 0.3 {
+		t.Fatalf("openai cache rate = %v, want 0.3", aggregates.Items[1].CacheRate)
+	}
+
+	mixed, errMixed := repo.ListUsageObservabilityAggregates(ctx, UsageObservabilityAggregateQuery{
+		From:      &from,
+		To:        &to,
+		GroupBy:   "model",
+		Metric:    "total_tokens",
+		Direction: "desc",
+		Limit:     10,
+	})
+	if errMixed != nil {
+		t.Fatalf("ListUsageObservabilityAggregates(mixed) error = %v", errMixed)
+	}
+	if len(mixed.Items) != 1 || mixed.Items[0].CacheRate != 0.225 {
+		t.Fatalf("mixed aggregate = %+v, want cache rate 0.225", mixed.Items)
+	}
+
+	realtime, errRealtime := repo.UsageObservabilityRealtime(ctx, UsageObservabilityRealtimeQuery{
+		From:          &from,
+		To:            &to,
+		GroupBy:       "provider",
+		BucketSeconds: 60,
+	})
+	if errRealtime != nil {
+		t.Fatalf("UsageObservabilityRealtime() error = %v", errRealtime)
+	}
+	if len(realtime.Velocity) != 1 || realtime.Velocity[0].TPM != 400 {
+		t.Fatalf("realtime velocity = %+v, want one bucket with TPM 400", realtime.Velocity)
+	}
+}
+
 func TestListUsageObservabilityAggregatesSortsBeforePagination(t *testing.T) {
 	t.Parallel()
 

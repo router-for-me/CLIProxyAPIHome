@@ -444,6 +444,8 @@ type usageObservabilityAggregateRow struct {
 	CacheReadTokens            int64           `gorm:"column:cache_read_tokens"`
 	CacheCreationTokens        int64           `gorm:"column:cache_creation_tokens"`
 	TotalTokens                int64           `gorm:"column:total_tokens"`
+	CacheRateTokens            int64           `gorm:"column:cache_rate_tokens"`
+	CacheRateTotalTokens       int64           `gorm:"column:cache_rate_total_tokens"`
 	TokenAccountingQuality     string          `gorm:"column:token_accounting_quality"`
 	AccountingTotalTokens      int64           `gorm:"column:accounting_total_tokens"`
 	AccountingInputTokens      int64           `gorm:"column:accounting_input_tokens"`
@@ -499,11 +501,13 @@ type UsageObservabilityHealthDetail struct {
 }
 
 type usageObservabilityAggregateAccumulator struct {
-	Item          UsageObservabilityAggregateItem
-	LatencyValues []int64
-	LatencyTotal  int64
-	AmountTotal   float64
-	AmountValid   bool
+	Item                 UsageObservabilityAggregateItem
+	LatencyValues        []int64
+	LatencyTotal         int64
+	AmountTotal          float64
+	AmountValid          bool
+	CacheRateTokens      int64
+	CacheRateTotalTokens int64
 }
 
 type usageObservabilityOverviewBounds struct {
@@ -935,6 +939,7 @@ func usageObservabilityTotalsSQL(db *gorm.DB, query UsageObservabilityRecordQuer
 func usageObservabilityTotalsSQLSelect() string {
 	credentialExpr := `NULLIF(` + usageObservabilitySQLCredentialID() + `, '')`
 	cacheReadTokensExpr := usageObservabilitySQLCacheReadTokens(`"usage"`)
+	accountingTotalTokensExpr := usageObservabilitySQLAccountingTotalTokens(`"usage"`)
 	return fmt.Sprintf(`
 		COUNT(DISTINCT "usage"."id") AS request_count,
 		SUM(CASE WHEN "usage"."failed" THEN 0 ELSE 1 END) AS success_count,
@@ -951,7 +956,7 @@ func usageObservabilityTotalsSQLSelect() string {
 			WHEN SUM(CASE WHEN "usage"."token_accounting_quality" = 'unclassified' AND "usage"."unclassified_tokens" > 0 THEN 1 ELSE 0 END) > 0 THEN 'unclassified'
 			ELSE 'complete'
 		END AS token_accounting_quality,
-		SUM("usage"."accounting_total_tokens") AS accounting_total_tokens,
+		SUM(%s) AS accounting_total_tokens,
 		SUM("usage"."accounting_input_tokens") AS accounting_input_tokens,
 		SUM("usage"."uncached_input_tokens") AS uncached_input_tokens,
 		SUM("usage"."accounting_cache_read_tokens") AS accounting_cache_read_tokens,
@@ -968,7 +973,7 @@ func usageObservabilityTotalsSQLSelect() string {
 		COUNT(DISTINCT %s) AS active_credential_count,
 		COUNT(DISTINCT NULLIF("usage"."model", '')) AS active_model_count,
 		MIN("usage"."timestamp") AS min_timestamp,
-		MAX("usage"."timestamp") AS max_timestamp`, cacheReadTokensExpr, credentialExpr)
+		MAX("usage"."timestamp") AS max_timestamp`, cacheReadTokensExpr, accountingTotalTokensExpr, credentialExpr)
 }
 
 func usageObservabilityTotalsFromRow(row *usageObservabilityTotalsRow) UsageObservabilityTotals {
@@ -1085,6 +1090,7 @@ func usageObservabilityLiveSQL(db *gorm.DB, query UsageObservabilityRecordQuery,
 func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery, interval string, location *time.Location, bounds usageObservabilityOverviewBounds) ([]UsageObservabilityTrendPoint, error) {
 	bucketExpr, bucketArgs := usageObservabilityTrendBucketUnixSQL(db, interval, location, query, bounds)
 	cacheReadTokensExpr := usageObservabilitySQLCacheReadTokens(`"usage"`)
+	accountingTotalTokensExpr := usageObservabilitySQLAccountingTotalTokens(`"usage"`)
 	baseSelect := fmt.Sprintf(`
 		%s AS bucket_unix,
 		"usage"."latency_ms" AS latency_ms,
@@ -1097,7 +1103,7 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 		"usage"."total_tokens" AS total_tokens,
 		"usage"."token_accounting_version" AS token_accounting_version,
 		"usage"."token_accounting_quality" AS token_accounting_quality,
-		"usage"."accounting_total_tokens" AS accounting_total_tokens,
+		%s AS accounting_total_tokens,
 		"usage"."accounting_input_tokens" AS accounting_input_tokens,
 		"usage"."uncached_input_tokens" AS uncached_input_tokens,
 		"usage"."accounting_cache_read_tokens" AS accounting_cache_read_tokens,
@@ -1107,7 +1113,7 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 		"usage"."accounting_reasoning_tokens" AS accounting_reasoning_tokens,
 		"usage"."unclassified_tokens" AS unclassified_tokens,
 		"usage"."failed" AS failed,
-		"billing_charge"."amount" AS amount`, bucketExpr, cacheReadTokensExpr)
+		"billing_charge"."amount" AS amount`, bucketExpr, cacheReadTokensExpr, accountingTotalTokensExpr)
 	base := usageObservabilityUsageBillingScope(db.Table("usage"), query).Select(baseSelect, bucketArgs...)
 	var rows []usageObservabilityTrendBucketRow
 	if errFind := db.Table("(?) AS trend_source", base).
@@ -1516,7 +1522,7 @@ func usageObservabilityRealtimeVelocitySQL(db *gorm.DB, query UsageObservability
 		%s AS bucket_unix,
 		COUNT(*) AS request_count,
 		SUM(CASE WHEN "usage"."failed" THEN 1 ELSE 0 END) AS failed_count,
-		SUM("usage"."accounting_total_tokens") AS total_tokens`, bucketExpr)
+		SUM(%s) AS total_tokens`, bucketExpr, usageObservabilitySQLAccountingTotalTokens(`"usage"`))
 	var rows []usageObservabilityRealtimeVelocityRow
 	if errFind := usageObservabilityNarrowUsageScope(db.Table("usage"), query).
 		Select(selectSQL, bucketArgs...).
@@ -1847,8 +1853,9 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		%s AS cache_read_tokens,
 		"usage"."cache_creation_tokens" AS cache_creation_tokens,
 		"usage"."total_tokens" AS total_tokens,
+		"usage"."token_accounting_version" AS token_accounting_version,
 		"usage"."token_accounting_quality" AS token_accounting_quality,
-		"usage"."accounting_total_tokens" AS accounting_total_tokens,
+		%s AS accounting_total_tokens,
 		"usage"."accounting_input_tokens" AS accounting_input_tokens,
 		"usage"."uncached_input_tokens" AS uncached_input_tokens,
 		"usage"."accounting_cache_read_tokens" AS accounting_cache_read_tokens,
@@ -1857,6 +1864,8 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		"usage"."non_reasoning_output_tokens" AS non_reasoning_output_tokens,
 		"usage"."accounting_reasoning_tokens" AS accounting_reasoning_tokens,
 		"usage"."unclassified_tokens" AS unclassified_tokens,
+		%s AS cache_rate_tokens,
+		%s AS cache_rate_total_tokens,
 		"billing_charge"."amount" AS amount`,
 		idExpr,
 		labelExpr,
@@ -1876,7 +1885,43 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		authDisabledExpr,
 		authUnavailableExpr,
 		usageObservabilitySQLCacheReadTokens(`"usage"`),
+		usageObservabilitySQLAccountingTotalTokens(`"usage"`),
+		usageObservabilitySQLCacheRateTokens(`"usage"`),
+		usageObservabilitySQLAccountingTotalTokens(`"usage"`),
 	)
+}
+
+func usageObservabilitySQLAccountingTotalTokens(table string) string {
+	return fmt.Sprintf(`CASE WHEN %s."token_accounting_version" = %d THEN %s."accounting_total_tokens" ELSE %s END`,
+		table, UsageTokenAccountingSchemaVersion, table, usageObservabilitySQLLegacyTotalTokens(table))
+}
+
+func usageObservabilitySQLLegacyTotalTokens(table string) string {
+	provider := fmt.Sprintf(`LOWER(TRIM(%s."provider"))`, table)
+	executorType := fmt.Sprintf(`LOWER(TRIM(%s."executor_type"))`, table)
+	providerAndExecutor := `(` + provider + ` || ' ' || ` + executorType + `)`
+	openAICompatible := `(` + executorType + ` = 'openaicompatexecutor' OR ` + provider + ` = 'openai-compatibility' OR ` + provider + ` LIKE 'openai-compatible-%')`
+	independent := `(` + providerAndExecutor + ` LIKE '%claude%' OR ` + providerAndExecutor + ` LIKE '%anthropic%')`
+	separateReasoning := `(` + providerAndExecutor + ` LIKE '%gemini%' OR ` + providerAndExecutor + ` LIKE '%aistudio%' OR ` + providerAndExecutor + ` LIKE '%antigravity%' OR ` + providerAndExecutor + ` LIKE '%vertex%' OR ` + providerAndExecutor + ` LIKE '%interaction%')`
+	cacheReadTokens := usageObservabilitySQLCacheReadTokens(table)
+	return fmt.Sprintf(`CASE
+		WHEN %s."total_tokens" <> 0 THEN %s."total_tokens"
+		WHEN %s THEN %s."input_tokens" + %s."output_tokens"
+		WHEN %s THEN %s."input_tokens" + (%s) + %s."cache_creation_tokens" + %s."output_tokens" + %s."reasoning_tokens"
+		WHEN %s THEN %s."input_tokens" + %s."output_tokens" + %s."reasoning_tokens"
+		ELSE %s."input_tokens" + %s."output_tokens" END`,
+		table, table,
+		openAICompatible, table, table,
+		independent, table, cacheReadTokens, table, table, table,
+		separateReasoning, table, table, table,
+		table, table)
+}
+
+func usageObservabilitySQLCacheRateTokens(table string) string {
+	return fmt.Sprintf(`CASE WHEN %s."token_accounting_version" = %d
+		THEN %s."accounting_cache_read_tokens" + %s."accounting_cache_write_tokens"
+		ELSE (%s) + %s."cache_creation_tokens" END`,
+		table, UsageTokenAccountingSchemaVersion, table, table, usageObservabilitySQLCacheReadTokens(table), table)
 }
 
 // usageObservabilitySQLCacheReadTokens keeps aggregate queries compatible with
@@ -1958,6 +2003,8 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 		SUM(scoped.cache_read_tokens) AS cache_read_tokens,
 		SUM(scoped.cache_creation_tokens) AS cache_creation_tokens,
 		SUM(scoped.total_tokens) AS total_tokens,
+		SUM(scoped.cache_rate_tokens) AS cache_rate_tokens,
+		SUM(scoped.cache_rate_total_tokens) AS cache_rate_total_tokens,
 		CASE
 			WHEN SUM(CASE WHEN scoped.token_accounting_quality = 'inconsistent' THEN 1 ELSE 0 END) > 0 THEN 'inconsistent'
 			WHEN SUM(CASE WHEN scoped.token_accounting_quality = 'unclassified' AND scoped.unclassified_tokens > 0 THEN 1 ELSE 0 END) > 0 THEN 'unclassified'
@@ -2494,9 +2541,9 @@ func usageObservabilityRecordOrder(sortValue string) string {
 	case "timestamp_asc":
 		return `"usage"."timestamp" ASC, "usage"."id" ASC`
 	case "tokens_desc":
-		return `"usage"."accounting_total_tokens" DESC, "usage"."timestamp" DESC, "usage"."id" DESC`
+		return usageObservabilitySQLAccountingTotalTokens(`"usage"`) + ` DESC, "usage"."timestamp" DESC, "usage"."id" DESC`
 	case "tokens_asc":
-		return `"usage"."accounting_total_tokens" ASC, "usage"."timestamp" ASC, "usage"."id" ASC`
+		return usageObservabilitySQLAccountingTotalTokens(`"usage"`) + ` ASC, "usage"."timestamp" ASC, "usage"."id" ASC`
 	case "cost_desc":
 		return `COALESCE("billing_charge"."amount", 0) DESC, "usage"."timestamp" DESC, "usage"."id" DESC`
 	case "cost_asc":
@@ -2638,7 +2685,9 @@ func usageObservabilityAggregateItemFromRow(row *usageObservabilityAggregateRow,
 		item.SuccessRate = float64(item.SuccessCount) / float64(item.RequestCount)
 		item.ErrorRate = float64(item.FailedCount) / float64(item.RequestCount)
 	}
-	if item.TokenBreakdown.TotalTokens > 0 {
+	if row.CacheRateTotalTokens > 0 {
+		item.CacheRate = float64(row.CacheRateTokens) / float64(row.CacheRateTotalTokens)
+	} else if item.TokenBreakdown.TotalTokens > 0 {
 		cacheTokens := item.TokenBreakdown.Input.CacheReadTokens + item.TokenBreakdown.Input.CacheWriteTokens
 		item.CacheRate = float64(cacheTokens) / float64(item.TokenBreakdown.TotalTokens)
 	}
@@ -3059,18 +3108,18 @@ func (a *usageObservabilityAggregateAccumulator) add(row *usageObservabilityReco
 	a.Item.CacheReadTokens += normalizedUsageCacheReadTokens(row.Provider, row.ExecutorType, row.CachedTokens, row.CacheReadTokens, row.CacheReadTokensPresent)
 	a.Item.CacheCreationTokens += row.CacheCreationTokens
 	a.Item.TotalTokens += row.TotalTokens
-	a.Item.TokenBreakdown = mergeUsageTokenBreakdowns(a.Item.TokenBreakdown, usageTokenBreakdownFromValues(
-		row.TokenAccountingQuality,
-		row.AccountingTotalTokens,
-		row.AccountingInputTokens,
-		row.UncachedInputTokens,
-		row.AccountingCacheReadTokens,
-		row.AccountingCacheWriteTokens,
-		row.AccountingOutputTokens,
-		row.NonReasoningOutputTokens,
-		row.AccountingReasoningTokens,
-		row.UnclassifiedTokens,
-	))
+	breakdown := usageTokenBreakdownFromObservabilityRow(row)
+	a.Item.TokenBreakdown = mergeUsageTokenBreakdowns(a.Item.TokenBreakdown, breakdown)
+	if row.TokenAccountingVersion == UsageTokenAccountingSchemaVersion {
+		a.CacheRateTokens += breakdown.Input.CacheReadTokens + breakdown.Input.CacheWriteTokens
+		a.CacheRateTotalTokens += breakdown.TotalTokens
+	} else {
+		a.CacheRateTokens += usageObservabilityCacheTokens(
+			normalizedUsageCacheReadTokens(row.Provider, row.ExecutorType, row.CachedTokens, row.CacheReadTokens, row.CacheReadTokensPresent),
+			row.CacheCreationTokens,
+		)
+		a.CacheRateTotalTokens += breakdown.TotalTokens
+	}
 	if row.Amount.Valid {
 		a.AmountTotal += row.Amount.Float64
 		a.AmountValid = true
@@ -3085,6 +3134,36 @@ func (a *usageObservabilityAggregateAccumulator) add(row *usageObservabilityReco
 	}
 }
 
+func usageTokenBreakdownFromObservabilityRow(row *usageObservabilityRecordRow) UsageTokenBreakdown {
+	if row == nil {
+		return newUnclassifiedUsageTokenBreakdown(0)
+	}
+	if row.TokenAccountingVersion == UsageTokenAccountingSchemaVersion {
+		return usageTokenBreakdownFromValues(
+			row.TokenAccountingQuality,
+			row.AccountingTotalTokens,
+			row.AccountingInputTokens,
+			row.UncachedInputTokens,
+			row.AccountingCacheReadTokens,
+			row.AccountingCacheWriteTokens,
+			row.AccountingOutputTokens,
+			row.NonReasoningOutputTokens,
+			row.AccountingReasoningTokens,
+			row.UnclassifiedTokens,
+		)
+	}
+	return usageTokenBreakdownFromLegacy(usageLegacyTokenCounters{
+		Provider:            row.Provider,
+		ExecutorType:        row.ExecutorType,
+		InputTokens:         row.InputTokens,
+		OutputTokens:        row.OutputTokens,
+		ReasoningTokens:     row.ReasoningTokens,
+		CacheReadTokens:     normalizedUsageCacheReadTokens(row.Provider, row.ExecutorType, row.CachedTokens, row.CacheReadTokens, row.CacheReadTokensPresent),
+		CacheCreationTokens: row.CacheCreationTokens,
+		TotalTokens:         row.TotalTokens,
+	})
+}
+
 func usageObservabilityCacheTokens(cacheReadTokens int64, cacheCreationTokens int64) int64 {
 	return cacheReadTokens + cacheCreationTokens
 }
@@ -3095,7 +3174,9 @@ func (a *usageObservabilityAggregateAccumulator) result() UsageObservabilityAggr
 		item.SuccessRate = float64(item.SuccessCount) / float64(item.RequestCount)
 		item.ErrorRate = float64(item.FailedCount) / float64(item.RequestCount)
 	}
-	if item.TokenBreakdown.TotalTokens > 0 {
+	if a.CacheRateTotalTokens > 0 {
+		item.CacheRate = float64(a.CacheRateTokens) / float64(a.CacheRateTotalTokens)
+	} else if item.TokenBreakdown.TotalTokens > 0 {
 		cacheTokens := item.TokenBreakdown.Input.CacheReadTokens + item.TokenBreakdown.Input.CacheWriteTokens
 		item.CacheRate = float64(cacheTokens) / float64(item.TokenBreakdown.TotalTokens)
 	}

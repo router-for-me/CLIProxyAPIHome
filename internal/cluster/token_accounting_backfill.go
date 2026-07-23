@@ -115,7 +115,7 @@ func runUsageTokenAccountingBackfillBatchTx(ctx context.Context, tx *gorm.DB, ba
 
 	var records []UsageRecord
 	if errFind := tx.WithContext(contextOrBackground(ctx)).
-		Select("id", "provider", "executor_type", "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_read_tokens_present", "cache_creation_tokens", "total_tokens", "token_accounting_version").
+		Select("id", "provider", "executor_type", "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_read_tokens_present", "cache_creation_tokens", "total_tokens", "token_accounting_version", "payload").
 		Where("id > ? AND id <= ?", state.LastScannedID, state.HighWaterID).
 		Order("id ASC").
 		Limit(batchSize).
@@ -135,7 +135,7 @@ func runUsageTokenAccountingBackfillBatchTx(ctx context.Context, tx *gorm.DB, ba
 			continue
 		}
 		cacheReadTokens := normalizedUsageCacheReadTokens(record.Provider, record.ExecutorType, record.CachedTokens, record.CacheReadTokens, record.CacheReadTokensPresent)
-		breakdown := usageTokenBreakdownFromLegacy(usageLegacyTokenCounters{
+		legacy := usageLegacyTokenCounters{
 			Provider:            record.Provider,
 			ExecutorType:        record.ExecutorType,
 			InputTokens:         record.InputTokens,
@@ -144,7 +144,11 @@ func runUsageTokenAccountingBackfillBatchTx(ctx context.Context, tx *gorm.DB, ba
 			CacheReadTokens:     cacheReadTokens,
 			CacheCreationTokens: record.CacheCreationTokens,
 			TotalTokens:         record.TotalTokens,
-		})
+		}
+		breakdown := usageTokenBreakdownFromLegacy(legacy)
+		if payloadBreakdown, errPayload := usageTokenBreakdownFromPayload(string(record.PayloadJSON), legacy); errPayload == nil {
+			breakdown = payloadBreakdown
+		}
 		update := tx.WithContext(contextOrBackground(ctx)).Model(&UsageRecord{}).
 			Where("id = ? AND token_accounting_version <> ?", record.ID, UsageTokenAccountingSchemaVersion).
 			Updates(usageTokenBreakdownUpdates(breakdown))
