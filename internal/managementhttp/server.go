@@ -111,6 +111,7 @@ type ClusterManagementOption struct {
 	NodePort         int
 	HeartbeatTimeout time.Duration
 	ForwardTLSConfig *tls.Config
+	QuotaRecollect   clustermanagement.QuotaRecollectTrigger
 }
 
 type DatabaseManagementOption = ClusterManagementOption
@@ -140,6 +141,7 @@ func WithDatabaseManagement(opt DatabaseManagementOption) RouteOption {
 		handler := clustermanagement.NewHandler(opt.Repository, opt.Runtime, opt.NodeIP, opt.NodePort)
 		handler.SetHeartbeatTimeout(opt.HeartbeatTimeout)
 		handler.SetForwardTLSConfig(opt.ForwardTLSConfig)
+		handler.SetQuotaRecollectTrigger(opt.QuotaRecollect)
 		registerClusterManagementRoutes(r, handler)
 	}
 }
@@ -211,6 +213,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPatch, "/credentials/:credential_id/concurrency-policy", handler.PatchCredentialConcurrencyPolicy)
 	r.Set(http.MethodGet, "/quota/credentials", handler.ListQuotaCredentials)
 	r.Set(http.MethodGet, "/quota/credentials/:credential_id", handler.GetQuotaCredential)
+	r.Set(http.MethodPost, "/quota/collect", handler.CollectQuota)
 	r.Set(http.MethodGet, "/usage/overview", handler.GetUsageOverview)
 	r.Set(http.MethodGet, "/usage/records", handler.ListUsageRecords)
 	r.Set(http.MethodGet, "/usage/records/:id", handler.GetUsageRecord)

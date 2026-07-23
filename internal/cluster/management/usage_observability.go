@@ -28,6 +28,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 		"capabilities": gin.H{
 			"quota_snapshots":                  true,
 			"quota_snapshot_details":           true,
+			"quota_recollect":                  h.quotaRecollect != nil,
 			"usage":                            true,
 			"usage_overview":                   true,
 			"usage_records":                    true,

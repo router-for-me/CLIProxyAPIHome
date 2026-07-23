@@ -36,6 +36,11 @@ const (
 	xaiBillingURL              = "https://cli-chat-proxy.grok.com/v1/billing"
 	codexUserAgent             = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 	antigravityUserAgent       = "antigravity/1.11.5 windows/amd64"
+	xaiTokenAuthHeader         = "X-XAI-Token-Auth"
+	xaiTokenAuthValue          = "xai-grok-cli"
+	xaiClientVersionHeader     = "x-grok-client-version"
+	xaiClientVersionValue      = "0.2.93"
+	xaiGrokUserAgent           = "xai-grok-workspace/0.2.93"
 )
 
 var defaultAntigravityURLs = []string{
@@ -66,8 +71,14 @@ type Options struct {
 }
 
 type Collector struct {
-	repo    *cluster.Repository
-	options Options
+	repo          *cluster.Repository
+	options       Options
+	globalSem     chan struct{}
+	providerSemMu sync.Mutex
+	providerSem   map[string]chan struct{}
+	onDemandMu    sync.Mutex
+	onDemandJobs  map[string]struct{}
+	background    sync.WaitGroup
 }
 
 func NewCollector(repo *cluster.Repository, options Options) *Collector {
@@ -90,11 +101,10 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 	if options.SnapshotFreshness <= 0 {
 		options.SnapshotFreshness = defaultSnapshotFreshness
 	}
-	if options.ProviderConcurrency <= 0 {
+	if repo.DialectName() == "sqlite" {
+		options.ProviderConcurrency = 1
+	} else if options.ProviderConcurrency <= 0 {
 		options.ProviderConcurrency = defaultProviderConcurrency
-		if repo.DialectName() == "sqlite" {
-			options.ProviderConcurrency = 1
-		}
 	}
 	if strings.TrimSpace(options.CodexUsageURL) == "" {
 		options.CodexUsageURL = codexUsageURL
@@ -126,7 +136,16 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 			return quotaHTTPClient(auth, globalProxyURL, timeout)
 		}
 	}
-	return &Collector{repo: repo, options: options}
+	collector := &Collector{
+		repo:         repo,
+		options:      options,
+		providerSem:  make(map[string]chan struct{}),
+		onDemandJobs: make(map[string]struct{}),
+	}
+	if repo.DialectName() == "sqlite" {
+		collector.globalSem = make(chan struct{}, options.ProviderConcurrency)
+	}
+	return collector
 }
 
 func (c *Collector) Start(ctx context.Context) {
@@ -160,43 +179,129 @@ func (c *Collector) collect(ctx context.Context) {
 		log.WithError(errAuths).Warn("quota collector: list credentials failed")
 		return
 	}
-	var globalSem chan struct{}
-	providerSem := make(map[string]chan struct{})
-	if c.repo.DialectName() == "sqlite" {
-		globalSem = make(chan struct{}, c.options.ProviderConcurrency)
+	c.collectCredentials(ctx, auths, false)
+}
+
+// TriggerCollection queues an asynchronous forced collection round for the
+// matching credentials and returns how many new local jobs were accepted.
+// Empty filters accept every eligible credential. The round runs on a detached
+// context so it outlives the caller (for example an HTTP request).
+func (c *Collector) TriggerCollection(ctx context.Context, credentialIDs map[string]struct{}, providers map[string]struct{}) (int, error) {
+	if c == nil || c.repo == nil {
+		return 0, fmt.Errorf("quota collector is unavailable")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	auths, errAuths := c.repo.ListAuths(ctx)
+	if errAuths != nil {
+		return 0, errAuths
+	}
+	accepted := make([]*coreauth.Auth, 0, len(auths))
+	now := c.options.Now().UTC()
+	c.onDemandMu.Lock()
+	for _, auth := range auths {
+		if !quotaProbeEligible(auth, now) {
+			continue
+		}
+		if len(credentialIDs) > 0 {
+			if _, ok := credentialIDs[strings.TrimSpace(auth.ID)]; !ok {
+				continue
+			}
+		}
+		if len(providers) > 0 {
+			if _, ok := providers[normalizedQuotaProvider(auth.Provider)]; !ok {
+				continue
+			}
+		}
+		credentialID := strings.TrimSpace(auth.ID)
+		if _, exists := c.onDemandJobs[credentialID]; exists {
+			continue
+		}
+		c.onDemandJobs[credentialID] = struct{}{}
+		accepted = append(accepted, auth)
+	}
+	c.onDemandMu.Unlock()
+	if len(accepted) > 0 {
+		c.background.Add(1)
+		go func() {
+			defer c.background.Done()
+			c.collectCredentials(context.WithoutCancel(ctx), accepted, true)
+		}()
+	}
+	return len(accepted), nil
+}
+
+// Wait waits for asynchronous on-demand collection rounds to finish. It is
+// primarily useful for deterministic tests.
+func (c *Collector) Wait() {
+	if c == nil {
+		return
+	}
+	c.background.Wait()
+}
+
+func (c *Collector) collectCredentials(ctx context.Context, auths []*coreauth.Auth, force bool) {
 	var wait sync.WaitGroup
 	for _, auth := range auths {
 		if !quotaProbeEligible(auth, c.options.Now().UTC()) {
+			if force {
+				c.releaseOnDemandJob(auth)
+			}
 			continue
 		}
-		sem := globalSem
-		if sem == nil {
-			provider := normalizedQuotaProvider(auth.Provider)
-			sem = providerSem[provider]
-			if sem == nil {
-				sem = make(chan struct{}, c.options.ProviderConcurrency)
-				providerSem[provider] = sem
-			}
-		}
+		sem := c.quotaSemaphore(auth.Provider)
 		wait.Add(1)
 		go func(candidate *coreauth.Auth, release chan struct{}) {
 			defer wait.Done()
+			if force {
+				defer c.releaseOnDemandJob(candidate)
+			}
 			select {
 			case release <- struct{}{}:
 			case <-ctx.Done():
 				return
 			}
 			defer func() { <-release }()
-			c.collectCredential(ctx, candidate)
+			c.collectCredential(ctx, candidate, force)
 		}(auth, sem)
 	}
 	wait.Wait()
 }
 
-func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth) {
+func (c *Collector) quotaSemaphore(provider string) chan struct{} {
+	if c.globalSem != nil {
+		return c.globalSem
+	}
+	provider = normalizedQuotaProvider(provider)
+	c.providerSemMu.Lock()
+	defer c.providerSemMu.Unlock()
+	sem := c.providerSem[provider]
+	if sem == nil {
+		sem = make(chan struct{}, c.options.ProviderConcurrency)
+		c.providerSem[provider] = sem
+	}
+	return sem
+}
+
+func (c *Collector) releaseOnDemandJob(auth *coreauth.Auth) {
+	if c == nil || auth == nil {
+		return
+	}
+	c.onDemandMu.Lock()
+	delete(c.onDemandJobs, strings.TrimSpace(auth.ID))
+	c.onDemandMu.Unlock()
+}
+
+func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, force bool) {
 	now := c.options.Now().UTC()
-	claimed, errClaim := c.repo.ClaimEligibleQuotaProbe(ctx, auth.ID, c.options.Owner, now, c.options.LeaseDuration)
+	var claimed bool
+	var errClaim error
+	if force {
+		claimed, errClaim = c.repo.ForceClaimEligibleQuotaProbe(ctx, auth.ID, c.options.Owner, now, c.options.LeaseDuration)
+	} else {
+		claimed, errClaim = c.repo.ClaimEligibleQuotaProbe(ctx, auth.ID, c.options.Owner, now, c.options.LeaseDuration)
+	}
 	if errClaim != nil {
 		log.WithError(errClaim).WithField("credential_id", auth.ID).Warn("quota collector: claim failed")
 		return
@@ -229,7 +334,7 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth) 
 	input := cluster.QuotaSnapshotWrite{
 		CredentialID: auth.ID, QuotaStatus: status, CollectionStatus: collectionStatus, Source: "active_probe",
 		ObservedAt: &observedAt, MaxAcceptedObservedAt: &observedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
-		NextProbeAt: &expiresAt, ConsecutiveFailure: 0, Error: result.collectionError, ParserVersion: 1, CollectorVersion: 1,
+		NextProbeAt: &expiresAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: true, ParserVersion: 1, CollectorVersion: 1,
 		ExpectedProbeOwner: c.options.Owner, ClearProbeLease: true, ReplaceWindows: result.replaceWindows, Windows: result.windows,
 	}
 	if strings.TrimSpace(c.options.HomeID) != "" {
@@ -258,6 +363,7 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth) 
 
 type probeResult struct {
 	windows         []cluster.QuotaWindow
+	plan            *cluster.QuotaPlan
 	partial         bool
 	replaceWindows  bool
 	collectionError *cluster.QuotaCollectionError
@@ -277,8 +383,8 @@ func (c *Collector) probeCredential(ctx context.Context, auth *coreauth.Auth) (p
 		windows, errProbe := c.probeKimi(ctx, auth)
 		return probeResult{windows: windows, replaceWindows: true}, errProbe
 	case "xai":
-		windows, errProbe := c.probeXAI(ctx, auth)
-		return probeResult{windows: windows, replaceWindows: true}, errProbe
+		windows, plan, errProbe := c.probeXAI(ctx, auth)
+		return probeResult{windows: windows, plan: plan, replaceWindows: true}, errProbe
 	default:
 		return probeResult{}, &probeError{code: "PROVIDER_UNSUPPORTED", message: "Credential provider does not have a quota collector.", retryable: false}
 	}
