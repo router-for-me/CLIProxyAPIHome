@@ -31,7 +31,8 @@ func TestQuotaManagementListAndDetailReadDatabaseSnapshots(t *testing.T) {
 	availableResetCredits := 3
 	_, errSnapshot := handler.repo.UpsertQuotaSnapshot(context.Background(), cluster.QuotaSnapshotWrite{
 		CredentialID: "quota-management-auth", QuotaStatus: "low", CollectionStatus: "success", Source: "response_header",
-		ObservedAt: &now, ExpiresAt: &expiresAt, LastAttemptAt: &now, LastSuccessAt: &now, ReplaceWindows: true,
+		ObservedAt: &now, ExpiresAt: &expiresAt, LastAttemptAt: &now, LastSuccessAt: &now,
+		ParserVersion: cluster.QuotaSnapshotVersion("codex"), CollectorVersion: cluster.QuotaSnapshotVersion("codex"), ReplaceWindows: true,
 		Plan: &cluster.QuotaPlan{Name: "Pro 20x", Premium: true}, ReplacePlan: true,
 		ResetCredits: &cluster.QuotaResetCredits{
 			AvailableCount: &availableResetCredits,
@@ -41,7 +42,7 @@ func TestQuotaManagementListAndDetailReadDatabaseSnapshots(t *testing.T) {
 			}},
 		},
 		ReplaceResetCredits: true,
-		Windows:             []cluster.QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "low", Unit: "percentage", RemainingRatio: &remaining, ResetAt: &resetAt, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: now}},
+		Windows:             []cluster.QuotaWindow{{ID: "codex-5-hour", Scope: "account", Mode: "rolling", Status: "low", Unit: "percentage", RemainingRatio: &remaining, ResetAt: &resetAt, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: now}},
 	})
 	if errSnapshot != nil {
 		t.Fatalf("UpsertQuotaSnapshot() error = %v", errSnapshot)

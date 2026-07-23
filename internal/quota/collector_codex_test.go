@@ -27,9 +27,12 @@ func TestCollectorPersistsCodexPlanWindowsAndResetCredits(t *testing.T) {
 		case "/usage":
 			usageRequests.Add(1)
 			_, _ = w.Write([]byte(`{
-				"plan_type":"pro",
-				"rate_limit_reset_credits":{"available_count":3},
-				"rate_limit":{"primary_window":{"used_percent":9,"limit_window_seconds":604800,"reset_at":1785296520}},
+					"plan_type":"pro",
+					"rate_limit_reset_credits":{"available_count":3},
+					"rate_limit":{
+						"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_at":1784775720},
+						"secondary_window":{"used_percent":9,"limit_window_seconds":604800,"reset_at":1785296520}
+					},
 				"additional_rate_limits":[{
 					"limit_name":"GPT-5.3-Codex-Spark",
 					"metered_feature":"codex_bengalfox",
@@ -71,8 +74,8 @@ func TestCollectorPersistsCodexPlanWindowsAndResetCredits(t *testing.T) {
 	if item.CollectionStatus != "success" || item.Source == nil || *item.Source != "active_probe" || item.Plan == nil || item.Plan.Name != "Pro 20x" || !item.Plan.Premium {
 		t.Fatalf("Codex snapshot metadata = %+v", item)
 	}
-	if len(item.Windows) != 2 {
-		t.Fatalf("Codex windows = %+v, want two", item.Windows)
+	if len(item.Windows) != 3 {
+		t.Fatalf("Codex windows = %+v, want three", item.Windows)
 	}
 	windows := make(map[string]cluster.QuotaWindow, len(item.Windows))
 	for _, window := range item.Windows {
@@ -86,6 +89,9 @@ func TestCollectorPersistsCodexPlanWindowsAndResetCredits(t *testing.T) {
 	if !sparkOK || spark.RemainingRatio == nil || *spark.RemainingRatio != 1 || spark.ScopeID == nil || *spark.ScopeID != "codex_bengalfox" {
 		t.Fatalf("Spark weekly window = %+v", spark)
 	}
+	if len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ID != "codex-1-week" || item.PrimaryWindows[1].ID != "codex-bengalfox-1-week" {
+		t.Fatalf("Codex primary windows = %+v, want default weekly and Spark weekly", item.PrimaryWindows)
+	}
 	if item.ResetCredits == nil || item.ResetCredits.AvailableCount == nil || *item.ResetCredits.AvailableCount != 3 || len(item.ResetCredits.Credits) != 3 {
 		t.Fatalf("reset credits = %+v", item.ResetCredits)
 	}
@@ -94,7 +100,7 @@ func TestCollectorPersistsCodexPlanWindowsAndResetCredits(t *testing.T) {
 	}
 }
 
-func TestCollectorCodexResetDetailsFailurePreservesLastKnownDetails(t *testing.T) {
+func TestCollectorCodexResetDetailsFailureUsesLatestSummaryCount(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 22, 2, 0, 0, 0, time.UTC)
 	seedCollectorAuth(t, repo, "codex-reset-failure", map[string]any{"type": "codex", "access_token": "probe-secret"})
@@ -127,7 +133,7 @@ func TestCollectorCodexResetDetailsFailurePreservesLastKnownDetails(t *testing.T
 		case "/usage":
 			_, _ = w.Write([]byte(`{
 				"plan_type":"pro",
-				"rate_limit_reset_credits":{"available_count":3},
+				"rate_limit_reset_credits":{"available_count":1},
 				"rate_limit":{"primary_window":{"used_percent":9,"limit_window_seconds":604800,"reset_at":1785296520}}
 			}`))
 		case "/resets":
@@ -151,29 +157,71 @@ func TestCollectorCodexResetDetailsFailurePreservesLastKnownDetails(t *testing.T
 	if item.CollectionStatus != "partial" || item.Error == nil || item.Error.Code != "UPSTREAM_UNAVAILABLE" || len(item.Windows) != 1 || item.Windows[0].ID != "codex-1-week" || item.Windows[0].RemainingRatio == nil || math.Abs(*item.Windows[0].RemainingRatio-0.91) > 1e-9 {
 		t.Fatalf("partial Codex result = %+v", item)
 	}
-	if item.ResetCredits == nil || item.ResetCredits.AvailableCount == nil || *item.ResetCredits.AvailableCount != 3 || len(item.ResetCredits.Credits) != 1 || item.ResetCredits.Credits[0].ID != "old-credit" || !item.ResetCredits.ObservedAt.Equal(oldObservedAt) {
-		t.Fatalf("last-known reset details were not preserved: %+v", item.ResetCredits)
+	if item.ResetCredits == nil || item.ResetCredits.AvailableCount == nil || *item.ResetCredits.AvailableCount != 1 || len(item.ResetCredits.Credits) != 0 || !item.ResetCredits.ObservedAt.Equal(now) {
+		t.Fatalf("latest reset summary was not retained with empty details: %+v", item.ResetCredits)
 	}
 }
 
-func TestCollectorCodexResetCountControlsDetailsRequest(t *testing.T) {
+func TestCollectorCodexResetDetailsRequestedWithoutUsageSummary(t *testing.T) {
+	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC)
+	seedCollectorAuth(t, repo, "codex-reset-detail-only", map[string]any{"type": "codex", "access_token": "probe-secret"})
+
+	var resetRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/usage":
+			_, _ = w.Write([]byte(`{
+				"plan_type":"plus",
+				"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1785296520}}
+			}`))
+		case "/resets":
+			resetRequests.Add(1)
+			_, _ = w.Write([]byte(`{
+				"available_count":1,
+				"credits":[{"id":"detail-credit","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-07-22T00:00:00Z","expires_at":"2026-07-30T00:00:00Z"}]
+			}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner: "home-a", CodexUsageURL: server.URL + "/usage",
+		CodexResetCreditsURL: server.URL + "/resets", Now: func() time.Time { return now },
+	})
+	collector.collect(context.Background())
+
+	if resetRequests.Load() != 1 {
+		t.Fatalf("reset detail requests = %d, want 1", resetRequests.Load())
+	}
+	item, errGet := repo.GetQuotaCredential(context.Background(), "codex-reset-detail-only", now.Add(time.Minute))
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if item.CollectionStatus != "success" || item.ResetCredits == nil || item.ResetCredits.AvailableCount == nil || *item.ResetCredits.AvailableCount != 1 || len(item.ResetCredits.Credits) != 1 || item.ResetCredits.Credits[0].ID != "detail-credit" {
+		t.Fatalf("detail-only reset snapshot = %+v", item)
+	}
+}
+
+func TestCollectorCodexResetDetailsFailureClearsUnreliableLastKnownData(t *testing.T) {
 	for _, test := range []struct {
-		name           string
-		resetSummary   string
-		wantCount      int
-		wantOldDetails bool
+		name         string
+		resetSummary string
+		wantCount    *int
 	}{
-		{name: "zero clears details without request", resetSummary: `,"rate_limit_reset_credits":{"available_count":0}`, wantCount: 0},
-		{name: "missing preserves details without request", resetSummary: "", wantCount: 2, wantOldDetails: true},
+		{name: "zero summary", resetSummary: `,"rate_limit_reset_credits":{"available_count":0}`, wantCount: quotaIntPtr(0)},
+		{name: "missing summary", resetSummary: "", wantCount: nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repo := newCollectorTestRepository(t)
-			now := time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC)
+			now := time.Date(2026, 7, 22, 4, 0, 0, 0, time.UTC)
 			credentialID := "codex-reset-count-" + test.name
 			seedCollectorAuth(t, repo, credentialID, map[string]any{"type": "codex", "access_token": "probe-secret"})
 			oldObservedAt := now.Add(-time.Hour)
 			oldExpiresAt := now.Add(-time.Minute)
-			oldResetExpiry := now.Add(48 * time.Hour)
+			oldResetExpiry := now.Add(-time.Minute)
 			oldCount := 2
 			remaining := 0.5
 			period := float64(1)
@@ -198,7 +246,7 @@ func TestCollectorCodexResetCountControlsDetailsRequest(t *testing.T) {
 					_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1785296520}}` + test.resetSummary + `}`))
 				case "/resets":
 					resetRequests.Add(1)
-					http.Error(w, "unexpected reset details request", http.StatusInternalServerError)
+					http.Error(w, "reset details unavailable", http.StatusServiceUnavailable)
 				default:
 					http.NotFound(w, request)
 				}
@@ -210,23 +258,27 @@ func TestCollectorCodexResetCountControlsDetailsRequest(t *testing.T) {
 				CodexResetCreditsURL: server.URL + "/resets", Now: func() time.Time { return now },
 			})
 			collector.collect(context.Background())
-			if resetRequests.Load() != 0 {
-				t.Fatalf("reset detail requests = %d, want 0", resetRequests.Load())
+			if resetRequests.Load() != 1 {
+				t.Fatalf("reset detail requests = %d, want 1", resetRequests.Load())
 			}
 			item, errGet := repo.GetQuotaCredential(context.Background(), credentialID, now.Add(time.Minute))
 			if errGet != nil {
 				t.Fatalf("GetQuotaCredential() error = %v", errGet)
 			}
-			if item.CollectionStatus != "success" || item.ResetCredits == nil || item.ResetCredits.AvailableCount == nil || *item.ResetCredits.AvailableCount != test.wantCount {
-				t.Fatalf("reset count snapshot = %+v", item)
+			if item.CollectionStatus != "success" || item.Error != nil {
+				t.Fatalf("unreliable reset details degraded usable quota: %+v", item)
 			}
-			if test.wantOldDetails {
-				if len(item.ResetCredits.Credits) != 1 || item.ResetCredits.Credits[0].ID != "old-credit" {
-					t.Fatalf("missing summary did not preserve old details: %+v", item.ResetCredits)
+			if test.wantCount == nil {
+				if item.ResetCredits != nil {
+					t.Fatalf("missing summary retained stale reset data: %+v", item.ResetCredits)
 				}
-			} else if len(item.ResetCredits.Credits) != 0 {
-				t.Fatalf("zero summary did not clear details: %+v", item.ResetCredits)
+			} else if item.ResetCredits == nil || item.ResetCredits.AvailableCount == nil || *item.ResetCredits.AvailableCount != *test.wantCount || len(item.ResetCredits.Credits) != 0 || !item.ResetCredits.ObservedAt.Equal(now) {
+				t.Fatalf("zero summary fallback = %+v", item.ResetCredits)
 			}
 		})
 	}
+}
+
+func quotaIntPtr(value int) *int {
+	return &value
 }

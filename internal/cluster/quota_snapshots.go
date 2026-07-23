@@ -17,7 +17,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const quotaSnapshotSchemaVersion = 1
+const (
+	quotaSnapshotSchemaVersion = 1
+	codexQuotaSnapshotVersion  = 2
+)
 
 const quotaSnapshotFallbackFreshness = 30 * time.Minute
 
@@ -38,6 +41,18 @@ var (
 	quotaRequestIDSecretPattern = regexp.MustCompile(`(?i)(bearer|authorization|access[_-]?token|refresh[_-]?token|api[_-]?key|cookie|secret|^sk[-_]|^gh[pousr]_)`)
 	quotaJWTSecretPattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$`)
 )
+
+// QuotaSnapshotVersion returns the active-collector snapshot version expected
+// for a provider. Provider-specific versions let one collector invalidate its
+// persisted representation without forcing unrelated providers to recollect.
+func QuotaSnapshotVersion(provider string) int {
+	switch normalizeQuotaProviderID(provider) {
+	case "codex":
+		return codexQuotaSnapshotVersion
+	default:
+		return quotaSnapshotSchemaVersion
+	}
+}
 
 type QuotaSnapshotRecord struct {
 	CredentialID        string     `gorm:"column:credential_id;primaryKey;size:128"`
@@ -333,6 +348,15 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 				record.ResetCredits = append(JSONB(nil), existing.ResetCredits...)
 			}
 			if input.Source == "response_header" {
+				// Passive observations must not downgrade an active collector
+				// version after a provider-specific snapshot migration succeeds
+				// or has already been attempted.
+				if existing.ParserVersion > record.ParserVersion {
+					record.ParserVersion = existing.ParserVersion
+				}
+				if existing.CollectorVersion > record.CollectorVersion {
+					record.CollectorVersion = existing.CollectorVersion
+				}
 				preserveQuotaProbeSchedule(&record, existing, input.ObservedAt, input.ReceivedAt)
 			}
 			if !input.ClearProbeLease {
@@ -587,6 +611,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 	}
 	claimed := false
 	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		targetCollectorVersion := quotaSnapshotSchemaVersion
 		if requireEligible {
 			var authRecord AuthRecord
 			errAuth := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&authRecord, "uuid = ?", credentialID).Error
@@ -600,10 +625,12 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 			if errConvert != nil {
 				return errConvert
 			}
+			provider := normalizeQuotaProviderID(authRecord.Provider)
 			credentialType := quotaCredentialType(auth)
-			if !quotaCredentialCollectorPlanned(normalizeQuotaProviderID(authRecord.Provider), credentialType) || authRecord.Disabled || authRecord.Status == coreauth.StatusDisabled || authRecord.NextRetryAfter != nil && authRecord.NextRetryAfter.After(now) {
+			if !quotaCredentialCollectorPlanned(provider, credentialType) || authRecord.Disabled || authRecord.Status == coreauth.StatusDisabled || authRecord.NextRetryAfter != nil && authRecord.NextRetryAfter.After(now) {
 				return nil
 			}
+			targetCollectorVersion = QuotaSnapshotVersion(provider)
 		}
 		var record QuotaSnapshotRecord
 		errFind := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "credential_id = ?", credentialID).Error
@@ -611,12 +638,14 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 			return errFind
 		}
 		observationInFuture := false
+		upgradeClaim := false
 		if errFind == nil {
 			if record.ProbeLeaseExpiresAt != nil && record.ProbeLeaseExpiresAt.After(now) {
 				return nil
 			}
+			upgradeClaim = record.CollectorVersion < targetCollectorVersion
 			observationInFuture = record.ObservedAt != nil && record.ObservedAt.After(now.Add(quotaMaxFutureObservationSkew))
-			if !force && !observationInFuture {
+			if !force && !observationInFuture && !upgradeClaim {
 				if record.NextProbeAt != nil && record.NextProbeAt.After(now) {
 					return nil
 				}
@@ -630,7 +659,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 			record = QuotaSnapshotRecord{
 				CredentialID: credentialID, QuotaStatus: "unknown", CollectionStatus: "collecting",
 				LastAttemptAt: &now, ProbeLeaseOwner: owner, ProbeLeaseExpiresAt: &leaseExpiresAt,
-				ParserVersion: quotaSnapshotSchemaVersion, CollectorVersion: quotaSnapshotSchemaVersion,
+				ParserVersion: quotaSnapshotSchemaVersion, CollectorVersion: targetCollectorVersion,
 				CreatedAt: now, UpdatedAt: now,
 			}
 			if errCreate := tx.Create(&record).Error; errCreate != nil {
@@ -658,6 +687,13 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 				updates["error_occurred_at"] = nil
 				updates["error_status_code"] = 0
 				updates["error_request_id"] = ""
+			}
+			if upgradeClaim {
+				updates["collector_version"] = targetCollectorVersion
+				// Mark the forced upgrade attempt before probing. A completed
+				// failure replaces this immediate retry with the normal backoff;
+				// a crashed attempt can retry after its lease expires.
+				updates["next_probe_at"] = now
 			}
 			if errUpdate := tx.Model(&QuotaSnapshotRecord{}).Where("credential_id = ?", credentialID).Updates(updates).Error; errUpdate != nil {
 				return errUpdate
@@ -926,6 +962,16 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 		}
 	}
 	displayWindows := append([]QuotaWindow{}, windows...)
+	codexLegacyPending := provider == "codex" && snapshot.ParserVersion < QuotaSnapshotVersion(provider) && codexHasLegacyQuotaWindows(displayWindows)
+	if codexLegacyPending {
+		currentWindows := codexCurrentQuotaWindows(displayWindows)
+		if len(currentWindows) > 0 {
+			// A new passive observation can arrive before the authoritative
+			// active recollection completes. Hide incompatible legacy IDs from
+			// the API while retaining their raw rows for diagnosis.
+			displayWindows = currentWindows
+		}
+	}
 	if item.Freshness == "fresh" {
 		validWindows := make([]QuotaWindow, 0, len(displayWindows))
 		for _, window := range displayWindows {
@@ -950,7 +996,18 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 		item.Plan = &QuotaPlan{Name: snapshot.PlanName, Premium: snapshot.PlanPremium != nil && *snapshot.PlanPremium}
 	}
 	item.ResetCredits = quotaResetCreditsFromJSON(snapshot.ResetCredits)
-	item.PrimaryWindows = quotaPrimaryWindows(displayWindows)
+	item.PrimaryWindows = quotaPrimaryWindows(provider, displayWindows)
+	if codexLegacyPending && len(codexCurrentQuotaWindows(displayWindows)) == 0 {
+		item.QuotaStatus = "unknown"
+		item.Freshness = "stale"
+		item.PrimaryWindows = []QuotaWindow{}
+		item.EarliestResetAt = nil
+	}
+	if codexLegacyPending && snapshot.CollectorVersion >= QuotaSnapshotVersion(provider) && item.CollectionStatus == "failed" {
+		item.QuotaStatus = "error"
+		item.Freshness = "stale"
+		item.PrimaryWindows = []QuotaWindow{}
+	}
 	return item
 }
 
@@ -1391,7 +1448,7 @@ func quotaFacetOptions(counts map[string]int) []QuotaFacetOption {
 	return items
 }
 
-func quotaPrimaryWindows(windows []QuotaWindow) []QuotaWindow {
+func quotaPrimaryWindows(provider string, windows []QuotaWindow) []QuotaWindow {
 	items := append([]QuotaWindow(nil), windows...)
 	sort.SliceStable(items, func(i, j int) bool {
 		if items[i].Priority != items[j].Priority {
@@ -1403,6 +1460,9 @@ func quotaPrimaryWindows(windows []QuotaWindow) []QuotaWindow {
 		}
 		return items[i].ID < items[j].ID
 	})
+	if normalizeQuotaProviderID(provider) == "codex" {
+		return codexPrimaryWindows(items)
+	}
 	if len(items) > 2 {
 		items = items[:2]
 	}
@@ -1410,6 +1470,119 @@ func quotaPrimaryWindows(windows []QuotaWindow) []QuotaWindow {
 		return []QuotaWindow{}
 	}
 	return items
+}
+
+func codexPrimaryWindows(items []QuotaWindow) []QuotaWindow {
+	selected := make([]QuotaWindow, 0, 2)
+	selectedIDs := make(map[string]struct{}, 2)
+	appendFamily := func(matches func(QuotaWindow) bool) {
+		if len(selected) >= 2 {
+			return
+		}
+		family := make([]QuotaWindow, 0, 2)
+		for _, window := range items {
+			if matches(window) {
+				family = append(family, window)
+			}
+		}
+		window, ok := quotaLongestWindow(family)
+		if !ok {
+			return
+		}
+		selected = append(selected, window)
+		selectedIDs[window.ID] = struct{}{}
+	}
+
+	appendFamily(func(window QuotaWindow) bool {
+		scopeID := strings.TrimSpace(quotaStringValue(window.ScopeID))
+		return window.Scope == "account" && (scopeID == "" || strings.EqualFold(scopeID, "codex"))
+	})
+	appendFamily(func(window QuotaWindow) bool {
+		return window.ScopeID != nil && strings.EqualFold(strings.TrimSpace(*window.ScopeID), "codex_bengalfox")
+	})
+	for _, window := range items {
+		if len(selected) >= 2 {
+			break
+		}
+		if _, exists := selectedIDs[window.ID]; exists {
+			continue
+		}
+		selected = append(selected, window)
+		selectedIDs[window.ID] = struct{}{}
+	}
+	if selected == nil {
+		return []QuotaWindow{}
+	}
+	return selected
+}
+
+func quotaLongestWindow(windows []QuotaWindow) (QuotaWindow, bool) {
+	if len(windows) == 0 {
+		return QuotaWindow{}, false
+	}
+	items := append([]QuotaWindow(nil), windows...)
+	sort.SliceStable(items, func(i, j int) bool {
+		leftDuration, rightDuration := quotaWindowDurationRank(items[i]), quotaWindowDurationRank(items[j])
+		if leftDuration != rightDuration {
+			return leftDuration > rightDuration
+		}
+		leftRisk, rightRisk := quotaWindowRisk(items[i].Status), quotaWindowRisk(items[j].Status)
+		if leftRisk != rightRisk {
+			return leftRisk < rightRisk
+		}
+		if items[i].Priority != items[j].Priority {
+			return items[i].Priority < items[j].Priority
+		}
+		return items[i].ID < items[j].ID
+	})
+	return items[0], true
+}
+
+func quotaWindowDurationRank(window QuotaWindow) float64 {
+	if window.WindowSeconds != nil && *window.WindowSeconds > 0 {
+		return float64(*window.WindowSeconds)
+	}
+	if window.PeriodValue == nil || *window.PeriodValue <= 0 {
+		return 0
+	}
+	multiplier := float64(0)
+	switch window.PeriodUnit {
+	case "minute":
+		multiplier = 60
+	case "hour":
+		multiplier = 60 * 60
+	case "day":
+		multiplier = 24 * 60 * 60
+	case "week":
+		multiplier = 7 * 24 * 60 * 60
+	case "month":
+		multiplier = 30 * 24 * 60 * 60
+	}
+	return multiplier * *window.PeriodValue
+}
+
+func codexHasLegacyQuotaWindows(windows []QuotaWindow) bool {
+	for _, window := range windows {
+		if codexLegacyQuotaWindowID(window.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexCurrentQuotaWindows(windows []QuotaWindow) []QuotaWindow {
+	items := make([]QuotaWindow, 0, len(windows))
+	for _, window := range windows {
+		if !codexLegacyQuotaWindowID(window.ID) {
+			items = append(items, window)
+		}
+	}
+	return items
+}
+
+func codexLegacyQuotaWindowID(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(value, "codex-") && (strings.HasSuffix(value, "-primary") || strings.HasSuffix(value, "-secondary"))
 }
 
 func quotaCollectionErrorFromRecord(record QuotaSnapshotRecord) *QuotaCollectionError {

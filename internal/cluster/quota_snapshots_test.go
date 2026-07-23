@@ -127,7 +127,7 @@ func TestUpsertQuotaSnapshotRejectsLateObservation(t *testing.T) {
 		_, errUpsert := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
 			CredentialID: "codex-late", QuotaStatus: status, CollectionStatus: "success", Source: "response_header",
 			ObservedAt: &observedAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt, ReplaceWindows: true,
-			Windows: []QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: status, Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "hour", PeriodValue: float64Ptr(5), Source: "response_header", ObservedAt: observedAt}},
+			Windows: []QuotaWindow{{ID: "codex-5-hour", Scope: "account", Mode: "rolling", Status: status, Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "hour", PeriodValue: float64Ptr(5), Source: "response_header", ObservedAt: observedAt}},
 		})
 		if errUpsert != nil {
 			t.Fatalf("UpsertQuotaSnapshot(%s) error = %v", observedAt, errUpsert)
@@ -541,6 +541,7 @@ func TestForceClaimEligibleQuotaProbeBypassesFreshnessButNotLease(t *testing.T) 
 	if _, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
 		CredentialID: "force-fresh-auth", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
 		ObservedAt: &now, ExpiresAt: &expiresAt, NextProbeAt: &expiresAt, LastSuccessAt: &now,
+		ParserVersion: codexQuotaSnapshotVersion, CollectorVersion: codexQuotaSnapshotVersion,
 	}); errSeed != nil {
 		t.Fatalf("UpsertQuotaSnapshot() error = %v", errSeed)
 	}
@@ -555,6 +556,175 @@ func TestForceClaimEligibleQuotaProbeBypassesFreshnessButNotLease(t *testing.T) 
 	claimed, errClaim = repo.ForceClaimEligibleQuotaProbe(ctx, "force-fresh-auth", "home-b", now.Add(30*time.Second), time.Minute)
 	if errClaim != nil || claimed {
 		t.Fatalf("forced leased claim = %v, %v, want false, nil", claimed, errClaim)
+	}
+}
+
+func TestCodexLegacySnapshotUpgradeForcesOneProbeAndHonorsBackoff(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	seedQuotaSnapshotAuth(t, repo, "codex-legacy-upgrade", "codex", "Codex Legacy", map[string]any{"type": "codex"})
+
+	now := time.Date(2026, 7, 23, 1, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Minute)
+	nextProbeAt := now.Add(25 * time.Minute)
+	remaining := 0.8
+	periodFive := float64(5)
+	periodWeek := float64(1)
+	_, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "codex-legacy-upgrade", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &now, ExpiresAt: &expiresAt, LastAttemptAt: &now, LastSuccessAt: &now, NextProbeAt: &nextProbeAt,
+		ParserVersion: 1, CollectorVersion: 1, ReplaceWindows: true,
+		Windows: []QuotaWindow{
+			{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "hour", PeriodValue: &periodFive, Source: "active_probe", ObservedAt: now},
+			{ID: "codex-secondary", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: now},
+		},
+	})
+	if errSeed != nil {
+		t.Fatalf("seed legacy snapshot: %v", errSeed)
+	}
+
+	legacy, errLegacy := repo.GetQuotaCredential(ctx, "codex-legacy-upgrade", now)
+	if errLegacy != nil {
+		t.Fatalf("GetQuotaCredential(legacy) error = %v", errLegacy)
+	}
+	if legacy.QuotaStatus != "unknown" || legacy.Freshness != "stale" || len(legacy.PrimaryWindows) != 0 || len(legacy.Windows) != 2 {
+		t.Fatalf("legacy snapshot presentation = %+v", legacy)
+	}
+
+	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "codex-legacy-upgrade", "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("upgrade claim = %v, %v, want true, nil", claimed, errClaim)
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	var claimedRecord QuotaSnapshotRecord
+	if errFirst := db.First(&claimedRecord, "credential_id = ?", "codex-legacy-upgrade").Error; errFirst != nil {
+		t.Fatalf("load claimed snapshot: %v", errFirst)
+	}
+	if claimedRecord.ParserVersion != 1 || claimedRecord.CollectorVersion != codexQuotaSnapshotVersion || claimedRecord.NextProbeAt == nil || !claimedRecord.NextProbeAt.Equal(now) || claimedRecord.CollectionStatus != "collecting" {
+		t.Fatalf("upgrade claim record = %+v", claimedRecord)
+	}
+
+	retryAt := now.Add(5 * time.Minute)
+	occurredAt := now.Add(time.Second)
+	if errFail := repo.FailQuotaProbeAt(ctx, "codex-legacy-upgrade", "home-a", QuotaCollectionError{
+		Code: "UPSTREAM_UNAVAILABLE", Message: "upgrade failed", Retryable: true, OccurredAt: &occurredAt,
+	}, retryAt, now); errFail != nil {
+		t.Fatalf("FailQuotaProbeAt() error = %v", errFail)
+	}
+	failed, errFailed := repo.GetQuotaCredential(ctx, "codex-legacy-upgrade", now.Add(time.Minute))
+	if errFailed != nil {
+		t.Fatalf("GetQuotaCredential(failed) error = %v", errFailed)
+	}
+	if failed.QuotaStatus != "error" || failed.Freshness != "stale" || failed.CollectionStatus != "failed" || len(failed.PrimaryWindows) != 0 || len(failed.Windows) != 2 {
+		t.Fatalf("failed upgrade presentation = %+v", failed)
+	}
+	claimed, errClaim = repo.ClaimEligibleQuotaProbe(ctx, "codex-legacy-upgrade", "home-b", now.Add(time.Minute), time.Minute)
+	if errClaim != nil || claimed {
+		t.Fatalf("upgrade backoff claim = %v, %v, want false, nil", claimed, errClaim)
+	}
+	claimed, errClaim = repo.ClaimEligibleQuotaProbe(ctx, "codex-legacy-upgrade", "home-b", retryAt, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("post-backoff claim = %v, %v, want true, nil", claimed, errClaim)
+	}
+}
+
+func TestCodexSnapshotUpgradeSuccessReplacesLegacyWindowsAndKeepsVersion(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	seedQuotaSnapshotAuth(t, repo, "codex-upgrade-success", "codex", "Codex Upgrade", map[string]any{"type": "codex"})
+
+	now := time.Date(2026, 7, 23, 2, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Minute)
+	remaining := 0.8
+	periodFive := float64(5)
+	_, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "codex-upgrade-success", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &now, ExpiresAt: &expiresAt, NextProbeAt: &expiresAt, ParserVersion: 1, CollectorVersion: 1, ReplaceWindows: true,
+		Windows: []QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "hour", PeriodValue: &periodFive, Source: "active_probe", ObservedAt: now}},
+	})
+	if errSeed != nil {
+		t.Fatalf("seed legacy snapshot: %v", errSeed)
+	}
+	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "codex-upgrade-success", "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("upgrade claim = %v, %v", claimed, errClaim)
+	}
+
+	probeAt := now.Add(time.Second)
+	probeExpiresAt := probeAt.Add(30 * time.Minute)
+	periodWeek := float64(1)
+	windowFive := int64(5 * 60 * 60)
+	windowWeek := int64(7 * 24 * 60 * 60)
+	sparkScopeID := "codex_bengalfox"
+	updated, errUpdate := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "codex-upgrade-success", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &probeAt, ExpiresAt: &probeExpiresAt, NextProbeAt: &probeExpiresAt,
+		ParserVersion: codexQuotaSnapshotVersion, CollectorVersion: codexQuotaSnapshotVersion,
+		ExpectedProbeOwner: "home-a", ClearProbeLease: true, ReplaceWindows: true,
+		Windows: []QuotaWindow{
+			{ID: "codex-5-hour", Priority: 0, Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, WindowSeconds: &windowFive, PeriodUnit: "hour", PeriodValue: &periodFive, Source: "active_probe", ObservedAt: probeAt},
+			{ID: "codex-1-week", Priority: 1, Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, WindowSeconds: &windowWeek, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: probeAt},
+			{ID: "codex-bengalfox-1-week", Priority: 20, Scope: "model", ScopeID: &sparkScopeID, Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, WindowSeconds: &windowWeek, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: probeAt},
+		},
+	})
+	if errUpdate != nil || !updated {
+		t.Fatalf("complete upgraded snapshot = %v, %v", updated, errUpdate)
+	}
+
+	headerAt := probeAt.Add(time.Minute)
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-upgrade-success","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
+	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
+		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
+	}
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	var record QuotaSnapshotRecord
+	if errFirst := db.First(&record, "credential_id = ?", "codex-upgrade-success").Error; errFirst != nil {
+		t.Fatalf("load upgraded snapshot: %v", errFirst)
+	}
+	if record.ParserVersion != codexQuotaSnapshotVersion || record.CollectorVersion != codexQuotaSnapshotVersion {
+		t.Fatalf("passive header downgraded snapshot versions: parser=%d collector=%d", record.ParserVersion, record.CollectorVersion)
+	}
+	var storedWindows []QuotaWindowRecord
+	if errFind := db.Order("window_id ASC").Find(&storedWindows, "credential_id = ?", "codex-upgrade-success").Error; errFind != nil {
+		t.Fatalf("load upgraded windows: %v", errFind)
+	}
+	for _, window := range storedWindows {
+		if codexLegacyQuotaWindowID(window.WindowID) {
+			t.Fatalf("legacy window survived successful replacement: %+v", storedWindows)
+		}
+	}
+	item, errGet := repo.GetQuotaCredential(ctx, "codex-upgrade-success", headerAt)
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if item.QuotaStatus != "healthy" || item.Freshness != "fresh" || len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ID != "codex-1-week" || item.PrimaryWindows[1].ID != "codex-bengalfox-1-week" {
+		t.Fatalf("upgraded Codex presentation = %+v", item)
+	}
+}
+
+func TestCodexPrimaryWindowsPreferLongestDefaultAndSparkFamilies(t *testing.T) {
+	periodFive := float64(5)
+	periodWeek := float64(1)
+	sparkScopeID := "codex_bengalfox"
+	codeReviewScopeID := "codex_code_review"
+	windows := []QuotaWindow{
+		{ID: "codex-5-hour", Priority: 0, Scope: "account", Status: "healthy", PeriodUnit: "hour", PeriodValue: &periodFive},
+		{ID: "codex-1-week", Priority: 1, Scope: "account", Status: "healthy", PeriodUnit: "week", PeriodValue: &periodWeek},
+		{ID: "codex-code-review-1-week", Priority: 10, Scope: "model", ScopeID: &codeReviewScopeID, Status: "healthy", PeriodUnit: "week", PeriodValue: &periodWeek},
+		{ID: "codex-bengalfox-1-week", Priority: 20, Scope: "model", ScopeID: &sparkScopeID, Status: "healthy", PeriodUnit: "week", PeriodValue: &periodWeek},
+	}
+	primary := quotaPrimaryWindows("codex", windows)
+	if len(primary) != 2 || primary[0].ID != "codex-1-week" || primary[1].ID != "codex-bengalfox-1-week" {
+		t.Fatalf("Codex primary windows = %+v", primary)
 	}
 }
 

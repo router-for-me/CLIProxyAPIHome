@@ -336,10 +336,11 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 	if result.partial {
 		collectionStatus = "partial"
 	}
+	snapshotVersion := cluster.QuotaSnapshotVersion(auth.Provider)
 	input := cluster.QuotaSnapshotWrite{
 		CredentialID: auth.ID, QuotaStatus: status, CollectionStatus: collectionStatus, Source: "active_probe",
 		ObservedAt: &observedAt, MaxAcceptedObservedAt: &observedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
-		NextProbeAt: &expiresAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: true, ParserVersion: 1, CollectorVersion: 1,
+		NextProbeAt: &expiresAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: true, ParserVersion: snapshotVersion, CollectorVersion: snapshotVersion,
 		ResetCredits: result.resetCredits, ReplaceResetCredits: result.replaceResetCredits,
 		ExpectedProbeOwner: c.options.Owner, ClearProbeLease: true, ReplaceWindows: result.replaceWindows, Windows: result.windows,
 	}
@@ -415,31 +416,29 @@ func (c *Collector) probeCodex(ctx context.Context, auth *coreauth.Auth) (probeR
 		usage.plan = codexPlanFromAuth(auth)
 	}
 	result := probeResult{
-		windows:        usage.windows,
-		plan:           usage.plan,
-		resetCredits:   codexResetCreditsCountFallback(usage.resetCreditsAvailableCount, observedAt),
-		replaceWindows: true,
-	}
-	if usage.resetCreditsAvailableCount == nil {
-		return result, nil
-	}
-	if *usage.resetCreditsAvailableCount == 0 {
-		result.replaceResetCredits = true
-		return result, nil
+		windows:             usage.windows,
+		plan:                usage.plan,
+		resetCredits:        codexResetCreditsCountFallback(usage.resetCreditsAvailableCount, observedAt),
+		replaceWindows:      true,
+		replaceResetCredits: true,
 	}
 	resetHeaders := headers.Clone()
 	resetHeaders.Set("Accept", "application/json")
 	resetBody, _, errResetRequest := c.probeRequest(ctx, auth, http.MethodGet, c.options.CodexResetCreditsURL, nil, resetHeaders)
 	if errResetRequest != nil {
-		result.partial = true
-		result.collectionError = probeCollectionError(errResetRequest, observedAt)
+		if codexResetCreditDetailsRequired(usage.resetCreditsAvailableCount) {
+			result.partial = true
+			result.collectionError = probeCollectionError(errResetRequest, observedAt)
+		}
 		return result, nil
 	}
 	resetCredits, errResetParse := parseCodexResetCredits(resetBody, observedAt, usage.resetCreditsAvailableCount)
 	if errResetParse != nil {
-		resetError := &probeError{code: "RESET_CREDITS_RESPONSE_INVALID", message: "Codex reset credits response could not be parsed.", retryable: true}
-		result.partial = true
-		result.collectionError = probeCollectionError(resetError, observedAt)
+		if codexResetCreditDetailsRequired(usage.resetCreditsAvailableCount) {
+			resetError := &probeError{code: "RESET_CREDITS_RESPONSE_INVALID", message: "Codex reset credits response could not be parsed.", retryable: true}
+			result.partial = true
+			result.collectionError = probeCollectionError(resetError, observedAt)
+		}
 		return result, nil
 	}
 	result.resetCredits = resetCredits
@@ -465,6 +464,10 @@ func codexResetCreditsCountFallback(availableCount *int, observedAt time.Time) *
 	}
 	count := *availableCount
 	return &cluster.QuotaResetCredits{AvailableCount: &count, ObservedAt: observedAt.UTC(), Credits: []cluster.QuotaResetCredit{}}
+}
+
+func codexResetCreditDetailsRequired(availableCount *int) bool {
+	return availableCount != nil && *availableCount > 0
 }
 
 func (c *Collector) probeRequest(ctx context.Context, auth *coreauth.Auth, method string, targetURL string, body []byte, headers http.Header) ([]byte, http.Header, *probeError) {
