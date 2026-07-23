@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	quotaSnapshotSchemaVersion = 1
-	codexQuotaSnapshotVersion  = 2
+	quotaSnapshotSchemaVersion      = 1
+	antigravityQuotaSnapshotVersion = 2
+	codexQuotaSnapshotVersion       = 2
 )
 
 const quotaSnapshotFallbackFreshness = 30 * time.Minute
@@ -47,6 +48,8 @@ var (
 // persisted representation without forcing unrelated providers to recollect.
 func QuotaSnapshotVersion(provider string) int {
 	switch normalizeQuotaProviderID(provider) {
+	case "antigravity":
+		return antigravityQuotaSnapshotVersion
 	case "codex":
 		return codexQuotaSnapshotVersion
 	default:
@@ -972,6 +975,13 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 			displayWindows = currentWindows
 		}
 	}
+	antigravityLegacyPending := provider == "antigravity" && snapshot.ParserVersion < QuotaSnapshotVersion(provider) && antigravityHasLegacyQuotaWindows(displayWindows)
+	if antigravityLegacyPending {
+		currentWindows := antigravityCurrentQuotaWindows(displayWindows)
+		if len(currentWindows) > 0 {
+			displayWindows = currentWindows
+		}
+	}
 	if item.Freshness == "fresh" {
 		validWindows := make([]QuotaWindow, 0, len(displayWindows))
 		for _, window := range displayWindows {
@@ -997,13 +1007,15 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 	}
 	item.ResetCredits = quotaResetCreditsFromJSON(snapshot.ResetCredits)
 	item.PrimaryWindows = quotaPrimaryWindows(provider, displayWindows)
-	if codexLegacyPending && len(codexCurrentQuotaWindows(displayWindows)) == 0 {
+	legacyOnly := (codexLegacyPending && len(codexCurrentQuotaWindows(displayWindows)) == 0) ||
+		(antigravityLegacyPending && len(antigravityCurrentQuotaWindows(displayWindows)) == 0)
+	if legacyOnly {
 		item.QuotaStatus = "unknown"
 		item.Freshness = "stale"
 		item.PrimaryWindows = []QuotaWindow{}
 		item.EarliestResetAt = nil
 	}
-	if codexLegacyPending && snapshot.CollectorVersion >= QuotaSnapshotVersion(provider) && item.CollectionStatus == "failed" {
+	if legacyOnly && snapshot.CollectorVersion >= QuotaSnapshotVersion(provider) && item.CollectionStatus == "failed" {
 		item.QuotaStatus = "error"
 		item.Freshness = "stale"
 		item.PrimaryWindows = []QuotaWindow{}
@@ -1460,7 +1472,10 @@ func quotaPrimaryWindows(provider string, windows []QuotaWindow) []QuotaWindow {
 		}
 		return items[i].ID < items[j].ID
 	})
-	if normalizeQuotaProviderID(provider) == "codex" {
+	switch normalizeQuotaProviderID(provider) {
+	case "antigravity":
+		return antigravityPrimaryWindows(items)
+	case "codex":
 		return codexPrimaryWindows(items)
 	}
 	if len(items) > 2 {
@@ -1470,6 +1485,19 @@ func quotaPrimaryWindows(provider string, windows []QuotaWindow) []QuotaWindow {
 		return []QuotaWindow{}
 	}
 	return items
+}
+
+func antigravityPrimaryWindows(items []QuotaWindow) []QuotaWindow {
+	selected := make([]QuotaWindow, 0, 2)
+	for _, scopeID := range []string{"gemini", "third-party"} {
+		for _, window := range items {
+			if window.ScopeID != nil && strings.EqualFold(strings.TrimSpace(*window.ScopeID), scopeID) {
+				selected = append(selected, window)
+				break
+			}
+		}
+	}
+	return selected
 }
 
 func codexPrimaryWindows(items []QuotaWindow) []QuotaWindow {
@@ -1583,6 +1611,38 @@ func codexCurrentQuotaWindows(windows []QuotaWindow) []QuotaWindow {
 func codexLegacyQuotaWindowID(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	return strings.HasPrefix(value, "codex-") && (strings.HasSuffix(value, "-primary") || strings.HasSuffix(value, "-secondary"))
+}
+
+func antigravityHasLegacyQuotaWindows(windows []QuotaWindow) bool {
+	for _, window := range windows {
+		if antigravityLegacyQuotaWindowID(window.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+func antigravityCurrentQuotaWindows(windows []QuotaWindow) []QuotaWindow {
+	items := make([]QuotaWindow, 0, len(windows))
+	for _, window := range windows {
+		if antigravityCurrentQuotaWindowID(window.ID) {
+			items = append(items, window)
+		}
+	}
+	return items
+}
+
+func antigravityLegacyQuotaWindowID(value string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "antigravity-model-")
+}
+
+func antigravityCurrentQuotaWindowID(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "antigravity-gemini-5h", "antigravity-gemini-weekly", "antigravity-3p-5h", "antigravity-3p-weekly":
+		return true
+	default:
+		return false
+	}
 }
 
 func quotaCollectionErrorFromRecord(record QuotaSnapshotRecord) *QuotaCollectionError {

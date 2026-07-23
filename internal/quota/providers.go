@@ -51,21 +51,23 @@ func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (
 		return nil, &probeError{code: "PROBE_REQUEST_INVALID", message: "Antigravity quota request could not be created.", retryable: false}
 	}
 	headers := http.Header{"Content-Type": []string{"application/json"}, "User-Agent": []string{antigravityUserAgent}}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, c.options.ProbeTimeout)
+	defer cancelProbe()
 	var lastError *probeError
 	for _, targetURL := range c.options.AntigravityURLs {
-		payload, _, errRequest := c.probeRequest(ctx, auth, http.MethodPost, targetURL, body, headers)
+		payload, _, errRequest := c.probeRequest(probeCtx, auth, http.MethodPost, targetURL, body, headers)
 		if errRequest != nil {
 			lastError = errRequest
-			if errRequest.code == "UPSTREAM_AUTH_REJECTED" {
+			if errRequest.code == "UPSTREAM_AUTH_REJECTED" || probeCtx.Err() != nil {
 				break
 			}
 			continue
 		}
 		windows, errParse := parseAntigravityWindows(payload, c.options.Now().UTC())
-		if errParse == nil && len(windows) > 0 {
+		if errParse == nil && antigravityQuotaGroupsComplete(windows) {
 			return windows, nil
 		}
-		lastError = &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Antigravity quota response did not contain usable windows.", retryable: true}
+		lastError = &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Antigravity quota response did not contain both usable weekly quota buckets.", retryable: true}
 	}
 	if lastError == nil {
 		lastError = &probeError{code: "PROVIDER_UNAVAILABLE", message: "Antigravity quota collector has no configured endpoint.", retryable: false}
@@ -210,14 +212,55 @@ func validClaudeProfile(body []byte) bool {
 }
 
 type antigravityPayload struct {
-	Models map[string]struct {
-		DisplayName string `json:"displayName"`
-		QuotaInfo   *struct {
-			RemainingFraction *float64 `json:"remainingFraction"`
-			Remaining         *float64 `json:"remaining"`
-			ResetTime         string   `json:"resetTime"`
-		} `json:"quotaInfo"`
-	} `json:"models"`
+	Groups []json.RawMessage `json:"groups"`
+}
+
+type antigravityQuotaGroup struct {
+	DisplayName string            `json:"displayName"`
+	Buckets     []json.RawMessage `json:"buckets"`
+}
+
+type antigravityQuotaBucket struct {
+	BucketID          string            `json:"bucketId"`
+	Disabled          bool              `json:"disabled"`
+	RemainingFraction flexQuotaFraction `json:"remainingFraction"`
+	ResetTime         string            `json:"resetTime"`
+}
+
+type antigravityBucketSpec struct {
+	scopeID       string
+	periodUnit    string
+	periodValue   float64
+	windowSeconds int64
+	priority      int
+}
+
+func antigravityQuotaBucketSpec(bucketID string) (antigravityBucketSpec, bool) {
+	switch strings.TrimSpace(bucketID) {
+	case "gemini-5h":
+		return antigravityBucketSpec{scopeID: "gemini", periodUnit: "hour", periodValue: 5, windowSeconds: 5 * 60 * 60, priority: 0}, true
+	case "3p-5h":
+		return antigravityBucketSpec{scopeID: "third-party", periodUnit: "hour", periodValue: 5, windowSeconds: 5 * 60 * 60, priority: 1}, true
+	case "gemini-weekly":
+		return antigravityBucketSpec{scopeID: "gemini", periodUnit: "week", periodValue: 1, windowSeconds: 7 * 24 * 60 * 60, priority: 2}, true
+	case "3p-weekly":
+		return antigravityBucketSpec{scopeID: "third-party", periodUnit: "week", periodValue: 1, windowSeconds: 7 * 24 * 60 * 60, priority: 3}, true
+	default:
+		return antigravityBucketSpec{}, false
+	}
+}
+
+func antigravityQuotaGroupsComplete(windows []cluster.QuotaWindow) bool {
+	var geminiWeekly, thirdPartyWeekly bool
+	for _, window := range windows {
+		switch strings.TrimSpace(window.ID) {
+		case "antigravity-gemini-weekly":
+			geminiWeekly = true
+		case "antigravity-3p-weekly":
+			thirdPartyWeekly = true
+		}
+	}
+	return geminiWeekly && thirdPartyWeekly
 }
 
 func parseAntigravityWindows(body []byte, observedAt time.Time) ([]cluster.QuotaWindow, error) {
@@ -225,38 +268,86 @@ func parseAntigravityWindows(body []byte, observedAt time.Time) ([]cluster.Quota
 	if errDecode := json.Unmarshal(body, &payload); errDecode != nil {
 		return nil, fmt.Errorf("decode antigravity quota response: %w", errDecode)
 	}
-	keys := make([]string, 0, len(payload.Models))
-	for key := range payload.Models {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	windows := make([]cluster.QuotaWindow, 0, len(keys))
-	for index, key := range keys {
-		model := payload.Models[key]
-		if model.QuotaInfo == nil {
+	windows := make([]cluster.QuotaWindow, 0, 4)
+	seenBuckets := make(map[string]struct{}, 4)
+	for _, rawGroup := range payload.Groups {
+		var group antigravityQuotaGroup
+		if errGroup := json.Unmarshal(rawGroup, &group); errGroup != nil {
 			continue
 		}
-		label := strings.TrimSpace(model.DisplayName)
-		if label == "" {
-			label = key
+		groupLabel := strings.TrimSpace(group.DisplayName)
+		var label *string
+		if groupLabel != "" {
+			label = quotaStringPtr(groupLabel)
 		}
-		window := cluster.QuotaWindow{ID: "antigravity-model-" + quotaIDSlug(key), Label: &label, Scope: "model", ScopeID: quotaStringPtr(key), Mode: "rolling", Status: "unknown", Unit: "percentage", PeriodUnit: "hour", PeriodValue: quotaFloatPtr(5), WindowSeconds: quotaInt64Ptr(5 * 60 * 60), Source: "active_probe", ObservedAt: observedAt, Priority: index}
-		if model.QuotaInfo.RemainingFraction != nil {
-			remainingRatio := math.Max(0, math.Min(1, *model.QuotaInfo.RemainingFraction))
+		for _, rawBucket := range group.Buckets {
+			var bucket antigravityQuotaBucket
+			if errBucket := json.Unmarshal(rawBucket, &bucket); errBucket != nil {
+				continue
+			}
+			bucketID := strings.TrimSpace(bucket.BucketID)
+			spec, supported := antigravityQuotaBucketSpec(bucketID)
+			if !supported || bucket.Disabled || !bucket.RemainingFraction.set {
+				continue
+			}
+			if _, exists := seenBuckets[bucketID]; exists {
+				continue
+			}
+			seenBuckets[bucketID] = struct{}{}
+			remainingRatio := bucket.RemainingFraction.value
 			usedRatio := 1 - remainingRatio
 			used, remaining, limit := usedRatio*100, remainingRatio*100, float64(100)
-			window.Used, window.Remaining, window.Limit = &used, &remaining, &limit
-			window.UsedRatio, window.RemainingRatio = &usedRatio, &remainingRatio
-			window.Status = quotaProbeStatus(remainingRatio)
-		} else if model.QuotaInfo.Remaining != nil {
-			window.Unit = "requests"
-			window.Remaining = nonNegativeFloat(model.QuotaInfo.Remaining)
+			window := cluster.QuotaWindow{
+				ID: "antigravity-" + bucketID, Label: label, Scope: "model", ScopeID: quotaStringPtr(spec.scopeID),
+				Mode: "rolling", Status: quotaProbeStatus(remainingRatio), Unit: "percentage",
+				Used: &used, Remaining: &remaining, Limit: &limit, UsedRatio: &usedRatio, RemainingRatio: &remainingRatio,
+				ResetAt: parseProviderTime(bucket.ResetTime), WindowSeconds: quotaInt64Ptr(spec.windowSeconds),
+				PeriodUnit: spec.periodUnit, PeriodValue: quotaFloatPtr(spec.periodValue), Source: "active_probe",
+				ObservedAt: observedAt, Priority: spec.priority,
+			}
+			normalizeWindowValues(&window)
+			windows = append(windows, window)
 		}
-		window.ResetAt = parseProviderTime(model.QuotaInfo.ResetTime)
-		normalizeWindowValues(&window)
-		windows = append(windows, window)
 	}
+	sort.SliceStable(windows, func(i, j int) bool {
+		if windows[i].Priority != windows[j].Priority {
+			return windows[i].Priority < windows[j].Priority
+		}
+		return windows[i].ID < windows[j].ID
+	})
 	return windows, nil
+}
+
+// flexQuotaFraction accepts finite JSON numbers, numeric strings, and percentage strings.
+// Invalid values stay unset so one malformed bucket cannot reject the full response.
+type flexQuotaFraction struct {
+	value float64
+	set   bool
+}
+
+func (f *flexQuotaFraction) UnmarshalJSON(data []byte) error {
+	*f = flexQuotaFraction{}
+	raw, ok := flexibleNumberText(data)
+	if !ok {
+		return nil
+	}
+	percentage := strings.HasSuffix(raw, "%")
+	if percentage {
+		raw = strings.TrimSpace(strings.TrimSuffix(raw, "%"))
+	}
+	value, errParse := strconv.ParseFloat(raw, 64)
+	if errParse != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	if percentage {
+		value /= 100
+	}
+	if value < 0 || value > 1 {
+		return nil
+	}
+	f.value = value
+	f.set = true
+	return nil
 }
 
 // flexFloat tolerates providers that encode finite numeric fields as JSON strings.

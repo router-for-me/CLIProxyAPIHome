@@ -146,7 +146,7 @@ func TestCollectorSupportsClaudeAntigravityKimiAndXAI(t *testing.T) {
 			if errDecode := json.NewDecoder(request.Body).Decode(&body); errDecode != nil || body["project"] != "project-123" {
 				t.Errorf("unexpected antigravity body: %#v error=%v", body, errDecode)
 			}
-			_, _ = w.Write([]byte(`{"models":{"pro":{"displayName":"Pro","quotaInfo":{"remainingFraction":0.4,"remaining":12,"resetTime":"2026-07-16T11:00:00Z"}}}}`))
+			_, _ = w.Write([]byte(`{"groups":[{"displayName":"Gemini models","buckets":[{"bucketId":"gemini-5h","remainingFraction":0.4,"resetTime":"2026-07-16T11:00:00Z"},{"bucketId":"gemini-weekly","remainingFraction":0.7,"resetTime":"2026-07-20T00:00:00Z"}]},{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-5h","remainingFraction":0.5,"resetTime":"2026-07-16T11:30:00Z"},{"bucketId":"3p-weekly","remainingFraction":0.8,"resetTime":"2026-07-20T00:00:00Z"}]}],"models":{"chat_20706":{"quotaInfo":{"remainingFraction":0.01}}}}`))
 		case "/kimi":
 			_, _ = w.Write([]byte(`{"user":{"userId":"user-1","region":"REGION_OVERSEA"},"usage":{"limit":"100","used":"44","remaining":"56","resetTime":"2026-07-21T13:09:11Z"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","used":"10","remaining":"90","resetTime":"2026-07-19T14:09:11Z"}}],"totalQuota":{"limit":"100","remaining":"99"}}`))
 		case "/xai":
@@ -175,7 +175,11 @@ func TestCollectorSupportsClaudeAntigravityKimiAndXAI(t *testing.T) {
 		assert   func(*testing.T, *cluster.QuotaCredentialSnapshot)
 	}{
 		{id: "claude-probe", provider: "claude", status: "healthy", windows: 3},
-		{id: "antigravity-probe", provider: "antigravity", status: "healthy", windows: 1},
+		{id: "antigravity-probe", provider: "antigravity", status: "healthy", windows: 4, assert: func(t *testing.T, item *cluster.QuotaCredentialSnapshot) {
+			if len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ScopeID == nil || item.PrimaryWindows[1].ScopeID == nil || *item.PrimaryWindows[0].ScopeID != "gemini" || *item.PrimaryWindows[1].ScopeID != "third-party" {
+				t.Fatalf("unexpected antigravity primary windows: %+v", item.PrimaryWindows)
+			}
+		}},
 		{id: "kimi-probe", provider: "kimi", status: "healthy", windows: 2, assert: func(t *testing.T, item *cluster.QuotaCredentialSnapshot) {
 			var summary, limit *cluster.QuotaWindow
 			for index := range item.Windows {
@@ -444,7 +448,7 @@ func TestProviderWindowNormalizationReconcilesContradictoryValues(t *testing.T) 
 	if window.Used == nil || *window.Used != 8 || window.Remaining == nil || *window.Remaining != 2 || window.UsedRatio == nil || *window.UsedRatio != 0.8 || window.RemainingRatio == nil || math.Abs(*window.RemainingRatio-0.2) > 1e-9 || window.Status != "low" {
 		t.Fatalf("reconciled Kimi window = %+v", window)
 	}
-	antigravity, errAntigravity := parseAntigravityWindows([]byte(`{"models":{"zero":{"quotaInfo":{"remaining":0}}}}`), now)
+	antigravity, errAntigravity := parseAntigravityWindows([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0}]}]}`), now)
 	if errAntigravity != nil || len(antigravity) != 1 || antigravity[0].Status != "exhausted" {
 		t.Fatalf("remaining-only zero window = %+v, %v", antigravity, errAntigravity)
 	}

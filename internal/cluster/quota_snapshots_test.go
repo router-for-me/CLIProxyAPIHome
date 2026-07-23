@@ -711,6 +711,159 @@ func TestCodexSnapshotUpgradeSuccessReplacesLegacyWindowsAndKeepsVersion(t *test
 	}
 }
 
+func TestAntigravityLegacySnapshotUpgradeForcesOneProbeAndHonorsBackoff(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	seedQuotaSnapshotAuth(t, repo, "antigravity-legacy-upgrade", "antigravity", "Antigravity Legacy", map[string]any{"type": "antigravity"})
+
+	now := time.Date(2026, 7, 23, 2, 30, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Minute)
+	nextProbeAt := now.Add(25 * time.Minute)
+	remaining := 0.8
+	periodFive := float64(5)
+	legacyScopeID := "gemini-3-pro-preview"
+	_, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "antigravity-legacy-upgrade", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &now, ExpiresAt: &expiresAt, LastAttemptAt: &now, LastSuccessAt: &now, NextProbeAt: &nextProbeAt,
+		ParserVersion: 1, CollectorVersion: 1, ReplaceWindows: true,
+		Windows: []QuotaWindow{{
+			ID: "antigravity-model-gemini-3-pro-preview", Scope: "model", ScopeID: &legacyScopeID,
+			Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining,
+			PeriodUnit: "hour", PeriodValue: &periodFive, Source: "active_probe", ObservedAt: now,
+		}},
+	})
+	if errSeed != nil {
+		t.Fatalf("seed legacy snapshot: %v", errSeed)
+	}
+
+	legacy, errLegacy := repo.GetQuotaCredential(ctx, "antigravity-legacy-upgrade", now)
+	if errLegacy != nil {
+		t.Fatalf("GetQuotaCredential(legacy) error = %v", errLegacy)
+	}
+	if legacy.QuotaStatus != "unknown" || legacy.Freshness != "stale" || len(legacy.PrimaryWindows) != 0 || len(legacy.Windows) != 1 {
+		t.Fatalf("legacy snapshot presentation = %+v", legacy)
+	}
+
+	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "antigravity-legacy-upgrade", "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("upgrade claim = %v, %v, want true, nil", claimed, errClaim)
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	var claimedRecord QuotaSnapshotRecord
+	if errFirst := db.First(&claimedRecord, "credential_id = ?", "antigravity-legacy-upgrade").Error; errFirst != nil {
+		t.Fatalf("load claimed snapshot: %v", errFirst)
+	}
+	if claimedRecord.ParserVersion != 1 || claimedRecord.CollectorVersion != antigravityQuotaSnapshotVersion || claimedRecord.NextProbeAt == nil || !claimedRecord.NextProbeAt.Equal(now) || claimedRecord.CollectionStatus != "collecting" {
+		t.Fatalf("upgrade claim record = %+v", claimedRecord)
+	}
+
+	retryAt := now.Add(5 * time.Minute)
+	occurredAt := now.Add(time.Second)
+	if errFail := repo.FailQuotaProbeAt(ctx, "antigravity-legacy-upgrade", "home-a", QuotaCollectionError{
+		Code: "UPSTREAM_UNAVAILABLE", Message: "upgrade failed", Retryable: true, OccurredAt: &occurredAt,
+	}, retryAt, now); errFail != nil {
+		t.Fatalf("FailQuotaProbeAt() error = %v", errFail)
+	}
+	failed, errFailed := repo.GetQuotaCredential(ctx, "antigravity-legacy-upgrade", now.Add(time.Minute))
+	if errFailed != nil {
+		t.Fatalf("GetQuotaCredential(failed) error = %v", errFailed)
+	}
+	if failed.QuotaStatus != "error" || failed.Freshness != "stale" || failed.CollectionStatus != "failed" || len(failed.PrimaryWindows) != 0 || len(failed.Windows) != 1 {
+		t.Fatalf("failed upgrade presentation = %+v", failed)
+	}
+	claimed, errClaim = repo.ClaimEligibleQuotaProbe(ctx, "antigravity-legacy-upgrade", "home-b", now.Add(time.Minute), time.Minute)
+	if errClaim != nil || claimed {
+		t.Fatalf("upgrade backoff claim = %v, %v, want false, nil", claimed, errClaim)
+	}
+	claimed, errClaim = repo.ClaimEligibleQuotaProbe(ctx, "antigravity-legacy-upgrade", "home-b", retryAt, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("post-backoff claim = %v, %v, want true, nil", claimed, errClaim)
+	}
+}
+
+func TestAntigravitySnapshotUpgradeSuccessReplacesLegacyWindows(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	seedQuotaSnapshotAuth(t, repo, "antigravity-upgrade-success", "antigravity", "Antigravity Upgrade", map[string]any{"type": "antigravity"})
+
+	now := time.Date(2026, 7, 23, 3, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Minute)
+	remaining := 0.8
+	periodFive := float64(5)
+	legacyScopeID := "chat-20706"
+	_, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "antigravity-upgrade-success", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &now, ExpiresAt: &expiresAt, NextProbeAt: &expiresAt, ParserVersion: 1, CollectorVersion: 1, ReplaceWindows: true,
+		Windows: []QuotaWindow{{
+			ID: "antigravity-model-chat-20706", Scope: "model", ScopeID: &legacyScopeID,
+			Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining,
+			PeriodUnit: "hour", PeriodValue: &periodFive, Source: "active_probe", ObservedAt: now,
+		}},
+	})
+	if errSeed != nil {
+		t.Fatalf("seed legacy snapshot: %v", errSeed)
+	}
+	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "antigravity-upgrade-success", "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("upgrade claim = %v, %v", claimed, errClaim)
+	}
+
+	probeAt := now.Add(time.Second)
+	probeExpiresAt := probeAt.Add(30 * time.Minute)
+	periodWeek := float64(1)
+	windowFive := int64(5 * 60 * 60)
+	windowWeek := int64(7 * 24 * 60 * 60)
+	geminiScopeID := "gemini"
+	thirdPartyScopeID := "third-party"
+	updated, errUpdate := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "antigravity-upgrade-success", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &probeAt, ExpiresAt: &probeExpiresAt, NextProbeAt: &probeExpiresAt,
+		ParserVersion: antigravityQuotaSnapshotVersion, CollectorVersion: antigravityQuotaSnapshotVersion,
+		ExpectedProbeOwner: "home-a", ClearProbeLease: true, ReplaceWindows: true,
+		Windows: []QuotaWindow{
+			{ID: "antigravity-gemini-5h", Priority: 0, Scope: "model", ScopeID: &geminiScopeID, Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, WindowSeconds: &windowFive, PeriodUnit: "hour", PeriodValue: &periodFive, Source: "active_probe", ObservedAt: probeAt},
+			{ID: "antigravity-gemini-weekly", Priority: 2, Scope: "model", ScopeID: &geminiScopeID, Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, WindowSeconds: &windowWeek, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: probeAt},
+			{ID: "antigravity-3p-weekly", Priority: 3, Scope: "model", ScopeID: &thirdPartyScopeID, Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, WindowSeconds: &windowWeek, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: probeAt},
+		},
+	})
+	if errUpdate != nil || !updated {
+		t.Fatalf("complete upgraded snapshot = %v, %v", updated, errUpdate)
+	}
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	var record QuotaSnapshotRecord
+	if errFirst := db.First(&record, "credential_id = ?", "antigravity-upgrade-success").Error; errFirst != nil {
+		t.Fatalf("load upgraded snapshot: %v", errFirst)
+	}
+	if record.ParserVersion != antigravityQuotaSnapshotVersion || record.CollectorVersion != antigravityQuotaSnapshotVersion {
+		t.Fatalf("upgraded snapshot versions: parser=%d collector=%d", record.ParserVersion, record.CollectorVersion)
+	}
+	var storedWindows []QuotaWindowRecord
+	if errFind := db.Order("window_id ASC").Find(&storedWindows, "credential_id = ?", "antigravity-upgrade-success").Error; errFind != nil {
+		t.Fatalf("load upgraded windows: %v", errFind)
+	}
+	for _, window := range storedWindows {
+		if antigravityLegacyQuotaWindowID(window.WindowID) {
+			t.Fatalf("legacy window survived successful replacement: %+v", storedWindows)
+		}
+	}
+	item, errGet := repo.GetQuotaCredential(ctx, "antigravity-upgrade-success", probeAt.Add(time.Minute))
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if item.QuotaStatus != "healthy" || item.Freshness != "fresh" || len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ID != "antigravity-gemini-5h" || item.PrimaryWindows[1].ID != "antigravity-3p-weekly" {
+		t.Fatalf("upgraded Antigravity presentation = %+v", item)
+	}
+}
+
 func TestCodexPrimaryWindowsPreferLongestDefaultAndSparkFamilies(t *testing.T) {
 	periodFive := float64(5)
 	periodWeek := float64(1)
