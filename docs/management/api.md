@@ -2666,6 +2666,7 @@ Response fields:
 | `capabilities.usage_provider_health` | boolean | Whether `GET /usage/health/providers` is available. |
 | `capabilities.usage_credential_health` | boolean | Whether `GET /usage/health/credentials` is available. |
 | `capabilities.usage_realtime` | boolean | Whether `GET /usage/realtime` is available. |
+| `capabilities.usage_token_breakdown_v2` | boolean | Whether every persisted usage row has the canonical token-accounting v2 breakdown. It remains `false` while the resumable historical backfill is pending. |
 | `capabilities.request_log_index` | boolean | Whether `GET /request-logs` is available. |
 | `capabilities.request_events` / `capabilities.requestEvents` | boolean | Whether `GET /request-events` is available. |
 | `capabilities.request_event_details` / `capabilities.requestEventDetails` | boolean | Whether `GET /request-events/:id` is available. |
@@ -2894,6 +2895,34 @@ Invalid filters, sorts, or pagination return `400`; missing credentials return `
 
 These endpoints read persisted `usage`, `billing_charge`, `api_key`, `user`, and `auth` data. Responses never return raw client access keys, provider API keys, OAuth tokens, cookies, authorization headers, complete payloads, or complete failure bodies. They may return `api_key_masked`, redacted `body_preview`, and payload summaries.
 
+Canonical token accounting is available only when `capabilities.usage_token_breakdown_v2=true`. Clients must read that declared capability and must not infer support by probing a usage route or rebuilding a breakdown from the legacy token counters. While the capability is `false`, the server may already return `token_breakdown` objects for newly normalized rows, but the selected range can still contain historical rows awaiting backfill. The legacy `input_tokens`, `output_tokens`, `reasoning_tokens`, `cached_tokens`, `cache_read_tokens`, `cache_creation_tokens`, and `total_tokens` fields remain available for diagnostics and backward compatibility; they are not mutually exclusive and must not be stacked into a total.
+
+When enabled, `totals`, every `trend[]` bucket, every usage record, and every aggregate item include this schema:
+
+```json
+{
+  "token_breakdown": {
+    "schema_version": 2,
+    "quality": "complete",
+    "total_tokens": 39346,
+    "input": {
+      "total_tokens": 39320,
+      "uncached_tokens": 6040,
+      "cache_read_tokens": 33280,
+      "cache_write_tokens": 0
+    },
+    "output": {
+      "total_tokens": 26,
+      "non_reasoning_tokens": 26,
+      "reasoning_tokens": 0
+    },
+    "unclassified_tokens": 0
+  }
+}
+```
+
+All values are non-negative and the buckets are mutually exclusive. The enforced invariants are `input.total_tokens = uncached_tokens + cache_read_tokens + cache_write_tokens`, `output.total_tokens = non_reasoning_tokens + reasoning_tokens`, and `total_tokens = input.total_tokens + output.total_tokens + unclassified_tokens`. `quality` is `complete`, `unclassified`, or `inconsistent`. Contradictory upstream totals are not silently repaired: the authoritative total is placed in `unclassified_tokens` and quality becomes `inconsistent`. Legacy rows from known protocol families are normalized during ingestion or the resumable background backfill; unknown provider semantics remain `unclassified`. The backfill uses a persisted high-water cursor and PostgreSQL advisory lock, rechecks for late pre-v2 rows during mixed-version operation, does not modify historical billing charges, and enables the capability only after no pre-v2 rows remain.
+
 The aggregate range parameters apply to `/usage/overview`, `/usage/aggregates`, `/usage/realtime`, `/usage/health/providers`, and `/usage/health/credentials`, and they also act as the base range for `/usage/records` and `/usage/export`. All usage ranges use the half-open interval `[from,to)`: `from` is included and `to` is excluded. A date-only `to` value is normalized to the next local midnight, so the selected calendar day remains fully included across DST transitions. `/usage/overview` and `/usage/aggregates` automatically fill a recent 24-hour window when `from` or `to` is missing; `/usage/records` and `/usage/export` do not fill a time range automatically.
 
 | Query | Type | Default | Description |
@@ -2919,6 +2948,7 @@ Key `UsageRecordSummary` fields:
 | `source` | string/null | Usage payload source. |
 | `service_tier` | string/null | Usage payload service tier. |
 | `reasoning_effort` | string/null | Usage payload reasoning effort. |
+| `token_breakdown` | object | Canonical v2 mutually exclusive input/output/unclassified token buckets. Consume only when `capabilities.usage_token_breakdown_v2=true`. |
 | `client.client_ip` | string/null | Caller IP associated with the usage payload. This is not treated as the CPA node IP. |
 | `credential.api_key_preview` | string/null | Redacted provider API key preview when available; raw keys are never returned. |
 | `billing.balance_before` / `billing.balance_after` | number/null | Balance before and after the charge when linked to `billing_charge`. |
@@ -2943,8 +2973,8 @@ Top-level response fields:
 | --- | --- | --- |
 | `range` | object | Applied time range, timezone, and interval. |
 | `live` | object | Recent short-window RPM, TPM, error rate, and latency. |
-| `totals` | object | Request counts, success/failure counts, tokens, amount, latency, and active subject counts. |
-| `trend` | array | Contiguous trend buckets intersecting the applied half-open range at `interval`, including zero-request buckets. The first and last buckets may be partial. |
+| `totals` | object | Request counts, success/failure counts, tokens, `token_breakdown`, amount, latency, and active subject counts. |
+| `trend` | array | Contiguous trend buckets intersecting the applied half-open range at `interval`, including zero-request buckets. Every bucket contains `token_breakdown`; the first and last buckets may be partial. |
 | `cost_breakdown` | array | Empty when reliable cost splitting is unavailable; the API does not fabricate indivisible cost details. |
 | `model_efficiency` | array | Model efficiency list sorted by total tokens. |
 | `top` | object | `users`, `client_keys`, `credentials`, `providers`, `models`, `endpoints`, and `errors`. |
@@ -2974,7 +3004,7 @@ Query parameters:
 | `min_latency_ms` / `max_latency_ms` | integer | none | Latency range. |
 | `min_amount` / `max_amount` | number | none | Billing amount range. |
 
-The response contains `items`, `total`, `limit`, `offset`, `sort`, and `sortable_fields`. `items[]` is a redacted request summary with `tokens`, `performance`, `client`, `credential`, `billing`, `runtime`, and optional `error`.
+The response contains `items`, `total`, `limit`, `offset`, `sort`, and `sortable_fields`. `items[]` is a redacted request summary with legacy `tokens`, canonical `token_breakdown`, `performance`, `client`, `credential`, `billing`, `runtime`, and optional `error`.
 
 ### GET `/usage/records/:id`
 
@@ -3003,7 +3033,7 @@ Query parameters:
 | `limit` | integer | `20` | Maximum `100`. |
 | `offset` | integer | `0` | Page offset. |
 
-The response contains `group_by`, `metric`, `direction`, `items`, `total`, `limit`, `offset`, and `sortable_metrics`.
+The response contains `group_by`, `metric`, `direction`, `items`, `total`, `limit`, `offset`, and `sortable_metrics`. Every `items[]` entry includes canonical `token_breakdown` in addition to the legacy token counters.
 
 ### GET `/usage/export`
 
@@ -3018,7 +3048,7 @@ Query parameters:
 
 Responses are attachments. CSV uses `text/csv; charset=utf-8`; JSONL uses `application/x-ndjson`.
 
-Export fields are flattened redacted summaries. In addition to core record response fields, they include `error_status_code`, `error_message`, `error_body_preview`, `request_log_available`, and `log_home_ip_required`.
+Export fields are flattened redacted summaries. In addition to core record response fields, they include `error_status_code`, `error_message`, `error_body_preview`, `request_log_available`, and `log_home_ip_required`. Token accounting v2 is exported as `token_breakdown_schema_version`, `token_breakdown_quality`, `token_breakdown_total_tokens`, the four `token_breakdown_input_*` fields, the three `token_breakdown_output_*` fields, and `token_breakdown_unclassified_tokens`.
 
 ### GET `/request-events`
 

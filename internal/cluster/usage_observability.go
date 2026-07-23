@@ -153,6 +153,7 @@ type UsageObservabilityTotals struct {
 	CacheReadTokens       int64
 	CacheCreationTokens   int64
 	TotalTokens           int64
+	TokenBreakdown        UsageTokenBreakdown
 	TotalAmount           *float64
 	Currency              string
 	BlendedCostPer1M      *float64
@@ -179,6 +180,7 @@ type UsageObservabilityTrendPoint struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	TokenBreakdown      UsageTokenBreakdown
 	TotalAmount         *float64
 	AvgLatencyMS        *float64
 	P95LatencyMS        *float64
@@ -230,6 +232,7 @@ type UsageObservabilityAggregateItem struct {
 	CacheCreationTokens int64
 	CacheRate           float64
 	TotalTokens         int64
+	TokenBreakdown      UsageTokenBreakdown
 	TotalAmount         *float64
 	Currency            string
 	AvgLatencyMS        *float64
@@ -273,6 +276,7 @@ type UsageObservabilityTokens struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	TokenBreakdown      UsageTokenBreakdown
 }
 
 type UsageObservabilityPerformance struct {
@@ -339,64 +343,75 @@ type UsageObservabilityPayloadSummary struct {
 }
 
 type usageObservabilityRecordRow struct {
-	UsageID                uint            `gorm:"column:usage_id"`
-	Timestamp              time.Time       `gorm:"column:timestamp"`
-	LatencyMS              int64           `gorm:"column:latency_ms"`
-	TTFTMS                 int64           `gorm:"column:ttft_ms"`
-	InputTokens            int64           `gorm:"column:input_tokens"`
-	OutputTokens           int64           `gorm:"column:output_tokens"`
-	ReasoningTokens        int64           `gorm:"column:reasoning_tokens"`
-	CachedTokens           int64           `gorm:"column:cached_tokens"`
-	CacheReadTokens        int64           `gorm:"column:cache_read_tokens"`
-	CacheReadTokensPresent bool            `gorm:"column:cache_read_tokens_present"`
-	CacheCreationTokens    int64           `gorm:"column:cache_creation_tokens"`
-	TotalTokens            int64           `gorm:"column:total_tokens"`
-	Failed                 bool            `gorm:"column:failed"`
-	FailStatusCode         int             `gorm:"column:fail_status_code"`
-	FailBody               string          `gorm:"column:fail_body"`
-	Source                 string          `gorm:"column:source"`
-	Provider               string          `gorm:"column:provider"`
-	ExecutorType           string          `gorm:"column:executor_type"`
-	Model                  string          `gorm:"column:model"`
-	Alias                  string          `gorm:"column:alias"`
-	ReasoningEffort        string          `gorm:"column:reasoning_effort"`
-	ServiceTier            string          `gorm:"column:service_tier"`
-	Endpoint               string          `gorm:"column:endpoint"`
-	AuthType               string          `gorm:"column:auth_type"`
-	RawAPIKey              string          `gorm:"column:raw_api_key"`
-	RequestID              string          `gorm:"column:request_id"`
-	UpstreamRequestID      string          `gorm:"column:upstream_request_id"`
-	EventType              string          `gorm:"column:event_type"`
-	UpstreamStatusCode     int             `gorm:"column:upstream_status_code"`
-	HomeIP                 string          `gorm:"column:home_ip"`
-	HomePort               int             `gorm:"column:home_port"`
-	CPANodeID              string          `gorm:"column:cpa_node_id"`
-	CPAIP                  string          `gorm:"column:cpa_ip"`
-	CPAPort                int             `gorm:"column:cpa_port"`
-	CPALabel               string          `gorm:"column:cpa_label"`
-	PayloadJSON            JSONB           `gorm:"column:payload_json"`
-	ClientAPIKeyID         *uint           `gorm:"column:client_api_key_id"`
-	ClientAPIKeyLabel      string          `gorm:"column:client_api_key_label"`
-	ClientAPIKeyMasked     string          `gorm:"column:client_api_key_masked"`
-	ClientUserID           *uint           `gorm:"column:client_user_id"`
-	Username               string          `gorm:"column:username"`
-	ChargeID               string          `gorm:"column:charge_id"`
-	Amount                 sql.NullFloat64 `gorm:"column:amount"`
-	MatchedPriceRule       string          `gorm:"column:matched_price_rule"`
-	BalanceBefore          sql.NullFloat64 `gorm:"column:balance_before"`
-	BalanceAfter           sql.NullFloat64 `gorm:"column:balance_after"`
-	UsageAuthIndex         string          `gorm:"column:usage_auth_index"`
-	AuthUUID               string          `gorm:"column:auth_uuid"`
-	AuthJSON               JSONB           `gorm:"column:auth_json"`
-	AuthID                 string          `gorm:"column:auth_id"`
-	AuthIndex              string          `gorm:"column:auth_index"`
-	AuthProvider           string          `gorm:"column:auth_provider"`
-	AuthLabel              string          `gorm:"column:auth_label"`
-	AuthStatus             string          `gorm:"column:auth_status"`
-	AuthDisabled           bool            `gorm:"column:auth_disabled"`
-	AuthUnavailable        bool            `gorm:"column:auth_unavailable"`
-	AuthNextRefreshAfter   sql.NullTime    `gorm:"column:auth_next_refresh_after"`
-	AuthNextRetryAfter     sql.NullTime    `gorm:"column:auth_next_retry_after"`
+	UsageID                    uint            `gorm:"column:usage_id"`
+	Timestamp                  time.Time       `gorm:"column:timestamp"`
+	LatencyMS                  int64           `gorm:"column:latency_ms"`
+	TTFTMS                     int64           `gorm:"column:ttft_ms"`
+	InputTokens                int64           `gorm:"column:input_tokens"`
+	OutputTokens               int64           `gorm:"column:output_tokens"`
+	ReasoningTokens            int64           `gorm:"column:reasoning_tokens"`
+	CachedTokens               int64           `gorm:"column:cached_tokens"`
+	CacheReadTokens            int64           `gorm:"column:cache_read_tokens"`
+	CacheReadTokensPresent     bool            `gorm:"column:cache_read_tokens_present"`
+	CacheCreationTokens        int64           `gorm:"column:cache_creation_tokens"`
+	TotalTokens                int64           `gorm:"column:total_tokens"`
+	TokenAccountingVersion     int             `gorm:"column:token_accounting_version"`
+	TokenAccountingQuality     string          `gorm:"column:token_accounting_quality"`
+	AccountingTotalTokens      int64           `gorm:"column:accounting_total_tokens"`
+	AccountingInputTokens      int64           `gorm:"column:accounting_input_tokens"`
+	UncachedInputTokens        int64           `gorm:"column:uncached_input_tokens"`
+	AccountingCacheReadTokens  int64           `gorm:"column:accounting_cache_read_tokens"`
+	AccountingCacheWriteTokens int64           `gorm:"column:accounting_cache_write_tokens"`
+	AccountingOutputTokens     int64           `gorm:"column:accounting_output_tokens"`
+	NonReasoningOutputTokens   int64           `gorm:"column:non_reasoning_output_tokens"`
+	AccountingReasoningTokens  int64           `gorm:"column:accounting_reasoning_tokens"`
+	UnclassifiedTokens         int64           `gorm:"column:unclassified_tokens"`
+	Failed                     bool            `gorm:"column:failed"`
+	FailStatusCode             int             `gorm:"column:fail_status_code"`
+	FailBody                   string          `gorm:"column:fail_body"`
+	Source                     string          `gorm:"column:source"`
+	Provider                   string          `gorm:"column:provider"`
+	ExecutorType               string          `gorm:"column:executor_type"`
+	Model                      string          `gorm:"column:model"`
+	Alias                      string          `gorm:"column:alias"`
+	ReasoningEffort            string          `gorm:"column:reasoning_effort"`
+	ServiceTier                string          `gorm:"column:service_tier"`
+	Endpoint                   string          `gorm:"column:endpoint"`
+	AuthType                   string          `gorm:"column:auth_type"`
+	RawAPIKey                  string          `gorm:"column:raw_api_key"`
+	RequestID                  string          `gorm:"column:request_id"`
+	UpstreamRequestID          string          `gorm:"column:upstream_request_id"`
+	EventType                  string          `gorm:"column:event_type"`
+	UpstreamStatusCode         int             `gorm:"column:upstream_status_code"`
+	HomeIP                     string          `gorm:"column:home_ip"`
+	HomePort                   int             `gorm:"column:home_port"`
+	CPANodeID                  string          `gorm:"column:cpa_node_id"`
+	CPAIP                      string          `gorm:"column:cpa_ip"`
+	CPAPort                    int             `gorm:"column:cpa_port"`
+	CPALabel                   string          `gorm:"column:cpa_label"`
+	PayloadJSON                JSONB           `gorm:"column:payload_json"`
+	ClientAPIKeyID             *uint           `gorm:"column:client_api_key_id"`
+	ClientAPIKeyLabel          string          `gorm:"column:client_api_key_label"`
+	ClientAPIKeyMasked         string          `gorm:"column:client_api_key_masked"`
+	ClientUserID               *uint           `gorm:"column:client_user_id"`
+	Username                   string          `gorm:"column:username"`
+	ChargeID                   string          `gorm:"column:charge_id"`
+	Amount                     sql.NullFloat64 `gorm:"column:amount"`
+	MatchedPriceRule           string          `gorm:"column:matched_price_rule"`
+	BalanceBefore              sql.NullFloat64 `gorm:"column:balance_before"`
+	BalanceAfter               sql.NullFloat64 `gorm:"column:balance_after"`
+	UsageAuthIndex             string          `gorm:"column:usage_auth_index"`
+	AuthUUID                   string          `gorm:"column:auth_uuid"`
+	AuthJSON                   JSONB           `gorm:"column:auth_json"`
+	AuthID                     string          `gorm:"column:auth_id"`
+	AuthIndex                  string          `gorm:"column:auth_index"`
+	AuthProvider               string          `gorm:"column:auth_provider"`
+	AuthLabel                  string          `gorm:"column:auth_label"`
+	AuthStatus                 string          `gorm:"column:auth_status"`
+	AuthDisabled               bool            `gorm:"column:auth_disabled"`
+	AuthUnavailable            bool            `gorm:"column:auth_unavailable"`
+	AuthNextRefreshAfter       sql.NullTime    `gorm:"column:auth_next_refresh_after"`
+	AuthNextRetryAfter         sql.NullTime    `gorm:"column:auth_next_retry_after"`
 }
 
 type usageObservabilityAggregateRow struct {
@@ -429,6 +444,16 @@ type usageObservabilityAggregateRow struct {
 	CacheReadTokens            int64           `gorm:"column:cache_read_tokens"`
 	CacheCreationTokens        int64           `gorm:"column:cache_creation_tokens"`
 	TotalTokens                int64           `gorm:"column:total_tokens"`
+	TokenAccountingQuality     string          `gorm:"column:token_accounting_quality"`
+	AccountingTotalTokens      int64           `gorm:"column:accounting_total_tokens"`
+	AccountingInputTokens      int64           `gorm:"column:accounting_input_tokens"`
+	UncachedInputTokens        int64           `gorm:"column:uncached_input_tokens"`
+	AccountingCacheReadTokens  int64           `gorm:"column:accounting_cache_read_tokens"`
+	AccountingCacheWriteTokens int64           `gorm:"column:accounting_cache_write_tokens"`
+	AccountingOutputTokens     int64           `gorm:"column:accounting_output_tokens"`
+	NonReasoningOutputTokens   int64           `gorm:"column:non_reasoning_output_tokens"`
+	AccountingReasoningTokens  int64           `gorm:"column:accounting_reasoning_tokens"`
+	UnclassifiedTokens         int64           `gorm:"column:unclassified_tokens"`
 	TotalAmount                sql.NullFloat64 `gorm:"column:total_amount"`
 	AvgLatencyMS               sql.NullFloat64 `gorm:"column:avg_latency_ms"`
 	P95LatencyMS               sql.NullFloat64 `gorm:"column:p95_latency_ms"`
@@ -487,25 +512,35 @@ type usageObservabilityOverviewBounds struct {
 }
 
 type usageObservabilityTotalsRow struct {
-	RequestCount          int64           `gorm:"column:request_count"`
-	SuccessCount          sql.NullInt64   `gorm:"column:success_count"`
-	FailedCount           sql.NullInt64   `gorm:"column:failed_count"`
-	InputTokens           sql.NullInt64   `gorm:"column:input_tokens"`
-	OutputTokens          sql.NullInt64   `gorm:"column:output_tokens"`
-	ReasoningTokens       sql.NullInt64   `gorm:"column:reasoning_tokens"`
-	CachedTokens          sql.NullInt64   `gorm:"column:cached_tokens"`
-	CacheReadTokens       sql.NullInt64   `gorm:"column:cache_read_tokens"`
-	CacheCreationTokens   sql.NullInt64   `gorm:"column:cache_creation_tokens"`
-	TotalTokens           sql.NullInt64   `gorm:"column:total_tokens"`
-	TotalAmount           sql.NullFloat64 `gorm:"column:total_amount"`
-	AvgLatencyMS          sql.NullFloat64 `gorm:"column:avg_latency_ms"`
-	AvgTTFTMS             sql.NullFloat64 `gorm:"column:avg_ttft_ms"`
-	ActiveUserCount       int64           `gorm:"column:active_user_count"`
-	ActiveClientKeyCount  int64           `gorm:"column:active_client_key_count"`
-	ActiveCredentialCount int64           `gorm:"column:active_credential_count"`
-	ActiveModelCount      int64           `gorm:"column:active_model_count"`
-	MinTimestamp          sql.NullString  `gorm:"column:min_timestamp"`
-	MaxTimestamp          sql.NullString  `gorm:"column:max_timestamp"`
+	RequestCount               int64           `gorm:"column:request_count"`
+	SuccessCount               sql.NullInt64   `gorm:"column:success_count"`
+	FailedCount                sql.NullInt64   `gorm:"column:failed_count"`
+	InputTokens                sql.NullInt64   `gorm:"column:input_tokens"`
+	OutputTokens               sql.NullInt64   `gorm:"column:output_tokens"`
+	ReasoningTokens            sql.NullInt64   `gorm:"column:reasoning_tokens"`
+	CachedTokens               sql.NullInt64   `gorm:"column:cached_tokens"`
+	CacheReadTokens            sql.NullInt64   `gorm:"column:cache_read_tokens"`
+	CacheCreationTokens        sql.NullInt64   `gorm:"column:cache_creation_tokens"`
+	TotalTokens                sql.NullInt64   `gorm:"column:total_tokens"`
+	TokenAccountingQuality     string          `gorm:"column:token_accounting_quality"`
+	AccountingTotalTokens      sql.NullInt64   `gorm:"column:accounting_total_tokens"`
+	AccountingInputTokens      sql.NullInt64   `gorm:"column:accounting_input_tokens"`
+	UncachedInputTokens        sql.NullInt64   `gorm:"column:uncached_input_tokens"`
+	AccountingCacheReadTokens  sql.NullInt64   `gorm:"column:accounting_cache_read_tokens"`
+	AccountingCacheWriteTokens sql.NullInt64   `gorm:"column:accounting_cache_write_tokens"`
+	AccountingOutputTokens     sql.NullInt64   `gorm:"column:accounting_output_tokens"`
+	NonReasoningOutputTokens   sql.NullInt64   `gorm:"column:non_reasoning_output_tokens"`
+	AccountingReasoningTokens  sql.NullInt64   `gorm:"column:accounting_reasoning_tokens"`
+	UnclassifiedTokens         sql.NullInt64   `gorm:"column:unclassified_tokens"`
+	TotalAmount                sql.NullFloat64 `gorm:"column:total_amount"`
+	AvgLatencyMS               sql.NullFloat64 `gorm:"column:avg_latency_ms"`
+	AvgTTFTMS                  sql.NullFloat64 `gorm:"column:avg_ttft_ms"`
+	ActiveUserCount            int64           `gorm:"column:active_user_count"`
+	ActiveClientKeyCount       int64           `gorm:"column:active_client_key_count"`
+	ActiveCredentialCount      int64           `gorm:"column:active_credential_count"`
+	ActiveModelCount           int64           `gorm:"column:active_model_count"`
+	MinTimestamp               sql.NullString  `gorm:"column:min_timestamp"`
+	MaxTimestamp               sql.NullString  `gorm:"column:max_timestamp"`
 }
 
 type usageObservabilityLatencyPercentileRow struct {
@@ -514,19 +549,29 @@ type usageObservabilityLatencyPercentileRow struct {
 }
 
 type usageObservabilityTrendBucketRow struct {
-	BucketUnix          int64           `gorm:"column:bucket_unix"`
-	RequestCount        int64           `gorm:"column:request_count"`
-	SuccessCount        sql.NullInt64   `gorm:"column:success_count"`
-	FailedCount         sql.NullInt64   `gorm:"column:failed_count"`
-	InputTokens         sql.NullInt64   `gorm:"column:input_tokens"`
-	OutputTokens        sql.NullInt64   `gorm:"column:output_tokens"`
-	ReasoningTokens     sql.NullInt64   `gorm:"column:reasoning_tokens"`
-	CachedTokens        sql.NullInt64   `gorm:"column:cached_tokens"`
-	CacheReadTokens     sql.NullInt64   `gorm:"column:cache_read_tokens"`
-	CacheCreationTokens sql.NullInt64   `gorm:"column:cache_creation_tokens"`
-	TotalTokens         sql.NullInt64   `gorm:"column:total_tokens"`
-	TotalAmount         sql.NullFloat64 `gorm:"column:total_amount"`
-	AvgLatencyMS        sql.NullFloat64 `gorm:"column:avg_latency_ms"`
+	BucketUnix                 int64           `gorm:"column:bucket_unix"`
+	RequestCount               int64           `gorm:"column:request_count"`
+	SuccessCount               sql.NullInt64   `gorm:"column:success_count"`
+	FailedCount                sql.NullInt64   `gorm:"column:failed_count"`
+	InputTokens                sql.NullInt64   `gorm:"column:input_tokens"`
+	OutputTokens               sql.NullInt64   `gorm:"column:output_tokens"`
+	ReasoningTokens            sql.NullInt64   `gorm:"column:reasoning_tokens"`
+	CachedTokens               sql.NullInt64   `gorm:"column:cached_tokens"`
+	CacheReadTokens            sql.NullInt64   `gorm:"column:cache_read_tokens"`
+	CacheCreationTokens        sql.NullInt64   `gorm:"column:cache_creation_tokens"`
+	TotalTokens                sql.NullInt64   `gorm:"column:total_tokens"`
+	TokenAccountingQuality     string          `gorm:"column:token_accounting_quality"`
+	AccountingTotalTokens      sql.NullInt64   `gorm:"column:accounting_total_tokens"`
+	AccountingInputTokens      sql.NullInt64   `gorm:"column:accounting_input_tokens"`
+	UncachedInputTokens        sql.NullInt64   `gorm:"column:uncached_input_tokens"`
+	AccountingCacheReadTokens  sql.NullInt64   `gorm:"column:accounting_cache_read_tokens"`
+	AccountingCacheWriteTokens sql.NullInt64   `gorm:"column:accounting_cache_write_tokens"`
+	AccountingOutputTokens     sql.NullInt64   `gorm:"column:accounting_output_tokens"`
+	NonReasoningOutputTokens   sql.NullInt64   `gorm:"column:non_reasoning_output_tokens"`
+	AccountingReasoningTokens  sql.NullInt64   `gorm:"column:accounting_reasoning_tokens"`
+	UnclassifiedTokens         sql.NullInt64   `gorm:"column:unclassified_tokens"`
+	TotalAmount                sql.NullFloat64 `gorm:"column:total_amount"`
+	AvgLatencyMS               sql.NullFloat64 `gorm:"column:avg_latency_ms"`
 }
 
 type usageObservabilityTrendPercentileRow struct {
@@ -901,6 +946,20 @@ func usageObservabilityTotalsSQLSelect() string {
 		SUM(%s) AS cache_read_tokens,
 		SUM("usage"."cache_creation_tokens") AS cache_creation_tokens,
 		SUM("usage"."total_tokens") AS total_tokens,
+		CASE
+			WHEN SUM(CASE WHEN "usage"."token_accounting_quality" = 'inconsistent' THEN 1 ELSE 0 END) > 0 THEN 'inconsistent'
+			WHEN SUM(CASE WHEN "usage"."token_accounting_quality" = 'unclassified' AND "usage"."unclassified_tokens" > 0 THEN 1 ELSE 0 END) > 0 THEN 'unclassified'
+			ELSE 'complete'
+		END AS token_accounting_quality,
+		SUM("usage"."accounting_total_tokens") AS accounting_total_tokens,
+		SUM("usage"."accounting_input_tokens") AS accounting_input_tokens,
+		SUM("usage"."uncached_input_tokens") AS uncached_input_tokens,
+		SUM("usage"."accounting_cache_read_tokens") AS accounting_cache_read_tokens,
+		SUM("usage"."accounting_cache_write_tokens") AS accounting_cache_write_tokens,
+		SUM("usage"."accounting_output_tokens") AS accounting_output_tokens,
+		SUM("usage"."non_reasoning_output_tokens") AS non_reasoning_output_tokens,
+		SUM("usage"."accounting_reasoning_tokens") AS accounting_reasoning_tokens,
+		SUM("usage"."unclassified_tokens") AS unclassified_tokens,
 		SUM("billing_charge"."amount") AS total_amount,
 		AVG(CASE WHEN "usage"."latency_ms" >= 0 THEN "usage"."latency_ms" END) AS avg_latency_ms,
 		AVG(CASE WHEN "usage"."ttft_ms" > 0 THEN "usage"."ttft_ms" END) AS avg_ttft_ms,
@@ -917,16 +976,28 @@ func usageObservabilityTotalsFromRow(row *usageObservabilityTotalsRow) UsageObse
 		return UsageObservabilityTotals{}
 	}
 	totals := UsageObservabilityTotals{
-		RequestCount:          row.RequestCount,
-		SuccessCount:          optionalSQLInt64Value(row.SuccessCount),
-		FailedCount:           optionalSQLInt64Value(row.FailedCount),
-		InputTokens:           optionalSQLInt64Value(row.InputTokens),
-		OutputTokens:          optionalSQLInt64Value(row.OutputTokens),
-		ReasoningTokens:       optionalSQLInt64Value(row.ReasoningTokens),
-		CachedTokens:          optionalSQLInt64Value(row.CachedTokens),
-		CacheReadTokens:       optionalSQLInt64Value(row.CacheReadTokens),
-		CacheCreationTokens:   optionalSQLInt64Value(row.CacheCreationTokens),
-		TotalTokens:           optionalSQLInt64Value(row.TotalTokens),
+		RequestCount:        row.RequestCount,
+		SuccessCount:        optionalSQLInt64Value(row.SuccessCount),
+		FailedCount:         optionalSQLInt64Value(row.FailedCount),
+		InputTokens:         optionalSQLInt64Value(row.InputTokens),
+		OutputTokens:        optionalSQLInt64Value(row.OutputTokens),
+		ReasoningTokens:     optionalSQLInt64Value(row.ReasoningTokens),
+		CachedTokens:        optionalSQLInt64Value(row.CachedTokens),
+		CacheReadTokens:     optionalSQLInt64Value(row.CacheReadTokens),
+		CacheCreationTokens: optionalSQLInt64Value(row.CacheCreationTokens),
+		TotalTokens:         optionalSQLInt64Value(row.TotalTokens),
+		TokenBreakdown: usageTokenBreakdownFromValues(
+			row.TokenAccountingQuality,
+			optionalSQLInt64Value(row.AccountingTotalTokens),
+			optionalSQLInt64Value(row.AccountingInputTokens),
+			optionalSQLInt64Value(row.UncachedInputTokens),
+			optionalSQLInt64Value(row.AccountingCacheReadTokens),
+			optionalSQLInt64Value(row.AccountingCacheWriteTokens),
+			optionalSQLInt64Value(row.AccountingOutputTokens),
+			optionalSQLInt64Value(row.NonReasoningOutputTokens),
+			optionalSQLInt64Value(row.AccountingReasoningTokens),
+			optionalSQLInt64Value(row.UnclassifiedTokens),
+		),
 		ActiveUserCount:       row.ActiveUserCount,
 		ActiveClientKeyCount:  row.ActiveClientKeyCount,
 		ActiveCredentialCount: row.ActiveCredentialCount,
@@ -949,8 +1020,8 @@ func usageObservabilityTotalsFromRow(row *usageObservabilityTotalsRow) UsageObse
 		avgTTFT := row.AvgTTFTMS.Float64
 		totals.AvgTTFTMS = &avgTTFT
 	}
-	if totals.TotalAmount != nil && totals.TotalTokens > 0 {
-		blended := *totals.TotalAmount * 1000000 / float64(totals.TotalTokens)
+	if totals.TotalAmount != nil && totals.TokenBreakdown.TotalTokens > 0 {
+		blended := *totals.TotalAmount * 1000000 / float64(totals.TokenBreakdown.TotalTokens)
 		totals.BlendedCostPer1M = &blended
 	}
 	return totals
@@ -1006,7 +1077,7 @@ func usageObservabilityLiveSQL(db *gorm.DB, query UsageObservabilityRecordQuery,
 	minutes := float64(windowSeconds) / 60
 	if minutes > 0 {
 		live.RPM = float64(totals.RequestCount) / minutes
-		live.TPM = float64(totals.TotalTokens) / minutes
+		live.TPM = float64(totals.TokenBreakdown.TotalTokens) / minutes
 	}
 	return live, nil
 }
@@ -1024,6 +1095,17 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 		%s AS cache_read_tokens,
 		"usage"."cache_creation_tokens" AS cache_creation_tokens,
 		"usage"."total_tokens" AS total_tokens,
+		"usage"."token_accounting_version" AS token_accounting_version,
+		"usage"."token_accounting_quality" AS token_accounting_quality,
+		"usage"."accounting_total_tokens" AS accounting_total_tokens,
+		"usage"."accounting_input_tokens" AS accounting_input_tokens,
+		"usage"."uncached_input_tokens" AS uncached_input_tokens,
+		"usage"."accounting_cache_read_tokens" AS accounting_cache_read_tokens,
+		"usage"."accounting_cache_write_tokens" AS accounting_cache_write_tokens,
+		"usage"."accounting_output_tokens" AS accounting_output_tokens,
+		"usage"."non_reasoning_output_tokens" AS non_reasoning_output_tokens,
+		"usage"."accounting_reasoning_tokens" AS accounting_reasoning_tokens,
+		"usage"."unclassified_tokens" AS unclassified_tokens,
 		"usage"."failed" AS failed,
 		"billing_charge"."amount" AS amount`, bucketExpr, cacheReadTokensExpr)
 	base := usageObservabilityUsageBillingScope(db.Table("usage"), query).Select(baseSelect, bucketArgs...)
@@ -1041,6 +1123,20 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 			SUM(trend_source.cache_read_tokens) AS cache_read_tokens,
 			SUM(trend_source.cache_creation_tokens) AS cache_creation_tokens,
 			SUM(trend_source.total_tokens) AS total_tokens,
+			CASE
+				WHEN SUM(CASE WHEN trend_source.token_accounting_quality = 'inconsistent' THEN 1 ELSE 0 END) > 0 THEN 'inconsistent'
+				WHEN SUM(CASE WHEN trend_source.token_accounting_quality = 'unclassified' AND trend_source.unclassified_tokens > 0 THEN 1 ELSE 0 END) > 0 THEN 'unclassified'
+				ELSE 'complete'
+			END AS token_accounting_quality,
+			SUM(trend_source.accounting_total_tokens) AS accounting_total_tokens,
+			SUM(trend_source.accounting_input_tokens) AS accounting_input_tokens,
+			SUM(trend_source.uncached_input_tokens) AS uncached_input_tokens,
+			SUM(trend_source.accounting_cache_read_tokens) AS accounting_cache_read_tokens,
+			SUM(trend_source.accounting_cache_write_tokens) AS accounting_cache_write_tokens,
+			SUM(trend_source.accounting_output_tokens) AS accounting_output_tokens,
+			SUM(trend_source.non_reasoning_output_tokens) AS non_reasoning_output_tokens,
+			SUM(trend_source.accounting_reasoning_tokens) AS accounting_reasoning_tokens,
+			SUM(trend_source.unclassified_tokens) AS unclassified_tokens,
 			SUM(trend_source.amount) AS total_amount,
 			AVG(CASE WHEN trend_source.latency_ms >= 0 THEN trend_source.latency_ms END) AS avg_latency_ms`).
 		Group("trend_source.bucket_unix").
@@ -1103,6 +1199,18 @@ func usageObservabilityTrendFromBucketRows(rows []usageObservabilityTrendBucketR
 			CacheReadTokens:     optionalSQLInt64Value(rows[index].CacheReadTokens),
 			CacheCreationTokens: optionalSQLInt64Value(rows[index].CacheCreationTokens),
 			TotalTokens:         optionalSQLInt64Value(rows[index].TotalTokens),
+			TokenBreakdown: usageTokenBreakdownFromValues(
+				rows[index].TokenAccountingQuality,
+				optionalSQLInt64Value(rows[index].AccountingTotalTokens),
+				optionalSQLInt64Value(rows[index].AccountingInputTokens),
+				optionalSQLInt64Value(rows[index].UncachedInputTokens),
+				optionalSQLInt64Value(rows[index].AccountingCacheReadTokens),
+				optionalSQLInt64Value(rows[index].AccountingCacheWriteTokens),
+				optionalSQLInt64Value(rows[index].AccountingOutputTokens),
+				optionalSQLInt64Value(rows[index].NonReasoningOutputTokens),
+				optionalSQLInt64Value(rows[index].AccountingReasoningTokens),
+				optionalSQLInt64Value(rows[index].UnclassifiedTokens),
+			),
 		}
 		if rows[index].TotalAmount.Valid {
 			amount := rows[index].TotalAmount.Float64
@@ -1145,8 +1253,9 @@ func usageObservabilityFillTrend(points []UsageObservabilityTrendPoint, interval
 			filled = append(filled, point)
 		} else {
 			filled = append(filled, UsageObservabilityTrendPoint{
-				BucketStart: bucketStart,
-				BucketEnd:   bucketEnd,
+				BucketStart:    bucketStart,
+				BucketEnd:      bucketEnd,
+				TokenBreakdown: newUnclassifiedUsageTokenBreakdown(0),
 			})
 		}
 
@@ -1407,7 +1516,7 @@ func usageObservabilityRealtimeVelocitySQL(db *gorm.DB, query UsageObservability
 		%s AS bucket_unix,
 		COUNT(*) AS request_count,
 		SUM(CASE WHEN "usage"."failed" THEN 1 ELSE 0 END) AS failed_count,
-		SUM("usage"."total_tokens") AS total_tokens`, bucketExpr)
+		SUM("usage"."accounting_total_tokens") AS total_tokens`, bucketExpr)
 	var rows []usageObservabilityRealtimeVelocityRow
 	if errFind := usageObservabilityNarrowUsageScope(db.Table("usage"), query).
 		Select(selectSQL, bucketArgs...).
@@ -1738,6 +1847,16 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		%s AS cache_read_tokens,
 		"usage"."cache_creation_tokens" AS cache_creation_tokens,
 		"usage"."total_tokens" AS total_tokens,
+		"usage"."token_accounting_quality" AS token_accounting_quality,
+		"usage"."accounting_total_tokens" AS accounting_total_tokens,
+		"usage"."accounting_input_tokens" AS accounting_input_tokens,
+		"usage"."uncached_input_tokens" AS uncached_input_tokens,
+		"usage"."accounting_cache_read_tokens" AS accounting_cache_read_tokens,
+		"usage"."accounting_cache_write_tokens" AS accounting_cache_write_tokens,
+		"usage"."accounting_output_tokens" AS accounting_output_tokens,
+		"usage"."non_reasoning_output_tokens" AS non_reasoning_output_tokens,
+		"usage"."accounting_reasoning_tokens" AS accounting_reasoning_tokens,
+		"usage"."unclassified_tokens" AS unclassified_tokens,
 		"billing_charge"."amount" AS amount`,
 		idExpr,
 		labelExpr,
@@ -1839,6 +1958,20 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 		SUM(scoped.cache_read_tokens) AS cache_read_tokens,
 		SUM(scoped.cache_creation_tokens) AS cache_creation_tokens,
 		SUM(scoped.total_tokens) AS total_tokens,
+		CASE
+			WHEN SUM(CASE WHEN scoped.token_accounting_quality = 'inconsistent' THEN 1 ELSE 0 END) > 0 THEN 'inconsistent'
+			WHEN SUM(CASE WHEN scoped.token_accounting_quality = 'unclassified' AND scoped.unclassified_tokens > 0 THEN 1 ELSE 0 END) > 0 THEN 'unclassified'
+			ELSE 'complete'
+		END AS token_accounting_quality,
+		SUM(scoped.accounting_total_tokens) AS accounting_total_tokens,
+		SUM(scoped.accounting_input_tokens) AS accounting_input_tokens,
+		SUM(scoped.uncached_input_tokens) AS uncached_input_tokens,
+		SUM(scoped.accounting_cache_read_tokens) AS accounting_cache_read_tokens,
+		SUM(scoped.accounting_cache_write_tokens) AS accounting_cache_write_tokens,
+		SUM(scoped.accounting_output_tokens) AS accounting_output_tokens,
+		SUM(scoped.non_reasoning_output_tokens) AS non_reasoning_output_tokens,
+		SUM(scoped.accounting_reasoning_tokens) AS accounting_reasoning_tokens,
+		SUM(scoped.unclassified_tokens) AS unclassified_tokens,
 		SUM(scoped.amount) AS total_amount,
 		AVG(CASE WHEN scoped.latency_ms >= 0 THEN scoped.latency_ms END) AS avg_latency_ms,
 		%s,
@@ -1849,7 +1982,7 @@ func usageObservabilityAggregateSQLOrder(metric string, direction string) string
 	metricColumn := "request_count"
 	switch strings.TrimSpace(metric) {
 	case "total_tokens":
-		metricColumn = "total_tokens"
+		metricColumn = "accounting_total_tokens"
 	case "total_amount":
 		metricColumn = "COALESCE(total_amount, 0)"
 	case "failed_count":
@@ -1920,6 +2053,17 @@ func usageObservabilityRecordSelect() string {
 		"usage"."cache_read_tokens_present" AS cache_read_tokens_present,
 		"usage"."cache_creation_tokens" AS cache_creation_tokens,
 		"usage"."total_tokens" AS total_tokens,
+		"usage"."token_accounting_version" AS token_accounting_version,
+		"usage"."token_accounting_quality" AS token_accounting_quality,
+		"usage"."accounting_total_tokens" AS accounting_total_tokens,
+		"usage"."accounting_input_tokens" AS accounting_input_tokens,
+		"usage"."uncached_input_tokens" AS uncached_input_tokens,
+		"usage"."accounting_cache_read_tokens" AS accounting_cache_read_tokens,
+		"usage"."accounting_cache_write_tokens" AS accounting_cache_write_tokens,
+		"usage"."accounting_output_tokens" AS accounting_output_tokens,
+		"usage"."non_reasoning_output_tokens" AS non_reasoning_output_tokens,
+		"usage"."accounting_reasoning_tokens" AS accounting_reasoning_tokens,
+		"usage"."unclassified_tokens" AS unclassified_tokens,
 		"usage"."failed" AS failed,
 		"usage"."fail_status_code" AS fail_status_code,
 		"usage"."fail_body" AS fail_body,
@@ -2350,9 +2494,9 @@ func usageObservabilityRecordOrder(sortValue string) string {
 	case "timestamp_asc":
 		return `"usage"."timestamp" ASC, "usage"."id" ASC`
 	case "tokens_desc":
-		return `"usage"."total_tokens" DESC, "usage"."timestamp" DESC, "usage"."id" DESC`
+		return `"usage"."accounting_total_tokens" DESC, "usage"."timestamp" DESC, "usage"."id" DESC`
 	case "tokens_asc":
-		return `"usage"."total_tokens" ASC, "usage"."timestamp" ASC, "usage"."id" ASC`
+		return `"usage"."accounting_total_tokens" ASC, "usage"."timestamp" ASC, "usage"."id" ASC`
 	case "cost_desc":
 		return `COALESCE("billing_charge"."amount", 0) DESC, "usage"."timestamp" DESC, "usage"."id" DESC`
 	case "cost_asc":
@@ -2401,6 +2545,18 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 			CacheReadTokens:     cacheReadTokens,
 			CacheCreationTokens: row.CacheCreationTokens,
 			TotalTokens:         row.TotalTokens,
+			TokenBreakdown: usageTokenBreakdownFromValues(
+				row.TokenAccountingQuality,
+				row.AccountingTotalTokens,
+				row.AccountingInputTokens,
+				row.UncachedInputTokens,
+				row.AccountingCacheReadTokens,
+				row.AccountingCacheWriteTokens,
+				row.AccountingOutputTokens,
+				row.NonReasoningOutputTokens,
+				row.AccountingReasoningTokens,
+				row.UnclassifiedTokens,
+			),
 		},
 		Performance: usageObservabilityPerformance(row),
 		Client:      usageObservabilityClient(row, payload),
@@ -2465,14 +2621,26 @@ func usageObservabilityAggregateItemFromRow(row *usageObservabilityAggregateRow,
 		CacheReadTokens:     row.CacheReadTokens,
 		CacheCreationTokens: row.CacheCreationTokens,
 		TotalTokens:         row.TotalTokens,
+		TokenBreakdown: usageTokenBreakdownFromValues(
+			row.TokenAccountingQuality,
+			row.AccountingTotalTokens,
+			row.AccountingInputTokens,
+			row.UncachedInputTokens,
+			row.AccountingCacheReadTokens,
+			row.AccountingCacheWriteTokens,
+			row.AccountingOutputTokens,
+			row.NonReasoningOutputTokens,
+			row.AccountingReasoningTokens,
+			row.UnclassifiedTokens,
+		),
 	}
 	if item.RequestCount > 0 {
 		item.SuccessRate = float64(item.SuccessCount) / float64(item.RequestCount)
 		item.ErrorRate = float64(item.FailedCount) / float64(item.RequestCount)
 	}
-	if item.TotalTokens > 0 {
-		cacheTokens := usageObservabilityCacheTokens(item.CacheReadTokens, item.CacheCreationTokens)
-		item.CacheRate = float64(cacheTokens) / float64(item.TotalTokens)
+	if item.TokenBreakdown.TotalTokens > 0 {
+		cacheTokens := item.TokenBreakdown.Input.CacheReadTokens + item.TokenBreakdown.Input.CacheWriteTokens
+		item.CacheRate = float64(cacheTokens) / float64(item.TokenBreakdown.TotalTokens)
 	}
 	if row.TotalAmount.Valid {
 		amount := row.TotalAmount.Float64
@@ -2720,6 +2888,7 @@ func usageObservabilityTotals(rows []usageObservabilityRecordRow) UsageObservabi
 		CacheReadTokens:       item.CacheReadTokens,
 		CacheCreationTokens:   item.CacheCreationTokens,
 		TotalTokens:           item.TotalTokens,
+		TokenBreakdown:        item.TokenBreakdown,
 		TotalAmount:           item.TotalAmount,
 		Currency:              item.Currency,
 		AvgLatencyMS:          item.AvgLatencyMS,
@@ -2741,8 +2910,8 @@ func usageObservabilityTotals(rows []usageObservabilityRecordRow) UsageObservabi
 		avgTTFT := float64(ttftTotal) / float64(len(ttftValues))
 		totals.AvgTTFTMS = &avgTTFT
 	}
-	if totals.TotalAmount != nil && totals.TotalTokens > 0 {
-		blended := *totals.TotalAmount * 1000000 / float64(totals.TotalTokens)
+	if totals.TotalAmount != nil && totals.TokenBreakdown.TotalTokens > 0 {
+		blended := *totals.TotalAmount * 1000000 / float64(totals.TokenBreakdown.TotalTokens)
 		totals.BlendedCostPer1M = &blended
 	}
 	return totals
@@ -2768,7 +2937,7 @@ func usageObservabilityLive(rows []usageObservabilityRecordRow, windowSeconds in
 	if windowSeconds > 0 {
 		minutes := float64(windowSeconds) / 60
 		live.RPM = float64(totals.RequestCount) / minutes
-		live.TPM = float64(totals.TotalTokens) / minutes
+		live.TPM = float64(totals.TokenBreakdown.TotalTokens) / minutes
 	}
 	return live
 }
@@ -2810,6 +2979,7 @@ func usageObservabilityTrend(rows []usageObservabilityRecordRow, interval string
 			CacheReadTokens:     item.CacheReadTokens,
 			CacheCreationTokens: item.CacheCreationTokens,
 			TotalTokens:         item.TotalTokens,
+			TokenBreakdown:      item.TokenBreakdown,
 			TotalAmount:         item.TotalAmount,
 			AvgLatencyMS:        item.AvgLatencyMS,
 			P95LatencyMS:        item.P95LatencyMS,
@@ -2889,6 +3059,18 @@ func (a *usageObservabilityAggregateAccumulator) add(row *usageObservabilityReco
 	a.Item.CacheReadTokens += normalizedUsageCacheReadTokens(row.Provider, row.ExecutorType, row.CachedTokens, row.CacheReadTokens, row.CacheReadTokensPresent)
 	a.Item.CacheCreationTokens += row.CacheCreationTokens
 	a.Item.TotalTokens += row.TotalTokens
+	a.Item.TokenBreakdown = mergeUsageTokenBreakdowns(a.Item.TokenBreakdown, usageTokenBreakdownFromValues(
+		row.TokenAccountingQuality,
+		row.AccountingTotalTokens,
+		row.AccountingInputTokens,
+		row.UncachedInputTokens,
+		row.AccountingCacheReadTokens,
+		row.AccountingCacheWriteTokens,
+		row.AccountingOutputTokens,
+		row.NonReasoningOutputTokens,
+		row.AccountingReasoningTokens,
+		row.UnclassifiedTokens,
+	))
 	if row.Amount.Valid {
 		a.AmountTotal += row.Amount.Float64
 		a.AmountValid = true
@@ -2913,9 +3095,9 @@ func (a *usageObservabilityAggregateAccumulator) result() UsageObservabilityAggr
 		item.SuccessRate = float64(item.SuccessCount) / float64(item.RequestCount)
 		item.ErrorRate = float64(item.FailedCount) / float64(item.RequestCount)
 	}
-	if item.TotalTokens > 0 {
-		cacheTokens := usageObservabilityCacheTokens(item.CacheReadTokens, item.CacheCreationTokens)
-		item.CacheRate = float64(cacheTokens) / float64(item.TotalTokens)
+	if item.TokenBreakdown.TotalTokens > 0 {
+		cacheTokens := item.TokenBreakdown.Input.CacheReadTokens + item.TokenBreakdown.Input.CacheWriteTokens
+		item.CacheRate = float64(cacheTokens) / float64(item.TokenBreakdown.TotalTokens)
 	}
 	if a.AmountValid {
 		amount := a.AmountTotal
@@ -2959,7 +3141,7 @@ func usageObservabilityAggregateMetricValue(item *UsageObservabilityAggregateIte
 	}
 	switch metric {
 	case "total_tokens":
-		return float64(item.TotalTokens)
+		return float64(item.TokenBreakdown.TotalTokens)
 	case "total_amount":
 		if item.TotalAmount == nil {
 			return 0

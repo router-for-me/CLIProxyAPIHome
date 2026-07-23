@@ -2666,6 +2666,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-
 | `capabilities.usage_provider_health` | boolean | 是否支持 `GET /usage/health/providers`。 |
 | `capabilities.usage_credential_health` | boolean | 是否支持 `GET /usage/health/credentials`。 |
 | `capabilities.usage_realtime` | boolean | 是否支持 `GET /usage/realtime`。 |
+| `capabilities.usage_token_breakdown_v2` | boolean | 是否所有已持久化 usage 行都具备规范化 Token Accounting v2 明细。可恢复的历史回填未完成时保持 `false`。 |
 | `capabilities.request_log_index` | boolean | 是否支持 `GET /request-logs`。 |
 | `capabilities.request_events` / `capabilities.requestEvents` | boolean | 是否支持 `GET /request-events`。 |
 | `capabilities.request_event_details` / `capabilities.requestEventDetails` | boolean | 是否支持 `GET /request-events/:id`。 |
@@ -2864,6 +2865,34 @@ Provider 未报告该能力或没有可靠观测时，`reset_credits` 为 `null`
 
 这些接口读取持久化 `usage`、`billing_charge`、`api_key`、`user` 和 `auth` 数据。响应不会返回 raw client access key、provider API key、OAuth token、cookie、authorization header、完整 payload 或完整失败 body。允许返回 `api_key_masked`、脱敏 `body_preview` 和 payload summary。
 
+只有 `capabilities.usage_token_breakdown_v2=true` 时，客户端才能消费规范化 Token Accounting。客户端必须读取该显式能力，不能通过探测 usage 路由推断支持，也不能使用旧 Token 字段自行拼装明细。能力为 `false` 时，服务端可能已经为新归一化记录返回 `token_breakdown`，但所选范围仍可能包含等待回填的历史记录。旧的 `input_tokens`、`output_tokens`、`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens` 和 `total_tokens` 继续用于诊断与向后兼容；这些字段并非互斥，不能直接堆叠求和。
+
+能力启用后，`totals`、每个 `trend[]` 桶、每条 usage record 和每个 aggregate item 都包含以下结构：
+
+```json
+{
+  "token_breakdown": {
+    "schema_version": 2,
+    "quality": "complete",
+    "total_tokens": 39346,
+    "input": {
+      "total_tokens": 39320,
+      "uncached_tokens": 6040,
+      "cache_read_tokens": 33280,
+      "cache_write_tokens": 0
+    },
+    "output": {
+      "total_tokens": 26,
+      "non_reasoning_tokens": 26,
+      "reasoning_tokens": 0
+    },
+    "unclassified_tokens": 0
+  }
+}
+```
+
+所有数值都必须非负，各桶互斥。强制不变量为：`input.total_tokens = uncached_tokens + cache_read_tokens + cache_write_tokens`、`output.total_tokens = non_reasoning_tokens + reasoning_tokens`、`total_tokens = input.total_tokens + output.total_tokens + unclassified_tokens`。`quality` 取值为 `complete`、`unclassified` 或 `inconsistent`。上游总量互相矛盾时不会静默修正：权威总量会进入 `unclassified_tokens`，quality 标记为 `inconsistent`。已知协议族的旧记录会在写入时或可恢复的后台回填中归一化；无法确认 Provider 语义的记录保持 `unclassified`。回填使用持久化高水位游标和 PostgreSQL advisory lock，在混合版本运行期间会重新检查后写入的 pre-v2 记录，不修改历史 billing charge，且只有不存在 pre-v2 记录后才启用该 capability。
+
 汇总范围参数适用于 `/usage/overview`、`/usage/aggregates`、`/usage/realtime`、`/usage/health/providers`、`/usage/health/credentials`，也作为 `/usage/records` 和 `/usage/export` 的基础范围。所有 usage 范围统一采用半开区间 `[from,to)`：包含 `from`，不包含 `to`。仅日期形式的 `to` 会归一化为下一个本地午夜，因此即使跨越 DST，也会完整包含所选日历日。`/usage/overview` 和 `/usage/aggregates` 在缺少 `from` 或 `to` 时会自动补齐最近 24 小时窗口；`/usage/records` 和 `/usage/export` 不自动补齐时间范围。
 
 | Query | 类型 | 默认值 | 说明 |
@@ -2889,6 +2918,7 @@ Provider 未报告该能力或没有可靠观测时，`reset_credits` 为 `null`
 | `source` | string/null | usage payload 的来源。 |
 | `service_tier` | string/null | usage payload 的 service tier。 |
 | `reasoning_effort` | string/null | usage payload 的 reasoning effort。 |
+| `token_breakdown` | object | Token Accounting v2 的互斥输入、输出和未分类 Token 桶；仅在 `capabilities.usage_token_breakdown_v2=true` 时消费。 |
 | `client.client_ip` | string/null | payload 中可关联的调用方 IP；不会被当作 CPA 节点 IP。 |
 | `credential.api_key_preview` | string/null | 仅 provider API key 可用时返回脱敏 preview；不会返回 raw key。 |
 | `billing.balance_before` / `billing.balance_after` | number/null | 关联 `billing_charge` 时的扣款前后余额。 |
@@ -2913,8 +2943,8 @@ Query 参数除汇总范围参数外还支持：
 | --- | --- | --- |
 | `range` | object | 应用后的时间范围、timezone 和 interval。 |
 | `live` | object | 最近短窗口 RPM、TPM、错误率和延迟。 |
-| `totals` | object | 请求数、成功/失败数、token、金额、延迟和活跃主体数量。 |
-| `trend` | array | 与已应用半开区间相交的连续 `interval` 趋势桶，包含请求数为零的时间桶；首尾桶可能是不完整桶。 |
+| `totals` | object | 请求数、成功/失败数、token、`token_breakdown`、金额、延迟和活跃主体数量。 |
+| `trend` | array | 与已应用半开区间相交的连续 `interval` 趋势桶，包含请求数为零的时间桶；每个桶都包含 `token_breakdown`，首尾桶可能是不完整桶。 |
 | `cost_breakdown` | array | 当前不伪造不可拆分的费用明细，无法可靠拆分时为空数组。 |
 | `model_efficiency` | array | 按总 token 排序的模型效率列表。 |
 | `top` | object | `users`、`client_keys`、`credentials`、`providers`、`models`、`endpoints` 和 `errors`。 |
@@ -2944,7 +2974,7 @@ Query 参数：
 | `min_latency_ms` / `max_latency_ms` | integer | 无 | 延迟范围。 |
 | `min_amount` / `max_amount` | number | 无 | billing amount 范围。 |
 
-响应包含 `items`、`total`、`limit`、`offset`、`sort` 和 `sortable_fields`。`items[]` 为脱敏后的请求摘要，包含 `tokens`、`performance`、`client`、`credential`、`billing`、`runtime` 和可选 `error`。
+响应包含 `items`、`total`、`limit`、`offset`、`sort` 和 `sortable_fields`。`items[]` 为脱敏后的请求摘要，包含旧版 `tokens`、规范化 `token_breakdown`、`performance`、`client`、`credential`、`billing`、`runtime` 和可选 `error`。
 
 ### GET `/usage/records/:id`
 
@@ -2973,7 +3003,7 @@ Query 参数：
 | `limit` | integer | `20` | 最大 `100`。 |
 | `offset` | integer | `0` | page offset。 |
 
-响应包含 `group_by`、`metric`、`direction`、`items`、`total`、`limit`、`offset` 和 `sortable_metrics`。
+响应包含 `group_by`、`metric`、`direction`、`items`、`total`、`limit`、`offset` 和 `sortable_metrics`。每个 `items[]` 除旧 Token 字段外还包含规范化 `token_breakdown`。
 
 ### GET `/usage/export`
 
@@ -2988,7 +3018,7 @@ Query 参数：
 
 响应为 attachment。CSV 使用 `text/csv; charset=utf-8`，JSONL 使用 `application/x-ndjson`。
 
-导出字段是展平后的脱敏摘要，除 records 响应中的核心字段外，还包含 `error_status_code`、`error_message`、`error_body_preview`、`request_log_available` 和 `log_home_ip_required`。
+导出字段是展平后的脱敏摘要，除 records 响应中的核心字段外，还包含 `error_status_code`、`error_message`、`error_body_preview`、`request_log_available` 和 `log_home_ip_required`。Token Accounting v2 使用 `token_breakdown_schema_version`、`token_breakdown_quality`、`token_breakdown_total_tokens`、四个 `token_breakdown_input_*` 字段、三个 `token_breakdown_output_*` 字段和 `token_breakdown_unclassified_tokens` 展平导出。
 
 ### GET `/request-events`
 

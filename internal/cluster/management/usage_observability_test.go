@@ -118,7 +118,7 @@ func TestGetCapabilitiesReturnsUsageObservabilityFlags(t *testing.T) {
 	if !ok {
 		t.Fatalf("capabilities = %T, want object", payload["capabilities"])
 	}
-	for _, key := range []string{"quota_snapshots", "quota_snapshot_details", "usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs", "topology"} {
+	for _, key := range []string{"quota_snapshots", "quota_snapshot_details", "usage", "usage_overview", "usage_records", "usage_record_details", "usage_aggregates", "usage_export", "usage_provider_health", "usage_credential_health", "usage_realtime", "usage_token_breakdown_v2", "request_log_index", "request_events", "request_event_details", "request_event_export", "request_event_filters", "request_events_details", "request_events_export", "request_events_filters", "requestEvents", "requestEventDetails", "requestEventExport", "requestEventFilters", "requestEventsDetails", "requestEventsExport", "requestEventsFilters", "oauth_usage", "logs", "request_error_logs", "topology"} {
 		if capabilities[key] != true {
 			t.Fatalf("capabilities[%s] = %v, want true", key, capabilities[key])
 		}
@@ -131,6 +131,58 @@ func TestGetCapabilitiesReturnsUsageObservabilityFlags(t *testing.T) {
 		if _, ok := serverInfo[key]; !ok {
 			t.Fatalf("server_info missing %s: %#v", key, serverInfo)
 		}
+	}
+}
+
+func TestGetCapabilitiesKeepsTokenBreakdownDisabledUntilBackfill(t *testing.T) {
+	db, errOpen := cluster.OpenSQLite(t.Context(), filepath.Join(t.TempDir(), "home.db"))
+	if errOpen != nil {
+		t.Fatalf("OpenSQLite() error = %v", errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("db.DB() error = %v", errDB)
+	}
+	defer func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sqlite db: %v", errClose)
+		}
+	}()
+	if errMigrate := cluster.AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+	legacy := cluster.UsageRecord{
+		Timestamp:   time.Date(2026, time.July, 23, 1, 0, 0, 0, time.UTC),
+		Provider:    "openai",
+		InputTokens: 10,
+		TotalTokens: 10,
+		PayloadJSON: cluster.JSONB(`{"timestamp":"2026-07-23T01:00:00Z"}`),
+		CreatedAt:   time.Now().UTC(),
+	}
+	if errCreate := db.Create(&legacy).Error; errCreate != nil {
+		t.Fatalf("create legacy usage row: %v", errCreate)
+	}
+
+	handler := NewHandler(cluster.NewRepository(db), nil, "192.0.2.10", 0)
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/capabilities", handler.GetCapabilities)
+
+	resp := httptest.NewRecorder()
+	engine.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/capabilities", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusOK)
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(resp.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	capabilities, ok := payload["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities = %T, want object", payload["capabilities"])
+	}
+	if capabilities["usage_token_breakdown_v2"] != false {
+		t.Fatalf("usage_token_breakdown_v2 = %v, want false", capabilities["usage_token_breakdown_v2"])
 	}
 }
 
@@ -169,6 +221,7 @@ func TestListUsageRecordsReturnsJoinedItems(t *testing.T) {
 	if !ok {
 		t.Fatalf("item = %T, want object", items[0])
 	}
+	assertUsageTokenBreakdown(t, item["token_breakdown"], 150, 100, 50)
 	client, ok := item["client"].(map[string]any)
 	if !ok {
 		t.Fatalf("client = %T, want object", item["client"])
@@ -678,6 +731,7 @@ func TestListUsageAggregatesReturnsItems(t *testing.T) {
 	if item["request_count"] != float64(1) {
 		t.Fatalf("request_count = %v, want 1", item["request_count"])
 	}
+	assertUsageTokenBreakdown(t, item["token_breakdown"], 150, 100, 50)
 	if _, ok := payload["sortable_metrics"].([]any); !ok {
 		t.Fatalf("sortable_metrics = %T, want array", payload["sortable_metrics"])
 	}
@@ -748,6 +802,16 @@ func TestGetUsageOverviewReturnsTotalsAndTopGroups(t *testing.T) {
 	if totals["request_count"] != float64(1) {
 		t.Fatalf("request_count = %v, want 1", totals["request_count"])
 	}
+	assertUsageTokenBreakdown(t, totals["token_breakdown"], 150, 100, 50)
+	trend, ok := payload["trend"].([]any)
+	if !ok || len(trend) == 0 {
+		t.Fatalf("trend = %#v, want at least one point", payload["trend"])
+	}
+	trendPoint, ok := trend[0].(map[string]any)
+	if !ok {
+		t.Fatalf("trend[0] = %T, want object", trend[0])
+	}
+	assertUsageTokenBreakdown(t, trendPoint["token_breakdown"], 150, 100, 50)
 	top, ok := payload["top"].(map[string]any)
 	if !ok {
 		t.Fatalf("top = %T, want object", payload["top"])
@@ -1033,7 +1097,7 @@ func TestExportUsageRecordsIncludesFlattenedSummaryFields(t *testing.T) {
 	if errDecode := json.Unmarshal([]byte(line), &row); errDecode != nil {
 		t.Fatalf("decode jsonl row: %v body=%s", errDecode, resp.Body.String())
 	}
-	for _, key := range []string{"error_status_code", "error_message", "error_body_preview", "request_log_available", "log_home_ip_required"} {
+	for _, key := range []string{"error_status_code", "error_message", "error_body_preview", "request_log_available", "log_home_ip_required", "token_breakdown_schema_version", "token_breakdown_quality", "token_breakdown_total_tokens", "token_breakdown_input_uncached_tokens", "token_breakdown_output_non_reasoning_tokens"} {
 		if _, ok := row[key]; !ok {
 			t.Fatalf("export row missing %s: %#v", key, row)
 		}
@@ -1078,14 +1142,39 @@ func TestExportUsageRecordsAllowsLargeLimitAndIncludesTPSInCSV(t *testing.T) {
 	}
 	header := rows[0]
 	foundTPS := false
+	foundTokenBreakdown := false
 	for _, column := range header {
 		if column == "tps" {
 			foundTPS = true
-			break
+		}
+		if column == "token_breakdown_quality" {
+			foundTokenBreakdown = true
 		}
 	}
 	if !foundTPS {
 		t.Fatalf("csv header missing tps: %v", header)
+	}
+	if !foundTokenBreakdown {
+		t.Fatalf("csv header missing token breakdown fields: %v", header)
+	}
+}
+
+func assertUsageTokenBreakdown(t *testing.T, value any, wantTotal float64, wantInput float64, wantOutput float64) {
+	t.Helper()
+	breakdown, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("token_breakdown = %T, want object", value)
+	}
+	if breakdown["schema_version"] != float64(cluster.UsageTokenAccountingSchemaVersion) || breakdown["quality"] != cluster.UsageTokenAccountingQualityComplete || breakdown["total_tokens"] != wantTotal {
+		t.Fatalf("token_breakdown = %#v", breakdown)
+	}
+	input, ok := breakdown["input"].(map[string]any)
+	if !ok || input["total_tokens"] != wantInput {
+		t.Fatalf("token_breakdown.input = %#v, want total %.0f", breakdown["input"], wantInput)
+	}
+	output, ok := breakdown["output"].(map[string]any)
+	if !ok || output["total_tokens"] != wantOutput {
+		t.Fatalf("token_breakdown.output = %#v, want total %.0f", breakdown["output"], wantOutput)
 	}
 }
 

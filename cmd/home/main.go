@@ -571,6 +571,7 @@ func run() int {
 	}()
 	go runUsageDerivedColumnBackfillMaintenance(runCtx, repo)
 	go runUsageCacheReadBackfillMaintenance(runCtx, repo)
+	go runUsageTokenAccountingBackfillMaintenance(runCtx, repo)
 	go runInFlightStagingCleanupMaintenance(runCtx, repo, rt)
 
 	go func() {
@@ -879,6 +880,31 @@ func runUsageCacheReadBackfillMaintenance(ctx context.Context, repo *cluster.Rep
 			return
 		} else if !result.Skipped {
 			// Keep draining successful batches without waiting on the idle ticker.
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runUsageTokenAccountingBackfillMaintenance(ctx context.Context, repo *cluster.Repository) {
+	if repo == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		batchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		result, errBackfill := repo.RunUsageTokenAccountingBackfillBatch(batchCtx)
+		cancel()
+		if errBackfill != nil {
+			if ctx.Err() == nil {
+				log.WithError(errBackfill).Warn("usage token accounting backfill batch failed")
+			}
+		} else if !result.Done && !result.Skipped {
 			continue
 		}
 		select {
