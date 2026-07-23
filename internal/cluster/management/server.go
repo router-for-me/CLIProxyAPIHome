@@ -63,6 +63,13 @@ func (h *Handler) SetModelsDevHTTPClient(client *http.Client) {
 	h.modelsDevHTTPClient = client
 }
 
+func (h *Handler) replaceConfigSnapshot(ctx context.Context, root map[string]any) error {
+	if h == nil || h.repo == nil {
+		return context.Canceled
+	}
+	return h.repo.ReplaceConfigSnapshotWithLifecycleConfig(ctx, h.heartbeatTimeout, root)
+}
+
 // requestContext handles a request context.
 func (h *Handler) requestContext(c *gin.Context) (context.Context, context.CancelFunc) {
 	ctx := context.Background()

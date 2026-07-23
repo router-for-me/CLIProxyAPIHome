@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"gorm.io/gorm"
 )
 
@@ -65,6 +67,192 @@ xai-api-key:
 	}
 	assertTableCount(t, db, &APIKeyRecord{}, 1)
 	assertActiveAuthCount(t, db, 3)
+}
+
+func TestImportLocalStateEmitsOneConfigEventForHotOnlyCredentialConcurrencyChange(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeFile(t, configPath, "credential-concurrency:\n  release-flush-interval: 500ms\n")
+
+	db := openImportTestSQLite(t)
+	repo := NewRepository(db)
+	if _, errEnsure := repo.EnsureLifecycleConfig(ctx, DefaultHeartbeatTimeout()); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	before := assertTableCount(t, db, &ClusterEventRecord{}, -1)
+
+	if _, errImport := ImportLocalState(ctx, ImportOptions{ConfigPath: configPath, Repository: repo}); errImport != nil {
+		t.Fatal(errImport)
+	}
+	var events []ClusterEventRecord
+	if errFind := db.Order("id ASC").Find(&events).Error; errFind != nil {
+		t.Fatal(errFind)
+	}
+	if int64(len(events)) != before+1 {
+		t.Fatalf("cluster events after hot-only import = %d, want %d", len(events), before+1)
+	}
+	event := events[len(events)-1]
+	if event.Scope != "config" || event.Op != "update" || event.EntityUUID != "credential-concurrency" {
+		t.Fatalf("hot-only import event = %#v, want credential-concurrency config update", event)
+	}
+
+	if _, errImport := ImportLocalState(ctx, ImportOptions{ConfigPath: configPath, Repository: repo}); errImport != nil {
+		t.Fatal(errImport)
+	}
+	assertTableCount(t, db, &ClusterEventRecord{}, before+1)
+}
+
+func TestImportLocalStateCountsProviderCredentialReconciliation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeFile(t, configPath, "gemini-api-key:\n  - id: 78787878-7878-4787-8787-787878787878\n    api-key: gemini\n")
+	repo := NewRepository(openImportTestSQLite(t))
+	opts := ImportOptions{ConfigPath: configPath, Repository: repo}
+
+	first, errFirst := ImportLocalState(context.Background(), opts)
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	if first.Created != 1 {
+		t.Fatalf("first import stats = %+v, want one created provider credential", first)
+	}
+	second, errSecond := ImportLocalState(context.Background(), opts)
+	if errSecond != nil {
+		t.Fatal(errSecond)
+	}
+	if second.Unchanged != 1 {
+		t.Fatalf("second import stats = %+v, want one unchanged provider credential", second)
+	}
+	writeFile(t, configPath, "gemini-api-key:\n  - id: 78787878-7878-4787-8787-787878787878\n    api-key: rotated\n")
+	updated, errUpdated := ImportLocalState(context.Background(), opts)
+	if errUpdated != nil {
+		t.Fatal(errUpdated)
+	}
+	if updated.Updated != 1 {
+		t.Fatalf("updated import stats = %+v, want one updated provider credential", updated)
+	}
+	if errRetire := repo.RetireProviderAuth(context.Background(), "78787878-7878-4787-8787-787878787878"); errRetire != nil {
+		t.Fatal(errRetire)
+	}
+	restored, errRestored := ImportLocalState(context.Background(), opts)
+	if errRestored != nil {
+		t.Fatal(errRestored)
+	}
+	if restored.Restored != 1 {
+		t.Fatalf("restored import stats = %+v, want one restored provider credential", restored)
+	}
+}
+
+func TestImportLocalStateCountsUnchangedGeneratedProviderCredential(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeFile(t, configPath, "gemini-api-key:\n  - api-key: gemini\n")
+	repo := NewRepository(openImportTestSQLite(t))
+	opts := ImportOptions{ConfigPath: configPath, Repository: repo}
+
+	if _, errImport := ImportLocalState(context.Background(), opts); errImport != nil {
+		t.Fatal(errImport)
+	}
+	second, errImport := ImportLocalState(context.Background(), opts)
+	if errImport != nil {
+		t.Fatal(errImport)
+	}
+	if second.Unchanged != 1 || second.Updated != 0 {
+		t.Fatalf("second import stats = %+v, want one unchanged generated provider credential", second)
+	}
+}
+
+func TestImportLocalStateRejectsDuplicateProviderCredentialIDs(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	id := "77777777-7777-4777-8777-777777777777"
+	writeFile(t, configPath, "gemini-api-key:\n  - id: "+id+"\n    api-key: gemini\ncodex-api-key:\n  - id: "+id+"\n    api-key: codex\n    base-url: https://example.test\n")
+
+	_, errImport := ImportLocalState(context.Background(), ImportOptions{ConfigPath: configPath, Repository: NewRepository(openImportTestSQLite(t))})
+	if !errors.Is(errImport, ErrCredentialIdentityConflict) {
+		t.Fatalf("ImportLocalState() error = %v, want ErrCredentialIdentityConflict", errImport)
+	}
+}
+
+func TestImportLocalStateRejectsExistingCredentialIdentityCollisions(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		config   string
+		retire   bool
+	}{
+		{
+			name:     "active oauth",
+			provider: "codex",
+			config:   "gemini-api-key:\n  - id: 88888888-8888-4888-8888-888888888888\n    api-key: gemini\n",
+		},
+		{
+			name:     "retired provider from another lineage",
+			provider: "gemini",
+			retire:   true,
+			config:   "codex-api-key:\n  - id: 88888888-8888-4888-8888-888888888888\n    api-key: codex\n    base-url: https://example.test\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			writeFile(t, configPath, tc.config)
+			repo := NewRepository(openImportTestSQLite(t))
+			id := "88888888-8888-4888-8888-888888888888"
+			existing := &coreauth.Auth{ID: id, Index: id, Provider: tc.provider, Attributes: map[string]string{"source": "oauth:existing", "api_key": "existing"}}
+			if _, errUpsert := repo.UpsertAuth(context.Background(), existing, "create"); errUpsert != nil {
+				t.Fatal(errUpsert)
+			}
+			if tc.retire {
+				if errRetire := repo.RetireProviderAuth(context.Background(), id); errRetire != nil {
+					t.Fatal(errRetire)
+				}
+			}
+
+			_, errImport := ImportLocalState(context.Background(), ImportOptions{ConfigPath: configPath, Repository: repo})
+			if !errors.Is(errImport, ErrCredentialIdentityConflict) {
+				t.Fatalf("ImportLocalState() error = %v, want ErrCredentialIdentityConflict", errImport)
+			}
+		})
+	}
+}
+
+func TestImportLocalStateRollsBackLifecycleOnCredentialCollision(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	id := "99999999-9999-4999-8999-999999999999"
+	writeFile(t, configPath, "credential-concurrency:\n  cpa-heartbeat-timeout: 4s\ngemini-api-key:\n  - id: "+id+"\n    api-key: gemini\n")
+	repo := NewRepository(openImportTestSQLite(t))
+	if _, errEnsure := repo.EnsureLifecycleConfig(ctx, 20*time.Second); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, &coreauth.Auth{
+		ID:       id,
+		Index:    id,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"source":  "oauth:existing",
+			"api_key": "codex",
+		},
+	}, "create"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+
+	_, errImport := ImportLocalState(ctx, ImportOptions{ConfigPath: configPath, Repository: repo, NodeHeartbeatTimeout: 20 * time.Second})
+	if !errors.Is(errImport, ErrCredentialIdentityConflict) {
+		t.Fatalf("ImportLocalState() error = %v, want ErrCredentialIdentityConflict", errImport)
+	}
+	lifecycle, errLifecycle := repo.LifecycleConfig(ctx)
+	if errLifecycle != nil {
+		t.Fatal(errLifecycle)
+	}
+	if lifecycle.LifecycleConfigRevision != 1 || lifecycle.CPAHeartbeatTimeout != config.DefaultCPAHeartbeatTimeout {
+		t.Fatalf("lifecycle config = %#v, want unchanged revision 1 defaults", lifecycle)
+	}
 }
 
 func TestRepositoryUpsertResult_UsesSemanticJSONEquality(t *testing.T) {

@@ -12,9 +12,11 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
@@ -22,11 +24,28 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type fingerprintCancellationStarter interface {
+	BeginFingerprintCancellation(context.Context, string) (int64, error)
+}
+
+type clusterHandler interface {
+	ClassifyConnection(context.Context, string) (cluster.ConnectionLifetime, error)
+	SubscribeMembership(context.Context, string, string, int, int64) (cluster.ConnectionLifetime, error)
+	RefreshCPALiveness(context.Context, cluster.ConnectionLifetime) error
+	UpdateClientCount(context.Context, int) error
+	Handle(context.Context, []string, string) ([]byte, error)
+	RequestClientCertificate(context.Context, string, string, []byte) ([]byte, error)
+}
+
 type Server struct {
-	addr     string
-	runtime  *home.Runtime
-	registry *dispatch.Registry
-	cluster  *cluster.RESPHandler
+	addr                    string
+	runtime                 *home.Runtime
+	registry                *dispatch.Registry
+	cluster                 clusterHandler
+	fingerprints            *FingerprintRegistry
+	inFlightStore           dispatch.InFlightSnapshotStore
+	concurrencyReleaseStore dispatch.ConcurrencyReleaseStore
+	inFlightLimits          atomic.Pointer[cluster.InFlightLimits]
 }
 
 const (
@@ -44,15 +63,71 @@ func New(addr string, runtime *home.Runtime) *Server {
 	if errSanitize := resppush.SanitizeUsageLog(); errSanitize != nil {
 		log.Errorf("usage log sanitization error: %v", errSanitize)
 	}
-	return &Server{
-		addr:     strings.TrimSpace(addr),
-		runtime:  runtime,
-		registry: buildRegistry(),
+	server := &Server{
+		addr:         strings.TrimSpace(addr),
+		runtime:      runtime,
+		registry:     buildRegistry(),
+		fingerprints: NewFingerprintRegistry(),
 	}
+	limits := cluster.DefaultInFlightLimits()
+	server.inFlightLimits.Store(&limits)
+	return server
+}
+
+// SetInFlightSnapshotStore sets the repository used to ingest in-flight observation frames.
+func (s *Server) SetInFlightSnapshotStore(store dispatch.InFlightSnapshotStore) {
+	if s == nil {
+		return
+	}
+	s.inFlightStore = store
+}
+
+// SetConcurrencyReleaseStore sets the repository used to apply cumulative limiter releases.
+func (s *Server) SetConcurrencyReleaseStore(store dispatch.ConcurrencyReleaseStore) {
+	if s == nil {
+		return
+	}
+	s.concurrencyReleaseStore = store
+}
+
+// ApplyInFlightConfig validates and atomically applies in-flight observation limits.
+func (s *Server) ApplyInFlightConfig(cfg config.CredentialInFlightConfig) error {
+	if s == nil {
+		return fmt.Errorf("RESP server is nil")
+	}
+	limits, errLimits := cluster.InFlightLimitsFromConfig(cfg)
+	if errLimits != nil {
+		return errLimits
+	}
+	s.inFlightLimits.Store(&limits)
+	return nil
+}
+
+func (s *Server) currentInFlightLimits() cluster.InFlightLimits {
+	if s == nil {
+		return cluster.DefaultInFlightLimits()
+	}
+	limits := s.inFlightLimits.Load()
+	if limits == nil {
+		return cluster.DefaultInFlightLimits()
+	}
+	return *limits
+}
+
+// FenceFingerprint drains an exact lifetime before persisting its acknowledgement.
+func (s *Server) FenceFingerprint(ctx context.Context, lifetime cluster.ConnectionLifetime, revision int64, acknowledge func() error) error {
+	if s == nil || s.fingerprints == nil {
+		return fmt.Errorf("fingerprint registry is unavailable")
+	}
+	errFence := s.fingerprints.FenceAndAcknowledge(ctx, lifetime, revision, acknowledge)
+	if strings.TrimSpace(lifetime.Fingerprint) != "" {
+		node.GlobalRegistry().UpdateFingerprintState(lifetime.Fingerprint, "", "", 0, 0, s.fingerprints.LatestFenceRevision(lifetime))
+	}
+	return errFence
 }
 
 // SetClusterHandler sets a cluster handler.
-func (s *Server) SetClusterHandler(handler *cluster.RESPHandler) {
+func (s *Server) SetClusterHandler(handler clusterHandler) {
 	if s == nil {
 		return
 	}
@@ -68,12 +143,12 @@ func (s *Server) syncClusterClientCount(ctx context.Context) {
 	}
 }
 
-func (s *Server) startSubscriptionUpdates(ctx context.Context, writer *safeWriter) context.CancelFunc {
+func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedConnection, writer *safeWriter) context.CancelFunc {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	if s == nil || writer == nil {
+	if s == nil || tracked == nil || writer == nil {
 		return cancel
 	}
 
@@ -86,6 +161,17 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, writer *safeWrite
 			case <-runCtx.Done():
 				return
 			case <-heartbeatTicker.C:
+				lifetime := tracked.Lifetime()
+				if errLiveness := s.refreshSubscriptionLiveness(runCtx, lifetime); errLiveness != nil {
+					log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
+					if s.fingerprints != nil {
+						if errFence := s.fingerprints.Fence(context.WithoutCancel(runCtx), lifetime, s.fingerprints.LatestFenceRevision(lifetime)); errFence != nil {
+							log.Warnf("failed to fence subscription after liveness failure: %v", errFence)
+						}
+					}
+					cancel()
+					return
+				}
 				if errSend := writer.WriteDispatchReply(subscriptionPong([]byte{})); errSend != nil {
 					log.Warnf("failed to publish subscription heartbeat: %v", errSend)
 					cancel()
@@ -118,6 +204,13 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, writer *safeWrite
 	return cancel
 }
 
+func (s *Server) refreshSubscriptionLiveness(ctx context.Context, lifetime cluster.ConnectionLifetime) error {
+	if s == nil || s.cluster == nil {
+		return fmt.Errorf("cluster lifecycle unavailable")
+	}
+	return s.cluster.RefreshCPALiveness(ctx, lifetime)
+}
+
 func (s *Server) writeClusterSubscriptionUpdate(ctx context.Context, writer *safeWriter) error {
 	if s == nil || s.cluster == nil || writer == nil {
 		return nil
@@ -135,6 +228,40 @@ func (s *Server) writeClusterSubscriptionUpdate(ctx context.Context, writer *saf
 		return nil
 	}
 	return writer.WriteDispatchReply(subscriptionMessage(clusterSubscriptionChannel, payload))
+}
+
+func buildOrWriteDispatchReply(writer *safeWriter, reply dispatch.Reply) error {
+	if reply.PreWriteError != nil {
+		return reply.PreWriteError
+	}
+	if writer == nil {
+		return net.ErrClosed
+	}
+	return writer.WriteDispatchReply(reply)
+}
+
+func writeDispatchReplyWithFence(serverCtx context.Context, writer *safeWriter, reply dispatch.Reply, connEnv *dispatch.ConnEnv) error {
+	errWrite := buildOrWriteDispatchReply(writer, reply)
+	if errWrite != nil && reply.AccountedAdmission {
+		fenceAccountedDispatch(serverCtx, connEnv)
+	}
+	return errWrite
+}
+
+func fenceAccountedDispatch(serverCtx context.Context, connEnv *dispatch.ConnEnv) {
+	if connEnv == nil {
+		return
+	}
+	if connEnv.FenceFingerprint != nil {
+		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(serverCtx), 5*time.Second)
+		if errFence := connEnv.FenceFingerprint(fenceCtx, "accounted_dispatch_delivery_failed"); errFence != nil {
+			log.Errorf("failed to fence ambiguous concurrency admission: %v", errFence)
+		}
+		cancelFence()
+	}
+	if connEnv.CloseLocalFingerprint != nil {
+		connEnv.CloseLocalFingerprint()
+	}
 }
 
 func (s *Server) writeNoAuth(writer *safeWriter) {
@@ -231,6 +358,32 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 	}
 	reader := bufio.NewReader(conn)
 	writer := newSafeWriter(conn)
+	connectionLifetime := cluster.ConnectionLifetime{
+		Fingerprint: clientCertificateFingerprint,
+	}
+	if s.cluster != nil && clientCertificateFingerprint != "" {
+		classifiedLifetime, errClassify := s.cluster.ClassifyConnection(ctx, clientCertificateFingerprint)
+		if errClassify != nil {
+			log.Warnf("failed to classify RESP connection membership: %v", errClassify)
+			if errClose := conn.Close(); errClose != nil {
+				log.Errorf("resp membership classification connection close error: %v", errClose)
+			}
+			return
+		}
+		connectionLifetime = classifiedLifetime
+	}
+	tracked, errAccept := s.fingerprints.Accept(ctx, conn, connectionLifetime)
+	if errAccept != nil {
+		log.Warnf("failed to track RESP connection: %v", errAccept)
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("resp tracking rejection connection close error: %v", errClose)
+		}
+		return
+	}
+	connectionCtx := tracked.Context()
+	if clientCertificateFingerprint != "" {
+		node.GlobalRegistry().UpdateFingerprintState(clientCertificateFingerprint, clientNodeID, clientIP, 1, 0, s.fingerprints.LatestFenceRevision(connectionLifetime))
+	}
 	connectedAt := time.Now()
 	addedNode := false
 	var unsubscribeConfig func()
@@ -245,18 +398,100 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			unsubscribeConfig = nil
 		}
 		if addedNode {
-			node.GlobalRegistry().RemoveWithNodeID(clientIP, clientNodeID)
+			if clientCertificateFingerprint != "" {
+				node.GlobalRegistry().UpdateFingerprintSubscription(clientCertificateFingerprint, clientNodeID, clientIP, -1)
+			} else {
+				node.GlobalRegistry().RemoveWithNodeID(clientIP, clientNodeID)
+			}
 			s.syncClusterClientCount(ctx)
 			addedNode = false
 		}
-		if errClose := conn.Close(); errClose != nil {
+		if clientCertificateFingerprint != "" {
+			node.GlobalRegistry().UpdateFingerprintState(clientCertificateFingerprint, clientNodeID, clientIP, -1, 0, s.fingerprints.LatestFenceRevision(tracked.Lifetime()))
+		}
+		if errClose := tracked.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
 			log.Errorf("resp connection close error: %v", errClose)
 		}
 	}()
 
+	var pendingConfigSubscriptionReady chan struct{}
+	var pendingConfigSubscriptionAborted chan struct{}
+	connEnv := &dispatch.ConnEnv{
+		AttachSubscriptionLifetimeFunc: tracked.AttachSubscriptionLifetime,
+		FenceFingerprint: func(fenceCtx context.Context, _ string) error {
+			starter, ok := s.cluster.(fingerprintCancellationStarter)
+			if !ok || starter == nil {
+				return fmt.Errorf("cluster fingerprint cancellation is unavailable")
+			}
+			_, errBegin := starter.BeginFingerprintCancellation(fenceCtx, connectionLifetime.Fingerprint)
+			return errBegin
+		},
+		CloseLocalFingerprint: func() {
+			if s.fingerprints == nil {
+				return
+			}
+			if errFence := s.fingerprints.Fence(context.WithoutCancel(ctx), connectionLifetime, s.fingerprints.LatestFenceRevision(connectionLifetime)); errFence != nil {
+				log.Errorf("failed to locally fence ambiguous concurrency admission: %v", errFence)
+			}
+		},
+		SubscribeConfigYAML: func() (int64, error) {
+			if s.runtime == nil {
+				return 0, fmt.Errorf("runtime not ready")
+			}
+			if unsubscribeConfig != nil {
+				return 1, nil
+			}
+			if !addedNode {
+				if clientCertificateFingerprint != "" {
+					node.GlobalRegistry().UpdateFingerprintSubscription(clientCertificateFingerprint, clientNodeID, clientIP, 1)
+				} else {
+					node.GlobalRegistry().AddWithNodeID(clientIP, clientNodeID, connectedAt)
+				}
+				s.syncClusterClientCount(ctx)
+				addedNode = true
+			}
+			ready := make(chan struct{})
+			aborted := make(chan struct{})
+			pendingConfigSubscriptionReady = ready
+			pendingConfigSubscriptionAborted = aborted
+			delivery := newConfigSubscriptionDelivery(connectionCtx, writer, ready, aborted)
+			unsubscribeConfig = s.runtime.SubscribeConfigYAML(delivery.Write)
+			return 1, nil
+		},
+		UnsubscribeConfigYAML: func() (int64, error) {
+			if unsubscribeConfig == nil {
+				return 0, nil
+			}
+			if cancelSubscriptionUpdates != nil {
+				cancelSubscriptionUpdates()
+				cancelSubscriptionUpdates = nil
+			}
+			unsubscribeConfig()
+			unsubscribeConfig = nil
+			if addedNode {
+				if clientCertificateFingerprint != "" {
+					node.GlobalRegistry().UpdateFingerprintSubscription(clientCertificateFingerprint, clientNodeID, clientIP, -1)
+				} else {
+					node.GlobalRegistry().RemoveWithNodeID(clientIP, clientNodeID)
+				}
+				s.syncClusterClientCount(ctx)
+				addedNode = false
+			}
+			return 0, nil
+		},
+		IsSubscribed: func() bool {
+			return unsubscribeConfig != nil
+		},
+	}
+	if s.cluster != nil && clientCertificateFingerprint != "" {
+		connEnv.SubscribeMembership = func(subscriptionCtx context.Context, protocolVersion int, lifecycleConfigRevision int64) (cluster.ConnectionLifetime, error) {
+			return s.cluster.SubscribeMembership(subscriptionCtx, clientCertificateFingerprint, clientNodeID, protocolVersion, lifecycleConfigRevision)
+		}
+	}
+
 	for {
-		var pendingConfigSubscriptionReady chan struct{}
-		var pendingConfigSubscriptionAborted chan struct{}
+		pendingConfigSubscriptionReady = nil
+		pendingConfigSubscriptionAborted = nil
 		args, errRead := readRESPArray(reader)
 		if errRead != nil {
 			if !errors.Is(errRead, io.EOF) {
@@ -264,141 +499,142 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
-		if len(args) == 0 {
-			_ = writer.WriteRedisError("ERR empty command")
-			continue
+
+		finishHandler, errBeginHandler := tracked.BeginHandler()
+		if errBeginHandler != nil {
+			log.Warnf("failed to begin RESP handler: %v", errBeginHandler)
+			return
+		}
+		if clientCertificateFingerprint != "" {
+			node.GlobalRegistry().UpdateFingerprintState(clientCertificateFingerprint, clientNodeID, clientIP, 0, 1, s.fingerprints.LatestFenceRevision(tracked.Lifetime()))
 		}
 
-		cmd := strings.ToUpper(strings.TrimSpace(args[0]))
-
-		if cmd == "CERTIFICATE" {
-			if authSource != respAuthSourceNone {
-				_ = writer.WriteRedisError("ERR certificate request is only allowed before authentication")
-				continue
+		var reply dispatch.Reply
+		hasReply := false
+		closeConnection := false
+		var livenessFailure *cluster.ConnectionLifetime
+		func() {
+			if len(args) == 0 {
+				_ = writer.WriteRedisError("ERR empty command")
+				return
 			}
-			if s.cluster == nil {
-				_ = writer.WriteRedisError("ERR cluster disabled")
-				continue
+			cmd := strings.ToUpper(strings.TrimSpace(args[0]))
+			if cmd == "CERTIFICATE" {
+				if authSource != respAuthSourceNone {
+					_ = writer.WriteRedisError("ERR certificate request is only allowed before authentication")
+					return
+				}
+				if s.cluster == nil {
+					_ = writer.WriteRedisError("ERR cluster disabled")
+					return
+				}
+				if len(args) != 5 || !strings.EqualFold(strings.TrimSpace(args[1]), "REQUEST") {
+					_ = writer.WriteRedisError("ERR wrong number of arguments for 'certificate request' command")
+					return
+				}
+				payload, errCertificate := s.cluster.RequestClientCertificate(connectionCtx, args[2], args[3], []byte(args[4]))
+				if errCertificate != nil {
+					_ = writer.WriteRedisError("ERR " + errCertificate.Error())
+					return
+				}
+				_ = writer.WriteRedisBulkString(payload)
+				return
 			}
-			if len(args) != 5 || !strings.EqualFold(strings.TrimSpace(args[1]), "REQUEST") {
-				_ = writer.WriteRedisError("ERR wrong number of arguments for 'certificate request' command")
-				continue
+			if cmd == clusterCommand {
+				if !isRESPAuthenticated(authSource) {
+					s.writeNoAuth(writer)
+					return
+				}
+				if s.cluster == nil {
+					_ = writer.WriteRedisError("ERR cluster disabled")
+					return
+				}
+				payload, errCluster := s.cluster.Handle(connectionCtx, args, clientIP)
+				if errCluster != nil {
+					_ = writer.WriteRedisError("ERR " + errCluster.Error())
+					return
+				}
+				_ = writer.WriteRedisBulkString(payload)
+				return
 			}
-			payload, errCertificate := s.cluster.RequestClientCertificate(ctx, args[2], args[3], []byte(args[4]))
-			if errCertificate != nil {
-				_ = writer.WriteRedisError("ERR " + errCertificate.Error())
-				continue
-			}
-			_ = writer.WriteRedisBulkString(payload)
-			continue
-		}
-
-		if cmd == clusterCommand {
-			if !isRESPAuthenticated(authSource) {
+			if cmd != "AUTH" && !isRESPAuthenticated(authSource) {
 				s.writeNoAuth(writer)
-				continue
+				return
 			}
-			if s.cluster == nil {
-				_ = writer.WriteRedisError("ERR cluster disabled")
-				continue
-			}
-			payload, errCluster := s.cluster.Handle(ctx, args, clientIP)
-			if errCluster != nil {
-				_ = writer.WriteRedisError("ERR " + errCluster.Error())
-				continue
-			}
-			_ = writer.WriteRedisBulkString(payload)
-			continue
-		}
-
-		if cmd != "AUTH" && !isRESPAuthenticated(authSource) {
-			s.writeNoAuth(writer)
-			continue
-		}
-
-		if cmd == "PING" {
-			switch len(args) {
-			case 1:
+			if cmd == "PING" {
 				if unsubscribeConfig != nil {
-					_ = writer.WriteDispatchReply(dispatch.Array(
-						dispatch.BulkString([]byte("pong")),
-						dispatch.BulkString([]byte{}),
-					))
-				} else {
-					_ = writer.WriteRedisSimpleString("PONG")
+					lifetime := tracked.Lifetime()
+					if errLiveness := s.refreshSubscriptionLiveness(connectionCtx, lifetime); errLiveness != nil {
+						log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
+						livenessFailure = &lifetime
+						closeConnection = true
+						return
+					}
 				}
-			case 2:
-				if unsubscribeConfig != nil {
-					_ = writer.WriteDispatchReply(dispatch.Array(
-						dispatch.BulkString([]byte("pong")),
-						dispatch.BulkString([]byte(args[1])),
-					))
-				} else {
-					_ = writer.WriteRedisBulkString([]byte(args[1]))
+				switch len(args) {
+				case 1:
+					if unsubscribeConfig != nil {
+						_ = writer.WriteDispatchReply(subscriptionPong([]byte{}))
+					} else {
+						_ = writer.WriteRedisSimpleString("PONG")
+					}
+				case 2:
+					if unsubscribeConfig != nil {
+						_ = writer.WriteDispatchReply(subscriptionPong([]byte(args[1])))
+					} else {
+						_ = writer.WriteRedisBulkString([]byte(args[1]))
+					}
+				default:
+					_ = writer.WriteRedisError("ERR wrong number of arguments for 'ping' command")
 				}
-			default:
-				_ = writer.WriteRedisError("ERR wrong number of arguments for 'ping' command")
+				return
 			}
+			if cmd == "AUTH" {
+				_ = writer.WriteRedisError("ERR RESP AUTH disabled; use mTLS")
+				return
+			}
+			reply = dispatch.Err("registry not ready")
+			if s.registry != nil {
+				reply = s.registry.Execute(connectionCtx, dispatch.Env{
+					Runtime:                      s.runtime,
+					ClientIP:                     clientIP,
+					NodeID:                       clientNodeID,
+					ClientCertificateFingerprint: clientCertificateFingerprint,
+					ConnectionLifetime:           connectionLifetime,
+					Conn:                         connEnv,
+					InFlightStore:                s.inFlightStore,
+					InFlightLimits:               s.currentInFlightLimits(),
+					ConcurrencyReleaseStore:      s.concurrencyReleaseStore,
+				}, args)
+			}
+			hasReply = true
+		}()
+		finishHandler()
+		if clientCertificateFingerprint != "" {
+			node.GlobalRegistry().UpdateFingerprintState(clientCertificateFingerprint, clientNodeID, clientIP, 0, -1, s.fingerprints.LatestFenceRevision(tracked.Lifetime()))
+		}
+		if livenessFailure != nil {
+			if errFence := s.fingerprints.Fence(context.WithoutCancel(connectionCtx), *livenessFailure, s.fingerprints.LatestFenceRevision(*livenessFailure)); errFence != nil {
+				log.Warnf("failed to fence subscription after client PING liveness failure: %v", errFence)
+			}
+		}
+		if closeConnection {
+			return
+		}
+		if !hasReply {
 			continue
 		}
-
-		if cmd == "AUTH" {
-			_ = writer.WriteRedisError("ERR RESP AUTH disabled; use mTLS")
-			continue
+		if reply.SubscriptionLifetime != nil {
+			if errAttach := connEnv.AttachSubscriptionLifetime(*reply.SubscriptionLifetime); errAttach != nil {
+				if pendingConfigSubscriptionReady != nil {
+					close(pendingConfigSubscriptionAborted)
+					close(pendingConfigSubscriptionReady)
+				}
+				log.Warnf("failed to attach RESP subscription lifetime: %v", errAttach)
+				return
+			}
 		}
-
-		reply := dispatch.Err("registry not ready")
-		if s.registry != nil {
-			reply = s.registry.Execute(ctx, dispatch.Env{
-				Runtime:                      s.runtime,
-				ClientIP:                     clientIP,
-				NodeID:                       clientNodeID,
-				ClientCertificateFingerprint: clientCertificateFingerprint,
-				Conn: &dispatch.ConnEnv{
-					SubscribeConfigYAML: func() (int64, error) {
-						if s.runtime == nil {
-							return 0, fmt.Errorf("runtime not ready")
-						}
-						if unsubscribeConfig != nil {
-							return 1, nil
-						}
-						if !addedNode {
-							node.GlobalRegistry().AddWithNodeID(clientIP, clientNodeID, connectedAt)
-							s.syncClusterClientCount(ctx)
-							addedNode = true
-						}
-						ready := make(chan struct{})
-						aborted := make(chan struct{})
-						pendingConfigSubscriptionReady = ready
-						pendingConfigSubscriptionAborted = aborted
-						delivery := newConfigSubscriptionDelivery(ctx, writer, ready, aborted)
-						unsubscribeConfig = s.runtime.SubscribeConfigYAML(delivery.Write)
-						return 1, nil
-					},
-					UnsubscribeConfigYAML: func() (int64, error) {
-						if unsubscribeConfig == nil {
-							return 0, nil
-						}
-						if cancelSubscriptionUpdates != nil {
-							cancelSubscriptionUpdates()
-							cancelSubscriptionUpdates = nil
-						}
-						unsubscribeConfig()
-						unsubscribeConfig = nil
-						if addedNode {
-							node.GlobalRegistry().RemoveWithNodeID(clientIP, clientNodeID)
-							s.syncClusterClientCount(ctx)
-							addedNode = false
-						}
-						return 0, nil
-					},
-					IsSubscribed: func() bool {
-						return unsubscribeConfig != nil
-					},
-				},
-			}, args)
-		}
-		if errWrite := writer.WriteDispatchReply(reply); errWrite != nil {
+		if errWrite := writeDispatchReplyWithFence(ctx, writer, reply, connEnv); errWrite != nil {
 			if pendingConfigSubscriptionReady != nil {
 				close(pendingConfigSubscriptionAborted)
 				close(pendingConfigSubscriptionReady)
@@ -407,7 +643,7 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		if pendingConfigSubscriptionReady != nil {
-			payload, errConfig := s.runtime.ReadConfigYAMLContext(ctx)
+			payload, errConfig := s.runtime.ReadConfigYAMLContext(connectionCtx)
 			if errConfig != nil {
 				close(pendingConfigSubscriptionAborted)
 				close(pendingConfigSubscriptionReady)
@@ -421,7 +657,7 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 				return
 			}
 			close(pendingConfigSubscriptionReady)
-			cancelSubscriptionUpdates = s.startSubscriptionUpdates(ctx, writer)
+			cancelSubscriptionUpdates = s.startSubscriptionUpdates(connectionCtx, tracked, writer)
 		}
 	}
 }

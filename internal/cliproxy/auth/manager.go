@@ -642,7 +642,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				fullProviderKey = providerKey
 			}
 			fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, fullProviderKey, routeModel, time.Now())
-			if !okCandidate {
+			if !okCandidate || concurrencyCandidateExcluded(opts, fullAuth.ID, fullCandidate.upstreamKey) {
 				continue
 			}
 			upstream := strings.TrimSpace(fullCandidate.upstreamModel)
@@ -712,6 +712,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				}
 				continue
 			}
+			if concurrencyCandidateExcluded(opts, candidate.ID, dispatchCandidate.upstreamKey) {
+				continue
+			}
 			dispatchCandidates = append(dispatchCandidates, dispatchCandidate)
 			availableAuths = append(availableAuths, candidate)
 		}
@@ -733,7 +736,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 
 		if auth == nil {
-			if isBuiltInSelector(selector) {
+			if isBuiltInSelector(selector) && len(excludedConcurrencyCandidatesFromOptions(opts)) == 0 {
 				builtinAuth, handledBuiltin, errBuiltinPick := m.pickViaBuiltinScheduler(ctx, schedulerStrategyCurrent, providerForSelector, normalizedProviders, routeModel, opts, tried)
 				if errBuiltinPick != nil {
 					return nil, errBuiltinPick
@@ -783,7 +786,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			providerKey = providerForSelector
 		}
 		fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, providerKey, routeModel, time.Now())
-		if !okCandidate {
+		if !okCandidate || concurrencyCandidateExcluded(opts, fullAuth.ID, fullCandidate.upstreamKey) {
 			continue
 		}
 		upstream := strings.TrimSpace(fullCandidate.upstreamModel)

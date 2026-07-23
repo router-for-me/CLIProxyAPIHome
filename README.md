@@ -56,6 +56,10 @@ docker compose -f docker-compose.single.yml run --rm \
 
 For PostgreSQL cluster compose, use `docker-compose.pgsql.yml` and omit `-sqlite-path`.
 
+## Strict Credential Concurrency Limits
+
+Before enabling credential concurrency policies, follow the [strict credential concurrency limits deployment runbook](docs/README.md). It defines the required SQLite and PostgreSQL topologies, certificate identity requirements, capability checks, and fail-closed mixed-version rollout.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

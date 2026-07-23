@@ -1,9 +1,13 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 )
 
@@ -201,6 +206,231 @@ func TestReplaceCPANodeSnapshotConcurrentSameHome(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].NodeID != "cpa-a" || records[0].HomeIP != "home-a" || records[0].HomePort != 8327 {
 		t.Fatalf("records = %+v, want one final CPA snapshot", records)
+	}
+}
+
+func TestReplaceCPANodeSnapshotPersistsRevisionAndHandlerOnlyStates(t *testing.T) {
+	db, errOpenSQLite := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
+	if errOpenSQLite != nil {
+		t.Fatalf("OpenSQLite failed: %v", errOpenSQLite)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("get sql db: %v", errDB)
+	}
+	defer func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sql db: %v", errClose)
+		}
+	}()
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate failed: %v", errMigrate)
+	}
+
+	seenAt := time.Now().UTC()
+	repo := NewRepository(db)
+	if errSnapshot := repo.ReplaceCPANodeSnapshot(context.Background(), "home-a", 8327, []node.Node{
+		{NodeID: "handler-only", IP: "10.0.0.1", Connected: seenAt, ActiveHandlers: 1},
+		{NodeID: "revision-only", IP: "10.0.0.2", Connected: seenAt, LatestCancelRevision: 1},
+	}, seenAt); errSnapshot != nil {
+		t.Fatalf("ReplaceCPANodeSnapshot() error = %v", errSnapshot)
+	}
+
+	records, errList := repo.ListLiveCPANodes(context.Background(), seenAt.Add(-time.Second))
+	if errList != nil {
+		t.Fatalf("ListLiveCPANodes() error = %v", errList)
+	}
+	if len(records) != 2 {
+		t.Fatalf("snapshot records = %d, want 2", len(records))
+	}
+	if records[0].NodeID != "handler-only" || records[0].ActiveHandlers != 1 {
+		t.Fatalf("handler-only record = %+v, want active handler state", records[0])
+	}
+	if records[1].NodeID != "revision-only" || records[1].LatestCancelRevision != 1 {
+		t.Fatalf("revision-only record = %+v, want cancellation revision state", records[1])
+	}
+}
+
+func TestAutoMigrateUpgradesLegacyCPANodePrimaryKey(t *testing.T) {
+	db, errOpenSQLite := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
+	if errOpenSQLite != nil {
+		t.Fatalf("OpenSQLite failed: %v", errOpenSQLite)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("get sql db: %v", errDB)
+	}
+	defer func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sql db: %v", errClose)
+		}
+	}()
+	if errCreate := db.Exec(`CREATE TABLE cpa_node (
+		home_ip TEXT NOT NULL,
+		home_port INTEGER NOT NULL,
+		node_key TEXT NOT NULL,
+		node_id TEXT,
+		client_ip TEXT,
+		client_count INTEGER,
+		certificate_fingerprint TEXT,
+		open_connections INTEGER,
+		active_handlers INTEGER,
+		latest_cancel_revision INTEGER,
+		connected_at DATETIME,
+		last_seen_at DATETIME,
+		created_at DATETIME,
+		updated_at DATETIME,
+		PRIMARY KEY (home_ip, home_port, node_key)
+	)`).Error; errCreate != nil {
+		t.Fatalf("create legacy cpa_node table: %v", errCreate)
+	}
+	legacySeenAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if errCreate := db.Exec(`INSERT INTO cpa_node (home_ip, home_port, node_key, node_id, client_count, connected_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, "home-a", 8327, "legacy", "legacy", 1, legacySeenAt, legacySeenAt).Error; errCreate != nil {
+		t.Fatalf("insert legacy cpa_node row: %v", errCreate)
+	}
+
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("second AutoMigrate() error = %v", errMigrate)
+	}
+
+	var legacy CPANodeRecord
+	if errFind := db.Where("home_ip = ? AND home_port = ? AND node_key = ?", "home-a", 8327, "legacy").First(&legacy).Error; errFind != nil {
+		t.Fatalf("find preserved legacy row: %v", errFind)
+	}
+	if legacy.NodeID != "legacy" || legacy.ClientCount != 1 || legacy.HomeStartedAt.IsZero() {
+		t.Fatalf("preserved legacy row = %+v", legacy)
+	}
+
+	startedAtA := time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC)
+	startedAtB := startedAtA.Add(time.Hour)
+	for _, startedAt := range []time.Time{startedAtA, startedAtB} {
+		record := CPANodeRecord{HomeIP: "home-a", HomePort: 8327, HomeStartedAt: startedAt, NodeKey: "same-node", NodeID: "same-node", ClientCount: 1, ConnectedAt: startedAt, LastSeenAt: startedAt}
+		if errCreate := db.Create(&record).Error; errCreate != nil {
+			t.Fatalf("insert cpa node for started_at %s: %v", startedAt, errCreate)
+		}
+	}
+	var count int64
+	if errCount := db.Model(&CPANodeRecord{}).Where("home_ip = ? AND home_port = ? AND node_key = ?", "home-a", 8327, "same-node").Count(&count).Error; errCount != nil {
+		t.Fatalf("count upgraded cpa nodes: %v", errCount)
+	}
+	if count != 2 {
+		t.Fatalf("upgraded cpa node rows = %d, want 2", count)
+	}
+}
+
+func TestAutoMigrateUpgradesLegacyCPANodePrimaryKeyPostgres(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("CLIPROXY_HOME_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("CLIPROXY_HOME_TEST_POSTGRES_DSN is not configured")
+	}
+	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	if errOpen != nil {
+		t.Fatalf("open postgres: %v", errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("get sql db: %v", errDB)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	schemaName := "cpa_node_upgrade_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if errCreate := db.Exec("CREATE SCHEMA " + schemaName).Error; errCreate != nil {
+		t.Fatalf("create test schema: %v", errCreate)
+	}
+	if errSearchPath := db.Exec("SET search_path TO " + schemaName).Error; errSearchPath != nil {
+		t.Fatalf("set test schema search path: %v", errSearchPath)
+	}
+	defer func() {
+		if errSearchPath := db.Exec("RESET search_path").Error; errSearchPath != nil {
+			t.Errorf("reset search path: %v", errSearchPath)
+		}
+		if errDrop := db.Exec("DROP SCHEMA " + schemaName + " CASCADE").Error; errDrop != nil {
+			t.Errorf("drop test schema: %v", errDrop)
+		}
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sql db: %v", errClose)
+		}
+	}()
+	if errCreate := db.Exec(`CREATE TABLE cpa_node (
+		home_ip TEXT NOT NULL,
+		home_port INTEGER NOT NULL,
+		node_key TEXT NOT NULL,
+		node_id TEXT,
+		client_ip TEXT,
+		client_count INTEGER,
+		certificate_fingerprint TEXT,
+		open_connections INTEGER,
+		active_handlers INTEGER,
+		latest_cancel_revision BIGINT,
+		connected_at TIMESTAMPTZ,
+		last_seen_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ,
+		updated_at TIMESTAMPTZ,
+		PRIMARY KEY (home_ip, home_port, node_key)
+	)`).Error; errCreate != nil {
+		t.Fatalf("create legacy cpa_node table: %v", errCreate)
+	}
+	legacySeenAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if errCreate := db.Exec(`INSERT INTO cpa_node (home_ip, home_port, node_key, node_id, client_count, connected_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, "home-a", 8327, "legacy", "legacy", 1, legacySeenAt, legacySeenAt).Error; errCreate != nil {
+		t.Fatalf("insert legacy cpa_node row: %v", errCreate)
+	}
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("second AutoMigrate() error = %v", errMigrate)
+	}
+	var legacy CPANodeRecord
+	if errFind := db.Where("home_ip = ? AND home_port = ? AND node_key = ?", "home-a", 8327, "legacy").First(&legacy).Error; errFind != nil {
+		t.Fatalf("find preserved legacy row: %v", errFind)
+	}
+	if legacy.NodeID != "legacy" || legacy.ClientCount != 1 || legacy.HomeStartedAt.IsZero() {
+		t.Fatalf("preserved legacy row = %+v", legacy)
+	}
+	startedAtA := time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC)
+	startedAtB := startedAtA.Add(time.Hour)
+	for _, startedAt := range []time.Time{startedAtA, startedAtB} {
+		record := CPANodeRecord{HomeIP: "home-a", HomePort: 8327, HomeStartedAt: startedAt, NodeKey: "same-node", NodeID: "same-node", ClientCount: 1, ConnectedAt: startedAt, LastSeenAt: startedAt}
+		if errCreate := db.Create(&record).Error; errCreate != nil {
+			t.Fatalf("insert cpa node for started_at %s: %v", startedAt, errCreate)
+		}
+	}
+	var count int64
+	if errCount := db.Model(&CPANodeRecord{}).Where("home_ip = ? AND home_port = ? AND node_key = ?", "home-a", 8327, "same-node").Count(&count).Error; errCount != nil {
+		t.Fatalf("count upgraded cpa nodes: %v", errCount)
+	}
+	if count != 2 {
+		t.Fatalf("upgraded cpa node rows = %d, want 2", count)
+	}
+}
+
+func TestMigrateCPANodePrimaryKeyPostgresUsesActualConstraintName(t *testing.T) {
+	var logs bytes.Buffer
+	db, errOpen := gorm.Open(postgres.New(postgres.Config{
+		DSN:                  "host=127.0.0.1 user=cliproxy dbname=cliproxy_home sslmode=disable",
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{
+		DisableAutomaticPing: true,
+		DryRun:               true,
+		Logger: logger.New(log.New(&logs, "", 0), logger.Config{
+			LogLevel: logger.Info,
+		}),
+	})
+	if errOpen != nil {
+		t.Fatalf("open postgres dry-run db: %v", errOpen)
+	}
+
+	if errMigrate := migrateCPANodePrimaryKey(db); errMigrate != nil {
+		t.Fatalf("migrateCPANodePrimaryKey() error = %v", errMigrate)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "pg_constraint") || !strings.Contains(output, "conname") || !strings.Contains(output, "DROP CONSTRAINT") {
+		t.Fatalf("postgres migration SQL = %q, want dynamic primary constraint lookup", output)
 	}
 }
 

@@ -41,11 +41,74 @@ func NewRESPHandler(coordinator *Coordinator, refresh *RefreshController, repo *
 }
 
 // UpdateClientCount stores the current active CPA client count for this node.
+// BeginFingerprintCancellation starts distributed cancellation for an ambiguous dispatch delivery.
+func (h *RESPHandler) BeginFingerprintCancellation(ctx context.Context, fingerprint string) (int64, error) {
+	if h == nil || h.repo == nil {
+		return 0, fmt.Errorf("cluster resp: membership handler is not ready")
+	}
+	return h.repo.BeginFingerprintCancellation(ctx, fingerprint)
+}
+
 func (h *RESPHandler) UpdateClientCount(ctx context.Context, clientCount int) error {
 	if h == nil || h.coordinator == nil {
 		return nil
 	}
 	return h.coordinator.UpdateClientCount(ctx, clientCount)
+}
+
+// ClassifyConnection classifies a CPA connection using this command Home incarnation.
+func (h *RESPHandler) ClassifyConnection(ctx context.Context, fingerprint string) (ConnectionLifetime, error) {
+	if h == nil || h.repo == nil || h.coordinator == nil {
+		return ConnectionLifetime{}, fmt.Errorf("cluster resp: membership handler is not ready")
+	}
+	home, initialized := h.coordinator.HomeIncarnation()
+	if !initialized {
+		return ConnectionLifetime{}, fmt.Errorf("cluster resp: Home incarnation is not initialized")
+	}
+	return h.repo.ClassifyConnection(ctx, fingerprint, home)
+}
+
+// SubscribeMembership creates a membership owned by this Home incarnation.
+// RefreshCPALiveness records a successful subscription heartbeat for the exact lifetime.
+func (h *RESPHandler) RefreshCPALiveness(ctx context.Context, lifetime ConnectionLifetime) error {
+	if h == nil || h.repo == nil || h.coordinator == nil {
+		return fmt.Errorf("cluster resp: membership handler is not ready")
+	}
+	home, initialized := h.coordinator.HomeIncarnation()
+	if !initialized {
+		return fmt.Errorf("cluster resp: Home incarnation is not initialized")
+	}
+	if lifetime.Home != home {
+		return ErrHomeIncarnationFenced
+	}
+	return h.repo.RefreshCPALiveness(ctx, lifetime)
+}
+
+// SubscribeMembership creates a membership owned by this Home incarnation.
+func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint string, nodeID string, protocolVersion int, lifecycleConfigRevision int64) (ConnectionLifetime, error) {
+	if h == nil || h.repo == nil || h.coordinator == nil {
+		return ConnectionLifetime{}, fmt.Errorf("cluster resp: membership handler is not ready")
+	}
+	home, initialized := h.coordinator.HomeIncarnation()
+	if !initialized {
+		return ConnectionLifetime{}, fmt.Errorf("cluster resp: Home incarnation is not initialized")
+	}
+	member, errSubscribe := h.repo.SubscribeMembership(ctx, SubscribeMembershipRequest{
+		Fingerprint:             fingerprint,
+		NodeID:                  nodeID,
+		Home:                    home,
+		ProtocolVersion:         protocolVersion,
+		LifecycleConfigRevision: lifecycleConfigRevision,
+	})
+	if errSubscribe != nil {
+		return ConnectionLifetime{}, errSubscribe
+	}
+	return ConnectionLifetime{
+		Fingerprint:  member.CertificateFingerprint,
+		ConnectedAt:  member.ConnectedAt,
+		Home:         home,
+		Subscription: true,
+	}, nil
 }
 
 // RequestClientCertificate signs a pending client certificate request.
@@ -119,7 +182,11 @@ func (h *RESPHandler) nodesPayload(ctx context.Context) ([]byte, error) {
 	if h.coordinator != nil && h.coordinator.heartbeatTimeout > 0 {
 		timeout = h.coordinator.heartbeatTimeout
 	}
-	cutoff := time.Now().UTC().Add(-timeout)
+	now, errNow := h.databaseNow(ctx)
+	if errNow != nil {
+		return nil, errNow
+	}
+	cutoff := now.Add(-timeout)
 	nodes, errNodes := h.repo.ListLiveClusterNodes(ctx, cutoff)
 	if errNodes != nil {
 		return nil, errNodes
@@ -188,7 +255,11 @@ func (h *RESPHandler) authorizeNode(ctx context.Context, remoteIP string, secret
 	if h.coordinator != nil && h.coordinator.heartbeatTimeout > 0 {
 		timeout = h.coordinator.heartbeatTimeout
 	}
-	cutoff := time.Now().UTC().Add(-timeout)
+	now, errNow := h.databaseNow(ctx)
+	if errNow != nil {
+		return nil, errNow
+	}
+	cutoff := now.Add(-timeout)
 	node, errNode := h.repo.LiveClusterNodeByIPAndSecret(ctx, remoteIP, secret, cutoff)
 	if errNode != nil {
 		return nil, errNode
@@ -197,6 +268,17 @@ func (h *RESPHandler) authorizeNode(ctx context.Context, remoteIP string, secret
 		return nil, fmt.Errorf("cluster resp: remote node is not authorized")
 	}
 	return node, nil
+}
+
+func (h *RESPHandler) databaseNow(ctx context.Context) (time.Time, error) {
+	if h == nil || h.repo == nil {
+		return time.Time{}, fmt.Errorf("cluster resp: repository is nil")
+	}
+	db, errDB := h.repo.database()
+	if errDB != nil {
+		return time.Time{}, errDB
+	}
+	return DatabaseNow(ctx, db)
 }
 
 // nodePayload handles a node payload.

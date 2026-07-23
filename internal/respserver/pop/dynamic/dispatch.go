@@ -3,11 +3,14 @@ package dynamic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
@@ -41,6 +44,16 @@ type authValidateResponse struct {
 type authValidateError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+}
+
+type dispatchConcurrencyRequest struct {
+	Protocol int `json:"concurrency_protocol"`
+}
+
+type dispatchConcurrencyResponse struct {
+	Accounted    bool   `json:"accounted"`
+	CredentialID string `json:"credential_id"`
+	Model        string `json:"model"`
 }
 
 // handleAuthValidate validates a downstream API key without dispatching auth.
@@ -86,48 +99,94 @@ func handleAuthValidate(ctx context.Context, env dispatch.Env, args []string) di
 
 // handleAuth handles an auth.
 func handleAuth(ctx context.Context, env dispatch.Env, args []string) dispatch.Reply {
-	// Validate request inputs before mutating persisted state.
-	result, userAPIKey, errReply := dispatchRequest(ctx, env, args)
+	result, _, errReply := dispatchRequest(ctx, env, args)
 	if errReply != nil {
 		return *errReply
 	}
 	if result == nil {
 		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageNoDispatchResult)))
 	}
-	if result.Auth == nil {
-		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageNoAuthAvailable)))
+	payload := result.UnaccountedReply
+	if result.Concurrency.Accounted {
+		payload = result.AccountedReply
 	}
+	reply := dispatch.BulkString(payload)
+	reply.AccountedAdmission = result.Concurrency.Accounted
+	if result.AdmissionFenceFailure != nil {
+		reply.PreWriteError = result.AdmissionFenceFailure
+		return reply
+	}
+	if result.Concurrency.Accounted && env.Conn != nil && env.Conn.AccountedReplyFailure != nil {
+		reply.PreWriteError = env.Conn.AccountedReplyFailure()
+	}
+	return reply
+}
 
+func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]byte, []byte, error) {
+	if result == nil || result.Auth == nil {
+		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
+	}
 	auth := home.SanitizeAuthForDownstream(result.Auth)
 	if auth == nil {
-		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageNoAuthAvailable)))
+		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
 	}
-
 	authJSON, errMarshal := json.Marshal(auth)
 	if errMarshal != nil {
-		return dispatch.BulkString([]byte(buildErrorJSON(errMarshal.Error())))
+		return nil, nil, errMarshal
 	}
-
 	authIndex := strings.TrimSpace(auth.EnsureIndex())
 	if authIndex == "" {
-		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageNoAuthAvailable)))
+		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
 	}
-	authJSON, errSetAuthIndex := sjson.SetBytes(authJSON, "auth_index", authIndex)
-	if errSetAuthIndex != nil {
-		return dispatch.BulkString([]byte(buildErrorJSON(errSetAuthIndex.Error())))
+	build := func(accounted bool) ([]byte, error) {
+		out := []byte("{}")
+		set := func(path string, value any) error {
+			var errSet error
+			out, errSet = sjson.SetBytes(out, path, value)
+			return errSet
+		}
+		if errSet := set("model", strings.TrimSpace(result.Model)); errSet != nil {
+			return nil, errSet
+		}
+		if errSet := set("provider", strings.TrimSpace(result.Provider)); errSet != nil {
+			return nil, errSet
+		}
+		if result.ForceMapping && strings.TrimSpace(result.OriginalAlias) != "" {
+			if errSet := set("force_mapping", true); errSet != nil {
+				return nil, errSet
+			}
+			if errSet := set("original_alias", strings.TrimSpace(result.OriginalAlias)); errSet != nil {
+				return nil, errSet
+			}
+		}
+		if errSet := set("auth_index", authIndex); errSet != nil {
+			return nil, errSet
+		}
+		if errSet := set("user_api_key", strings.TrimSpace(userAPIKey)); errSet != nil {
+			return nil, errSet
+		}
+		var errSetAuth error
+		out, errSetAuth = sjson.SetRawBytes(out, "auth", authJSON)
+		if errSetAuth != nil {
+			return nil, errSetAuth
+		}
+		if accounted {
+			out, errSetAuth = sjson.SetBytes(out, "concurrency", dispatchConcurrencyResponse{Accounted: true, CredentialID: result.Concurrency.CredentialID, Model: result.Concurrency.Model})
+			if errSetAuth != nil {
+				return nil, errSetAuth
+			}
+		}
+		return out, nil
 	}
-
-	out := []byte("{}")
-	out, _ = sjson.SetBytes(out, "model", strings.TrimSpace(result.Model))
-	out, _ = sjson.SetBytes(out, "provider", strings.TrimSpace(result.Provider))
-	if result.ForceMapping && strings.TrimSpace(result.OriginalAlias) != "" {
-		out, _ = sjson.SetBytes(out, "force_mapping", true)
-		out, _ = sjson.SetBytes(out, "original_alias", strings.TrimSpace(result.OriginalAlias))
+	unaccounted, errUnaccounted := build(false)
+	if errUnaccounted != nil {
+		return nil, nil, errUnaccounted
 	}
-	out, _ = sjson.SetBytes(out, "auth_index", authIndex)
-	out, _ = sjson.SetBytes(out, "user_api_key", strings.TrimSpace(userAPIKey))
-	out, _ = sjson.SetRawBytes(out, "auth", authJSON)
-	return dispatch.BulkString(out)
+	accounted, errAccounted := build(true)
+	if errAccounted != nil {
+		return nil, nil, errAccounted
+	}
+	return unaccounted, accounted, nil
 }
 
 // dispatchRequest handles a dispatch request.
@@ -180,9 +239,27 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		userAPIKey = authRes.Principal
 	}
 
-	result, errDispatch := env.Runtime.DispatchForAPIKey(ctx, model, headers, userAPIKey)
+	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
+	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, home.DispatchConcurrencyContext{
+		Fingerprint:     env.ConnectionLifetime.Fingerprint,
+		ConnectedAt:     env.ConnectionLifetime.ConnectedAt,
+		Controlled:      env.ConnectionLifetime.Controlled,
+		ProtocolVersion: concurrencyReq.Protocol,
+		PrepareResponse: func(result *home.DispatchResult) ([]byte, []byte, error) {
+			unaccounted, accounted, errPrepare := prepareDispatchResponse(result, userAPIKey)
+			if errPrepare != nil {
+				return nil, nil, errPrepare
+			}
+			if env.Conn != nil && env.Conn.PrepareDispatchReply != nil {
+				if errHook := env.Conn.PrepareDispatchReply(); errHook != nil {
+					return nil, nil, errHook
+				}
+			}
+			return unaccounted, accounted, nil
+		},
+	})
 	if errDispatch != nil {
-		reply := dispatch.BulkString([]byte(buildErrorJSON(errDispatch.Error())))
+		reply := dispatch.BulkString([]byte(buildDispatchErrorJSON(env.Runtime, errDispatch)))
 		return nil, "", &reply
 	}
 
@@ -349,6 +426,61 @@ func buildErrorJSON(message string) string {
 // buildAuthErrorJSON renders an access error as the standard {error:{type,message}} envelope,
 // preserving the structured access error code (e.g. no_credentials, invalid_credential) so the
 // downstream proxy can map it to the correct HTTP status.
+func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
+	var admissionErr *cluster.ConcurrencyAdmissionError
+	if errors.As(errDispatch, &admissionErr) {
+		out := "{}"
+		out, _ = sjson.Set(out, "error.type", admissionErr.Type)
+		out, _ = sjson.Set(out, "error.message", concurrencyErrorMessage(admissionErr.Type))
+		if cluster.IsConcurrencySaturated(admissionErr) {
+			out, _ = sjson.Set(out, "error.retryable", true)
+			out, _ = sjson.Set(out, "error.retry_after_ms", concurrencyRetryAfterMS(runtime, admissionErr.RetryAfterMS))
+		}
+		return out
+	}
+	return buildErrorJSON(errDispatch.Error())
+}
+
+func concurrencyErrorMessage(errorType string) string {
+	if errorType == "credential_model_concurrency_exceeded" {
+		return "credential model concurrency limit exceeded"
+	}
+	return "credential concurrency limit reached"
+}
+
+func wholePositiveMilliseconds(value string) (int64, bool) {
+	duration, errDuration := time.ParseDuration(value)
+	if errDuration != nil || duration <= 0 || duration%time.Millisecond != 0 {
+		return 0, false
+	}
+	return duration.Milliseconds(), true
+}
+
+func concurrencyRetryAfterMS(runtime *home.Runtime, retryAfterMS int64) int64 {
+	if retryAfterMS > 0 {
+		return retryAfterMS
+	}
+	min, max := int64(250), int64(1000)
+	if runtime != nil {
+		if runtimeConfig := runtime.Config(); runtimeConfig != nil {
+			cfg := runtimeConfig.CredentialConcurrency
+			if parsedMin, okMin := wholePositiveMilliseconds(cfg.BusyRetryMin); okMin {
+				min = parsedMin
+			}
+			if parsedMax, okMax := wholePositiveMilliseconds(cfg.BusyRetryMax); okMax {
+				max = parsedMax
+			}
+		}
+	}
+	if min < 1 {
+		min = 1
+	}
+	if max < min {
+		max = min
+	}
+	return min + time.Now().UnixNano()%(max-min+1)
+}
+
 func buildAuthErrorJSON(authErr *access.AuthError) string {
 	errorType := string(access.AuthErrorCodeInternal)
 	message := "authentication error"

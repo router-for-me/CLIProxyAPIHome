@@ -45,7 +45,10 @@ func executeKVCommand(t *testing.T, rt *home.Runtime, args ...string) dispatch.R
 
 	reg := dispatch.NewRegistry()
 	Register(reg)
-	return reg.Execute(context.Background(), dispatch.Env{Runtime: rt}, args)
+	return reg.Execute(context.Background(), dispatch.Env{
+		Runtime:            rt,
+		ConnectionLifetime: cluster.ConnectionLifetime{Controlled: true},
+	}, args)
 }
 
 func requireSimpleOK(t *testing.T, reply dispatch.Reply) {

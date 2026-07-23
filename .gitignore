@@ -33,3 +33,4 @@ plugins
 .gemini
 .gemini/*
 .worktrees/
+.superpowers/

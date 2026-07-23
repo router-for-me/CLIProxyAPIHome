@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -129,6 +130,14 @@ func (h *Handler) putAPIKeyList(c *gin.Context, key string) {
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	if errReplace := h.replaceAPIKeyAuths(ctx, key, auths); errReplace != nil {
+		if errors.Is(errReplace, cluster.ErrCredentialValidation) {
+			respondError(c, http.StatusBadRequest, "invalid body", errReplace)
+			return
+		}
+		if errors.Is(errReplace, cluster.ErrCredentialIdentityConflict) {
+			respondError(c, http.StatusConflict, "credential_identity_conflict", errReplace)
+			return
+		}
 		respondError(c, http.StatusInternalServerError, "write_failed", errReplace)
 		return
 	}
@@ -178,8 +187,12 @@ func (h *Handler) patchAPIKey(c *gin.Context, key string) {
 		entry[patchKey] = value
 	}
 	delete(entry, "auth_index")
-	delete(entry, "id")
-	delete(entry, "uuid")
+	if key == "openai-compatibility" {
+		setOpenAICompatibilityCredentialID(entry, target.ID)
+	} else {
+		entry["id"] = target.ID
+		delete(entry, "uuid")
+	}
 
 	rawEntry, errMarshal := json.Marshal(entry)
 	if errMarshal != nil {
@@ -192,7 +205,7 @@ func (h *Handler) patchAPIKey(c *gin.Context, key string) {
 		return
 	}
 	if len(nextAuths) == 0 {
-		if errDelete := h.repo.SoftDeleteAuth(ctx, target.ID); errDelete != nil {
+		if errDelete := h.repo.RetireProviderAuth(ctx, target.ID); errDelete != nil {
 			respondError(c, http.StatusInternalServerError, "write_failed", errDelete)
 			return
 		}
@@ -200,10 +213,12 @@ func (h *Handler) patchAPIKey(c *gin.Context, key string) {
 		next := nextAuths[0]
 		preserveAPIKeyAuthDisabledState(next, target)
 		if next.ID != target.ID {
-			if errDelete := h.repo.SoftDeleteAuth(ctx, target.ID); errDelete != nil {
-				respondError(c, http.StatusInternalServerError, "write_failed", errDelete)
-				return
-			}
+			respondError(c, http.StatusBadRequest, "invalid body", fmt.Errorf("credential id cannot change"))
+			return
+		}
+		if next.Provider != target.Provider {
+			respondError(c, http.StatusBadRequest, "invalid body", fmt.Errorf("credential provider cannot change"))
+			return
 		}
 		if _, errUpsert := h.repo.UpsertAuthPreservingDisabled(ctx, next, "update"); errUpsert != nil {
 			respondError(c, http.StatusInternalServerError, "write_failed", errUpsert)
@@ -237,7 +252,7 @@ func (h *Handler) deleteAPIKey(c *gin.Context, key string) {
 		respondError(c, http.StatusNotFound, "item not found", nil)
 		return
 	}
-	if errDelete := h.repo.SoftDeleteAuth(ctx, target.ID); errDelete != nil {
+	if errDelete := h.repo.RetireProviderAuth(ctx, target.ID); errDelete != nil {
 		respondError(c, http.StatusInternalServerError, "write_failed", errDelete)
 		return
 	}
@@ -259,45 +274,48 @@ func (h *Handler) synthesizeAPIKeyBody(key string, body []byte) ([]*coreauth.Aut
 			return nil, errDecode
 		}
 		cfg.GeminiKey = entries
-		cfg.SanitizeGeminiKeys()
 	case "vertex-api-key":
 		var entries []appconfig.VertexCompatKey
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
 			return nil, errDecode
 		}
 		cfg.VertexCompatAPIKey = entries
-		cfg.SanitizeVertexCompatKeys()
 	case "codex-api-key":
 		var entries []appconfig.CodexKey
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
 			return nil, errDecode
 		}
 		cfg.CodexKey = entries
-		cfg.SanitizeCodexKeys()
 	case "xai-api-key":
 		var entries []appconfig.XAIKey
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
 			return nil, errDecode
 		}
 		cfg.XAIKey = entries
-		cfg.SanitizeXAIKeys()
 	case "claude-api-key":
 		var entries []appconfig.ClaudeKey
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
 			return nil, errDecode
 		}
 		cfg.ClaudeKey = entries
-		cfg.SanitizeClaudeKeys()
 	case "openai-compatibility":
 		var entries []appconfig.OpenAICompatibility
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
 			return nil, errDecode
 		}
 		cfg.OpenAICompatibility = entries
-		cfg.SanitizeOpenAICompatibility()
 	default:
 		return nil, fmt.Errorf("unsupported api key route %s", key)
 	}
+	if errNormalizeIDs := cfg.NormalizeProviderCredentialIDs(); errNormalizeIDs != nil {
+		return nil, errNormalizeIDs
+	}
+	cfg.SanitizeGeminiKeys()
+	cfg.SanitizeVertexCompatKeys()
+	cfg.SanitizeCodexKeys()
+	cfg.SanitizeXAIKeys()
+	cfg.SanitizeClaudeKeys()
+	cfg.SanitizeOpenAICompatibility()
 	return synthesizeConfigAuths(cfg), nil
 }
 
@@ -309,19 +327,6 @@ func synthesizeConfigAuths(cfg *appconfig.Config) []*coreauth.Auth {
 		Config:      cfg,
 		Now:         now,
 		IDGenerator: synthesizer.NewStableIDGenerator(),
-		ClusterMode: true,
-		UUIDForAuth: func(auth *coreauth.Auth) string {
-			if auth == nil || auth.Attributes == nil {
-				return ""
-			}
-			return cluster.DeterministicAPIKeyUUID(
-				auth.Provider,
-				auth.Attributes["base_url"],
-				cluster.APIKeyHash(auth.Attributes["api_key"]),
-				auth.Attributes["compat_name"],
-				auth.Attributes["provider_key"],
-			)
-		},
 	}
 	auths, errSynthesize := synthesizer.NewConfigSynthesizer().Synthesize(sctx)
 	if errSynthesize != nil {
@@ -332,45 +337,66 @@ func synthesizeConfigAuths(cfg *appconfig.Config) []*coreauth.Auth {
 
 // replaceAPIKeyAuths handles a replace api key auths.
 func (h *Handler) replaceAPIKeyAuths(ctx context.Context, key string, next []*coreauth.Auth) error {
-	// Validate request inputs before mutating persisted state.
 	existing, errExisting := h.repo.ListAuths(ctx)
 	if errExisting != nil {
 		return errExisting
 	}
-	nextIDs := make(map[string]struct{}, len(next))
-	existingByID := make(map[string]*coreauth.Auth, len(existing))
+	existingBySource := make(map[string]*coreauth.Auth, len(existing))
 	for _, auth := range existing {
-		if auth != nil {
-			existingByID[auth.ID] = auth
+		if !isAPIKeyAuthForKey(auth, key) || auth.Attributes == nil {
+			continue
+		}
+		source := strings.TrimSpace(auth.Attributes["source"])
+		if source != "" {
+			existingBySource[auth.Provider+"\x00"+source] = auth
 		}
 	}
 	for _, auth := range next {
-		if auth == nil {
+		if auth == nil || auth.Attributes == nil {
 			continue
 		}
-		preserveAPIKeyAuthDisabledState(auth, existingByID[auth.ID])
-		nextIDs[auth.ID] = struct{}{}
+		source := strings.TrimSpace(auth.Attributes["source"])
+		previous := existingBySource[auth.Provider+"\x00"+source]
+		if previous == nil || auth.Attributes["provider_credential_id_generated"] != "true" {
+			continue
+		}
+		auth.ID = previous.ID
+		auth.Index = previous.Index
+		auth.Attributes["cluster_uuid"] = previous.ID
 	}
-	for _, auth := range existing {
-		if !isAPIKeyAuthForKey(auth, key) {
-			continue
-		}
-		if _, ok := nextIDs[auth.ID]; ok {
-			continue
-		}
-		if errDelete := h.repo.SoftDeleteAuth(ctx, auth.ID); errDelete != nil {
-			return errDelete
-		}
+	return h.repo.ReconcileProviderAuths(ctx, key, next, nil)
+}
+
+func setOpenAICompatibilityCredentialID(entry map[string]any, credentialID string) {
+	delete(entry, "id")
+	delete(entry, "uuid")
+	rawEntries, okEntries := entry["api-key-entries"]
+	if !okEntries {
+		entry["id"] = credentialID
+		return
 	}
-	for _, auth := range next {
-		if auth == nil {
-			continue
+	switch entries := rawEntries.(type) {
+	case []map[string]any:
+		if len(entries) == 0 {
+			entry["id"] = credentialID
+			return
 		}
-		if _, errUpsert := h.repo.UpsertAuthPreservingDisabled(ctx, auth, "upsert"); errUpsert != nil {
-			return errUpsert
+		entries[0]["id"] = credentialID
+		delete(entries[0], "uuid")
+	case []any:
+		if len(entries) == 0 {
+			entry["id"] = credentialID
+			return
 		}
+		if item, okItem := entries[0].(map[string]any); okItem {
+			item["id"] = credentialID
+			delete(item, "uuid")
+			return
+		}
+		entry["id"] = credentialID
+	default:
+		entry["id"] = credentialID
 	}
-	return nil
 }
 
 func preserveAPIKeyAuthDisabledState(next, current *coreauth.Auth) {
@@ -558,7 +584,6 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 	}
 	item["auth_index"] = auth.ID
 	item["id"] = auth.ID
-	item["uuid"] = auth.ID
 	item["api-key"] = attrs["api_key"]
 	item["base-url"] = attrs["base_url"]
 	item["prefix"] = auth.Prefix
@@ -584,10 +609,14 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 			name = strings.TrimSpace(auth.Label)
 		}
 		item["name"] = name
-		item["api-key-entries"] = []map[string]any{{
-			"api-key":   attrs["api_key"],
-			"proxy-url": auth.ProxyURL,
-		}}
+		if attrs["api_key"] != "" || auth.ProxyURL != "" {
+			delete(item, "id")
+			item["api-key-entries"] = []map[string]any{{
+				"id":        auth.ID,
+				"api-key":   attrs["api_key"],
+				"proxy-url": auth.ProxyURL,
+			}}
+		}
 	}
 	if (key == "codex-api-key" || key == "xai-api-key") && strings.EqualFold(attrs["websockets"], "true") {
 		item["websockets"] = true

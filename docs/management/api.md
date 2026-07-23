@@ -175,6 +175,12 @@ The table below is extracted from the final Home route registry built by `intern
 | `PUT` | `/codex-api-key` |
 | `GET` | `/codex-auth-url` |
 | `GET` | `/config` |
+| `GET` | `/credentials/in-flight` |
+| `GET` | `/credentials/in-flight/summary` |
+| `GET` | `/credentials/concurrency-policies` |
+| `GET` | `/credentials/concurrency` |
+| `GET` | `/credentials/:credential_id/concurrency-policy` |
+| `PATCH` | `/credentials/:credential_id/concurrency-policy` |
 | `GET` | `/config.yaml` |
 | `PUT` | `/config.yaml` |
 | `GET` | `/debug` |
@@ -387,6 +393,21 @@ Example response:
 
 Fields with `json:"-"` are not returned. Home hides `host`, `port`, `allow-host`, `remote-management`, and `auth-dir` from this JSON response.
 
+#### Credential concurrency lifecycle fields
+
+The `credential-concurrency` object is included in both config responses. Home owns `lifecycle-config-revision` and `observation-barrier-revision`: clients may send them, but Home derives the lifecycle revision from its singleton record and always publishes barrier revision `0`. They cannot be changed through YAML import or Management API updates.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `lifecycle-config-revision` | `1` on initialization | Home-owned monotonic lifecycle revision. |
+| `observation-barrier-revision` | `0` | Home-owned foundation barrier revision. |
+| `cpa-heartbeat-timeout` | `3s` | CPA heartbeat timeout. |
+| `cpa-cancel-bound` | `5s` | Maximum CPA cancellation bound. |
+| `reclaim-grace` | `5s` | Grace period before reclaim. |
+| `cleanup-interval` | `5s` | Lifecycle cleanup interval. |
+
+All durations must be positive. Home also requires `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`, rejecting duration-sum overflow as invalid. Lifecycle updates are rejected with `lifecycle configuration is in use` while any CPA membership is `active` or `canceling`, including an otherwise identical update.
+
 ### GET `/config.yaml`
 
 Returns the current YAML config.
@@ -420,6 +441,8 @@ openai-compatibility
 ```
 
 `auth-dir` is still treated as an import/export path and is not persisted into the runtime config snapshot.
+
+A supplied `credential-concurrency` object updates the Home-owned lifecycle configuration only when no CPA membership is `active` or `canceling`. Lifecycle, credential reconciliation, config snapshot replacement, and plugin task creation (when applicable) are committed atomically; any failure rolls all of them back.
 
 Example response:
 
@@ -1913,7 +1936,8 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `excluded-models` | array of string | Model IDs excluded from this key. |
 | `disable-cooling` | boolean | Disable quota cooldown scheduling for this credential. |
 | `auth-index` | string | Compatibility credential identifier. |
-| `auth_index`, `id`, `uuid` | string | DB auth identifier aliases. |
+| `id` | string | Canonical immutable credential UUID. Responses and exports use this field. |
+| `uuid` | string | Legacy input-only alias for `id`; it is normalized to `id` and never returned or exported. |
 | `disabled` | boolean | Read-only DB auth disabled flag. Use `PATCH /auth-files/status` to change it. |
 
 `ClaudeKey`, `CodexKey`, `XAIKey`, and `VertexCompatKey` use the same common fields. `XAIKey` uses the native xAI executor and requires `base-url` (normally `https://api.x.ai/v1`). Additional notable fields:
@@ -1938,8 +1962,8 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `models` | array of `OpenAICompatibilityModel` | Model definitions and aliases. |
 | `headers` | object string to string | Extra upstream headers. |
 | `disable-cooling` | boolean | Disable quota cooldown scheduling for this provider. |
-| `auth-index` | string | Compatibility credential identifier when no per-key entries exist. |
-| `auth_index`, `id`, `uuid` | string | DB auth identifier aliases. |
+| `id` | string | Canonical immutable UUID of the fallback credential when `api-key-entries` is empty. Responses and exports use this field. |
+| `uuid` | string | Legacy input-only alias for the fallback `id`; it is normalized to `id` and never returned or exported. |
 
 Shared nested structures:
 
@@ -1952,6 +1976,8 @@ Shared nested structures:
     "force-mapping": true
   },
   "OpenAICompatibilityAPIKey": {
+    "id": "canonical-credential-uuid",
+    "uuid": "legacy-input-only-credential-uuid",
     "api-key": "provider-key",
     "proxy-url": "http://127.0.0.1:7890"
   },
@@ -1974,6 +2000,8 @@ Shared nested structures:
   }
 }
 ```
+
+For each `OpenAICompatibilityAPIKey`, `uuid` is accepted as a legacy input-only alias for `id`. It is normalized to `id` and is never returned or exported.
 
 ### GET Provider Key Routes
 
@@ -2512,6 +2540,54 @@ Example response:
 }
 ```
 
+## Credential in-flight observation
+
+`GET /credentials/in-flight` returns bounded request details derived only from the latest complete CPA snapshots. It accepts optional `credential_id` and `model` exact-match filters plus `limit` and `offset`. `limit` defaults to 100 and is bounded to 1 through 1000; `offset` defaults to 0. Each item contains `request_id`, `credential_id`, normalized upstream `model`, `request_kind`, and `started_at`. A credential with a policy also includes its authoritative `limiter` state. It never exposes CPA identity, tokens, or request payloads.
+
+`GET /credentials/in-flight/summary` returns eventually consistent observed totals. For a credential with a concurrency policy, it also joins authoritative `max_in_flight`, admitted counters, remaining capacity, saturation, and a `limiter` object. The observed `in_flight` value remains snapshot-derived; `observed` keeps accounted and unaccounted snapshot totals separate from authoritative limiter state. Credentials without a policy retain the compatible `null`/`false` limiter fields.
+
+Both responses include `observed_at`, `stale`, `coverage_complete`, `aggregates_complete`, `protocol_coverage_complete`, `minimum_processed_barrier_revision`, and `details_truncated`. The minimum barrier is the lowest processed barrier from the exact active membership lifetimes with visible snapshots. Freshness is calculated from Home database ingestion time, not CPA wall-clock time. Only complete multipart revisions are visible. Detail truncation does not make aggregates incomplete; a canceling membership, an active-lifetime mismatch, an incomplete/newer attempt, or a non-v1 active protocol makes diagnostics incomplete.
+
+`GET /auth-files` joins observations and authoritative limiter state by the stable DB credential UUID (`id`/`auth_index`). It always exposes the compatible in-flight fields: `in_flight`, `max_in_flight`, `max_in_flight_by_model`, `remaining`, `total_saturated`, `saturated_model_count`, and `admitted_in_flight`, plus `observed` and `limiter`. Credentials without a matching observation have `in_flight` and `observed` set to `null`; authoritative limiter counters remain available when a policy exists. Observation and limiter reads are independent optional joins: failure of either leaves only that projection `null` and still returns the auth files.
+
+`GET /credentials/concurrency-policies` lists stored policies. `GET` and `PATCH /credentials/:credential_id/concurrency-policy` read or replace the presence-aware `max_in_flight` and `max_in_flight_by_model` fields. `PATCH` accepts an optional policy `version`; a stale version returns HTTP `409`. `GET /credentials/concurrency` consumes only policy and admitted-counter state; it never reads observations, always returns `observed: null`, and returns `fully_enforced: "unknown"`.
+
+When an observation is joined to a policy in `/credentials/in-flight`, `/credentials/in-flight/summary`, or `/auth-files`, `fully_enforced` is a diagnostic only: `"unknown"` for absent, stale, canceling, incomplete, non-v1-protocol, or barrier-behind observations; `"false"` when all coverage and barrier checks are known and the credential has unaccounted observed work; and `"true"` when those checks are known and unaccounted work is zero. A policy barrier is acknowledged only when the minimum processed active-lifetime observation barrier is at least the policy barrier. If the optional limiter read fails, the in-flight summary and details still return their observation with `limiter: null`.
+
+`PATCH /auth-files/fields` accepts the same limiter fields and optional `version`. Auth metadata and policy changes are one database transaction, so either both persist or neither does. Limiter fields are not written into auth JSON.
+
+### Credential concurrency policy and limiter routes
+
+Before activating a policy, follow the [strict credential concurrency limits deployment runbook](../README.md). It defines the required topology, capability checks, certificate identities, and fail-closed mixed-version rollout.
+
+The policy route groups are `GET /credentials/concurrency-policies`, `GET /credentials/:credential_id/concurrency-policy` plus `PATCH /credentials/:credential_id/concurrency-policy`, and `GET /credentials/concurrency`. The first two read stored policy; the patch replaces only supplied fields; the final route reads policy plus the authoritative admitted-counter state. `PATCH /auth-files/fields` is the auth-files compatibility form of the same policy patch.
+
+A patch body must be valid JSON and supply at least one of `max_in_flight` or `max_in_flight_by_model`. A supplied total or model limit is `0` to remove that limit, or an integer from `1` through `credential-concurrency.max-limit`; model keys must be valid canonical model keys and cannot collide after canonicalization. `null` clears a supplied total or model map. `version` is optional optimistic concurrency control: the response includes the current `version`, and a stale submitted version is rejected rather than overwriting a newer policy.
+
+`admitted_in_flight` is the authoritative counter, not a reconstructed observation. `GET /credentials/concurrency` never joins snapshots, so every item has `observed: null` and `fully_enforced: "unknown"`. The compatible `/auth-files` fields remain `in_flight`, `max_in_flight`, `max_in_flight_by_model`, `remaining`, `total_saturated`, `saturated_model_count`, `admitted_in_flight`, `observed`, and `limiter`; absent observations do not hide an available authoritative counter.
+
+The Management capability `credential_concurrency_limits_v2` declares policy and admitted-counter support. Policy errors always use the envelope `{ "error": "<code>", "message": "<message>" }`. Clients must branch on the exact HTTP status and `error` code below; decoder and database detail in `message` is not stable.
+
+| Condition | HTTP status | `error` code | `message` on the wire |
+| --- | --- | --- | --- |
+| PATCH body is not valid JSON or cannot be decoded | `400` | `invalid body` | The JSON decoder detail. |
+| PATCH has neither `max_in_flight` nor `max_in_flight_by_model` | `400` | `no fields to update` | `no fields to update` |
+| A supplied limit or model is invalid, or canonical model keys collide | `400` | `invalid_concurrency_policy` | The validation detail, such as `invalid credential concurrency limit`, `invalid credential concurrency model`, or `duplicate credential concurrency model: <model>`. |
+| Credential does not exist | `404` | `not_found` | `credential concurrency policy credential not found` |
+| Submitted `version` is stale | `409` | `concurrency_policy_version_conflict` | `credential concurrency policy version conflict` |
+| Activating a policy is blocked by a legacy CPA, a capability-missing Home, or multiple active Homes on SQLite | `500` | `concurrency_policy_write_failed` | Respectively `legacy CPA membership is active`, `active Home lacks credential concurrency limiter capability`, or `active concurrency limits require a single SQLite Home`. |
+| Policy list/read-after-patch cannot be loaded | `500` | `concurrency_policy_load_failed` | Database error detail. |
+| Authoritative limiter state cannot be loaded | `500` | `concurrency_state_load_failed` | Database error detail. |
+| Another policy write failure occurs | `500` | `concurrency_policy_write_failed` | Underlying write error detail. |
+
+The `credential_in_flight_snapshots` capability is independent from `credential_concurrency_limits_v2`. The latter declares Management concurrency policy and authoritative counter support. Snapshot availability, freshness, barrier acknowledgement, staging, overflow, and cleanup never participate in admission or release. Observation failures are best effort and do not gate traffic.
+
+The observation configuration is database-backed for Home-managed CPA nodes. `credential-in-flight.snapshot-interval` defaults to `2s`; `stale-after` defaults to `10s` and must be at least three snapshot intervals; `max-part-bytes`, `max-part-count`, `max-revision-bytes`, `max-aggregate-groups`, `max-details`, and `max-string-bytes` default to `262144`, `64`, `16777216`, `100000`, `10000`, and `256`; `staging-retention` defaults to `1m`. Cleanup uses Home database time. Closed lifetimes are removed with their exact fingerprint and `membership_connected_at`; stale staging never removes an active or canceling lifetime's watermark or highest-revision parts.
+
+Request details are limited to the documented fields. Headers, bodies, credentials, API keys, tokens, and certificate material are prohibited.
+
+Historical `in_flight_lease` tables are not used by this feature and automatic migration does not delete them. Operators may remove those legacy tables only through an explicit, separately planned maintenance procedure after confirming that no prior deployment still depends on them.
+
 ### GET `/capabilities`
 
 Returns the frontend capability flags and build metadata exposed by the current Home Management API. The management panel uses this endpoint to decide whether to enable usage overview, request records, aggregate rankings, export, realtime diagnostics, health attribution, request events, and request log indexes.
@@ -2540,6 +2616,8 @@ Response fields:
 | `capabilities.logs` | boolean | Whether application log APIs are available. |
 | `capabilities.request_error_logs` | boolean | Whether request error log file list/download APIs are available. |
 | `capabilities.topology` | boolean | Whether `GET /topology` is available for Home + CPA cluster topology. |
+| `capabilities.credential_in_flight_snapshots` | boolean | Whether the independent CPA in-flight observation snapshot APIs are available. |
+| `capabilities.credential_concurrency_limits_v2` | boolean | Whether concurrency policy and authoritative admitted-counter APIs are available. |
 | `server_info.home_version` | string | Home build version. |
 | `server_info.home_commit` | string | Home build commit. |
 | `server_info.home_build_date` | string | Home build time. |

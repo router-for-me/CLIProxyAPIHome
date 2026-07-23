@@ -257,5 +257,8 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
+	if len(excludedConcurrencyCandidatesFromOptions(opts)) > 0 {
+		return nil, false, nil
+	}
 	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
 }

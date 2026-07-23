@@ -239,11 +239,24 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
+func filterConcurrencyExcludedAuths(auths []*Auth, model string, opts Options) []*Auth {
+	if len(excludedConcurrencyCandidatesFromOptions(opts)) == 0 {
+		return auths
+	}
+	filtered := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || concurrencyCandidateExcluded(opts, auth.ID, model) {
+			continue
+		}
+		filtered = append(filtered, auth)
+	}
+	return filtered
+}
+
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(filterConcurrencyExcludedAuths(auths, model, opts), provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -277,9 +290,8 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(filterConcurrencyExcludedAuths(auths, model, opts), provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -401,6 +413,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
+	auths = filterConcurrencyExcludedAuths(auths, model, opts)
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err

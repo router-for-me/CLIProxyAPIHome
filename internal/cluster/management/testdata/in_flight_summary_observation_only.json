@@ -1,0 +1,38 @@
+{
+  "observed_at": "2026-07-21T12:00:00Z",
+  "stale": false,
+  "coverage_complete": true,
+  "aggregates_complete": true,
+  "protocol_coverage_complete": true,
+  "minimum_processed_barrier_revision": 0,
+  "details_truncated": false,
+  "items": [
+    {
+      "credential_id": "cred-a",
+      "in_flight": 3,
+      "max_in_flight": null,
+      "remaining": null,
+      "total_saturated": false,
+      "saturated_model_count": 0,
+      "models": [
+        {
+          "model": "gpt-5",
+          "in_flight": 3,
+          "max_in_flight": null,
+          "remaining": null,
+          "saturated": false
+        }
+      ],
+      "observed": {
+        "in_flight": 3,
+        "accounted": 2,
+        "unaccounted": 1,
+        "stale": false,
+        "coverage_complete": true,
+        "aggregates_complete": true,
+        "details_truncated": false
+      },
+      "limiter": null
+    }
+  ]
+}

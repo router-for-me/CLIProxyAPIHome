@@ -175,6 +175,12 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `PUT` | `/codex-api-key` |
 | `GET` | `/codex-auth-url` |
 | `GET` | `/config` |
+| `GET` | `/credentials/in-flight` |
+| `GET` | `/credentials/in-flight/summary` |
+| `GET` | `/credentials/concurrency-policies` |
+| `GET` | `/credentials/concurrency` |
+| `GET` | `/credentials/:credential_id/concurrency-policy` |
+| `PATCH` | `/credentials/:credential_id/concurrency-policy` |
 | `GET` | `/config.yaml` |
 | `PUT` | `/config.yaml` |
 | `GET` | `/debug` |
@@ -387,6 +393,21 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 带 `json:"-"` 的字段不会出现在响应中。Home 会隐藏 `host`、`port`、`allow-host`、`remote-management` 和 `auth-dir`。
 
+#### Credential concurrency lifecycle 字段
+
+两个配置响应都包含 `credential-concurrency` 对象。`lifecycle-config-revision` 和 `observation-barrier-revision` 由 Home 管理：客户端可以提交它们，但 Home 从单例记录派生 lifecycle revision，并始终下发 barrier revision `0`。不能通过 YAML import 或 Management API 修改这两个值。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `lifecycle-config-revision` | 初始化时为 `1` | Home 管理的单调递增 lifecycle revision。 |
+| `observation-barrier-revision` | `0` | Home 管理的 foundation barrier revision。 |
+| `cpa-heartbeat-timeout` | `3s` | CPA heartbeat timeout。 |
+| `cpa-cancel-bound` | `5s` | CPA cancellation 的最大 bound。 |
+| `reclaim-grace` | `5s` | reclaim 前的 grace period。 |
+| `cleanup-interval` | `5s` | lifecycle cleanup interval。 |
+
+所有 duration 必须为正数。Home 还要求 `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`，duration 求和溢出也会被视为无效。只要存在状态为 `active` 或 `canceling` 的 CPA membership，所有 lifecycle 更新（包括字段完全相同的更新）都会被拒绝，并返回 `lifecycle configuration is in use`。
+
 ### GET `/config.yaml`
 
 返回当前 YAML 配置。
@@ -420,6 +441,8 @@ openai-compatibility
 ```
 
 `auth-dir` 仍然只作为 import/export 路径处理，不会持久化到运行时 config snapshot。
+
+提交的 `credential-concurrency` 对象仅在没有 `active` 或 `canceling` CPA membership 时才会更新 Home 管理的 lifecycle configuration。Lifecycle、credential reconciliation、config snapshot replacement 和 plugin task creation（如适用）会原子提交；任一步失败都会全部回滚。
 
 输出示例：
 
@@ -1913,7 +1936,8 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `excluded-models` | array of string | 该 key 排除的模型 ID。 |
 | `disable-cooling` | boolean | 对该凭证禁用 quota cooldown 调度。 |
 | `auth-index` | string | Compatibility credential identifier。 |
-| `auth_index`, `id`, `uuid` | string | DB auth identifier aliases。 |
+| `id` | string | 规范且不可变的 credential UUID。响应和导出使用此字段。 |
+| `uuid` | string | 仅用于兼容输入的旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
 | `disabled` | boolean | 只读 DB auth disabled flag；请使用 `PATCH /auth-files/status` 修改。 |
 
 `ClaudeKey`、`CodexKey`、`XAIKey` 和 `VertexCompatKey` 使用相同通用字段。`XAIKey` 使用原生 xAI executor，并要求提供 `base-url`（通常为 `https://api.x.ai/v1`）。额外字段如下：
@@ -1938,8 +1962,8 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `models` | array of `OpenAICompatibilityModel` | 模型定义和 alias。 |
 | `headers` | object string to string | 额外上游 headers。 |
 | `disable-cooling` | boolean | 对该 provider 禁用 quota cooldown 调度。 |
-| `auth-index` | string | 无 per-key entries 时的 compatibility credential identifier。 |
-| `auth_index`, `id`, `uuid` | string | DB auth identifier aliases。 |
+| `id` | string | `api-key-entries` 为空时 fallback credential 的规范且不可变 UUID。响应和导出使用此字段。 |
+| `uuid` | string | fallback `id` 的仅输入兼容旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
 
 共享嵌套结构：
 
@@ -1952,6 +1976,8 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
     "force-mapping": true
   },
   "OpenAICompatibilityAPIKey": {
+    "id": "canonical-credential-uuid",
+    "uuid": "legacy-input-only-credential-uuid",
     "api-key": "provider-key",
     "proxy-url": "http://127.0.0.1:7890"
   },
@@ -1974,6 +2000,8 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
   }
 }
 ```
+
+每个 `OpenAICompatibilityAPIKey` 都接受 `uuid` 作为 `id` 的仅输入兼容旧字段。它会被规范化为 `id`，不会在响应或导出中出现。
 
 ### GET Provider Key Routes
 
@@ -2512,6 +2540,54 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 }
 ```
 
+## Credential in-flight observation
+
+`GET /credentials/in-flight` 只返回从最新完整 CPA snapshot 派生的有界请求详情。它支持可选的精确匹配 `credential_id`、`model` 过滤，以及 `limit` 和 `offset`。`limit` 默认 100，范围为 1 到 1000；`offset` 默认 0。每项包含 `request_id`、`credential_id`、规范化上游 `model`、`request_kind` 和 `started_at`。带有策略的凭证还会包含权威 `limiter` 状态。接口绝不暴露 CPA 身份、token 或请求 payload。
+
+`GET /credentials/in-flight/summary` 返回最终一致的观测总数。对于带有并发策略的凭证，它还会联结权威的 `max_in_flight`、已准入计数、剩余容量、饱和状态和 `limiter` 对象。`in_flight` 仍然来自 snapshot；`observed` 将 accounted/unaccounted snapshot 总数与权威 limiter 状态分开。没有策略的凭证保持兼容的 `null`/`false` limiter 字段。
+
+两个响应都包含 `observed_at`、`stale`、`coverage_complete`、`aggregates_complete`、`protocol_coverage_complete`、`minimum_processed_barrier_revision` 和 `details_truncated`。minimum barrier 是具有可见 snapshot 的精确 active membership lifetime 中已处理 barrier 的最小值。freshness 由 Home 数据库摄取时间计算，而不是 CPA 的墙上时钟。只有完整 multipart revision 对外可见。详情截断不会使 aggregate 不完整；canceling membership、active lifetime 不匹配、存在不完整/更新的 attempt 或非 v1 active protocol 会使诊断不完整。
+
+`GET /auth-files` 按稳定的 DB credential UUID（`id`/`auth_index`）联结 observation 和权威 limiter 状态。它始终公开兼容 in-flight 字段：`in_flight`、`max_in_flight`、`max_in_flight_by_model`、`remaining`、`total_saturated`、`saturated_model_count` 和 `admitted_in_flight`，以及 `observed` 和 `limiter`。没有匹配 observation 的 credential 的 `in_flight` 和 `observed` 为 `null`；有策略时仍会返回权威 limiter 计数。observation 和 limiter 是独立的 optional join：任一读取失败时只将对应 projection 设为 `null`，auth files 仍会成功返回。
+
+`GET /credentials/concurrency-policies` 列出存储的策略。`GET` 和 `PATCH /credentials/:credential_id/concurrency-policy` 读取或替换具备 presence-aware 语义的 `max_in_flight` 和 `max_in_flight_by_model` 字段。`PATCH` 可选接收策略 `version`；版本过期返回 HTTP `409`。`GET /credentials/concurrency` 只消费策略和已准入计数；它绝不读取 observation，始终返回 `observed: null` 和 `fully_enforced: "unknown"`。
+
+在 `/credentials/in-flight`、`/credentials/in-flight/summary` 或 `/auth-files` 将 observation 联结到策略时，`fully_enforced` 仅用于诊断：observation 缺失、stale、canceling、不完整、非 v1 protocol 或 barrier 落后时为 `"unknown"`；覆盖和 barrier 检查均已知且 credential 存在 unaccounted observed work 时为 `"false"`；检查均已知且 unaccounted work 为零时为 `"true"`。只有精确 active-lifetime observation 的 minimum processed barrier 不低于 policy barrier，才视为已确认策略 barrier。optional limiter 读取失败时，in-flight summary 和 details 仍会返回 observation，且 `limiter: null`。
+
+`PATCH /auth-files/fields` 可接收相同 limiter 字段及可选 `version`。auth metadata 与策略在同一个数据库 transaction 中写入，二者要么同时成功，要么同时回滚。limiter 字段不会写入 auth JSON。
+
+### Credential concurrency policy 和 limiter 路由
+
+启用 policy 前，必须遵循[严格凭证并发限制部署运行手册](../CN.md)。手册规定所需拓扑、capability 检查、certificate identity 和 fail-closed mixed-version 发布方式。
+
+policy 路由组为 `GET /credentials/concurrency-policies`、`GET /credentials/:credential_id/concurrency-policy` 加 `PATCH /credentials/:credential_id/concurrency-policy`，以及 `GET /credentials/concurrency`。前两组读取已存储的 policy；PATCH 只替换明确提供的字段；最后一个路由读取 policy 和权威 admitted-counter state。`PATCH /auth-files/fields` 是同一 policy patch 的 auth-files compatibility 形式。
+
+PATCH body 必须是有效 JSON，且至少提供 `max_in_flight` 或 `max_in_flight_by_model` 之一。提供的总量或 model limit 可以是 `0`（删除该 limit），或 `1` 到 `credential-concurrency.max-limit` 的整数；model key 必须是有效的 canonical model key，且 canonicalization 后不能冲突。`null` 会清除明确提供的总量或 model map。`version` 是可选的 optimistic concurrency control：响应会包含当前 `version`，提交过期 version 会被拒绝，不会覆盖较新的 policy。
+
+`admitted_in_flight` 是权威 counter，不是重新计算出的 observation。`GET /credentials/concurrency` 从不 join snapshot，因此每个 item 都是 `observed: null` 和 `fully_enforced: "unknown"`。兼容的 `/auth-files` 字段保持为 `in_flight`、`max_in_flight`、`max_in_flight_by_model`、`remaining`、`total_saturated`、`saturated_model_count`、`admitted_in_flight`、`observed` 和 `limiter`；observation 缺失不会隐藏仍可用的权威 counter。
+
+Management capability `credential_concurrency_limits_v2` 声明 policy 和 admitted-counter 支持。policy 错误始终使用 `{ "error": "<code>", "message": "<message>" }` envelope。客户端必须根据下表中的精确 HTTP status 和 `error` code 分支；`message` 中的 decoder 和 database detail 不稳定。
+
+| 条件 | HTTP status | `error` code | wire 上的 `message` |
+| --- | --- | --- | --- |
+| PATCH body 不是有效 JSON 或无法 decode | `400` | `invalid body` | JSON decoder detail。 |
+| PATCH 未提供 `max_in_flight` 和 `max_in_flight_by_model` | `400` | `no fields to update` | `no fields to update` |
+| 提供的 limit 或 model 无效，或 canonical model key 冲突 | `400` | `invalid_concurrency_policy` | validation detail，例如 `invalid credential concurrency limit`、`invalid credential concurrency model` 或 `duplicate credential concurrency model: <model>`。 |
+| credential 不存在 | `404` | `not_found` | `credential concurrency policy credential not found` |
+| 提交的 `version` 已过期 | `409` | `concurrency_policy_version_conflict` | `credential concurrency policy version conflict` |
+| activation 被 legacy CPA、缺少 capability 的 Home，或 SQLite 上多个 active Home 阻止 | `500` | `concurrency_policy_write_failed` | 依次为 `legacy CPA membership is active`、`active Home lacks credential concurrency limiter capability` 或 `active concurrency limits require a single SQLite Home`。 |
+| 无法加载 policy list 或 PATCH 后的 policy | `500` | `concurrency_policy_load_failed` | Database error detail。 |
+| 无法加载权威 limiter state | `500` | `concurrency_state_load_failed` | Database error detail。 |
+| 发生其他 policy write failure | `500` | `concurrency_policy_write_failed` | Underlying write error detail。 |
+
+`credential_in_flight_snapshots` capability 独立于 `credential_concurrency_limits_v2`。后者声明 Management concurrency policy 和权威已准入计数支持。snapshot 可用性、freshness、barrier acknowledgement、staging、overflow 和 cleanup 从不参与 admission 或 release。observation 失败仅按 best effort 处理，绝不阻塞流量。
+
+Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-flight.snapshot-interval` 默认 `2s`；`stale-after` 默认 `10s`，且至少为三个 snapshot interval；`max-part-bytes`、`max-part-count`、`max-revision-bytes`、`max-aggregate-groups`、`max-details` 和 `max-string-bytes` 的默认值依次为 `262144`、`64`、`16777216`、`100000`、`10000` 和 `256`；`staging-retention` 默认 `1m`。cleanup 使用 Home 数据库时间。closed lifetime 仅以精确的 fingerprint 和 `membership_connected_at` 删除；stale staging 不会删除 active 或 canceling lifetime 的 watermark 或最高 revision parts。
+
+请求详情仅限本文档所列字段，禁止包含 header、body、credential、API key、token 和证书材料。
+
+历史 `in_flight_lease` 表不被此功能使用，自动 migration 也不会删除它们。只有确认没有旧部署依赖后，运维人员才能通过明确且单独规划的维护流程清理这些 legacy 表。
+
 ### GET `/capabilities`
 
 返回当前 Home Management API 暴露的前端能力开关和构建信息。该接口用于管理面板判断是否可以启用用量总览、请求明细、聚合排行、导出、实时诊断、健康归因和 request log index。
@@ -2540,6 +2616,8 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 | `capabilities.logs` | boolean | 是否支持应用日志接口。 |
 | `capabilities.request_error_logs` | boolean | 是否支持 request error log file list/download。 |
 | `capabilities.topology` | boolean | 是否支持 `GET /topology` Home + CPA 集群拓扑接口。 |
+| `capabilities.credential_in_flight_snapshots` | boolean | 是否支持独立的 CPA in-flight observation snapshot 接口。 |
+| `capabilities.credential_concurrency_limits_v2` | boolean | 是否支持 concurrency policy 和权威已准入计数接口。 |
 | `server_info.home_version` | string | Home 构建版本。 |
 | `server_info.home_commit` | string | Home 构建 commit。 |
 | `server_info.home_build_date` | string | Home 构建时间。 |

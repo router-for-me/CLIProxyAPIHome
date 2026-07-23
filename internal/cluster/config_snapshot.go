@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
 	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 )
 
 // LoadConfigAsRuntimeConfig loads a config as runtime config.
@@ -21,6 +25,16 @@ func (r *Repository) LoadConfigAsRuntimeConfig(ctx context.Context) (*appconfig.
 	if errRoot != nil {
 		return nil, nil, errRoot
 	}
+	lifecycleConfig, errLifecycle := r.LifecycleConfig(ctx)
+	if errLifecycle != nil {
+		return nil, nil, errLifecycle
+	}
+	observationBarrierRevision, errBarrier := r.concurrencyObservationBarrierRevision(ctx)
+	if errBarrier != nil {
+		return nil, nil, errBarrier
+	}
+	lifecycleConfig.ObservationBarrierRevision = observationBarrierRevision
+	root["credential-concurrency"] = lifecycleConfig
 	secretChanged, errSecret := normalizeConfigRootSecrets(root)
 	if errSecret != nil {
 		return nil, nil, errSecret
@@ -44,11 +58,69 @@ func (r *Repository) LoadConfigAsRuntimeConfig(ctx context.Context) (*appconfig.
 	return cfg, payload, nil
 }
 
+func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context, tx *gorm.DB, values map[string]any) error {
+	if tx == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	if errLock := r.lockAllProviderAuthsForReconciliationTx(ctx, tx); errLock != nil {
+		return errLock
+	}
+	explicitKeys := explicitProviderCredentialConfigKeys(values)
+	if len(explicitKeys) == 0 {
+		return nil
+	}
+	cfg, _, errConfig := RuntimeConfigFromRoot(values)
+	if errConfig != nil {
+		return errConfig
+	}
+	sctx := &synthesizer.SynthesisContext{
+		Config:      cfg,
+		Now:         time.Now().UTC(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	}
+	auths, errSynthesize := synthesizer.NewConfigSynthesizer().Synthesize(sctx)
+	if errSynthesize != nil {
+		return errSynthesize
+	}
+	exported := make(map[string]any, len(explicitKeys))
+	ApplyCredentialConfigToRoot(exported, auths)
+	for key := range explicitKeys {
+		if value, exists := exported[key]; exists {
+			values[key] = value
+		}
+		next := providerAuthsForConfigKey(auths, key)
+		if errReconcile := r.reconcileProviderAuthsWithLockedActivationGateTx(ctx, tx, key, next, ConcurrencyCredentialReferenceChecker{}); errReconcile != nil {
+			return errReconcile
+		}
+	}
+	return nil
+}
+
+func explicitProviderCredentialConfigKeys(values map[string]any) map[string]struct{} {
+	explicit := make(map[string]struct{})
+	for _, key := range providerCredentialConfigKeys {
+		if _, exists := values[key]; exists {
+			explicit[key] = struct{}{}
+		}
+	}
+	return explicit
+}
+
+func providerAuthsForConfigKey(auths []*coreauth.Auth, key string) []*coreauth.Auth {
+	next := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if isProviderAuthForConfigKey(auth, key) {
+			next = append(next, auth)
+		}
+	}
+	return next
+}
+
 // ConfigRootFromSnapshot derives config root from snapshot.
 func ConfigRootFromSnapshot(snapshot map[string]json.RawMessage) (map[string]any, error) {
 	root := make(map[string]any, len(snapshot))
 	for key, raw := range snapshot {
-		if isClusterCredentialConfigKey(key) {
+		if isClusterCredentialConfigKey(key) || strings.TrimSpace(key) == credentialConcurrencyPoliciesRootKey {
 			continue
 		}
 		var value any
@@ -73,12 +145,23 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 		return nil, nil, errMarshal
 	}
 	cfg := &appconfig.Config{}
+	cfg.CredentialConcurrency = appconfig.DefaultCredentialConcurrencyConfig()
+	cfg.CredentialInFlight = appconfig.DefaultCredentialInFlightConfig()
 	cfg.Pprof.Addr = appconfig.DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = appconfig.DefaultPanelGitHubRepository
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	if errUnmarshal := yaml.Unmarshal(data, cfg); errUnmarshal != nil {
 		return nil, nil, errUnmarshal
+	}
+	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
+		return nil, nil, errValidate
+	}
+	if errValidate := appconfig.ValidateCredentialConcurrencyConfig(cfg.CredentialConcurrency); errValidate != nil {
+		return nil, nil, errValidate
+	}
+	if errNormalizeIDs := cfg.NormalizeProviderCredentialIDs(); errNormalizeIDs != nil {
+		return nil, nil, errNormalizeIDs
 	}
 	cfg.NormalizePluginsConfig()
 	cfg.SanitizeGeminiKeys()
@@ -170,7 +253,7 @@ func normalizeConfigRootSecrets(root map[string]any) (bool, error) {
 // isClusterCredentialConfigKey reports whether cluster credential config key.
 func isClusterCredentialConfigKey(key string) bool {
 	switch strings.TrimSpace(key) {
-	case "auth-dir", "gemini-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
+	case "auth-dir", "credential-concurrency", "gemini-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
 		return true
 	default:
 		return false

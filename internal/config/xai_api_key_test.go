@@ -3,8 +3,56 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+func TestLoadConfigOptionalFallbacksOnlyApplyCredentialDefaults(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		write   bool
+	}{
+		{name: "missing"},
+		{name: "empty", content: []byte{}, write: true},
+		{name: "whitespace", content: []byte(" \t\r\n "), write: true},
+		{name: "invalid", content: []byte("credential-in-flight: ["), write: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if test.write {
+				if errWrite := os.WriteFile(configPath, test.content, 0o600); errWrite != nil {
+					t.Fatalf("WriteFile() error = %v", errWrite)
+				}
+			}
+
+			cfg, errLoad := LoadConfigOptional(configPath, true)
+			if errLoad != nil {
+				t.Fatalf("LoadConfigOptional() error = %v", errLoad)
+			}
+			if cfg.CredentialInFlight != DefaultCredentialInFlightConfig() {
+				t.Fatalf("CredentialInFlight = %#v, want %#v", cfg.CredentialInFlight, DefaultCredentialInFlightConfig())
+			}
+			if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
+				t.Fatalf("CredentialInFlight.Validate() error = %v", errValidate)
+			}
+			if cfg.CredentialConcurrency != DefaultCredentialConcurrencyConfig() {
+				t.Fatalf("CredentialConcurrency = %#v, want %#v", cfg.CredentialConcurrency, DefaultCredentialConcurrencyConfig())
+			}
+			if errValidate := ValidateCredentialConcurrencyConfig(cfg.CredentialConcurrency); errValidate != nil {
+				t.Fatalf("ValidateCredentialConcurrencyConfig() error = %v", errValidate)
+			}
+			want := &Config{
+				CredentialConcurrency: DefaultCredentialConcurrencyConfig(),
+				CredentialInFlight:    DefaultCredentialInFlightConfig(),
+			}
+			if !reflect.DeepEqual(cfg, want) {
+				t.Fatalf("fallback config = %#v, want %#v", cfg, want)
+			}
+		})
+	}
+}
 
 func TestLoadConfigOptionalParsesAndSanitizesXAIKeys(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")

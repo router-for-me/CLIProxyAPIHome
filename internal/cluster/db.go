@@ -123,7 +123,10 @@ func AutoMigrate(db *gorm.DB) error {
 }
 
 func autoMigrate(db *gorm.DB) error {
-	if errMigrate := db.AutoMigrate(&AuthRecord{}, &ConfigRecord{}, &KVRecord{}, &PluginStatusRecord{}, &PluginTaskRecord{}, &PluginStoreAuthRecord{}, &PluginStoreAuthKeyRecord{}, &UserRecord{}, &APIKeyRecord{}, &ChannelGroupRecord{}, &ChannelGroupDetailRecord{}, &ModelGroupRecord{}, &ModelGroupDetailRecord{}, &ClusterNodeRecord{}, &CPANodeRecord{}, &ClusterEventRecord{}, &UsageRecord{}, &QuotaSnapshotRecord{}, &QuotaWindowRecord{}, &BillingModelPriceRecord{}, &BillingModelPriceImportPreviewRecord{}, &BillingModelPriceImportOperationRecord{}, &BillingBalanceRecord{}, &BillingChargeRecord{}, &ProxyPoolRecord{}, &AppLogRecord{}, &OAuthSessionRecord{}, &CertificateRecord{}); errMigrate != nil {
+	if errMigrate := db.AutoMigrate(&AuthRecord{}, &ConfigRecord{}, &LifecycleConfigRecord{}, &ConcurrencyActivationGateRecord{}, &CredentialConcurrencyPolicyRecord{}, &CredentialConcurrencyModelPolicyRecord{}, &CredentialConcurrencyCounterRecord{}, &ConcurrencyObservationBarrierRecord{}, &HomeProcessIncarnationRecord{}, &CPANodeMembershipRecord{}, &CPANodeParticipationRecord{}, &CPANodeQuiescenceRecord{}, &CPAInFlightSnapshotRecord{}, &CPAInFlightSnapshotAttemptRecord{}, &CPAInFlightSnapshotPartRecord{}, &KVRecord{}, &PluginStatusRecord{}, &PluginTaskRecord{}, &PluginStoreAuthRecord{}, &PluginStoreAuthKeyRecord{}, &UserRecord{}, &APIKeyRecord{}, &ChannelGroupRecord{}, &ChannelGroupDetailRecord{}, &ModelGroupRecord{}, &ModelGroupDetailRecord{}, &ClusterNodeRecord{}, &CPANodeRecord{}, &ClusterEventRecord{}, &UsageRecord{}, &QuotaSnapshotRecord{}, &QuotaWindowRecord{}, &BillingModelPriceRecord{}, &BillingModelPriceImportPreviewRecord{}, &BillingModelPriceImportOperationRecord{}, &BillingBalanceRecord{}, &BillingChargeRecord{}, &ProxyPoolRecord{}, &AppLogRecord{}, &OAuthSessionRecord{}, &CertificateRecord{}); errMigrate != nil {
+		return errMigrate
+	}
+	if errMigrate := migrateCPANodePrimaryKey(db); errMigrate != nil {
 		return errMigrate
 	}
 	if errMigrate := migrateBillingIndexes(db); errMigrate != nil {
@@ -157,6 +160,146 @@ func autoMigrate(db *gorm.DB) error {
 		return errMigrate
 	}
 	return migrateLegacyAPIKeys(db)
+}
+
+func migrateCPANodePrimaryKey(db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	switch db.Dialector.Name() {
+	case "sqlite":
+		return migrateSQLiteCPANodePrimaryKey(db)
+	case "postgres":
+		return migratePostgresCPANodePrimaryKey(db)
+	default:
+		return fmt.Errorf("unsupported database dialect %q for cpa_node primary key migration", db.Dialector.Name())
+	}
+}
+
+func migrateSQLiteCPANodePrimaryKey(db *gorm.DB) error {
+	primaryKeyColumns, errColumns := sqliteTablePrimaryKeyColumns(db, "cpa_node")
+	if errColumns != nil {
+		return errColumns
+	}
+	if equalStringSlices(primaryKeyColumns, cpaNodePrimaryKeyColumns()) {
+		return nil
+	}
+	if !equalStringSlices(primaryKeyColumns, legacyCPANodePrimaryKeyColumns()) {
+		return fmt.Errorf("unsupported cpa_node primary key %q", primaryKeyColumns)
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		if errCreate := tx.Exec(`CREATE TABLE "cpa_node_migration" (
+			"home_ip" TEXT NOT NULL,
+			"home_port" INTEGER NOT NULL,
+			"home_started_at" DATETIME NOT NULL,
+			"node_key" TEXT NOT NULL,
+			"node_id" TEXT,
+			"client_ip" TEXT,
+			"client_count" INTEGER,
+			"certificate_fingerprint" TEXT,
+			"open_connections" INTEGER,
+			"active_handlers" INTEGER,
+			"latest_cancel_revision" INTEGER,
+			"connected_at" DATETIME,
+			"last_seen_at" DATETIME,
+			"created_at" DATETIME,
+			"updated_at" DATETIME,
+			PRIMARY KEY ("home_ip", "home_port", "home_started_at", "node_key")
+		)`).Error; errCreate != nil {
+			return errCreate
+		}
+		if errCopy := tx.Exec(`INSERT INTO "cpa_node_migration" (
+			"home_ip", "home_port", "home_started_at", "node_key", "node_id", "client_ip", "client_count",
+			"certificate_fingerprint", "open_connections", "active_handlers", "latest_cancel_revision",
+			"connected_at", "last_seen_at", "created_at", "updated_at"
+		)
+		SELECT
+			"home_ip", "home_port", COALESCE("home_started_at", "connected_at", "last_seen_at", "created_at", CURRENT_TIMESTAMP),
+			"node_key", "node_id", "client_ip", "client_count", "certificate_fingerprint", "open_connections",
+			"active_handlers", "latest_cancel_revision", "connected_at", "last_seen_at", "created_at", "updated_at"
+		FROM "cpa_node"`).Error; errCopy != nil {
+			return errCopy
+		}
+		if errDrop := tx.Migrator().DropTable("cpa_node"); errDrop != nil {
+			return errDrop
+		}
+		if errRename := tx.Migrator().RenameTable("cpa_node_migration", "cpa_node"); errRename != nil {
+			return errRename
+		}
+		return tx.AutoMigrate(&CPANodeRecord{})
+	})
+}
+
+func migratePostgresCPANodePrimaryKey(db *gorm.DB) error {
+	if errUpdate := db.Exec(`UPDATE "cpa_node"
+		SET "home_started_at" = COALESCE("home_started_at", "connected_at", "last_seen_at", "created_at", CURRENT_TIMESTAMP)
+		WHERE "home_started_at" IS NULL`).Error; errUpdate != nil {
+		return errUpdate
+	}
+	return db.Exec(`DO $$
+DECLARE
+	legacy_constraint_name TEXT;
+BEGIN
+	SELECT constraint_record.conname INTO legacy_constraint_name
+	FROM pg_constraint AS constraint_record
+	WHERE constraint_record.conrelid = 'cpa_node'::regclass
+		AND constraint_record.contype = 'p'
+		AND (
+			SELECT array_agg(attribute_record.attname::TEXT ORDER BY key_column.ordinality)
+			FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+			JOIN pg_attribute AS attribute_record
+				ON attribute_record.attrelid = constraint_record.conrelid
+				AND attribute_record.attnum = key_column.attnum
+		) = ARRAY['home_ip', 'home_port', 'node_key'];
+
+	IF legacy_constraint_name IS NOT NULL THEN
+		EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', 'cpa_node', legacy_constraint_name);
+		ALTER TABLE "cpa_node" ADD PRIMARY KEY ("home_ip", "home_port", "home_started_at", "node_key");
+	END IF;
+END $$`).Error
+}
+
+type sqliteTableInfo struct {
+	Name string
+	PK   int
+}
+
+func sqliteTablePrimaryKeyColumns(db *gorm.DB, table string) ([]string, error) {
+	var columns []sqliteTableInfo
+	if errQuery := db.Raw(`PRAGMA table_info("` + table + `")`).Scan(&columns).Error; errQuery != nil {
+		return nil, errQuery
+	}
+	primaryKeyColumns := make([]string, 0, len(columns))
+	for position := 1; position <= len(columns); position++ {
+		for _, column := range columns {
+			if column.PK == position {
+				primaryKeyColumns = append(primaryKeyColumns, column.Name)
+				break
+			}
+		}
+	}
+	return primaryKeyColumns, nil
+}
+
+func cpaNodePrimaryKeyColumns() []string {
+	return []string{"home_ip", "home_port", "home_started_at", "node_key"}
+}
+
+func legacyCPANodePrimaryKeyColumns() []string {
+	return []string{"home_ip", "home_port", "node_key"}
+}
+
+func equalStringSlices(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func migrateUsageObservabilityIndexes(db *gorm.DB) error {

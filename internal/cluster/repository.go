@@ -14,6 +14,7 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -500,18 +501,30 @@ func (r *Repository) ListClusterNodes(ctx context.Context, cutoff time.Time) ([]
 
 // ReplaceCPANodeSnapshot replaces the active CPA connection snapshot owned by one Home node.
 func (r *Repository) ReplaceCPANodeSnapshot(ctx context.Context, homeIP string, homePort int, nodes []node.Node, seenAt time.Time) error {
+	return r.replaceCPANodeSnapshot(ctx, HomeIncarnationID{IP: homeIP, Port: homePort}, nodes, seenAt, false)
+}
+
+// ReplaceCPANodeSnapshotForIncarnation writes a snapshot only for the active exact Home process incarnation.
+func (r *Repository) ReplaceCPANodeSnapshotForIncarnation(ctx context.Context, home HomeIncarnationID, nodes []node.Node, seenAt time.Time) error {
+	return r.replaceCPANodeSnapshot(ctx, home, nodes, seenAt, true)
+}
+
+func (r *Repository) replaceCPANodeSnapshot(ctx context.Context, home HomeIncarnationID, nodes []node.Node, seenAt time.Time, requireActiveIncarnation bool) error {
 	db, errDB := r.database()
 	if errDB != nil {
 		return errDB
 	}
 	r.cpaSnapshotMu.Lock()
 	defer r.cpaSnapshotMu.Unlock()
-	homeIP = strings.TrimSpace(homeIP)
-	if homeIP == "" {
+	home.IP = strings.TrimSpace(home.IP)
+	if home.IP == "" {
 		return fmt.Errorf("home ip is required")
 	}
-	if homePort <= 0 {
+	if home.Port <= 0 {
 		return fmt.Errorf("home port must be greater than 0")
+	}
+	if requireActiveIncarnation && home.StartedAt.IsZero() {
+		return fmt.Errorf("Home incarnation is required")
 	}
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
@@ -531,29 +544,39 @@ func (r *Repository) ReplaceCPANodeSnapshot(ctx context.Context, homeIP string, 
 		}
 		seenKeys[key] = struct{}{}
 		clientCount := item.ClientCount
-		if clientCount <= 0 {
-			continue
-		}
 		connectedAt := item.Connected
 		if connectedAt.IsZero() {
 			connectedAt = seenAt
 		} else {
 			connectedAt = connectedAt.UTC()
 		}
+		if clientCount <= 0 && item.OpenConnections <= 0 && item.ActiveHandlers <= 0 && item.LatestCancelRevision <= 0 {
+			continue
+		}
 		records = append(records, CPANodeRecord{
-			HomeIP:      homeIP,
-			HomePort:    homePort,
-			NodeKey:     key,
-			NodeID:      strings.TrimSpace(item.NodeID),
-			ClientIP:    strings.TrimSpace(item.IP),
-			ClientCount: clientCount,
-			ConnectedAt: connectedAt,
-			LastSeenAt:  seenAt,
+			HomeIP:                 home.IP,
+			HomePort:               home.Port,
+			HomeStartedAt:          home.StartedAt,
+			NodeKey:                key,
+			NodeID:                 strings.TrimSpace(item.NodeID),
+			ClientIP:               strings.TrimSpace(item.IP),
+			ClientCount:            clientCount,
+			CertificateFingerprint: strings.TrimSpace(item.CertificateFingerprint),
+			OpenConnections:        item.OpenConnections,
+			ActiveHandlers:         item.ActiveHandlers,
+			LatestCancelRevision:   item.LatestCancelRevision,
+			ConnectedAt:            connectedAt,
+			LastSeenAt:             seenAt,
 		})
 	}
 
 	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
-		if errDelete := tx.Where("home_ip = ? AND home_port = ?", homeIP, homePort).Delete(&CPANodeRecord{}).Error; errDelete != nil {
+		if requireActiveIncarnation {
+			if errHome := verifyActiveHomeIncarnation(tx, home); errHome != nil {
+				return errHome
+			}
+		}
+		if errDelete := tx.Where("home_ip = ? AND home_port = ? AND home_started_at = ?", home.IP, home.Port, home.StartedAt).Delete(&CPANodeRecord{}).Error; errDelete != nil {
 			return errDelete
 		}
 		if len(records) == 0 {
@@ -604,6 +627,10 @@ func (r *Repository) ListCPANodeSnapshots(ctx context.Context, cutoff time.Time)
 }
 
 func cpaNodeKey(item node.Node) string {
+	fingerprint := strings.TrimSpace(item.CertificateFingerprint)
+	if fingerprint != "" {
+		return "fingerprint:" + fingerprint
+	}
 	nodeID := strings.TrimSpace(item.NodeID)
 	if nodeID != "" {
 		return "node:" + nodeID
@@ -974,18 +1001,51 @@ func semanticJSONEqual(left []byte, right []byte) (bool, error) {
 
 // ReplaceConfigSnapshot handles a replace config snapshot.
 func (r *Repository) ReplaceConfigSnapshot(ctx context.Context, values map[string]any) error {
-	// Normalize source data before building the derived payload.
+	nodeHeartbeatTimeout, errTimeout := r.lifecycleConfigNodeHeartbeatTimeout(ctx)
+	if errTimeout != nil {
+		return errTimeout
+	}
+	return r.ReplaceConfigSnapshotWithLifecycleConfig(ctx, nodeHeartbeatTimeout, values)
+}
+
+// ReplaceConfigSnapshotWithLifecycleConfig replaces a snapshot after applying its lifecycle configuration.
+func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfig(ctx context.Context, nodeHeartbeatTimeout time.Duration, values map[string]any) error {
 	db, errDB := r.database()
 	if errDB != nil {
 		return errDB
 	}
-	apiKeys, clean, errPrepare := prepareConfigSnapshotReplace(values)
-	if errPrepare != nil {
-		return errPrepare
-	}
-
 	ctx = contextOrBackground(ctx)
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	lifecycleValue, lifecycleProvided := values["credential-concurrency"]
+	var nextLifecycle appconfig.CredentialConcurrencyConfig
+	if lifecycleProvided {
+		var errConfig error
+		nextLifecycle, errConfig = credentialConcurrencyConfigFromValue(lifecycleValue)
+		if errConfig != nil {
+			return errConfig
+		}
+	}
+	return withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		gate, errGate := lockConcurrencyActivationGate(tx)
+		if errGate != nil {
+			return errGate
+		}
+		if lifecycleProvided {
+			if _, _, errUpdate := updateLifecycleConfigTx(ctx, tx, nodeHeartbeatTimeout, nextLifecycle); errUpdate != nil {
+				return errUpdate
+			}
+		} else if _, errEnsure := ensureLifecycleConfigTx(tx, nodeHeartbeatTimeout); errEnsure != nil {
+			return errEnsure
+		}
+		if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values); errReconcile != nil {
+			return mapCredentialConcurrencyOrphan(errReconcile)
+		}
+		if errImportPolicies := r.importCredentialConcurrencyPoliciesWithLockedActivationGateTx(ctx, tx, gate, values); errImportPolicies != nil {
+			return errImportPolicies
+		}
+		apiKeys, clean, errPrepare := prepareConfigSnapshotReplace(values)
+		if errPrepare != nil {
+			return errPrepare
+		}
 		return replaceConfigSnapshotTx(ctx, tx, apiKeys, clean)
 	})
 }
@@ -998,7 +1058,7 @@ func prepareConfigSnapshotReplace(values map[string]any) ([]string, map[string]j
 		if key == "" {
 			continue
 		}
-		if key == configAPIKeysRootKey {
+		if key == configAPIKeysRootKey || key == "credential-concurrency" || key == credentialConcurrencyPoliciesRootKey {
 			continue
 		}
 		rawJSON, errMarshal := json.Marshal(value)

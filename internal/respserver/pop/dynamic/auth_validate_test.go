@@ -170,7 +170,8 @@ func newAuthValidateRuntime(t *testing.T, ctx context.Context, validKey string, 
 
 	repo := cluster.NewRepository(db)
 	username := "auth-validate-user"
-	user, errCreateUser := repo.CreateUser(ctx, cluster.UserUpdate{Username: &username})
+	creditsUnlimited := true
+	user, errCreateUser := repo.CreateUser(ctx, cluster.UserUpdate{Username: &username, CreditsUnlimited: &creditsUnlimited})
 	if errCreateUser != nil {
 		t.Fatalf("CreateUser() error = %v", errCreateUser)
 	}

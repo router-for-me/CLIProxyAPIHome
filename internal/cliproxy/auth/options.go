@@ -15,6 +15,16 @@ const AllowedAuthIDsMetadataKey = "allowed_auth_ids"
 // AllowedModelIDsMetadataKey stores the model allowlist in Options.Metadata.
 const AllowedModelIDsMetadataKey = "allowed_model_ids"
 
+// ExcludedConcurrencyCandidatesMetadataKey stores candidates rejected by atomic
+// concurrency admission during this dispatch attempt.
+const ExcludedConcurrencyCandidatesMetadataKey = "excluded_concurrency_candidates"
+
+// ExcludedConcurrencyCandidate identifies a credential-wide or model-scoped exclusion.
+type ExcludedConcurrencyCandidate struct {
+	CredentialID string
+	Model        string
+}
+
 // Options carries optional request hints used during dispatch selection.
 //
 // This is a deliberately small subset of CPA's execution options: CLIProxyAPIHome only needs

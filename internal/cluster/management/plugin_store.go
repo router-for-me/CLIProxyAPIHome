@@ -131,7 +131,7 @@ func (h *Handler) UninstallPluginFromStore(c *gin.Context) {
 		respondError(c, http.StatusUnprocessableEntity, "invalid_config", errValidate)
 		return
 	}
-	task, errTask := h.repo.ReplaceConfigSnapshotAndCreatePluginTask(ctx, root, deleteTask)
+	task, errTask := h.repo.ReplaceConfigSnapshotWithLifecycleConfigAndCreatePluginTask(ctx, h.heartbeatTimeout, root, deleteTask)
 	if errTask != nil {
 		respondError(c, http.StatusInternalServerError, "plugin_task_create_failed", errTask)
 		return
@@ -277,7 +277,7 @@ func (h *Handler) InstallPluginFromStore(c *gin.Context) {
 		respondError(c, http.StatusUnprocessableEntity, "invalid_config", errValidate)
 		return
 	}
-	if errReplace := h.repo.ReplaceConfigSnapshot(ctx, root); errReplace != nil {
+	if errReplace := h.replaceConfigSnapshot(ctx, root); errReplace != nil {
 		respondError(c, http.StatusInternalServerError, "write_failed", errReplace)
 		return
 	}

@@ -8,10 +8,14 @@ import (
 )
 
 type Node struct {
-	NodeID      string    `json:"node_id,omitempty"`
-	IP          string    `json:"ip"`
-	Connected   time.Time `json:"connected_time"`
-	ClientCount int       `json:"client_count"`
+	NodeID                 string    `json:"node_id,omitempty"`
+	IP                     string    `json:"ip"`
+	Connected              time.Time `json:"connected_time"`
+	ClientCount            int       `json:"client_count"`
+	CertificateFingerprint string    `json:"certificate_fingerprint,omitempty"`
+	OpenConnections        int       `json:"open_connections"`
+	ActiveHandlers         int       `json:"active_handlers"`
+	LatestCancelRevision   int64     `json:"latest_cancel_revision"`
 }
 
 type Registry struct {
@@ -20,10 +24,14 @@ type Registry struct {
 }
 
 type nodeEntry struct {
-	nodeID      string
-	ip          string
-	connectedAt time.Time
-	count       int
+	nodeID                 string
+	ip                     string
+	connectedAt            time.Time
+	count                  int
+	certificateFingerprint string
+	openConnections        int
+	activeHandlers         int
+	latestCancelRevision   int64
 }
 
 // NewRegistry creates a new registry.
@@ -79,6 +87,65 @@ func (r *Registry) AddWithNodeID(ip string, nodeID string, connectedAt time.Time
 }
 
 // Remove removes the value.
+// UpdateFingerprintState applies local connection and handler deltas for a certificate fingerprint.
+func (r *Registry) UpdateFingerprintState(fingerprint string, nodeID string, ip string, openConnections int, activeHandlers int, revision int64) {
+	r.updateFingerprintState(fingerprint, nodeID, ip, 0, openConnections, activeHandlers, revision)
+}
+
+// UpdateFingerprintSubscription applies a subscription delta for a certificate fingerprint.
+func (r *Registry) UpdateFingerprintSubscription(fingerprint string, nodeID string, ip string, subscriptions int) {
+	r.updateFingerprintState(fingerprint, nodeID, ip, subscriptions, 0, 0, 0)
+}
+
+func (r *Registry) updateFingerprintState(fingerprint string, nodeID string, ip string, subscriptions int, openConnections int, activeHandlers int, revision int64) {
+	if r == nil {
+		return
+	}
+	fingerprint = strings.TrimSpace(fingerprint)
+	nodeID = strings.TrimSpace(nodeID)
+	ip = strings.TrimSpace(ip)
+	if fingerprint == "" {
+		return
+	}
+	key := "fingerprint:" + fingerprint
+	r.mu.Lock()
+	if r.nodes == nil {
+		r.nodes = make(map[string]nodeEntry)
+	}
+	entry := r.nodes[key]
+	if nodeID != "" {
+		entry.nodeID = nodeID
+	}
+	if ip != "" {
+		entry.ip = ip
+	}
+	if entry.connectedAt.IsZero() {
+		entry.connectedAt = time.Now()
+	}
+	entry.certificateFingerprint = fingerprint
+	entry.count += subscriptions
+	if entry.count < 0 {
+		entry.count = 0
+	}
+	entry.openConnections += openConnections
+	if entry.openConnections < 0 {
+		entry.openConnections = 0
+	}
+	entry.activeHandlers += activeHandlers
+	if entry.activeHandlers < 0 {
+		entry.activeHandlers = 0
+	}
+	if revision > entry.latestCancelRevision {
+		entry.latestCancelRevision = revision
+	}
+	if entry.count == 0 && entry.openConnections == 0 && entry.activeHandlers == 0 && entry.latestCancelRevision == 0 {
+		delete(r.nodes, key)
+	} else {
+		r.nodes[key] = entry
+	}
+	r.mu.Unlock()
+}
+
 func (r *Registry) Remove(ip string) {
 	r.RemoveWithNodeID(ip, "")
 }
@@ -121,10 +188,14 @@ func (r *Registry) List() []Node {
 	snapshot := make([]Node, 0, len(r.nodes))
 	for _, entry := range r.nodes {
 		snapshot = append(snapshot, Node{
-			NodeID:      entry.nodeID,
-			IP:          strings.TrimSpace(entry.ip),
-			Connected:   entry.connectedAt,
-			ClientCount: entry.count,
+			NodeID:                 entry.nodeID,
+			IP:                     strings.TrimSpace(entry.ip),
+			Connected:              entry.connectedAt,
+			ClientCount:            entry.count,
+			CertificateFingerprint: entry.certificateFingerprint,
+			OpenConnections:        entry.openConnections,
+			ActiveHandlers:         entry.activeHandlers,
+			LatestCancelRevision:   entry.latestCancelRevision,
 		})
 	}
 	r.mu.RUnlock()

@@ -9,6 +9,45 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestRuntimeConfigFromRootAppliesConcurrencyDefaults(t *testing.T) {
+	cfg, _, errConfig := RuntimeConfigFromRoot(map[string]any{})
+	if errConfig != nil {
+		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
+	}
+	if cfg.CredentialConcurrency.ReleaseFlushInterval != "250ms" {
+		t.Fatalf("ReleaseFlushInterval = %q", cfg.CredentialConcurrency.ReleaseFlushInterval)
+	}
+	if cfg.CredentialConcurrency.ReleaseMaxBackoff != "2s" {
+		t.Fatalf("ReleaseMaxBackoff = %q", cfg.CredentialConcurrency.ReleaseMaxBackoff)
+	}
+	if cfg.CredentialConcurrency.MaxLimit != 1_000_000 {
+		t.Fatalf("MaxLimit = %d", cfg.CredentialConcurrency.MaxLimit)
+	}
+}
+
+func TestRuntimeConfigFromRootPreservesConcurrencyLimiterConfig(t *testing.T) {
+	root := map[string]any{
+		"credential-concurrency": map[string]any{
+			"release-flush-interval": "500ms",
+			"release-max-backoff":    "3s",
+			"busy-retry-min":         "300ms",
+			"busy-retry-max":         "2s",
+			"max-limit":              99,
+		},
+	}
+
+	cfg, payload, errConfig := RuntimeConfigFromRoot(root)
+	if errConfig != nil {
+		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
+	}
+	if cfg.CredentialConcurrency.ReleaseFlushInterval != "500ms" || cfg.CredentialConcurrency.ReleaseMaxBackoff != "3s" || cfg.CredentialConcurrency.BusyRetryMin != "300ms" || cfg.CredentialConcurrency.BusyRetryMax != "2s" || cfg.CredentialConcurrency.MaxLimit != 99 {
+		t.Fatalf("CredentialConcurrency = %#v", cfg.CredentialConcurrency)
+	}
+	if !strings.Contains(string(payload), "max-limit: 99") {
+		t.Fatalf("runtime payload omitted max-limit:\n%s", payload)
+	}
+}
+
 func TestRuntimeConfigFromRootAppliesHomeModeScalarsAndPreservesRemoteManagement(t *testing.T) {
 	root := map[string]any{
 		"api-keys":                 []any{"local-key"},

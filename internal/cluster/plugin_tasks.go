@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	"gorm.io/gorm"
 )
@@ -34,6 +36,15 @@ func (r *Repository) CreatePluginTask(ctx context.Context, task node.PluginTask)
 
 // ReplaceConfigSnapshotAndCreatePluginTask replaces config and creates a plugin task atomically.
 func (r *Repository) ReplaceConfigSnapshotAndCreatePluginTask(ctx context.Context, values map[string]any, task node.PluginTask) (node.PluginTask, error) {
+	nodeHeartbeatTimeout, errTimeout := r.lifecycleConfigNodeHeartbeatTimeout(ctx)
+	if errTimeout != nil {
+		return node.PluginTask{}, errTimeout
+	}
+	return r.ReplaceConfigSnapshotWithLifecycleConfigAndCreatePluginTask(ctx, nodeHeartbeatTimeout, values, task)
+}
+
+// ReplaceConfigSnapshotWithLifecycleConfigAndCreatePluginTask applies lifecycle config before replacing a snapshot and creating a task.
+func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfigAndCreatePluginTask(ctx context.Context, nodeHeartbeatTimeout time.Duration, values map[string]any, task node.PluginTask) (node.PluginTask, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return node.PluginTask{}, errDB
@@ -42,14 +53,39 @@ func (r *Repository) ReplaceConfigSnapshotAndCreatePluginTask(ctx context.Contex
 	if errTask != nil {
 		return node.PluginTask{}, errTask
 	}
-	apiKeys, clean, errSnapshot := prepareConfigSnapshotReplace(values)
-	if errSnapshot != nil {
-		return node.PluginTask{}, errSnapshot
-	}
-
 	ctx = contextOrBackground(ctx)
+	lifecycleValue, lifecycleProvided := values["credential-concurrency"]
+	var nextLifecycle config.CredentialConcurrencyConfig
+	if lifecycleProvided {
+		var errConfig error
+		nextLifecycle, errConfig = credentialConcurrencyConfigFromValue(lifecycleValue)
+		if errConfig != nil {
+			return node.PluginTask{}, errConfig
+		}
+	}
 	var out node.PluginTask
-	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		gate, errGate := lockConcurrencyActivationGate(tx)
+		if errGate != nil {
+			return errGate
+		}
+		if lifecycleProvided {
+			if _, _, errUpdate := updateLifecycleConfigTx(ctx, tx, nodeHeartbeatTimeout, nextLifecycle); errUpdate != nil {
+				return errUpdate
+			}
+		} else if _, errEnsure := ensureLifecycleConfigTx(tx, nodeHeartbeatTimeout); errEnsure != nil {
+			return errEnsure
+		}
+		if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values); errReconcile != nil {
+			return mapCredentialConcurrencyOrphan(errReconcile)
+		}
+		if errImportPolicies := r.importCredentialConcurrencyPoliciesWithLockedActivationGateTx(ctx, tx, gate, values); errImportPolicies != nil {
+			return errImportPolicies
+		}
+		apiKeys, clean, errSnapshot := prepareConfigSnapshotReplace(values)
+		if errSnapshot != nil {
+			return errSnapshot
+		}
 		if errReplace := replaceConfigSnapshotTx(ctx, tx, apiKeys, clean); errReplace != nil {
 			return errReplace
 		}

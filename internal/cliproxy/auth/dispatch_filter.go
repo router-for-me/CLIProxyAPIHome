@@ -1,6 +1,10 @@
 package auth
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPIHome/internal/concurrency"
+)
 
 func allowedAuthIDsFromOptions(opts Options) map[string]struct{} {
 	if opts.Metadata == nil {
@@ -92,6 +96,43 @@ func allowedModelIDsFromOptions(opts Options) map[string]struct{} {
 		}
 	}
 	return allowed
+}
+
+func excludedConcurrencyCandidatesFromOptions(opts Options) []ExcludedConcurrencyCandidate {
+	if opts.Metadata == nil {
+		return nil
+	}
+	raw, ok := opts.Metadata[ExcludedConcurrencyCandidatesMetadataKey]
+	if !ok {
+		return nil
+	}
+	candidates, ok := raw.([]ExcludedConcurrencyCandidate)
+	if !ok {
+		return nil
+	}
+	return candidates
+}
+
+func concurrencyCandidateExcluded(opts Options, credentialID string, model string) bool {
+	credentialID = strings.TrimSpace(credentialID)
+	model, validModel := concurrency.ValidCanonicalConcurrencyModelKey(model)
+	if !validModel {
+		return false
+	}
+	for _, candidate := range excludedConcurrencyCandidatesFromOptions(opts) {
+		if strings.TrimSpace(candidate.CredentialID) != credentialID {
+			continue
+		}
+		rawModel := strings.TrimSpace(candidate.Model)
+		if rawModel == "" {
+			return true
+		}
+		excludedModel, validExcludedModel := concurrency.ValidCanonicalConcurrencyModelKey(rawModel)
+		if validExcludedModel && excludedModel == model {
+			return true
+		}
+	}
+	return false
 }
 
 func authAllowedByID(authID string, allowed map[string]struct{}) bool {

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -36,6 +37,30 @@ type SynthesisContext struct {
 	UUIDForAuth func(auth *coreauth.Auth) string
 	// PluginAuthParser parses provider-specific plugin auth files.
 	PluginAuthParser PluginAuthParser
+}
+
+// applyClusterUUID applies a cluster uuid.
+func applyProviderCredentialID(ctx *SynthesisContext, auth *coreauth.Auth, explicitID string) {
+	if auth == nil {
+		return
+	}
+	credentialID := strings.TrimSpace(explicitID)
+	if credentialID == "" && ctx != nil && ctx.UUIDForAuth != nil {
+		credentialID = strings.TrimSpace(ctx.UUIDForAuth(auth))
+	}
+	generated := credentialID == ""
+	if generated {
+		credentialID = uuid.NewString()
+	}
+	auth.ID = credentialID
+	auth.Index = credentialID
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes["cluster_uuid"] = credentialID
+	if generated {
+		auth.Attributes["provider_credential_id_generated"] = "true"
+	}
 }
 
 // applyClusterUUID applies a cluster uuid.
