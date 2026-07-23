@@ -30,36 +30,47 @@ type UsageRecord struct {
 	CacheReadTokens int64     `gorm:"column:cache_read_tokens;not null;default:0"`
 	// CacheReadTokensPresent distinguishes a canonical zero from a legacy CPA
 	// payload that did not know the cache_read_tokens field.
-	CacheReadTokensPresent bool      `gorm:"column:cache_read_tokens_present;not null;default:false"`
-	CacheCreationTokens    int64     `gorm:"column:cache_creation_tokens;not null;default:0"`
-	TotalTokens            int64     `gorm:"column:total_tokens;not null;default:0"`
-	Failed                 bool      `gorm:"column:failed;not null;default:false;index:idx_usage_failed;index:idx_usage_failed_time,priority:1;index:idx_usage_failed_status_time,priority:1"`
-	FailStatusCode         int       `gorm:"column:fail_status_code;not null;default:0;index:idx_usage_failed_status_time,priority:2"`
-	FailBody               string    `gorm:"column:fail_body;type:text"`
-	Provider               string    `gorm:"column:provider;index:idx_usage_provider_model,priority:1;index:idx_usage_provider_model_time,priority:1;index:idx_usage_provider_time,priority:1"`
-	ExecutorType           string    `gorm:"column:executor_type"`
-	Model                  string    `gorm:"column:model;index:idx_usage_provider_model,priority:2;index:idx_usage_provider_model_time,priority:2"`
-	Alias                  string    `gorm:"column:alias"`
-	Effort                 string    `gorm:"column:effort"`
-	ServiceTier            string    `gorm:"column:service_tier"`
-	ResponseServiceTier    string    `gorm:"column:response_service_tier"`
-	Endpoint               string    `gorm:"column:endpoint;index:idx_usage_endpoint;index:idx_usage_endpoint_time,priority:1"`
-	AuthType               string    `gorm:"column:auth_type;index:idx_usage_auth_type_time,priority:1"`
-	APIKey                 string    `gorm:"column:api_key;index:idx_usage_api_key"`
-	RequestID              string    `gorm:"column:request_id;index:idx_usage_request_id"`
-	UpstreamRequestID      string    `gorm:"column:upstream_request_id;index:idx_usage_upstream_request_id"`
-	EventType              string    `gorm:"column:event_type;index:idx_usage_event_type;index:idx_usage_event_time,priority:1"`
-	UpstreamStatusCode     int       `gorm:"column:upstream_status_code;not null;default:0;index:idx_usage_upstream_status_code"`
-	HomeIP                 string    `gorm:"column:home_ip;index:idx_usage_home_ip;index:idx_usage_home_time,priority:1;index:idx_usage_home_port_time,priority:1"`
-	HomePort               int       `gorm:"column:home_port;not null;default:0;index:idx_usage_home_port_time,priority:2"`
-	CPANodeID              string    `gorm:"column:cpa_node_id;index:idx_usage_cpa_node_id;index:idx_usage_cpa_node_time,priority:1"`
-	CPAIP                  string    `gorm:"column:cpa_ip;index:idx_usage_cpa_ip"`
-	CPAPort                int       `gorm:"column:cpa_port;not null;default:0"`
-	CPALabel               string    `gorm:"column:cpa_label;index:idx_usage_cpa_label"`
-	TokensJSON             JSONB     `gorm:"column:tokens"`
-	FailJSON               JSONB     `gorm:"column:fail"`
-	PayloadJSON            JSONB     `gorm:"column:payload;not null"`
-	CreatedAt              time.Time `gorm:"column:created_at;not null"`
+	CacheReadTokensPresent     bool      `gorm:"column:cache_read_tokens_present;not null;default:false"`
+	CacheCreationTokens        int64     `gorm:"column:cache_creation_tokens;not null;default:0"`
+	TotalTokens                int64     `gorm:"column:total_tokens;not null;default:0"`
+	TokenAccountingVersion     int       `gorm:"column:token_accounting_version;not null;default:0;index:idx_usage_token_accounting_version"`
+	TokenAccountingQuality     string    `gorm:"column:token_accounting_quality;not null;default:'unclassified'"`
+	AccountingTotalTokens      int64     `gorm:"column:accounting_total_tokens;not null;default:0"`
+	AccountingInputTokens      int64     `gorm:"column:accounting_input_tokens;not null;default:0"`
+	UncachedInputTokens        int64     `gorm:"column:uncached_input_tokens;not null;default:0"`
+	AccountingCacheReadTokens  int64     `gorm:"column:accounting_cache_read_tokens;not null;default:0"`
+	AccountingCacheWriteTokens int64     `gorm:"column:accounting_cache_write_tokens;not null;default:0"`
+	AccountingOutputTokens     int64     `gorm:"column:accounting_output_tokens;not null;default:0"`
+	NonReasoningOutputTokens   int64     `gorm:"column:non_reasoning_output_tokens;not null;default:0"`
+	AccountingReasoningTokens  int64     `gorm:"column:accounting_reasoning_tokens;not null;default:0"`
+	UnclassifiedTokens         int64     `gorm:"column:unclassified_tokens;not null;default:0"`
+	Failed                     bool      `gorm:"column:failed;not null;default:false;index:idx_usage_failed;index:idx_usage_failed_time,priority:1;index:idx_usage_failed_status_time,priority:1"`
+	FailStatusCode             int       `gorm:"column:fail_status_code;not null;default:0;index:idx_usage_failed_status_time,priority:2"`
+	FailBody                   string    `gorm:"column:fail_body;type:text"`
+	Provider                   string    `gorm:"column:provider;index:idx_usage_provider_model,priority:1;index:idx_usage_provider_model_time,priority:1;index:idx_usage_provider_time,priority:1"`
+	ExecutorType               string    `gorm:"column:executor_type"`
+	Model                      string    `gorm:"column:model;index:idx_usage_provider_model,priority:2;index:idx_usage_provider_model_time,priority:2"`
+	Alias                      string    `gorm:"column:alias"`
+	Effort                     string    `gorm:"column:effort"`
+	ServiceTier                string    `gorm:"column:service_tier"`
+	ResponseServiceTier        string    `gorm:"column:response_service_tier"`
+	Endpoint                   string    `gorm:"column:endpoint;index:idx_usage_endpoint;index:idx_usage_endpoint_time,priority:1"`
+	AuthType                   string    `gorm:"column:auth_type;index:idx_usage_auth_type_time,priority:1"`
+	APIKey                     string    `gorm:"column:api_key;index:idx_usage_api_key"`
+	RequestID                  string    `gorm:"column:request_id;index:idx_usage_request_id"`
+	UpstreamRequestID          string    `gorm:"column:upstream_request_id;index:idx_usage_upstream_request_id"`
+	EventType                  string    `gorm:"column:event_type;index:idx_usage_event_type;index:idx_usage_event_time,priority:1"`
+	UpstreamStatusCode         int       `gorm:"column:upstream_status_code;not null;default:0;index:idx_usage_upstream_status_code"`
+	HomeIP                     string    `gorm:"column:home_ip;index:idx_usage_home_ip;index:idx_usage_home_time,priority:1;index:idx_usage_home_port_time,priority:1"`
+	HomePort                   int       `gorm:"column:home_port;not null;default:0;index:idx_usage_home_port_time,priority:2"`
+	CPANodeID                  string    `gorm:"column:cpa_node_id;index:idx_usage_cpa_node_id;index:idx_usage_cpa_node_time,priority:1"`
+	CPAIP                      string    `gorm:"column:cpa_ip;index:idx_usage_cpa_ip"`
+	CPAPort                    int       `gorm:"column:cpa_port;not null;default:0"`
+	CPALabel                   string    `gorm:"column:cpa_label;index:idx_usage_cpa_label"`
+	TokensJSON                 JSONB     `gorm:"column:tokens"`
+	FailJSON                   JSONB     `gorm:"column:fail"`
+	PayloadJSON                JSONB     `gorm:"column:payload;not null"`
+	CreatedAt                  time.Time `gorm:"column:created_at;not null"`
 }
 
 type UsageRuntimeMetadata struct {
@@ -120,47 +131,75 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 		cacheCreation = gjson.Get(payload, "tokens.cache_write_tokens")
 	}
 	cacheReadTokens = normalizedUsageCacheReadTokens(provider, executorType, cachedTokens, cacheReadTokens, cacheReadTokensPresent)
+	inputTokens := gjson.Get(payload, "tokens.input_tokens").Int()
+	outputTokens := gjson.Get(payload, "tokens.output_tokens").Int()
+	reasoningTokens := gjson.Get(payload, "tokens.reasoning_tokens").Int()
+	totalTokens := gjson.Get(payload, "tokens.total_tokens").Int()
+	breakdown, errBreakdown := usageTokenBreakdownFromPayload(payload, usageLegacyTokenCounters{
+		Provider:            provider,
+		ExecutorType:        executorType,
+		InputTokens:         inputTokens,
+		OutputTokens:        outputTokens,
+		ReasoningTokens:     reasoningTokens,
+		CacheReadTokens:     cacheReadTokens,
+		CacheCreationTokens: cacheCreation.Int(),
+		TotalTokens:         totalTokens,
+	})
+	if errBreakdown != nil {
+		return nil, errBreakdown
+	}
 
 	record := &UsageRecord{
-		Timestamp:              timestamp.UTC(),
-		LatencyMS:              gjson.Get(payload, "latency_ms").Int(),
-		TTFTMS:                 gjson.Get(payload, "ttft_ms").Int(),
-		Source:                 strings.TrimSpace(gjson.Get(payload, "source").String()),
-		AuthIndex:              strings.TrimSpace(gjson.Get(payload, "auth_index").String()),
-		InputTokens:            gjson.Get(payload, "tokens.input_tokens").Int(),
-		OutputTokens:           gjson.Get(payload, "tokens.output_tokens").Int(),
-		ReasoningTokens:        gjson.Get(payload, "tokens.reasoning_tokens").Int(),
-		CachedTokens:           cachedTokens,
-		CacheReadTokens:        cacheReadTokens,
-		CacheReadTokensPresent: cacheReadTokensPresent,
-		CacheCreationTokens:    cacheCreation.Int(),
-		TotalTokens:            gjson.Get(payload, "tokens.total_tokens").Int(),
-		Failed:                 gjson.Get(payload, "failed").Bool(),
-		FailStatusCode:         int(gjson.Get(payload, "fail.status_code").Int()),
-		FailBody:               gjson.Get(payload, "fail.body").String(),
-		Provider:               provider,
-		ExecutorType:           executorType,
-		Model:                  strings.TrimSpace(gjson.Get(payload, "model").String()),
-		Alias:                  strings.TrimSpace(gjson.Get(payload, "alias").String()),
-		Effort:                 strings.TrimSpace(gjson.Get(payload, "reasoning_effort").String()),
-		ServiceTier:            usageServiceTierFromPayload(payload),
-		ResponseServiceTier:    strings.TrimSpace(gjson.Get(payload, "response_service_tier").String()),
-		Endpoint:               strings.TrimSpace(gjson.Get(payload, "endpoint").String()),
-		AuthType:               strings.TrimSpace(gjson.Get(payload, "auth_type").String()),
-		APIKey:                 strings.TrimSpace(gjson.Get(payload, "api_key").String()),
-		RequestID:              strings.TrimSpace(gjson.Get(payload, "request_id").String()),
-		UpstreamRequestID:      usagePayloadString(payload, "upstream_request_id", "upstream.request_id", "response.request_id", "response.id"),
-		UpstreamStatusCode:     int(usagePayloadInt(payload, "upstream_status_code", "upstream.status_code", "response.status_code")),
-		HomeIP:                 usageHomeIP(payload, metadata),
-		HomePort:               int(usagePayloadInt(payload, "home_port", "home.port")),
-		CPANodeID:              usagePayloadString(payload, "cpa_node_id", "cpa.node_id", "node_id"),
-		CPAIP:                  usagePayloadString(payload, "cpa_ip", "cpa.ip"),
-		CPAPort:                int(usagePayloadInt(payload, "cpa_port", "cpa.port")),
-		CPALabel:               usagePayloadString(payload, "cpa_label", "cpa.label"),
-		TokensJSON:             jsonbFromPayloadField(payload, "tokens"),
-		FailJSON:               jsonbFromPayloadField(payload, "fail"),
-		PayloadJSON:            JSONB(payload),
-		CreatedAt:              time.Now().UTC(),
+		Timestamp:                  timestamp.UTC(),
+		LatencyMS:                  gjson.Get(payload, "latency_ms").Int(),
+		TTFTMS:                     gjson.Get(payload, "ttft_ms").Int(),
+		Source:                     strings.TrimSpace(gjson.Get(payload, "source").String()),
+		AuthIndex:                  strings.TrimSpace(gjson.Get(payload, "auth_index").String()),
+		InputTokens:                inputTokens,
+		OutputTokens:               outputTokens,
+		ReasoningTokens:            reasoningTokens,
+		CachedTokens:               cachedTokens,
+		CacheReadTokens:            cacheReadTokens,
+		CacheReadTokensPresent:     cacheReadTokensPresent,
+		CacheCreationTokens:        cacheCreation.Int(),
+		TotalTokens:                totalTokens,
+		TokenAccountingVersion:     breakdown.SchemaVersion,
+		TokenAccountingQuality:     breakdown.Quality,
+		AccountingTotalTokens:      breakdown.TotalTokens,
+		AccountingInputTokens:      breakdown.Input.TotalTokens,
+		UncachedInputTokens:        breakdown.Input.UncachedTokens,
+		AccountingCacheReadTokens:  breakdown.Input.CacheReadTokens,
+		AccountingCacheWriteTokens: breakdown.Input.CacheWriteTokens,
+		AccountingOutputTokens:     breakdown.Output.TotalTokens,
+		NonReasoningOutputTokens:   breakdown.Output.NonReasoningTokens,
+		AccountingReasoningTokens:  breakdown.Output.ReasoningTokens,
+		UnclassifiedTokens:         breakdown.UnclassifiedTokens,
+		Failed:                     gjson.Get(payload, "failed").Bool(),
+		FailStatusCode:             int(gjson.Get(payload, "fail.status_code").Int()),
+		FailBody:                   gjson.Get(payload, "fail.body").String(),
+		Provider:                   provider,
+		ExecutorType:               executorType,
+		Model:                      strings.TrimSpace(gjson.Get(payload, "model").String()),
+		Alias:                      strings.TrimSpace(gjson.Get(payload, "alias").String()),
+		Effort:                     strings.TrimSpace(gjson.Get(payload, "reasoning_effort").String()),
+		ServiceTier:                usageServiceTierFromPayload(payload),
+		ResponseServiceTier:        strings.TrimSpace(gjson.Get(payload, "response_service_tier").String()),
+		Endpoint:                   strings.TrimSpace(gjson.Get(payload, "endpoint").String()),
+		AuthType:                   strings.TrimSpace(gjson.Get(payload, "auth_type").String()),
+		APIKey:                     strings.TrimSpace(gjson.Get(payload, "api_key").String()),
+		RequestID:                  strings.TrimSpace(gjson.Get(payload, "request_id").String()),
+		UpstreamRequestID:          usagePayloadString(payload, "upstream_request_id", "upstream.request_id", "response.request_id", "response.id"),
+		UpstreamStatusCode:         int(usagePayloadInt(payload, "upstream_status_code", "upstream.status_code", "response.status_code")),
+		HomeIP:                     usageHomeIP(payload, metadata),
+		HomePort:                   int(usagePayloadInt(payload, "home_port", "home.port")),
+		CPANodeID:                  usagePayloadString(payload, "cpa_node_id", "cpa.node_id", "node_id"),
+		CPAIP:                      usagePayloadString(payload, "cpa_ip", "cpa.ip"),
+		CPAPort:                    int(usagePayloadInt(payload, "cpa_port", "cpa.port")),
+		CPALabel:                   usagePayloadString(payload, "cpa_label", "cpa.label"),
+		TokensJSON:                 jsonbFromPayloadField(payload, "tokens"),
+		FailJSON:                   jsonbFromPayloadField(payload, "fail"),
+		PayloadJSON:                JSONB(payload),
+		CreatedAt:                  time.Now().UTC(),
 	}
 	record.EventType = usageEventTypeFromPayload(payload, record.Endpoint)
 	if strings.TrimSpace(record.CPALabel) == "" {

@@ -638,10 +638,16 @@ func TestUsageObservabilityAggregateCacheRateUsesExplicitBuckets(t *testing.T) {
 	t.Parallel()
 
 	row := &usageObservabilityAggregateRow{
-		CachedTokens:        20,
-		CacheReadTokens:     20,
-		CacheCreationTokens: 10,
-		TotalTokens:         100,
+		CachedTokens:               20,
+		CacheReadTokens:            20,
+		CacheCreationTokens:        10,
+		TotalTokens:                100,
+		TokenAccountingQuality:     UsageTokenAccountingQualityComplete,
+		AccountingTotalTokens:      100,
+		AccountingInputTokens:      100,
+		UncachedInputTokens:        70,
+		AccountingCacheReadTokens:  20,
+		AccountingCacheWriteTokens: 10,
 	}
 	item := usageObservabilityAggregateItemFromRow(row, "provider")
 	if item.CacheRate != 0.3 {
@@ -659,9 +665,13 @@ func TestUsageObservabilityAggregateCacheRatePreservesCanonicalZeroRead(t *testi
 	t.Parallel()
 
 	row := &usageObservabilityAggregateRow{
-		CachedTokens:    20,
-		CacheReadTokens: 0,
-		TotalTokens:     100,
+		CachedTokens:           20,
+		CacheReadTokens:        0,
+		TotalTokens:            100,
+		TokenAccountingQuality: UsageTokenAccountingQualityComplete,
+		AccountingTotalTokens:  100,
+		AccountingInputTokens:  100,
+		UncachedInputTokens:    100,
 	}
 	item := usageObservabilityAggregateItemFromRow(row, "provider")
 	if item.CacheRate != 0 {
@@ -691,26 +701,38 @@ func TestUsageObservabilityAggregateNormalizesMixedLegacyCacheHistory(t *testing
 		Timestamp:    now,
 		Provider:     "openai",
 		Model:        "gpt-5",
+		InputTokens:  900,
+		OutputTokens: 100,
 		CachedTokens: 100,
 		TotalTokens:  1000,
 		PayloadJSON:  JSONB(`{}`),
 		CreatedAt:    now,
 	}
 	current := &UsageRecord{
-		Timestamp:           now.Add(time.Second),
-		Provider:            "openai",
-		Model:               "gpt-5",
-		CachedTokens:        100,
-		CacheReadTokens:     100,
-		CacheCreationTokens: 50,
-		TotalTokens:         1000,
-		PayloadJSON:         JSONB(`{}`),
-		CreatedAt:           now,
+		Timestamp:              now.Add(time.Second),
+		Provider:               "openai",
+		Model:                  "gpt-5",
+		InputTokens:            900,
+		OutputTokens:           100,
+		CachedTokens:           100,
+		CacheReadTokens:        100,
+		CacheReadTokensPresent: true,
+		CacheCreationTokens:    50,
+		TotalTokens:            1000,
+		PayloadJSON:            JSONB(`{}`),
+		CreatedAt:              now,
 	}
 	for _, record := range []*UsageRecord{legacy, current} {
 		if errCreate := db.Create(record).Error; errCreate != nil {
 			t.Fatalf("Create(usage) error = %v", errCreate)
 		}
+	}
+	backfill, errBackfill := repo.RunUsageTokenAccountingBackfillBatch(ctx)
+	if errBackfill != nil {
+		t.Fatalf("RunUsageTokenAccountingBackfillBatch() error = %v", errBackfill)
+	}
+	if !backfill.Done || backfill.Updated != 2 {
+		t.Fatalf("usage token accounting backfill = %+v, want done with 2 updates", backfill)
 	}
 
 	result, errAggregates := repo.ListUsageObservabilityAggregates(ctx, UsageObservabilityAggregateQuery{

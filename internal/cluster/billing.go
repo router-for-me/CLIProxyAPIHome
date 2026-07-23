@@ -1265,47 +1265,21 @@ func billingChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot) floa
 	if usage == nil {
 		return 0
 	}
-	inputTokens := usage.InputTokens
-	cacheReadTokens := normalizedUsageCacheReadTokens(usage.Provider, usage.ExecutorType, usage.CachedTokens, usage.CacheReadTokens, usage.CacheReadTokensPresent)
-	// OpenAI/Codex style: cache_read/cache_write live under input_tokens details and
-	// are subsets of input_tokens. Claude/Anthropic report mutually exclusive buckets.
-	cacheWriteTokens := usage.CacheCreationTokens
-	// Only peel write out of input when a positive separate write rate is used.
-	// Configured write=0 means "no write premium" while tokens still bill as input.
-	if billingCacheTokensIncludedInInput(usage) {
-		inputTokens -= cacheReadTokens
-		if snapshot.CacheWritePricePerMillion > 0 {
-			inputTokens -= cacheWriteTokens
-		}
-		if inputTokens < 0 {
-			inputTokens = 0
-		}
-	}
+	breakdown := usageTokenBreakdownForRecord(usage)
+	inputTokens := breakdown.Input.UncachedTokens
+	cacheReadTokens := breakdown.Input.CacheReadTokens
+	cacheWriteTokens := breakdown.Input.CacheWriteTokens
+	// A zero cache-write rate means the write bucket keeps the ordinary input
+	// price, matching the existing billing contract without provider branching.
 	if snapshot.CacheWritePricePerMillion <= 0 {
+		inputTokens += cacheWriteTokens
 		cacheWriteTokens = 0
 	}
 	return snapshot.RequestPrice +
 		float64(inputTokens)*snapshot.InputPricePerMillion/1000000 +
-		float64(usage.OutputTokens)*snapshot.OutputPricePerMillion/1000000 +
+		float64(breakdown.Output.TotalTokens)*snapshot.OutputPricePerMillion/1000000 +
 		float64(cacheReadTokens)*snapshot.CacheReadPricePerMillion/1000000 +
 		float64(cacheWriteTokens)*snapshot.CacheWritePricePerMillion/1000000
-}
-
-// billingCacheTokensIncludedInInput reports whether cache read/write counts are
-// already included inside usage.InputTokens (OpenAI/Codex/OpenAI-compatible).
-func billingCacheTokensIncludedInInput(usage *UsageRecord) bool {
-	if usage == nil {
-		return false
-	}
-	provider := strings.ToLower(strings.TrimSpace(usage.Provider))
-	executorType := strings.ToLower(strings.TrimSpace(usage.ExecutorType))
-	if executorType == "openaicompatexecutor" || provider == "openai-compatibility" || strings.HasPrefix(provider, "openai-compatible-") {
-		return true
-	}
-	return !strings.Contains(provider, "claude") &&
-		!strings.Contains(provider, "anthropic") &&
-		!strings.Contains(executorType, "claude") &&
-		!strings.Contains(executorType, "anthropic")
 }
 
 func billingUsageHasBillableActivity(usage *UsageRecord, amount float64) bool {
@@ -1313,6 +1287,7 @@ func billingUsageHasBillableActivity(usage *UsageRecord, amount float64) bool {
 		return false
 	}
 	return amount != 0 ||
+		usage.AccountingTotalTokens > 0 ||
 		usage.TotalTokens > 0 ||
 		usage.InputTokens > 0 ||
 		usage.OutputTokens > 0 ||
@@ -1325,7 +1300,8 @@ func billingCacheTokens(usage *UsageRecord) int64 {
 	if usage == nil {
 		return 0
 	}
-	return normalizedUsageCacheReadTokens(usage.Provider, usage.ExecutorType, usage.CachedTokens, usage.CacheReadTokens, usage.CacheReadTokensPresent) + usage.CacheCreationTokens
+	breakdown := usageTokenBreakdownForRecord(usage)
+	return breakdown.Input.CacheReadTokens + breakdown.Input.CacheWriteTokens
 }
 
 func billingAPIKeyID(record *APIKeyRecord) *uint {

@@ -28,6 +28,77 @@ func TestUsageRecordFromPayloadStoresRequestIDAndHomeIP(t *testing.T) {
 	if record.TotalTokens != 15 {
 		t.Fatalf("total tokens = %d, want 15", record.TotalTokens)
 	}
+	if record.TokenAccountingVersion != UsageTokenAccountingSchemaVersion || record.AccountingTotalTokens != 15 {
+		t.Fatalf("token accounting = version:%d total:%d", record.TokenAccountingVersion, record.AccountingTotalTokens)
+	}
+}
+
+func TestUsageRecordFromPayloadStoresCanonicalTokenBreakdownV2(t *testing.T) {
+	payload := `{"timestamp":"2026-07-23T01:02:03Z","provider":"openai","accounting_version":2,"tokens":{"input_tokens":100,"output_tokens":30,"reasoning_tokens":12,"cached_tokens":40,"cache_read_tokens":40,"cache_read_tokens_present":true,"total_tokens":130},"token_breakdown":{"schema_version":2,"quality":"complete","total_tokens":130,"input":{"total_tokens":100,"uncached_tokens":60,"cache_read_tokens":40,"cache_write_tokens":0},"output":{"total_tokens":30,"non_reasoning_tokens":18,"reasoning_tokens":12},"unclassified_tokens":0}}`
+
+	record, errRecord := UsageRecordFromPayload(payload, "192.0.2.10")
+	if errRecord != nil {
+		t.Fatalf("UsageRecordFromPayload() error = %v", errRecord)
+	}
+	breakdown := usageTokenBreakdownFromRecord(record)
+	if !breakdown.Valid() || breakdown.Quality != UsageTokenAccountingQualityComplete {
+		t.Fatalf("token breakdown = %+v", breakdown)
+	}
+	if breakdown.Input.UncachedTokens != 60 || breakdown.Output.NonReasoningTokens != 18 {
+		t.Fatalf("token breakdown = %+v", breakdown)
+	}
+}
+
+func TestUsageRecordFromPayloadRejectsInvalidTokenBreakdownV2(t *testing.T) {
+	payload := `{"timestamp":"2026-07-23T01:02:03Z","accounting_version":2,"tokens":{"total_tokens":130},"token_breakdown":{"schema_version":2,"quality":"complete","total_tokens":130,"input":{"total_tokens":100,"uncached_tokens":100,"cache_read_tokens":40,"cache_write_tokens":0},"output":{"total_tokens":30,"non_reasoning_tokens":30,"reasoning_tokens":0},"unclassified_tokens":0}}`
+
+	if _, errRecord := UsageRecordFromPayload(payload, "192.0.2.10"); errRecord == nil || !strings.Contains(errRecord.Error(), "schema v2 invariants") {
+		t.Fatalf("UsageRecordFromPayload() error = %v, want invariant failure", errRecord)
+	}
+}
+
+func TestUsageRecordFromPayloadNormalizesLegacyProviderSemantics(t *testing.T) {
+	tests := []struct {
+		name          string
+		payload       string
+		wantInput     int64
+		wantUncached  int64
+		wantOutput    int64
+		wantReasoning int64
+	}{
+		{
+			name:          "openai subsets",
+			payload:       `{"timestamp":"2026-07-23T01:02:03Z","provider":"openai","executor_type":"OpenAICompatExecutor","tokens":{"input_tokens":100,"output_tokens":30,"reasoning_tokens":12,"cached_tokens":40,"cache_read_tokens":40,"cache_read_tokens_present":true,"total_tokens":130}}`,
+			wantInput:     100,
+			wantUncached:  60,
+			wantOutput:    30,
+			wantReasoning: 12,
+		},
+		{
+			name:          "claude independent cache",
+			payload:       `{"timestamp":"2026-07-23T01:02:03Z","provider":"claude","executor_type":"ClaudeExecutor","tokens":{"input_tokens":30,"output_tokens":5,"cache_read_tokens":7,"cache_read_tokens_present":true,"cache_creation_tokens":13,"total_tokens":55}}`,
+			wantInput:     50,
+			wantUncached:  30,
+			wantOutput:    5,
+			wantReasoning: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record, errRecord := UsageRecordFromPayload(test.payload, "192.0.2.10")
+			if errRecord != nil {
+				t.Fatalf("UsageRecordFromPayload() error = %v", errRecord)
+			}
+			breakdown := usageTokenBreakdownFromRecord(record)
+			if !breakdown.Valid() || breakdown.Quality != UsageTokenAccountingQualityComplete {
+				t.Fatalf("token breakdown = %+v", breakdown)
+			}
+			if breakdown.Input.TotalTokens != test.wantInput || breakdown.Input.UncachedTokens != test.wantUncached || breakdown.Output.TotalTokens != test.wantOutput || breakdown.Output.ReasoningTokens != test.wantReasoning {
+				t.Fatalf("token breakdown = %+v", breakdown)
+			}
+		})
+	}
 }
 
 func TestUsageRecordFromPayloadStoresXAIAPIKeyStatistics(t *testing.T) {
