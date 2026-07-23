@@ -45,9 +45,9 @@ const (
 )
 
 var defaultAntigravityURLs = []string{
-	"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
-	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+	"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+	"https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 }
 
 type Options struct {
