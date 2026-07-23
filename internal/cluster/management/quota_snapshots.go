@@ -24,6 +24,40 @@ type quotaHTTPError struct {
 	Message string
 }
 
+type quotaResetCreditDTO struct {
+	Status    string     `json:"status"`
+	GrantedAt time.Time  `json:"granted_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+type quotaResetCreditsDTO struct {
+	AvailableCount *int                  `json:"available_count"`
+	ObservedAt     time.Time             `json:"observed_at"`
+	Credits        []quotaResetCreditDTO `json:"credits"`
+}
+
+func quotaResetCreditsDTOFrom(value *cluster.QuotaResetCredits) *quotaResetCreditsDTO {
+	if value == nil {
+		return nil
+	}
+	credits := make([]quotaResetCreditDTO, 0, len(value.Credits))
+	for _, credit := range value.Credits {
+		var expiresAt *time.Time
+		if credit.ExpiresAt != nil {
+			expiresAtUTC := credit.ExpiresAt.UTC()
+			expiresAt = &expiresAtUTC
+		}
+		credits = append(credits, quotaResetCreditDTO{
+			Status: credit.Status, GrantedAt: credit.GrantedAt.UTC(), ExpiresAt: expiresAt,
+		})
+	}
+	return &quotaResetCreditsDTO{
+		AvailableCount: value.AvailableCount,
+		ObservedAt:     value.ObservedAt.UTC(),
+		Credits:        credits,
+	}
+}
+
 func (h *Handler) ListQuotaCredentials(c *gin.Context) {
 	query, errParse := parseQuotaListQuery(c)
 	if errParse != nil {
@@ -65,8 +99,9 @@ func (h *Handler) GetQuotaCredential(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"credential": item,
-		"windows":    item.Windows,
+		"credential":    item,
+		"windows":       item.Windows,
+		"reset_credits": quotaResetCreditsDTOFrom(item.ResetCredits),
 		"collection": gin.H{
 			"source": item.Source, "freshness": item.Freshness, "status": item.CollectionStatus,
 			"observed_at": item.ObservedAt, "expires_at": item.ExpiresAt, "last_attempt_at": item.LastAttemptAt,

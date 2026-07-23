@@ -2690,9 +2690,9 @@ Quota snapshot endpoints are read-only DB views. Reading them does not call an u
 
 All timestamps are RFC3339 UTC values or `null`. Ratios are numbers in `[0,1]`. Quantity fields may be `null`; unlimited quota uses `is_unlimited=true`. Different provider periods remain separate windows. While a snapshot is fresh, an individually expired merged window is omitted and no longer contributes to status/source. Once the snapshot itself is stale, the detail view retains its last-known windows for diagnosis. `earliest_reset_at` is the minimum non-null `reset_at` across the same complete internal window set represented by the credential item. It may be in the past for stale last-known data.
 
-Current passive collection extracts a bounded `quota_headers` object from the CPA usage event `response_headers`. Home preserves only the Codex `X-Codex-*` quota allowlist plus a syntax-validated, non-secret-like upstream request ID, and removes the raw `response_headers` object before writing the usage payload. The reported `auth_index` is resolved against the active auth UUID, runtime index, and ID before the snapshot is stored under the stable UUID. Codex Header observations are normalized and upserted in the same database transaction as the usage record; invalid quota metadata is isolated so it cannot roll back the core usage or billing write. Timestamps more than five minutes ahead of Home's receive time are normalized to the receive time. Older observations cannot replace a newer snapshot or window, including concurrent first writes. A newer Header observation invalidates an in-flight active-probe lease. Partial Header updates retain only still-valid older windows; expired windows cannot make a new snapshot appear healthy or exhausted.
+Current passive collection extracts a bounded `quota_headers` object from the CPA usage event `response_headers`. Home preserves only the Codex `X-Codex-*` quota allowlist plus a syntax-validated, non-secret-like upstream request ID, and removes the raw `response_headers` object before writing the usage payload. The reported `auth_index` is resolved against the active auth UUID, runtime index, and ID before the snapshot is stored under the stable UUID. Codex Header observations are normalized and upserted in the same database transaction as the usage record; invalid quota metadata is isolated so it cannot roll back the core usage or billing write. Timestamps more than five minutes ahead of Home's receive time are normalized to the receive time. Older observations cannot replace a newer snapshot or window, including concurrent first writes. Codex Header observations are always treated as sparse rolling updates: they merge by stable limit identity and period, retain still-valid windows and metadata learned by the authoritative active probe, do not clear an in-flight probe lease, and do not postpone the next active probe or bypass its retry backoff. Repeated Primary/Secondary observations for the same limit period collapse to one window. Expired windows cannot make a new snapshot appear healthy or exhausted.
 
-Home also runs fixed-target active collectors for Claude, Antigravity, Codex, Kimi, and xAI OAuth/file credentials. Codex reads the official usage endpoint; Claude reads usage and profile, reporting `partial` when quota succeeds but profile metadata fails; Antigravity tries its fixed backend candidates with the credential `project_id`; Kimi reads coding usage and preserves both the account usage summary and each returned limit window while accepting numeric fields encoded as numbers or strings. Kimi provider limits take primary-window priority over its aggregate summary so weekly and duration limits remain visible in list views. xAI calls the Grok CLI billing endpoint with the CLI token-auth, client-version, user-agent, and optional user-ID headers. It accepts camelCase or snake_case billing fields and `{ "val": ... }`, numeric, or string cent values. `monthlyLimit=15000` maps to SuperGrok and `monthlyLimit=150000` maps to SuperGrok Heavy. Positive `onDemandCap` plus explicit or derived `onDemandUsed` values produce the `xai-on-demand` monthly USD window; a missing or zero cap means pay-as-you-go is disabled and no such window is emitted. Provider API-key credentials that cannot use these OAuth collectors are returned as `unsupported`.
+Home also runs fixed-target active collectors for Claude, Antigravity, Codex, Kimi, and xAI OAuth/file credentials. Codex reads the official usage endpoint, uses `metered_feature` as the stable identity for additional limits, and derives normalized plan metadata. It queries the reset-credit detail endpoint independently of whether the usage summary contains `rate_limit_reset_credits`. If that detail request fails while the usage summary reports a positive current count, the collection is `partial` and stores the latest count with an empty detail list instead of carrying forward older quantities or expired credits. If neither endpoint provides reliable reset-credit information, older reset-credit data is cleared without degrading otherwise usable quota windows. Codex `primary_windows` keeps one representative from the default account family and one from `codex_bengalfox`, preferring the longest (normally weekly) window in each family, so the default 5-hour window or code-review limits cannot hide Spark. Existing Codex v1 snapshots that use positional `*-primary`/`*-secondary` IDs trigger one immediate v2 active recollection even when freshness or `next_probe_at` would normally defer it. The upgrade attempt is recorded before the request, so a failure returns to the normal retry backoff instead of bypassing it repeatedly. Legacy raw windows remain stored for diagnosis, but the API reports them as `unknown`/`stale` before a successful upgrade and `error`/`stale` after a failed upgrade; a successful v2 probe atomically replaces the old IDs, and later passive Header observations cannot downgrade the snapshot version. No reset-credit consume operation is exposed through the Management API. Claude reads usage and profile, reporting `partial` when quota succeeds but profile metadata fails; Antigravity tries its fixed backend candidates with the credential `project_id`; Kimi reads coding usage and preserves both the account usage summary and each returned limit window while accepting numeric fields encoded as numbers or strings. Kimi provider limits take primary-window priority over its aggregate summary so weekly and duration limits remain visible in list views. xAI calls the Grok CLI billing endpoint with the CLI token-auth, client-version, user-agent, and optional user-ID headers. It accepts camelCase or snake_case billing fields and `{ "val": ... }`, numeric, or string cent values. `monthlyLimit=15000` maps to SuperGrok and `monthlyLimit=150000` maps to SuperGrok Heavy. Positive `onDemandCap` plus explicit or derived `onDemandUsed` values produce the `xai-on-demand` monthly USD window; a missing or zero cap means pay-as-you-go is disabled and no such window is emitted. Provider API-key credentials that cannot use these OAuth collectors are returned as `unsupported`.
 
 Collectors read DB credentials directly and never accept a URL from HMC. Before probing, they resolve the latest DB credential and refresh OAuth state when the runtime refresh policy says it is due. They use the current hot-reloaded global proxy unless the credential has its own proxy. They use a 20-second request timeout, a per-provider concurrency limit of 3 on PostgreSQL and a global limit of 1 on SQLite, a per-credential DB lease, and a five-minute exponential retry backoff with per-credential jitter capped near one hour. `Retry-After` can extend the next attempt. Disabled credentials and credentials whose retry deadline is still in the future are not actively probed; persisted unavailable/error state no longer blocks recovery after that deadline. Successful snapshots are fresh for 30 minutes. Failures preserve last-known windows and store only structured, redacted error metadata.
 
@@ -2715,11 +2715,11 @@ Credential fields:
 | `earliest_reset_at` | string/null | Earliest reset across all effective windows, including windows omitted from `primary_windows`. Stale last-known values may be in the past. |
 | `last_attempt_at`, `last_success_at`, `next_probe_at` | string/null | Collection scheduling metadata. |
 | `consecutive_failures` | integer | Consecutive collection failures. |
-| `primary_windows` | array | Stable selection of at most two current windows. |
+| `primary_windows` | array | Provider-aware stable selection of at most two current windows. Codex returns one longest representative for the default account family and one for `codex_bengalfox` when present. |
 | `window_count` | integer | Number of all current windows. |
 | `error` | object/null | Redacted collection error. Messages are capped at 500 bytes. |
 | `runtime` | object/null | Home and CPA ownership metadata. |
-| `plan` | object/null | Provider subscription plan metadata derived by the collector (for example xAI monthly billing limits). Shape: `{"name": "SuperGrok", "premium": false}`. A successful authoritative probe clears an older plan when the current payload no longer maps to one. |
+| `plan` | object/null | Provider subscription plan metadata derived by the collector (for example Codex `Pro 20x` or xAI `SuperGrok`). Shape: `{"name": "Pro 20x", "premium": true}`. A successful authoritative probe clears an older plan when the current payload no longer maps to one. |
 
 Quota window fields:
 
@@ -2809,7 +2809,7 @@ Returns filtered, paginated current credential snapshots.
 
 ### GET `/quota/credentials/:credential_id`
 
-Returns the same credential core object, every current window in stable order, collection metadata, and `generated_at`. Unknown or unsupported current credentials return HTTP `200`; missing, deleted, or invisible credentials return `404`.
+Returns the same credential core object, every current window in stable order, optional provider-specific read-only detail metadata, collection metadata, and `generated_at`. Unknown or unsupported current credentials return HTTP `200`; missing, deleted, or invisible credentials return `404`.
 
 ```json
 {
@@ -2817,11 +2817,23 @@ Returns the same credential core object, every current window in stable order, c
     "credential_id": "auth-db-id",
     "provider": "codex",
     "quota_status": "low",
+    "plan": {"name": "Pro 20x", "premium": true},
     "earliest_reset_at": "2026-07-16T01:10:00Z",
     "primary_windows": [],
     "window_count": 1
   },
   "windows": [],
+  "reset_credits": {
+    "available_count": 3,
+    "observed_at": "2026-07-16T01:00:00Z",
+    "credits": [
+      {
+        "status": "available",
+        "granted_at": "2026-07-15T01:00:00Z",
+        "expires_at": "2026-07-27T07:40:51Z"
+      }
+    ]
+  },
   "collection": {
     "source": "response_header",
     "freshness": "fresh",
@@ -2837,6 +2849,8 @@ Returns the same credential core object, every current window in stable order, c
   "generated_at": "2026-07-16T01:01:00Z"
 }
 ```
+
+`reset_credits` is `null` when the provider does not report this capability or no reliable observation is available. It is detail-only and is not included in `GET /quota/credentials` list items. `available_count` is the latest provider-reported number of currently available credits, `observed_at` is the time of that reset-credit observation, and `credits` contains the bounded, expiry-sorted list of currently available Codex rate-limit reset credits. When the usage summary supplies a positive count but the independent detail request fails, `available_count` remains current while `credits` is empty and `collection_status=partial`; older quantities and expired detail rows are not presented as current. Credit entries expose only status and timing metadata; provider reset-credit identifiers are not returned. This endpoint is read-only and does not consume a credit.
 
 ### POST `/quota/collect`
 

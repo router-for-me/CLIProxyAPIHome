@@ -220,6 +220,14 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	if quota.ProbeLeaseOwner != "old-home" || quota.ProbeLeaseExpiresAt == nil {
 		t.Fatalf("imported quota lease fields = owner %q expires %v", quota.ProbeLeaseOwner, quota.ProbeLeaseExpiresAt)
 	}
+	resetCredits := quotaResetCreditsFromJSON(quota.ResetCredits)
+	if resetCredits == nil || resetCredits.AvailableCount == nil || *resetCredits.AvailableCount != 3 || !resetCredits.ObservedAt.Equal(want.resetCreditObservedAt) || len(resetCredits.Credits) != 1 {
+		t.Fatalf("imported quota reset credits = %+v", resetCredits)
+	}
+	resetCredit := resetCredits.Credits[0]
+	if resetCredit.ID != "snapshot-reset-credit" || resetCredit.Status != "available" || !resetCredit.GrantedAt.Equal(want.resetCreditGrantedAt) || resetCredit.ExpiresAt == nil || !resetCredit.ExpiresAt.Equal(want.resetCreditExpiresAt) {
+		t.Fatalf("imported quota reset credit = %+v", resetCredit)
+	}
 	assertDatabaseSnapshotRuntimeTablesEmpty(t, target)
 
 	createdUser := UserRecord{Username: "next-user"}
@@ -1100,10 +1108,13 @@ func TestDatabaseSnapshotPostgresCrossBackendRoundTrips(t *testing.T) {
 }
 
 type databaseSnapshotTestData struct {
-	authUUID      string
-	pluginAuthID  uint
-	maximumUserID uint
-	maximumLogID  uint
+	authUUID              string
+	pluginAuthID          uint
+	maximumUserID         uint
+	maximumLogID          uint
+	resetCreditObservedAt time.Time
+	resetCreditGrantedAt  time.Time
+	resetCreditExpiresAt  time.Time
 }
 
 type databaseSnapshotWriteTracker struct {
@@ -1127,6 +1138,18 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 	deletedAt := now.Add(time.Minute)
 	expiresAt := now.Add(24 * time.Hour)
 	expiredAt := now.Add(-24 * time.Hour)
+	resetCreditExpiresAt := now.Add(72 * time.Hour)
+	availableResetCredits := 3
+	resetCredits, errResetCredits := quotaResetCreditsJSON(&QuotaResetCredits{
+		AvailableCount: &availableResetCredits,
+		ObservedAt:     now,
+		Credits: []QuotaResetCredit{{
+			ID: "snapshot-reset-credit", Status: "available", GrantedAt: now.Add(-time.Hour), ExpiresAt: &resetCreditExpiresAt,
+		}},
+	})
+	if errResetCredits != nil {
+		t.Fatalf("encode database snapshot reset credits: %v", errResetCredits)
+	}
 	userID := uint(101)
 	channelGroupID := uint(201)
 	modelGroupID := uint(301)
@@ -1157,7 +1180,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 		&ChannelGroupDetailRecord{ID: 211, ChannelGroupID: channelGroupID, AuthID: "auth-logical-id", CreatedAt: now, UpdatedAt: now},
 		&ModelGroupDetailRecord{ID: 311, ModelGroupID: modelGroupID, ModelID: "gpt-test", CreatedAt: now, UpdatedAt: now},
 		&UsageRecord{ID: usageID, Timestamp: now, Source: "snapshot", AuthIndex: "auth-index", InputTokens: 1, OutputTokens: 2, TotalTokens: 3, Provider: "codex", Model: "gpt-test", TokensJSON: JSONB(`{"input":1}`), FailJSON: JSONB(`null`), PayloadJSON: JSONB(`{"model":"gpt-test"}`), CreatedAt: now},
-		&QuotaSnapshotRecord{CredentialID: authUUID, QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe", ObservedAt: &now, ExpiresAt: &expiresAt, ProbeLeaseOwner: "old-home", ProbeLeaseExpiresAt: &expiresAt, ParserVersion: 1, CollectorVersion: 1, CreatedAt: now, UpdatedAt: now},
+		&QuotaSnapshotRecord{CredentialID: authUUID, QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe", ObservedAt: &now, ExpiresAt: &expiresAt, ResetCredits: resetCredits, ProbeLeaseOwner: "old-home", ProbeLeaseExpiresAt: &expiresAt, ParserVersion: 1, CollectorVersion: 1, CreatedAt: now, UpdatedAt: now},
 		&QuotaWindowRecord{CredentialID: authUUID, WindowID: "primary", Label: "Primary", Scope: "credential", Mode: "rolling", Status: "available", Unit: "requests", Used: float64Pointer(2), Remaining: float64Pointer(8), Limit: float64Pointer(10), PeriodUnit: "hour", Source: "active_probe", ObservedAt: now, ExpiresAt: &expiresAt, CreatedAt: now, UpdatedAt: now},
 		&BillingModelPriceRecord{ID: "price-1", Provider: "codex", Model: "gpt-test", ServiceTier: "*", InputPricePerMillion: 1.25, OutputPricePerMillion: 2.5, Source: "manual", Enabled: true, CreatedAt: now, UpdatedAt: now, Revision: 1},
 		&BillingModelPriceImportPreviewRecord{ID: "preview-1", Revision: "revision-1", Source: "models.dev", SourceURL: "https://example.invalid/models", SourceVersion: "1", SourceFetchedAt: now, SourceModelCount: 1, Atomic: true, GeneratedAt: now, ExpiresAt: expiresAt, Payload: JSONB(`{"rows":[]}`), CreatedAt: now},
@@ -1185,7 +1208,15 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 	if errDisable := db.Model(&ProxyPoolRecord{}).Where("id = ?", "proxy-1").Update("enabled", false).Error; errDisable != nil {
 		t.Fatalf("disable database snapshot proxy pool: %v", errDisable)
 	}
-	return databaseSnapshotTestData{authUUID: authUUID, pluginAuthID: pluginAuthID, maximumUserID: userID, maximumLogID: 701}
+	return databaseSnapshotTestData{
+		authUUID:              authUUID,
+		pluginAuthID:          pluginAuthID,
+		maximumUserID:         userID,
+		maximumLogID:          701,
+		resetCreditObservedAt: now.UTC(),
+		resetCreditGrantedAt:  now.Add(-time.Hour).UTC(),
+		resetCreditExpiresAt:  resetCreditExpiresAt.UTC(),
+	}
 }
 
 func openDatabaseSnapshotSQLiteTestDB(t *testing.T, path string) *gorm.DB {

@@ -196,17 +196,15 @@ func quotaSnapshotWriteFromUsagePayload(payload string, metadata UsageRuntimeMet
 	if observedAt.After(receivedAt.Add(quotaMaxFutureObservationSkew)) {
 		observedAt = receivedAt
 	}
-	windows, partial := parseCodexQuotaHeaderWindows(headers, observedAt)
+	windows := parseCodexQuotaHeaderWindows(headers, observedAt)
 	if len(windows) == 0 {
 		return QuotaSnapshotWrite{}, false
 	}
 	status := aggregateQuotaWindowStatus(windows)
-	collectionStatus := "success"
-	if partial {
-		collectionStatus = "partial"
-	}
+	collectionStatus := "partial"
 	expiresAt := observedAt.UTC().Add(quotaHeaderSnapshotFreshness)
 	maxAcceptedObservedAt := receivedAt.Add(quotaMaxFutureObservationSkew)
+	plan := codexQuotaPlan(firstQuotaHeaderValue(headers, "X-Codex-Plan-Type"))
 	homeID := strings.TrimSpace(metadata.HomeIP)
 	if metadata.HomePort > 0 {
 		homeID = fmt.Sprintf("%s:%d", homeID, metadata.HomePort)
@@ -222,75 +220,121 @@ func quotaSnapshotWriteFromUsagePayload(payload string, metadata UsageRuntimeMet
 	}
 	return QuotaSnapshotWrite{
 		CredentialID: credentialID, QuotaStatus: status, CollectionStatus: collectionStatus, Source: "response_header",
-		ObservedAt: &observedAt, MaxAcceptedObservedAt: &maxAcceptedObservedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
-		NextProbeAt: &expiresAt, Runtime: runtime, ParserVersion: quotaSnapshotSchemaVersion,
-		CollectorVersion: quotaSnapshotSchemaVersion, ClearProbeLease: true, ReplaceWindows: !partial, Windows: windows,
+		ObservedAt: &observedAt, ReceivedAt: &receivedAt, MaxAcceptedObservedAt: &maxAcceptedObservedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
+		NextProbeAt: &observedAt, Runtime: runtime, Plan: plan, ParserVersion: quotaSnapshotSchemaVersion,
+		CollectorVersion: quotaSnapshotSchemaVersion, ClearProbeLease: false, ReplaceWindows: false, Windows: windows,
 	}, true
 }
 
-func parseCodexQuotaHeaderWindows(headers http.Header, observedAt time.Time) ([]QuotaWindow, bool) {
-	headers = canonicalQuotaHeaders(headers)
-	windows := make([]QuotaWindow, 0, 4)
-	partial := false
-	baseCount := 0
-	var added, present bool
-	windows, added, present = appendCodexHeaderWindow(windows, headers, codexQuotaHeaderPrefix+"Primary-", "codex-primary", nil, 0, observedAt)
-	if added {
-		baseCount++
-	} else if present {
-		partial = true
-	}
-	windows, added, present = appendCodexHeaderWindow(windows, headers, codexQuotaHeaderPrefix+"Secondary-", "codex-secondary", nil, 1, observedAt)
-	if added {
-		baseCount++
-	} else if present {
-		partial = true
-	}
-	if baseCount == 1 {
-		partial = true
-	}
-	type group struct{ prefix, id, label string }
-	groups := make([]group, 0)
-	for key := range headers {
-		if !strings.HasPrefix(key, codexQuotaHeaderPrefix) || !strings.HasSuffix(key, "-Limit-Name") {
-			continue
-		}
-		name := firstQuotaHeaderValue(headers, key)
-		groupName := strings.TrimSuffix(strings.TrimPrefix(key, codexQuotaHeaderPrefix), "-Limit-Name")
-		if name == "" || groupName == "" {
-			continue
-		}
-		groups = append(groups, group{prefix: codexQuotaHeaderPrefix + groupName + "-", id: quotaSlug(groupName), label: name})
-	}
-	sort.Slice(groups, func(i, j int) bool { return groups[i].id < groups[j].id })
-	for index, item := range groups {
-		label := item.label
-		groupCount := 0
-		windows, added, present = appendCodexHeaderWindow(windows, headers, item.prefix+"Primary-", "codex-"+item.id+"-primary", &label, 10+index*2, observedAt)
-		if added {
-			groupCount++
-		} else if present {
-			partial = true
-		}
-		windows, added, present = appendCodexHeaderWindow(windows, headers, item.prefix+"Secondary-", "codex-"+item.id+"-secondary", &label, 11+index*2, observedAt)
-		if added {
-			groupCount++
-		} else if present {
-			partial = true
-		}
-		if groupCount == 1 {
-			partial = true
-		}
-	}
-	return windows, partial
+type codexHeaderLimitFamily struct {
+	groupName string
+	limitKey  string
 }
 
-func appendCodexHeaderWindow(windows []QuotaWindow, headers http.Header, prefix, id string, label *string, priority int, observedAt time.Time) ([]QuotaWindow, bool, bool) {
-	present := codexQuotaHeaderWindowPresent(headers, prefix)
+func parseCodexQuotaHeaderWindows(headers http.Header, observedAt time.Time) []QuotaWindow {
+	headers = canonicalQuotaHeaders(headers)
+	windows := make([]QuotaWindow, 0, 4)
+	windows = appendCodexHeaderLimitWindows(windows, headers, codexQuotaHeaderPrefix, "", nil, "account", nil, 0, observedAt)
+
+	groupNames := make(map[string]struct{})
+	for key := range headers {
+		if groupName := codexQuotaHeaderGroupName(key); groupName != "" {
+			groupNames[groupName] = struct{}{}
+		}
+	}
+	families := make([]codexHeaderLimitFamily, 0, len(groupNames))
+	for groupName := range groupNames {
+		families = append(families, codexHeaderLimitFamily{groupName: groupName, limitKey: codexQuotaLimitKey(groupName)})
+	}
+	sort.Slice(families, func(i, j int) bool {
+		if families[i].limitKey != families[j].limitKey {
+			return families[i].limitKey < families[j].limitKey
+		}
+		return families[i].groupName < families[j].groupName
+	})
+	for index, family := range families {
+		prefix := codexQuotaHeaderPrefix + family.groupName + "-"
+		var label *string
+		if value := firstQuotaHeaderValue(headers, prefix+"Limit-Name"); value != "" {
+			label = &value
+		}
+		var scopeID *string
+		if family.limitKey != "" {
+			value := "codex_" + strings.ReplaceAll(family.limitKey, "-", "_")
+			scopeID = &value
+		}
+		windows = appendCodexHeaderLimitWindows(windows, headers, prefix, family.limitKey, label, "model", scopeID, 20+index*10, observedAt)
+	}
+	return windows
+}
+
+func codexQuotaHeaderGroupName(key string) string {
+	if !strings.HasPrefix(key, codexQuotaHeaderPrefix) {
+		return ""
+	}
+	body := strings.TrimPrefix(key, codexQuotaHeaderPrefix)
+	for _, suffix := range []string{
+		"-Limit-Name",
+		"-Primary-Used-Percent",
+		"-Primary-Window-Minutes",
+		"-Primary-Reset-At",
+		"-Primary-Reset-After-Seconds",
+		"-Secondary-Used-Percent",
+		"-Secondary-Window-Minutes",
+		"-Secondary-Reset-At",
+		"-Secondary-Reset-After-Seconds",
+	} {
+		if strings.HasSuffix(body, suffix) {
+			return strings.TrimSpace(strings.TrimSuffix(body, suffix))
+		}
+	}
+	return ""
+}
+
+func codexQuotaPlan(planType string) *QuotaPlan {
+	planType = strings.TrimSpace(planType)
+	if planType == "" {
+		return nil
+	}
+	normalized := strings.ToLower(planType)
+	switch normalized {
+	case "pro":
+		return &QuotaPlan{Name: "Pro 20x", Premium: true}
+	case "prolite", "pro-lite", "pro_lite":
+		return &QuotaPlan{Name: "Pro 5x", Premium: true}
+	case "plus":
+		return &QuotaPlan{Name: "Plus"}
+	case "team":
+		return &QuotaPlan{Name: "Team"}
+	case "free":
+		return &QuotaPlan{Name: "Free"}
+	default:
+		return &QuotaPlan{Name: planType}
+	}
+}
+
+func appendCodexHeaderLimitWindows(windows []QuotaWindow, headers http.Header, prefix string, limitKey string, label *string, scope string, scopeID *string, priority int, observedAt time.Time) []QuotaWindow {
+	seenDurations := make(map[int64]struct{}, 2)
+	for index, windowName := range []string{"Primary-", "Secondary-"} {
+		window, ok := codexHeaderWindow(headers, prefix+windowName, label, scope, scopeID, priority+index, observedAt)
+		if !ok || window.WindowSeconds == nil {
+			continue
+		}
+		if _, exists := seenDurations[*window.WindowSeconds]; exists {
+			continue
+		}
+		seenDurations[*window.WindowSeconds] = struct{}{}
+		window.ID = codexQuotaWindowID(limitKey, *window.WindowSeconds)
+		windows = append(windows, window)
+	}
+	return windows
+}
+
+func codexHeaderWindow(headers http.Header, prefix string, label *string, scope string, scopeID *string, priority int, observedAt time.Time) (QuotaWindow, bool) {
 	usedPercent, okUsed := quotaFloatHeader(headers, prefix+"Used-Percent")
 	windowMinutes, okWindow := quotaIntHeader(headers, prefix+"Window-Minutes")
 	if !okUsed || !okWindow || windowMinutes <= 0 || math.IsNaN(usedPercent) || math.IsInf(usedPercent, 0) {
-		return windows, false, present
+		return QuotaWindow{}, false
 	}
 	usedRatio := math.Max(0, math.Min(1, usedPercent/100))
 	remainingRatio := 1 - usedRatio
@@ -298,25 +342,40 @@ func appendCodexHeaderWindow(windows []QuotaWindow, headers http.Header, prefix,
 	windowSeconds := windowMinutes * 60
 	resetAt, okReset := codexQuotaResetAt(headers, prefix, observedAt)
 	if !okReset {
-		return windows, false, present
+		return QuotaWindow{}, false
 	}
 	periodUnit, periodValue := quotaPeriodFromSeconds(windowSeconds)
 	status := quotaStatusFromRemainingRatio(remainingRatio)
-	return append(windows, QuotaWindow{
-		ID: id, Label: label, Scope: "account", Mode: "rolling", Status: status, Unit: "percentage",
+	return QuotaWindow{
+		Label: label, Scope: scope, ScopeID: scopeID, Mode: "rolling", Status: status, Unit: "percentage",
 		Used: &used, Remaining: &remaining, Limit: &limit, UsedRatio: &usedRatio, RemainingRatio: &remainingRatio,
 		ResetAt: &resetAt, WindowSeconds: &windowSeconds, PeriodUnit: periodUnit, PeriodValue: periodValue,
 		Source: "response_header", ObservedAt: observedAt.UTC(), Priority: priority,
-	}), true, true
+	}, true
 }
 
-func codexQuotaHeaderWindowPresent(headers http.Header, prefix string) bool {
-	for _, suffix := range []string{"Used-Percent", "Window-Minutes", "Reset-At", "Reset-After-Seconds"} {
-		if firstQuotaHeaderValue(headers, prefix+suffix) != "" {
-			return true
-		}
+func codexQuotaLimitKey(value string) string {
+	key := quotaSlug(value)
+	if key == "codex" {
+		return ""
 	}
-	return false
+	return strings.TrimPrefix(key, "codex-")
+}
+
+func codexQuotaWindowID(limitKey string, seconds int64) string {
+	prefix := "codex"
+	if key := codexQuotaLimitKey(limitKey); key != "" {
+		prefix += "-" + key
+	}
+	return prefix + "-" + codexQuotaWindowIDSuffix(seconds)
+}
+
+func codexQuotaWindowIDSuffix(seconds int64) string {
+	unit, value := quotaPeriodFromSeconds(seconds)
+	if value != nil && unit != "unknown" {
+		return quotaSlug(strconv.FormatFloat(*value, 'f', -1, 64) + "-" + unit)
+	}
+	return strconv.FormatInt(seconds, 10) + "-second"
 }
 
 func codexQuotaResetAt(headers http.Header, prefix string, observedAt time.Time) (time.Time, bool) {
@@ -333,6 +392,8 @@ func quotaPeriodFromSeconds(seconds int64) (string, *float64) {
 	var unit string
 	var value float64
 	switch {
+	case seconds == 30*24*60*60 || seconds == 2628000:
+		unit, value = "month", 1
 	case seconds%(7*24*60*60) == 0:
 		unit, value = "week", float64(seconds/(7*24*60*60))
 	case seconds%(24*60*60) == 0:

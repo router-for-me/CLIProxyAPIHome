@@ -24,12 +24,25 @@ func TestQuotaManagementListAndDetailReadDatabaseSnapshots(t *testing.T) {
 	}
 	expiresAt := now.Add(time.Hour)
 	resetAt := now.Add(30 * time.Minute)
+	resetCreditGrantedAt := now.Add(-time.Hour)
+	resetCreditExpiry := now.Add(72 * time.Hour)
 	remaining := 0.15
 	period := float64(5)
+	availableResetCredits := 3
 	_, errSnapshot := handler.repo.UpsertQuotaSnapshot(context.Background(), cluster.QuotaSnapshotWrite{
 		CredentialID: "quota-management-auth", QuotaStatus: "low", CollectionStatus: "success", Source: "response_header",
-		ObservedAt: &now, ExpiresAt: &expiresAt, LastAttemptAt: &now, LastSuccessAt: &now, ReplaceWindows: true,
-		Windows: []cluster.QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "low", Unit: "percentage", RemainingRatio: &remaining, ResetAt: &resetAt, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: now}},
+		ObservedAt: &now, ExpiresAt: &expiresAt, LastAttemptAt: &now, LastSuccessAt: &now,
+		ParserVersion: cluster.QuotaSnapshotVersion("codex"), CollectorVersion: cluster.QuotaSnapshotVersion("codex"), ReplaceWindows: true,
+		Plan: &cluster.QuotaPlan{Name: "Pro 20x", Premium: true}, ReplacePlan: true,
+		ResetCredits: &cluster.QuotaResetCredits{
+			AvailableCount: &availableResetCredits,
+			ObservedAt:     now,
+			Credits: []cluster.QuotaResetCredit{{
+				ID: "reset-credit-1", Status: "available", GrantedAt: resetCreditGrantedAt, ExpiresAt: &resetCreditExpiry,
+			}},
+		},
+		ReplaceResetCredits: true,
+		Windows:             []cluster.QuotaWindow{{ID: "codex-5-hour", Scope: "account", Mode: "rolling", Status: "low", Unit: "percentage", RemainingRatio: &remaining, ResetAt: &resetAt, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: now}},
 	})
 	if errSnapshot != nil {
 		t.Fatalf("UpsertQuotaSnapshot() error = %v", errSnapshot)
@@ -60,6 +73,12 @@ func TestQuotaManagementListAndDetailReadDatabaseSnapshots(t *testing.T) {
 	if !ok || listItem["earliest_reset_at"] != resetAt.Format(time.RFC3339) {
 		t.Fatalf("list earliest_reset_at = %#v, want %s", listItem["earliest_reset_at"], resetAt.Format(time.RFC3339))
 	}
+	if plan, ok := listItem["plan"].(map[string]any); !ok || plan["name"] != "Pro 20x" {
+		t.Fatalf("list plan = %#v, want Pro 20x", listItem["plan"])
+	}
+	if _, exists := listItem["reset_credits"]; exists {
+		t.Fatalf("list unexpectedly exposed detail-only reset credits: %#v", listItem["reset_credits"])
+	}
 	if _, ok := listPayload["global_summary"].(map[string]any); !ok {
 		t.Fatalf("global_summary = %T, want object", listPayload["global_summary"])
 	}
@@ -86,6 +105,21 @@ func TestQuotaManagementListAndDetailReadDatabaseSnapshots(t *testing.T) {
 	credential, ok := detailPayload["credential"].(map[string]any)
 	if !ok || credential["earliest_reset_at"] != resetAt.Format(time.RFC3339) {
 		t.Fatalf("detail earliest_reset_at = %#v, want %s", credential["earliest_reset_at"], resetAt.Format(time.RFC3339))
+	}
+	resetCredits, ok := detailPayload["reset_credits"].(map[string]any)
+	if !ok || resetCredits["available_count"] != float64(3) {
+		t.Fatalf("detail reset_credits = %#v, want available_count=3", detailPayload["reset_credits"])
+	}
+	credits, ok := resetCredits["credits"].([]any)
+	if !ok || len(credits) != 1 {
+		t.Fatalf("detail reset credit entries = %#v, want one", resetCredits["credits"])
+	}
+	credit, ok := credits[0].(map[string]any)
+	if !ok || credit["status"] != "available" || credit["granted_at"] != resetCreditGrantedAt.Format(time.RFC3339) || credit["expires_at"] != resetCreditExpiry.Format(time.RFC3339) {
+		t.Fatalf("detail reset credit = %#v, want read-only timing fields", credits[0])
+	}
+	if _, exists := credit["id"]; exists || strings.Contains(detailResponse.Body.String(), "reset-credit-1") {
+		t.Fatalf("detail exposed provider reset-credit id: %s", detailResponse.Body.String())
 	}
 	if strings.Contains(detailResponse.Body.String(), "management-token-must-not-leak") {
 		t.Fatalf("detail response leaked credential token: %s", detailResponse.Body.String())

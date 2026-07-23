@@ -67,8 +67,9 @@ func TestCollectorFailureRetainsLastKnownWindows(t *testing.T) {
 	remaining := 0.5
 	_, errSeed := repo.UpsertQuotaSnapshot(context.Background(), cluster.QuotaSnapshotWrite{
 		CredentialID: "codex-failed-probe", QuotaStatus: "healthy", CollectionStatus: "success", Source: "response_header",
-		ObservedAt: &oldObservedAt, ExpiresAt: &oldExpiresAt, LastSuccessAt: &oldObservedAt, NextProbeAt: &oldExpiresAt, ReplaceWindows: true,
-		Windows: []cluster.QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: oldObservedAt}},
+		ObservedAt: &oldObservedAt, ExpiresAt: &oldExpiresAt, LastSuccessAt: &oldObservedAt, NextProbeAt: &oldExpiresAt,
+		ParserVersion: cluster.QuotaSnapshotVersion("codex"), CollectorVersion: cluster.QuotaSnapshotVersion("codex"), ReplaceWindows: true,
+		Windows: []cluster.QuotaWindow{{ID: "codex-5-hour", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &remaining, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: oldObservedAt}},
 	})
 	if errSeed != nil {
 		t.Fatalf("seed snapshot: %v", errSeed)
@@ -524,7 +525,10 @@ func TestCollectorEnforcesSQLiteSingleWriter(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseProbes := func() { releaseOnce.Do(func() { close(release) }) }
 	defer releaseProbes()
-	started := make(chan struct{}, 4)
+	// Codex performs an independent reset-credit detail request after usage, so
+	// leave enough signal capacity for both requests per credential. Concurrency
+	// is still measured by current/maximum below.
+	started := make(chan struct{}, 16)
 	var current atomic.Int32
 	var maximum atomic.Int32
 	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
