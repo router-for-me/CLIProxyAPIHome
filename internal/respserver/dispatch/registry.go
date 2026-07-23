@@ -4,14 +4,34 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/tidwall/gjson"
 )
 
+type InFlightSnapshotStore interface {
+	IngestInFlightFrame(context.Context, cluster.InFlightIngestIdentity, []byte, cluster.InFlightLimits) (cluster.InFlightIngestResult, error)
+}
+
+// ConcurrencyReleaseStore atomically applies cumulative credential concurrency releases.
+type ConcurrencyReleaseStore interface {
+	ApplyConcurrencyRelease(context.Context, cluster.ConcurrencyReleaseRequest) error
+}
+
 type Env struct {
 	Runtime *home.Runtime
 	Conn    *ConnEnv
+
+	// InFlightStore persists in-flight observation frames.
+	InFlightStore InFlightSnapshotStore
+
+	// InFlightLimits bounds the in-flight observation frame accepted by InFlightStore.
+	InFlightLimits cluster.InFlightLimits
+
+	// ConcurrencyReleaseStore applies cumulative limiter releases from this connection.
+	ConcurrencyReleaseStore ConcurrencyReleaseStore
 
 	// ClientIP is the remote TCP client's IP address as resolved by the RESP server.
 	// It can be empty when the address cannot be resolved.
@@ -23,12 +43,65 @@ type Env struct {
 
 	// ClientCertificateFingerprint is the SHA-256 fingerprint of the mTLS leaf certificate.
 	ClientCertificateFingerprint string
+
+	// ConnectionLifetime is fixed when the connection is accepted and cannot be
+	// upgraded by a subscription performed on the same socket. Its fingerprint and
+	// connected time are the only in-flight snapshot ownership identity.
+	ConnectionLifetime cluster.ConnectionLifetime
 }
 
 type ConnEnv struct {
-	SubscribeConfigYAML   func() (int64, error)
-	UnsubscribeConfigYAML func() (int64, error)
-	IsSubscribed          func() bool
+	SubscribeConfigYAML            func() (int64, error)
+	UnsubscribeConfigYAML          func() (int64, error)
+	IsSubscribed                   func() bool
+	SubscribeMembership            func(context.Context, int, int64) (cluster.ConnectionLifetime, error)
+	AttachSubscriptionLifetimeFunc func(cluster.ConnectionLifetime) error
+	FenceFingerprint               func(context.Context, string) error
+	CloseLocalFingerprint          func()
+	PrepareDispatchReply           func() error
+	AccountedReplyFailure          func() error
+
+	lifetimeMu           sync.RWMutex
+	subscriptionLifetime *cluster.ConnectionLifetime
+}
+
+// AttachSubscriptionLifetime records the lifetime attached to a subscription socket.
+func (e *ConnEnv) AttachSubscriptionLifetime(lifetime cluster.ConnectionLifetime) error {
+	if e == nil {
+		return fmt.Errorf("connection environment is nil")
+	}
+	if strings.TrimSpace(lifetime.Fingerprint) == "" || lifetime.ConnectedAt.IsZero() {
+		return fmt.Errorf("subscription lifetime is invalid")
+	}
+	if lifetime.Controlled || !lifetime.Subscription {
+		return fmt.Errorf("subscription lifetime must be non-controlled")
+	}
+	if e.AttachSubscriptionLifetimeFunc != nil {
+		if errAttach := e.AttachSubscriptionLifetimeFunc(lifetime); errAttach != nil {
+			return errAttach
+		}
+	}
+	e.lifetimeMu.Lock()
+	defer e.lifetimeMu.Unlock()
+	if e.subscriptionLifetime != nil && *e.subscriptionLifetime != lifetime {
+		return fmt.Errorf("subscription lifetime is already attached")
+	}
+	attached := lifetime
+	e.subscriptionLifetime = &attached
+	return nil
+}
+
+// SubscriptionLifetime returns the attached subscription lifetime, when present.
+func (e *ConnEnv) SubscriptionLifetime() (cluster.ConnectionLifetime, bool) {
+	if e == nil {
+		return cluster.ConnectionLifetime{}, false
+	}
+	e.lifetimeMu.RLock()
+	defer e.lifetimeMu.RUnlock()
+	if e.subscriptionLifetime == nil {
+		return cluster.ConnectionLifetime{}, false
+	}
+	return *e.subscriptionLifetime, true
 }
 
 type ReplyKind int
@@ -44,12 +117,17 @@ const (
 type Reply struct {
 	Kind ReplyKind
 
-	SimpleString string
-	BulkString   []byte
-	RedisError   string
-	Integer      int64
-	Array        []Reply
-	Sensitive    bool
+	// SubscriptionLifetime is server-only metadata and is never serialized.
+	SubscriptionLifetime *cluster.ConnectionLifetime
+
+	SimpleString       string
+	BulkString         []byte
+	RedisError         string
+	Integer            int64
+	Array              []Reply
+	Sensitive          bool
+	AccountedAdmission bool
+	PreWriteError      error
 }
 
 func SensitiveBulkString(payload []byte) Reply {
@@ -262,6 +340,9 @@ func (r *Registry) Execute(ctx context.Context, env Env, args []string) Reply {
 	if command == "" {
 		return Err("empty command")
 	}
+	if commandRequiresControlledLifetime(args) && !env.ConnectionLifetime.Controlled {
+		return Err("controlled connection required")
+	}
 
 	if direct := r.directHandlers[command]; direct != nil {
 		if len(args) < 2 {
@@ -306,6 +387,18 @@ func (r *Registry) Execute(ctx context.Context, env Env, args []string) Reply {
 	}
 
 	return RedisError(fmt.Sprintf("ERR unknown command '%s'", strings.ToLower(command)))
+}
+
+func commandRequiresControlledLifetime(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(args[0])) {
+	case "RPOP", "LPUSH", "RPUSH", "SET", "DEL", "MSET", "INCRBY", "EXPIRE":
+		return true
+	default:
+		return false
+	}
 }
 
 // ExtractJSONArgument extracts a json argument.

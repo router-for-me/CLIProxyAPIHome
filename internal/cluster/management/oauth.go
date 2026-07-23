@@ -29,17 +29,47 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "auth_load_failed", errAuths)
 		return
 	}
+	observation, errObservation := h.repo.ReadInFlightObservation(ctx, h.inFlightStaleAfter())
+	var observationRead *cluster.InFlightObservationReadModel
+	if errObservation == nil {
+		observationRead = &observation
+	}
+	states, errStates := h.repo.ReadConcurrencyState(ctx)
+	limiterAvailable := errStates == nil
+	observedCredentials := map[string]cluster.InFlightObservedCredentialItem{}
+	if observationRead != nil {
+		observedCredentials = observedCredentialsByID(*observationRead)
+	}
+	statesByCredential := make(map[string]cluster.CredentialConcurrencyState, len(states))
+	for index := range states {
+		state := states[index]
+		statesByCredential[state.CredentialID] = state
+	}
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if !isOAuthAuth(auth) {
 			continue
 		}
-		files = append(files, authFileEntry(auth))
+		entry := authFileEntry(auth)
+		observed, observedOK := observedCredentials[auth.ID]
+		if observationRead != nil && observedOK {
+			applyInFlightObservationToAuthFile(entry, *observationRead, observed)
+		} else {
+			applyNoInFlightObservationToAuthFile(entry)
+		}
+		if limiterAvailable {
+			applyConcurrencyStateToAuthFile(entry, statesByCredential[auth.ID], observationRead, observed, observedOK)
+		}
+		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
 		return fmt.Sprint(files[i]["name"]) < fmt.Sprint(files[j]["name"])
 	})
-	c.JSON(http.StatusOK, gin.H{"files": files})
+	var observedAt any
+	if observationRead != nil {
+		observedAt = inFlightObservedAt(*observationRead)
+	}
+	c.JSON(http.StatusOK, gin.H{"in_flight_observed_at": observedAt, "files": files})
 }
 
 // DownloadAuthFile downloads an auth file.
@@ -211,6 +241,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid body", errValues)
 		return
 	}
+	concurrencyPatch, errConcurrencyPatch := decodeConcurrencyPolicyPatchRequest(body)
+	if errConcurrencyPatch != nil {
+		respondError(c, http.StatusBadRequest, "invalid body", errConcurrencyPatch)
+		return
+	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	auth, errAuth := h.findOAuthAuth(ctx, authIdentifierFromBodyAndRequest(c, values))
@@ -223,18 +258,29 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 	removeOAuthFieldPatchIdentifierFields(body)
+	removeOAuthFieldPatchConcurrencyFields(body)
 	changed, errPatch := applyOAuthFieldPatch(auth, body)
 	if errPatch != nil {
 		respondError(c, http.StatusBadRequest, "invalid body", errPatch)
 		return
 	}
-	if !changed {
+	policyChanged := concurrencyPatch.MaxInFlight.Set || concurrencyPatch.MaxInFlightByModel.Set
+	if !changed && !policyChanged {
 		respondError(c, http.StatusBadRequest, "no fields to update", nil)
 		return
 	}
-	auth.UpdatedAt = time.Now().UTC()
-	if _, errUpsert := h.repo.UpsertAuth(ctx, auth, "update"); errUpsert != nil {
-		respondError(c, http.StatusInternalServerError, "write_failed", errUpsert)
+	if changed {
+		auth.UpdatedAt = time.Now().UTC()
+	}
+	errWrite := h.repo.PatchAuthAndConcurrency(ctx, cluster.AuthConcurrencyPatchRequest{
+		CredentialID:          auth.ID,
+		Auth:                  auth,
+		AuthChanged:           changed,
+		PolicyPatch:           cluster.ConcurrencyPolicyPatch{MaxInFlight: concurrencyPatch.MaxInFlight, MaxInFlightByModel: concurrencyPatch.MaxInFlightByModel},
+		ExpectedPolicyVersion: concurrencyPatch.Version,
+	})
+	if errWrite != nil {
+		respondConcurrencyPolicyError(c, errWrite)
 		return
 	}
 	if errRefresh := h.refreshAuths(ctx); errRefresh != nil {
@@ -611,6 +657,12 @@ func decodeOAuthFieldPatchValue(raw json.RawMessage) (any, error) {
 
 func removeOAuthFieldPatchIdentifierFields(fields map[string]json.RawMessage) {
 	for _, key := range []string{"id", "uuid", "auth_index", "index", "name", "file", "filename"} {
+		delete(fields, key)
+	}
+}
+
+func removeOAuthFieldPatchConcurrencyFields(fields map[string]json.RawMessage) {
+	for _, key := range []string{"version", "max_in_flight", "max_in_flight_by_model"} {
 		delete(fields, key)
 	}
 }

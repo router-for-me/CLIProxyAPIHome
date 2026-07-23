@@ -127,6 +127,25 @@ func TestClusterManagementAPIKeyUsageRouteRegistered(t *testing.T) {
 	}
 }
 
+func TestClusterManagementInFlightRoutesRegistered(t *testing.T) {
+	reg := newRouteRegistry()
+	handler := clustermanagement.NewHandler(nil, nil, "", 0)
+	registerClusterManagementRoutes(reg, handler)
+
+	for _, route := range []RouteKey{
+		{Method: http.MethodGet, Path: "/credentials/in-flight"},
+		{Method: http.MethodGet, Path: "/credentials/in-flight/summary"},
+		{Method: http.MethodGet, Path: "/credentials/concurrency-policies"},
+		{Method: http.MethodGet, Path: "/credentials/concurrency"},
+		{Method: http.MethodGet, Path: "/credentials/:credential_id/concurrency-policy"},
+		{Method: http.MethodPatch, Path: "/credentials/:credential_id/concurrency-policy"},
+	} {
+		if reg.routes[route] == nil {
+			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
+		}
+	}
+}
+
 func TestClusterManagementUsageObservabilityRoutesRegistered(t *testing.T) {
 	reg := newRouteRegistry()
 	handler := clustermanagement.NewHandler(nil, nil, "", 0)

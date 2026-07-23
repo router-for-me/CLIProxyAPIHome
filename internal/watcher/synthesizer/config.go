@@ -100,7 +100,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
-		applyClusterUUID(ctx, a)
+		applyProviderCredentialID(ctx, a, entry.ID)
 		out = append(out, a)
 	}
 	return out
@@ -159,7 +159,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
-		applyClusterUUID(ctx, a)
+		applyProviderCredentialID(ctx, a, ck.ID)
 		out = append(out, a)
 	}
 	return out
@@ -238,7 +238,7 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
-		applyClusterUUID(ctx, a)
+		applyProviderCredentialID(ctx, a, entry.ID)
 		out = append(out, a)
 	}
 	return out
@@ -308,7 +308,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
 			}
-			applyClusterUUID(ctx, a)
+			applyProviderCredentialID(ctx, a, entry.ID)
 			out = append(out, a)
 			createdEntries++
 		}
@@ -348,7 +348,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
 			}
-			applyClusterUUID(ctx, a)
+			applyProviderCredentialID(ctx, a, compat.ID)
 			out = append(out, a)
 		}
 	}
@@ -406,7 +406,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
-		applyClusterUUID(ctx, a)
+		applyProviderCredentialID(ctx, a, compat.ID)
 		out = append(out, a)
 	}
 	return out

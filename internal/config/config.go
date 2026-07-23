@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -23,6 +24,8 @@ const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Home-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
+
+var ErrInvalidProviderCredentialID = errors.New("provider credential id must be a canonical UUID")
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
@@ -52,6 +55,12 @@ type Config struct {
 
 	// UserEmail configures verified user emails and password-recovery delivery.
 	UserEmail UserEmailConfig `yaml:"user-email" json:"-"`
+
+	// CredentialConcurrency controls Home credential concurrency lifecycle behavior.
+	CredentialConcurrency CredentialConcurrencyConfig `yaml:"credential-concurrency" json:"credential-concurrency"`
+
+	// CredentialInFlight configures credential observation snapshots.
+	CredentialInFlight CredentialInFlightConfig `yaml:"credential-in-flight" json:"credential-in-flight"`
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
@@ -367,6 +376,10 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	// ID is the immutable credential identity.
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
+	// UUID is accepted for backward-compatible input and normalized to ID.
+	UUID string `yaml:"uuid,omitempty" json:"uuid,omitempty"`
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -429,6 +442,10 @@ func (m ClaudeModel) GetAlias() string { return m.Alias }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	// ID is the immutable credential identity.
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
+	// UUID is accepted for backward-compatible input and normalized to ID.
+	UUID string `yaml:"uuid,omitempty" json:"uuid,omitempty"`
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -504,6 +521,10 @@ type XAIModel = CodexModel
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	// ID is the immutable credential identity.
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
+	// UUID is accepted for backward-compatible input and normalized to ID.
+	UUID string `yaml:"uuid,omitempty" json:"uuid,omitempty"`
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -557,6 +578,10 @@ func (m GeminiModel) GetAlias() string { return m.Alias }
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
+	// ID is the immutable identity of the fallback credential when no API key entries exist.
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
+	// UUID is accepted for backward-compatible input and normalized to ID.
+	UUID string `yaml:"uuid,omitempty" json:"uuid,omitempty"`
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
@@ -588,6 +613,10 @@ type OpenAICompatibility struct {
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
 type OpenAICompatibilityAPIKey struct {
+	// ID is the immutable credential identity.
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
+	// UUID is accepted for backward-compatible input and normalized to ID.
+	UUID string `yaml:"uuid,omitempty" json:"uuid,omitempty"`
 	// APIKey is the authentication key for accessing the external API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -616,24 +645,24 @@ func (m OpenAICompatibilityModel) GetName() string { return m.Name }
 func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
 
 // LoadConfigOptional reads YAML from configFile.
-// If optional is true and the file is missing, it returns an empty Config.
-// If optional is true and the file is empty or invalid, it returns an empty Config.
+// If optional is true and the file is missing, it returns a Config with credential defaults.
+// If optional is true and the file is empty or invalid, it returns a Config with credential defaults.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
 		if optional {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
-				// Missing and optional: return empty config (cloud deploy standby).
-				return &Config{}, nil
+				// Missing and optional: return credential defaults (cloud deploy standby).
+				return optionalConfigFallback(), nil
 			}
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
-	if optional && len(data) == 0 {
-		return &Config{}, nil
+	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return credential defaults.
+	if optional && len(bytes.TrimSpace(data)) == 0 {
+		return optionalConfigFallback(), nil
 	}
 
 	// Unmarshal the YAML data into the Config struct.
@@ -650,12 +679,21 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.CredentialConcurrency = DefaultCredentialConcurrencyConfig()
+	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
-			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
-			return &Config{}, nil
+			// In cloud deploy mode, if YAML parsing fails, return credential defaults instead of error.
+			return optionalConfigFallback(), nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
+	if errValidate := ValidateCredentialConcurrencyConfig(cfg.CredentialConcurrency); errValidate != nil {
+		return nil, errValidate
 	}
 
 	cfg.NormalizePluginsConfig()
@@ -705,6 +743,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	if errNormalizeIDs := cfg.NormalizeProviderCredentialIDs(); errNormalizeIDs != nil {
+		return nil, errNormalizeIDs
+	}
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -742,6 +784,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func optionalConfigFallback() *Config {
+	return &Config{
+		CredentialConcurrency: DefaultCredentialConcurrencyConfig(),
+		CredentialInFlight:    DefaultCredentialInFlightConfig(),
+	}
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
@@ -863,6 +912,90 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 		}
 	}
 	cfg.OAuthModelAlias = out
+}
+
+// NormalizeProviderCredentialIDs normalizes legacy UUID input to immutable IDs.
+func (cfg *Config) NormalizeProviderCredentialIDs() error {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.GeminiKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.GeminiKey[i].ID, cfg.GeminiKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.GeminiKey[i].ID, cfg.GeminiKey[i].UUID = id, ""
+	}
+	for i := range cfg.VertexCompatAPIKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.VertexCompatAPIKey[i].ID, cfg.VertexCompatAPIKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.VertexCompatAPIKey[i].ID, cfg.VertexCompatAPIKey[i].UUID = id, ""
+	}
+	for i := range cfg.CodexKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.CodexKey[i].ID, cfg.CodexKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.CodexKey[i].ID, cfg.CodexKey[i].UUID = id, ""
+	}
+	for i := range cfg.XAIKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.XAIKey[i].ID, cfg.XAIKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.XAIKey[i].ID, cfg.XAIKey[i].UUID = id, ""
+	}
+	for i := range cfg.ClaudeKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.ClaudeKey[i].ID, cfg.ClaudeKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.ClaudeKey[i].ID, cfg.ClaudeKey[i].UUID = id, ""
+	}
+	for i := range cfg.OpenAICompatibility {
+		id, errNormalize := normalizeProviderCredentialID(cfg.OpenAICompatibility[i].ID, cfg.OpenAICompatibility[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.OpenAICompatibility[i].ID, cfg.OpenAICompatibility[i].UUID = id, ""
+		for j := range cfg.OpenAICompatibility[i].APIKeyEntries {
+			keyID, errNormalizeKey := normalizeProviderCredentialID(cfg.OpenAICompatibility[i].APIKeyEntries[j].ID, cfg.OpenAICompatibility[i].APIKeyEntries[j].UUID)
+			if errNormalizeKey != nil {
+				return errNormalizeKey
+			}
+			cfg.OpenAICompatibility[i].APIKeyEntries[j].ID, cfg.OpenAICompatibility[i].APIKeyEntries[j].UUID = keyID, ""
+		}
+	}
+	return nil
+}
+
+func normalizeProviderCredentialID(id string, legacyUUID string) (string, error) {
+	if errValidateID := validateProviderCredentialID(id); errValidateID != nil {
+		return "", errValidateID
+	}
+	if errValidateUUID := validateProviderCredentialID(legacyUUID); errValidateUUID != nil {
+		return "", errValidateUUID
+	}
+	if id != "" && legacyUUID != "" && id != legacyUUID {
+		return "", fmt.Errorf("credential id and uuid must match")
+	}
+	if id == "" {
+		id = legacyUUID
+	}
+	return id, nil
+}
+
+func validateProviderCredentialID(id string) error {
+	if id == "" {
+		return nil
+	}
+	parsed, errParse := uuid.Parse(id)
+	if errParse != nil || parsed.String() != id {
+		return fmt.Errorf("%w: %q", ErrInvalidProviderCredentialID, id)
+	}
+	return nil
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
@@ -1114,7 +1247,11 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if errClose := f.Close(); errClose != nil {
+			log.Errorf("close config file: %v", errClose)
+		}
+	}()
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)

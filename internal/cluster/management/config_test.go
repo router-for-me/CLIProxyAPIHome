@@ -9,8 +9,61 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 )
+
+func TestPutConfigYAMLDoesNotReplaceSnapshotWhenCredentialReconciliationFails(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	repo := cluster.NewRepository(db)
+	if errReplace := repo.ReplaceConfigSnapshot(context.Background(), map[string]any{"port": 8327}); errReplace != nil {
+		t.Fatal(errReplace)
+	}
+	id := "23232323-2323-4232-8232-232323232323"
+	if _, errUpsert := repo.UpsertAuth(context.Background(), &coreauth.Auth{
+		ID:       id,
+		Index:    id,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"source": "oauth:existing",
+		},
+	}, "create"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+	handler := NewHandler(repo, nil, "127.0.0.1", 0)
+	engine := gin.New()
+	engine.PUT("/config.yaml", handler.PutConfigYAML)
+
+	resp := httptest.NewRecorder()
+	engine.ServeHTTP(resp, httptest.NewRequest(http.MethodPut, "/config.yaml", strings.NewReader("port: 9999\ngemini-api-key:\n  - id: "+id+"\n    api-key: key\n")))
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("credential identity collision PUT status = %d, want %d body=%s", resp.Code, http.StatusConflict, resp.Body.String())
+	}
+	snapshot, errSnapshot := repo.LoadConfigSnapshot(context.Background())
+	if errSnapshot != nil {
+		t.Fatal(errSnapshot)
+	}
+	if string(snapshot["port"]) != "8327" {
+		t.Fatalf("snapshot port = %s, want original 8327", snapshot["port"])
+	}
+}
+
+func TestPutConfigYAMLRejectsInvalidProviderCredentialID(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	handler := NewHandler(cluster.NewRepository(db), nil, "127.0.0.1", 0)
+	engine := gin.New()
+	engine.PUT("/config.yaml", handler.PutConfigYAML)
+
+	resp := httptest.NewRecorder()
+	engine.ServeHTTP(resp, httptest.NewRequest(http.MethodPut, "/config.yaml", strings.NewReader("port: 9999\ngemini-api-key:\n  - id: not-a-uuid\n    api-key: key\n")))
+	if resp.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid credential ID PUT status = %d, want %d body=%s", resp.Code, http.StatusUnprocessableEntity, resp.Body.String())
+	}
+}
 
 func TestPutConfigYAMLPersistsCredentialRoots(t *testing.T) {
 	db, cleanup := openManagementLogTestDB(t)

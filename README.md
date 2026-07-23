@@ -56,6 +56,10 @@ docker compose -f "$COMPOSE_FILE" run --rm \
   home ./CLIProxyAPIHome -import
 ```
 
+## Strict Credential Concurrency Limits
+
+Before enabling credential concurrency policies, follow the [strict credential concurrency limits deployment runbook](docs/README.md). It defines the required SQLite and PostgreSQL topologies, certificate identity requirements, capability checks, and fail-closed mixed-version rollout.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

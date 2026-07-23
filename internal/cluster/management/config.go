@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"gopkg.in/yaml.v3"
@@ -78,29 +78,19 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid_yaml", errRoot)
 		return
 	}
+	appconfig.ApplyDownstreamHomeModeScalars(fullRoot)
 	root := configRootWithoutCredentials(fullRoot)
-	appconfig.ApplyDownstreamHomeModeScalars(root)
 	if _, errConfig := configFromRoot(root); errConfig != nil {
 		respondError(c, http.StatusUnprocessableEntity, "invalid_config", errConfig)
 		return
 	}
-	credentialAuths, credentialsChanged, errCredentials := h.credentialConfigAuthsFromRoot(fullRoot)
-	if errCredentials != nil {
-		respondError(c, http.StatusBadRequest, "invalid_body", errCredentials)
-		return
-	}
+	credentialsChanged := hasCredentialConfigRoots(fullRoot)
 
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
-	if errReplace := h.repo.ReplaceConfigSnapshot(ctx, root); errReplace != nil {
-		respondError(c, http.StatusInternalServerError, "write_failed", errReplace)
+	if errReplace := h.replaceConfigSnapshot(ctx, fullRoot); errReplace != nil {
+		respondConfigWriteError(c, errReplace)
 		return
-	}
-	if credentialsChanged {
-		if errReplaceCredentials := h.replaceCredentialConfigAuths(ctx, credentialAuths); errReplaceCredentials != nil {
-			respondError(c, http.StatusInternalServerError, "write_failed", errReplaceCredentials)
-			return
-		}
 	}
 	if errRefresh := h.refreshConfig(ctx); errRefresh != nil {
 		respondError(c, http.StatusInternalServerError, "reload_failed", errRefresh)
@@ -119,40 +109,27 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": changed})
 }
 
-type credentialConfigAuthList struct {
-	Key   string
-	Auths []*coreauth.Auth
+func respondConfigWriteError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	code := "write_failed"
+	switch {
+	case errors.Is(err, cluster.ErrCredentialIdentityConflict):
+		status = http.StatusConflict
+		code = "credential_identity_conflict"
+	case errors.Is(err, cluster.ErrCredentialValidation), errors.Is(err, cluster.ErrCredentialUUIDMappingRequired), errors.Is(err, appconfig.ErrInvalidProviderCredentialID):
+		status = http.StatusUnprocessableEntity
+		code = "invalid_credential"
+	}
+	respondError(c, status, code, err)
 }
 
-// credentialConfigAuthsFromRoot synthesizes DB-backed credentials present in YAML config.
-func (h *Handler) credentialConfigAuthsFromRoot(root map[string]any) ([]credentialConfigAuthList, bool, error) {
-	out := make([]credentialConfigAuthList, 0, 6)
+func hasCredentialConfigRoots(root map[string]any) bool {
 	for _, key := range []string{"gemini-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility"} {
-		value, exists := root[key]
-		if !exists {
-			continue
-		}
-		rawJSON, errMarshal := json.Marshal(value)
-		if errMarshal != nil {
-			return nil, false, errMarshal
-		}
-		auths, errSynthesize := h.synthesizeAPIKeyBody(key, rawJSON)
-		if errSynthesize != nil {
-			return nil, false, errSynthesize
-		}
-		out = append(out, credentialConfigAuthList{Key: key, Auths: auths})
-	}
-	return out, len(out) > 0, nil
-}
-
-// replaceCredentialConfigAuths replaces DB-backed credentials present in YAML config.
-func (h *Handler) replaceCredentialConfigAuths(ctx context.Context, entries []credentialConfigAuthList) error {
-	for _, entry := range entries {
-		if errReplace := h.replaceAPIKeyAuths(ctx, entry.Key, entry.Auths); errReplace != nil {
-			return errReplace
+		if _, exists := root[key]; exists {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // GetConfigRoot returns a config root.
@@ -262,7 +239,7 @@ func (h *Handler) DeleteConfigRoot(route string) gin.HandlerFunc {
 			respondError(c, http.StatusUnprocessableEntity, "invalid_config", errConfig)
 			return
 		}
-		if errReplace := h.repo.ReplaceConfigSnapshot(ctx, root); errReplace != nil {
+		if errReplace := h.replaceConfigSnapshot(ctx, root); errReplace != nil {
 			respondError(c, http.StatusInternalServerError, "write_failed", errReplace)
 			return
 		}
@@ -283,7 +260,19 @@ func (h *Handler) configRoot(ctx context.Context) (map[string]any, error) {
 	if errSnapshot != nil {
 		return nil, errSnapshot
 	}
-	return cluster.ConfigRootFromSnapshot(snapshot)
+	root, errRoot := cluster.ConfigRootFromSnapshot(snapshot)
+	if errRoot != nil {
+		return nil, errRoot
+	}
+	if _, errEnsureLifecycle := h.repo.EnsureLifecycleConfig(ctx, h.heartbeatTimeout); errEnsureLifecycle != nil {
+		return nil, errEnsureLifecycle
+	}
+	lifecycleConfig, errLifecycle := h.repo.LifecycleConfig(ctx)
+	if errLifecycle != nil {
+		return nil, errLifecycle
+	}
+	root["credential-concurrency"] = lifecycleConfig
+	return root, nil
 }
 
 // applyCredentialConfig applies a credential config.

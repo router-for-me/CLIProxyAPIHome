@@ -1,0 +1,25 @@
+{
+  "items": [
+    {
+      "credential_id": "cred-1",
+      "max_in_flight": 3,
+      "admitted_in_flight": 2,
+      "remaining": 1,
+      "total_saturated": false,
+      "models": [
+        {
+          "model": "gpt",
+          "max_in_flight": 2,
+          "admitted_in_flight": 2,
+          "remaining": 0,
+          "saturated": true
+        }
+      ],
+      "policy_version": 1,
+      "effective_at": "2026-07-21T12:00:00Z",
+      "observation_barrier_revision": 0,
+      "fully_enforced": "unknown",
+      "observed": null
+    }
+  ]
+}

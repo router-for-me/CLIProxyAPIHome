@@ -54,7 +54,7 @@ func (h *Handler) saveRuntimeConfigRootKey(ctx context.Context, cfg *appconfig.C
 		return errCurrentRoot
 	}
 	delete(currentRoot, key)
-	return h.repo.ReplaceConfigSnapshot(ctx, currentRoot)
+	return h.replaceConfigSnapshot(ctx, currentRoot)
 }
 
 // runtimeConfigRoot runs a time config root.

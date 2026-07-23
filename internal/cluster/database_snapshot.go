@@ -29,7 +29,7 @@ import (
 
 const (
 	databaseSnapshotFormat        = "cliproxyapihome-database-snapshot"
-	databaseSnapshotFormatVersion = 1
+	databaseSnapshotFormatVersion = 2
 	databaseSnapshotManifestName  = "manifest.json"
 	databaseSnapshotBatchSize     = 500
 	databaseSnapshotManifestLimit = 4 << 20
@@ -90,6 +90,7 @@ type ValidatedDatabaseSnapshot struct {
 	reader           *zip.Reader
 	entries          map[string]*zip.File
 	manifest         DatabaseSnapshotManifest
+	models           []databaseModel
 	validationMu     sync.Mutex
 	validatedTargets map[DatabaseBackend]bool
 }
@@ -399,11 +400,21 @@ func OpenDatabaseSnapshot(ctx context.Context, path string) (*ValidatedDatabaseS
 	if errManifest != nil {
 		return nil, errManifest
 	}
-	if errManifest := validateDatabaseSnapshotManifest(manifest, entries); errManifest != nil {
+	if manifest.FormatVersion > databaseSnapshotFormatVersion {
+		return nil, fmt.Errorf("database snapshot format version %d is newer than supported version %d", manifest.FormatVersion, databaseSnapshotFormatVersion)
+	}
+	models, okModels := databaseSnapshotModels(manifest.FormatVersion)
+	if !okModels {
+		return nil, fmt.Errorf("unsupported database snapshot format version %d", manifest.FormatVersion)
+	}
+	if errEntries := validateDatabaseSnapshotEntrySet(entries, models); errEntries != nil {
+		return nil, errEntries
+	}
+	if errManifest := validateDatabaseSnapshotManifest(manifest, entries, models); errManifest != nil {
 		return nil, errManifest
 	}
 	for index, table := range manifest.Tables {
-		model := homeDatabaseModels[index]
+		model := models[index]
 		if errTable := validateDatabaseSnapshotTable(ctx, entries[databaseSnapshotTableEntryName(table.Name)], model, table); errTable != nil {
 			return nil, errTable
 		}
@@ -414,22 +425,16 @@ func OpenDatabaseSnapshot(ctx context.Context, path string) (*ValidatedDatabaseS
 		reader:           reader,
 		entries:          entries,
 		manifest:         manifest,
+		models:           models,
 		validatedTargets: make(map[DatabaseBackend]bool, 2),
 	}, nil
 }
 
 func validateDatabaseSnapshotEntries(reader *zip.Reader) (map[string]*zip.File, error) {
-	allowed := map[string]struct{}{databaseSnapshotManifestName: {}}
-	for _, model := range homeDatabaseModels {
-		allowed[databaseSnapshotTableEntryName(model.name)] = struct{}{}
-	}
 	entries := make(map[string]*zip.File, len(reader.File))
 	for _, entry := range reader.File {
 		if entry == nil {
 			return nil, fmt.Errorf("database snapshot contains an invalid zip entry")
-		}
-		if _, okAllowed := allowed[entry.Name]; !okAllowed {
-			return nil, fmt.Errorf("database snapshot contains disallowed zip entry %q", entry.Name)
 		}
 		if _, duplicate := entries[entry.Name]; duplicate {
 			return nil, fmt.Errorf("database snapshot contains duplicate zip entry %q", entry.Name)
@@ -439,15 +444,31 @@ func validateDatabaseSnapshotEntries(reader *zip.Reader) (map[string]*zip.File, 
 		}
 		entries[entry.Name] = entry
 	}
+	if entries[databaseSnapshotManifestName] == nil {
+		return nil, fmt.Errorf("database snapshot is missing zip entry %q", databaseSnapshotManifestName)
+	}
+	return entries, nil
+}
+
+func validateDatabaseSnapshotEntrySet(entries map[string]*zip.File, models []databaseModel) error {
+	allowed := map[string]struct{}{databaseSnapshotManifestName: {}}
+	for _, model := range models {
+		allowed[databaseSnapshotTableEntryName(model.name)] = struct{}{}
+	}
 	if len(entries) != len(allowed) {
-		return nil, fmt.Errorf("database snapshot zip entry set is incomplete")
+		return fmt.Errorf("database snapshot zip entry set is incomplete")
+	}
+	for name := range entries {
+		if _, okAllowed := allowed[name]; !okAllowed {
+			return fmt.Errorf("database snapshot contains disallowed zip entry %q", name)
+		}
 	}
 	for name := range allowed {
 		if entries[name] == nil {
-			return nil, fmt.Errorf("database snapshot is missing zip entry %q", name)
+			return fmt.Errorf("database snapshot is missing zip entry %q", name)
 		}
 	}
-	return entries, nil
+	return nil
 }
 
 func readDatabaseSnapshotManifest(entry *zip.File) (DatabaseSnapshotManifest, error) {
@@ -476,7 +497,7 @@ func readDatabaseSnapshotManifest(entry *zip.File) (DatabaseSnapshotManifest, er
 	return manifest, nil
 }
 
-func validateDatabaseSnapshotManifest(manifest DatabaseSnapshotManifest, entries map[string]*zip.File) error {
+func validateDatabaseSnapshotManifest(manifest DatabaseSnapshotManifest, entries map[string]*zip.File, models []databaseModel) error {
 	if manifest.Format != databaseSnapshotFormat {
 		return fmt.Errorf("unsupported database snapshot format %q", manifest.Format)
 	}
@@ -498,10 +519,10 @@ func validateDatabaseSnapshotManifest(manifest DatabaseSnapshotManifest, entries
 	default:
 		return fmt.Errorf("unsupported database snapshot source backend %q", manifest.SourceBackend)
 	}
-	if len(manifest.Tables) != len(homeDatabaseModels) {
-		return fmt.Errorf("database snapshot manifest contains %d tables, want %d", len(manifest.Tables), len(homeDatabaseModels))
+	if len(manifest.Tables) != len(models) {
+		return fmt.Errorf("database snapshot manifest contains %d tables, want %d", len(manifest.Tables), len(models))
 	}
-	for index, model := range homeDatabaseModels {
+	for index, model := range models {
 		table := manifest.Tables[index]
 		if table.Name != model.name {
 			return fmt.Errorf("database snapshot table %d is %q, want %q", index, table.Name, model.name)
@@ -627,7 +648,7 @@ func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, mo
 }
 
 func (s *ValidatedDatabaseSnapshot) validatePostgresFields(ctx context.Context) error {
-	for _, model := range homeDatabaseModels {
+	for _, model := range s.models {
 		if !model.restore {
 			continue
 		}
@@ -1039,13 +1060,13 @@ func ImportDatabaseSnapshot(ctx context.Context, db *gorm.DB, snapshot *Validate
 		return DatabaseSnapshotImportResult{}, fmt.Errorf("migrate database before snapshot import: %w", errMigrate)
 	}
 
-	result := DatabaseSnapshotImportResult{Tables: make([]DatabaseSnapshotImportTableResult, 0, len(homeDatabaseModels))}
+	result := DatabaseSnapshotImportResult{Tables: make([]DatabaseSnapshotImportTableResult, 0, len(snapshot.models))}
 	now := time.Now().UTC()
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if errEmpty := ensureDatabaseSnapshotTargetEmpty(ctx, tx); errEmpty != nil {
 			return errEmpty
 		}
-		for index, model := range homeDatabaseModels {
+		for index, model := range snapshot.models {
 			manifestTable := snapshot.manifest.Tables[index]
 			tableResult := DatabaseSnapshotImportTableResult{Name: model.name}
 			if !model.restore {
@@ -1070,10 +1091,10 @@ func ImportDatabaseSnapshot(ctx context.Context, db *gorm.DB, snapshot *Validate
 		if errRelationships := validateImportedDatabaseSnapshotRelationships(tx); errRelationships != nil {
 			return errRelationships
 		}
-		if errCounts := validateDatabaseSnapshotImportCounts(tx, result); errCounts != nil {
+		if errCounts := validateDatabaseSnapshotImportCounts(tx, result, snapshot.models); errCounts != nil {
 			return errCounts
 		}
-		if errSequences := resetDatabaseSnapshotSequences(tx, backend); errSequences != nil {
+		if errSequences := resetDatabaseSnapshotSequences(tx, backend, snapshot.models); errSequences != nil {
 			return errSequences
 		}
 		return nil
@@ -1224,12 +1245,12 @@ func restoreDatabaseSnapshotRecord(record any, now time.Time) bool {
 	return kvRecord.ExpiresAt == nil || kvRecord.ExpiresAt.After(now)
 }
 
-func validateDatabaseSnapshotImportCounts(tx *gorm.DB, result DatabaseSnapshotImportResult) error {
+func validateDatabaseSnapshotImportCounts(tx *gorm.DB, result DatabaseSnapshotImportResult, models []databaseModel) error {
 	results := make(map[string]DatabaseSnapshotImportTableResult, len(result.Tables))
 	for _, table := range result.Tables {
 		results[table.Name] = table
 	}
-	for _, model := range homeDatabaseModels {
+	for _, model := range models {
 		if !model.restore {
 			continue
 		}
@@ -1260,6 +1281,8 @@ func validateImportedDatabaseSnapshotRelationships(tx *gorm.DB) error {
 		{name: "billing_charge.usage_id", query: `SELECT COUNT(*) FROM "billing_charge" AS child WHERE NOT EXISTS (SELECT 1 FROM "usage" AS parent WHERE parent."id" = child."usage_id")`},
 		{name: "billing_charge.user_id", query: `SELECT COUNT(*) FROM "billing_charge" AS child WHERE child."user_id" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "user" AS parent WHERE parent."id" = child."user_id")`},
 		{name: "billing_charge.api_key_id", query: `SELECT COUNT(*) FROM "billing_charge" AS child WHERE child."api_key_id" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "api_key" AS parent WHERE parent."id" = child."api_key_id")`},
+		{name: "credential_concurrency_policies.credential_id", query: `SELECT COUNT(*) FROM "credential_concurrency_policies" AS child WHERE NOT EXISTS (SELECT 1 FROM "auth" AS parent WHERE parent."uuid" = child."credential_id")`},
+		{name: "credential_concurrency_model_policies.credential_id", query: `SELECT COUNT(*) FROM "credential_concurrency_model_policies" AS child WHERE NOT EXISTS (SELECT 1 FROM "credential_concurrency_policies" AS parent WHERE parent."credential_id" = child."credential_id")`},
 	}
 	for _, check := range checks {
 		var count int64
@@ -1270,7 +1293,62 @@ func validateImportedDatabaseSnapshotRelationships(tx *gorm.DB) error {
 			return fmt.Errorf("verify imported database snapshot relationship %s: found %d orphaned records", check.name, count)
 		}
 	}
-	return validateImportedDatabaseSnapshotAPIKeyGroups(tx)
+	if errGroups := validateImportedDatabaseSnapshotAPIKeyGroups(tx); errGroups != nil {
+		return errGroups
+	}
+	return validateImportedDatabaseSnapshotConcurrencyState(tx)
+}
+
+func validateImportedDatabaseSnapshotConcurrencyState(tx *gorm.DB) error {
+	var invalidGateIDs int64
+	if errCount := tx.Model(&ConcurrencyActivationGateRecord{}).Where("id <> ?", 1).Count(&invalidGateIDs).Error; errCount != nil {
+		return fmt.Errorf("verify imported database snapshot concurrency activation gate ids: %w", errCount)
+	}
+	if invalidGateIDs != 0 {
+		return fmt.Errorf("verify imported database snapshot concurrency activation gate: found %d records outside singleton id 1", invalidGateIDs)
+	}
+
+	var activePolicyCount int64
+	if errCount := tx.Raw(`SELECT COUNT(*) FROM "credential_concurrency_policies" AS policy WHERE policy."max_in_flight" IS NOT NULL OR EXISTS (SELECT 1 FROM "credential_concurrency_model_policies" AS model_policy WHERE model_policy."credential_id" = policy."credential_id")`).Scan(&activePolicyCount).Error; errCount != nil {
+		return fmt.Errorf("verify imported database snapshot active concurrency policy count: %w", errCount)
+	}
+	activationGate := ConcurrencyActivationGateRecord{}
+	errGate := tx.First(&activationGate, "id = ?", 1).Error
+	if errors.Is(errGate, gorm.ErrRecordNotFound) {
+		if activePolicyCount != 0 {
+			return fmt.Errorf("verify imported database snapshot concurrency activation gate: missing singleton for %d active policies", activePolicyCount)
+		}
+	} else if errGate != nil {
+		return fmt.Errorf("verify imported database snapshot concurrency activation gate: %w", errGate)
+	} else if activationGate.ActivePolicyCount != activePolicyCount {
+		return fmt.Errorf("verify imported database snapshot concurrency activation gate: active policy count is %d, want %d", activationGate.ActivePolicyCount, activePolicyCount)
+	}
+
+	var invalidBarrierIDs int64
+	if errCount := tx.Model(&ConcurrencyObservationBarrierRecord{}).Where("id <> ?", 1).Count(&invalidBarrierIDs).Error; errCount != nil {
+		return fmt.Errorf("verify imported database snapshot concurrency observation barrier ids: %w", errCount)
+	}
+	if invalidBarrierIDs != 0 {
+		return fmt.Errorf("verify imported database snapshot concurrency observation barrier: found %d records outside singleton id 1", invalidBarrierIDs)
+	}
+
+	var maximumPolicyRevision sql.NullInt64
+	if errRevision := tx.Model(&CredentialConcurrencyPolicyRecord{}).Select("MAX(observation_barrier_revision)").Scan(&maximumPolicyRevision).Error; errRevision != nil {
+		return fmt.Errorf("verify imported database snapshot concurrency policy barrier revisions: %w", errRevision)
+	}
+	if !maximumPolicyRevision.Valid {
+		return nil
+	}
+	barrier := ConcurrencyObservationBarrierRecord{}
+	if errBarrier := tx.First(&barrier, "id = ?", 1).Error; errors.Is(errBarrier, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("verify imported database snapshot concurrency observation barrier: missing singleton for policy revision %d", maximumPolicyRevision.Int64)
+	} else if errBarrier != nil {
+		return fmt.Errorf("verify imported database snapshot concurrency observation barrier: %w", errBarrier)
+	}
+	if barrier.Revision < maximumPolicyRevision.Int64 {
+		return fmt.Errorf("verify imported database snapshot concurrency observation barrier: revision is %d, want at least %d", barrier.Revision, maximumPolicyRevision.Int64)
+	}
+	return nil
 }
 
 func validateImportedDatabaseSnapshotAPIKeyGroups(tx *gorm.DB) error {
@@ -1334,8 +1412,8 @@ func loadImportedDatabaseSnapshotUintIDs(tx *gorm.DB, model any, table string) (
 	return ids, nil
 }
 
-func resetDatabaseSnapshotSequences(tx *gorm.DB, backend DatabaseBackend) error {
-	for _, model := range homeDatabaseModels {
+func resetDatabaseSnapshotSequences(tx *gorm.DB, backend DatabaseBackend, models []databaseModel) error {
+	for _, model := range models {
 		if !model.restore || !model.autoIncrement {
 			continue
 		}

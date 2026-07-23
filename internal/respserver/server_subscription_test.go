@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"path/filepath"
 	goruntime "runtime"
 	"strconv"
 	"strings"
@@ -17,9 +18,104 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 )
+
+func TestProtocolOneSubscribeCreatesMembershipWithCurrentHome(t *testing.T) {
+	repo := newSubscriptionTestRepository(t)
+	coordinator := cluster.NewCoordinator(repo, cluster.NodeIdentity{IP: "127.0.0.1", Port: 8317}, cluster.CoordinatorOptions{})
+	if errInitialize := coordinator.Initialize(context.Background()); errInitialize != nil {
+		t.Fatal(errInitialize)
+	}
+	defer func() {
+		if errRetire := coordinator.RetireHomeIncarnation(context.Background()); errRetire != nil {
+			t.Errorf("retire Home incarnation: %v", errRetire)
+		}
+	}()
+	lifecycle, errLifecycle := repo.LifecycleConfig(context.Background())
+	if errLifecycle != nil {
+		t.Fatal(errLifecycle)
+	}
+
+	runtimeHome := newSubscriptionTestRuntime(t, &blockingConfigAdapter{payload: []byte("host: \"\"\nport: 8327\n"), loadStarted: make(chan struct{})})
+	conn := newSubscriptionTestConn("SUBSCRIBE", "config", strconv.FormatInt(lifecycle.LifecycleConfigRevision, 10))
+	server := New("", runtimeHome)
+	server.SetClusterHandler(cluster.NewRESPHandler(coordinator, nil, repo))
+	serverDone := make(chan struct{})
+	go func() {
+		server.HandleConn(context.Background(), conn)
+		close(serverDone)
+	}()
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Errorf("close test connection: %v", errClose)
+		}
+		waitSubscriptionTestSignal(t, serverDone, "RESP server shutdown")
+	}()
+
+	fingerprint := peerCertificateFingerprint(conn)
+	commandHome, initialized := coordinator.HomeIncarnation()
+	if !initialized {
+		t.Fatal("coordinator Home incarnation is not initialized")
+	}
+	deadline := time.Now().Add(respPipeDeadline)
+	for time.Now().Before(deadline) {
+		lifetime, errClassify := repo.ClassifyConnection(context.Background(), fingerprint, commandHome)
+		if errClassify == nil && lifetime.Controlled {
+			return
+		}
+		goruntime.Gosched()
+	}
+	t.Fatalf("protocol 1 subscription did not create membership")
+}
+
+func TestBootstrapConnectionNeverBecomesControlled(t *testing.T) {
+	repo := newSubscriptionTestRepository(t)
+	coordinator := cluster.NewCoordinator(repo, cluster.NodeIdentity{IP: "127.0.0.1", Port: 8317}, cluster.CoordinatorOptions{})
+	if errInitialize := coordinator.Initialize(context.Background()); errInitialize != nil {
+		t.Fatal(errInitialize)
+	}
+	defer func() {
+		if errRetire := coordinator.RetireHomeIncarnation(context.Background()); errRetire != nil {
+			t.Errorf("retire Home incarnation: %v", errRetire)
+		}
+	}()
+	lifecycle, errLifecycle := repo.LifecycleConfig(context.Background())
+	if errLifecycle != nil {
+		t.Fatal(errLifecycle)
+	}
+
+	runtimeHome := newSubscriptionTestRuntime(t, &blockingConfigAdapter{payload: []byte("host: \"\"\nport: 8327\n"), loadStarted: make(chan struct{})})
+	conn := newSubscriptionTestConnCommands(
+		[]string{"SUBSCRIBE", "config", strconv.FormatInt(lifecycle.LifecycleConfigRevision, 10)},
+		[]string{"RPOP", "dispatch"},
+	)
+	server := New("", runtimeHome)
+	server.SetClusterHandler(cluster.NewRESPHandler(coordinator, nil, repo))
+	serverDone := make(chan struct{})
+	go func() {
+		server.HandleConn(context.Background(), conn)
+		close(serverDone)
+	}()
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Errorf("close test connection: %v", errClose)
+		}
+		waitSubscriptionTestSignal(t, serverDone, "RESP server shutdown")
+	}()
+
+	deadline := time.Now().Add(respPipeDeadline)
+	for time.Now().Before(deadline) {
+		if strings.Contains(conn.Output(), "controlled connection required") {
+			return
+		}
+		goruntime.Gosched()
+	}
+	t.Fatalf("bootstrap subscriber executed controlled command: %q", conn.Output())
+}
 
 func TestConfigSubscriptionPublishesInitialSnapshotBeforeConcurrentUpdate(t *testing.T) {
 	previousMaxProcs := goruntime.GOMAXPROCS(1)
@@ -138,6 +234,103 @@ func TestConfigSubscriptionReadFailureAbortsPendingUpdates(t *testing.T) {
 	}
 }
 
+func TestAccountedReplyWriteFailureFencesFingerprint(t *testing.T) {
+	var fenceCalls, closeCalls int
+	connEnv := &dispatch.ConnEnv{
+		FenceFingerprint: func(_ context.Context, reason string) error {
+			fenceCalls++
+			if reason != "accounted_dispatch_delivery_failed" {
+				t.Fatalf("fence reason = %q", reason)
+			}
+			return nil
+		},
+		CloseLocalFingerprint: func() { closeCalls++ },
+	}
+	if errWrite := writeDispatchReplyWithFence(context.Background(), newSafeWriter(failingSubscriptionWriter{}), dispatch.Reply{Kind: dispatch.ReplyKindBulkString, BulkString: []byte("reply"), AccountedAdmission: true}, connEnv); errWrite == nil {
+		t.Fatal("write unexpectedly succeeded")
+	}
+	if fenceCalls != 1 || closeCalls != 1 {
+		t.Fatalf("fence calls = %d, close calls = %d", fenceCalls, closeCalls)
+	}
+}
+
+func TestAccountedReplyPreparationFailureFencesFingerprint(t *testing.T) {
+	var fenceCalls, closeCalls int
+	connEnv := &dispatch.ConnEnv{
+		FenceFingerprint:      func(context.Context, string) error { fenceCalls++; return errors.New("database unavailable") },
+		CloseLocalFingerprint: func() { closeCalls++ },
+	}
+	reply := dispatch.Reply{Kind: dispatch.ReplyKindBulkString, BulkString: []byte("reply"), AccountedAdmission: true, PreWriteError: errors.New("tuple injection failed")}
+	if errWrite := writeDispatchReplyWithFence(context.Background(), newSafeWriter(&bytes.Buffer{}), reply, connEnv); errWrite == nil {
+		t.Fatal("write unexpectedly succeeded")
+	}
+	if fenceCalls != 1 || closeCalls != 1 {
+		t.Fatalf("fence calls = %d, close calls = %d", fenceCalls, closeCalls)
+	}
+}
+
+func TestAccountedFenceStartsDistributedFenceBeforeBlockingLocalClose(t *testing.T) {
+	fenceStarted := make(chan struct{})
+	localCloseStarted := make(chan struct{})
+	releaseLocalClose := make(chan struct{})
+	finished := make(chan struct{})
+	connEnv := &dispatch.ConnEnv{
+		FenceFingerprint: func(context.Context, string) error {
+			close(fenceStarted)
+			return nil
+		},
+		CloseLocalFingerprint: func() {
+			close(localCloseStarted)
+			<-releaseLocalClose
+		},
+	}
+	go func() {
+		fenceAccountedDispatch(context.Background(), connEnv)
+		close(finished)
+	}()
+
+	select {
+	case <-fenceStarted:
+	case <-time.After(time.Second):
+		t.Fatal("distributed fence did not start before blocking local close")
+	}
+	select {
+	case <-localCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("local fingerprint close did not start after distributed fence")
+	}
+
+	close(releaseLocalClose)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("fence did not complete")
+	}
+}
+
+func TestAccountedFenceUsesServerContext(t *testing.T) {
+	type contextKey struct{}
+	serverCtx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "server"))
+	cancel()
+	fenced := false
+	connEnv := &dispatch.ConnEnv{
+		FenceFingerprint: func(fenceCtx context.Context, _ string) error {
+			fenced = fenceCtx.Value(contextKey{}) == "server" && fenceCtx.Err() == nil
+			return nil
+		},
+	}
+	fenceAccountedDispatch(serverCtx, connEnv)
+	if !fenced {
+		t.Fatal("fence did not receive a live context derived from the server context")
+	}
+}
+
+type failingSubscriptionWriter struct{}
+
+func (failingSubscriptionWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
+
 func TestConfigSubscriptionDeliveryCanceledContextDoesNotWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -154,6 +347,26 @@ func TestConfigSubscriptionDeliveryCanceledContextDoesNotWrite(t *testing.T) {
 	if output.Len() != 0 {
 		t.Fatalf("canceled delivery wrote %d bytes: %q", output.Len(), output.String())
 	}
+}
+
+func newSubscriptionTestRepository(t *testing.T) *cluster.Repository {
+	t.Helper()
+	db, errOpen := cluster.OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
+	if errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	if errMigrate := cluster.AutoMigrate(db); errMigrate != nil {
+		t.Fatal(errMigrate)
+	}
+	t.Cleanup(func() {
+		sqlDB, errDB := db.DB()
+		if errDB == nil {
+			if errClose := sqlDB.Close(); errClose != nil {
+				t.Errorf("close database: %v", errClose)
+			}
+		}
+	})
+	return cluster.NewRepository(db)
 }
 
 func newSubscriptionTestRuntime(t *testing.T, adapter *blockingConfigAdapter) *home.Runtime {
@@ -245,16 +458,22 @@ type subscriptionTestConn struct {
 }
 
 func newSubscriptionTestConn(args ...string) *subscriptionTestConn {
+	return newSubscriptionTestConnCommands(args)
+}
+
+func newSubscriptionTestConnCommands(commands ...[]string) *subscriptionTestConn {
 	var command bytes.Buffer
-	command.WriteString("*")
-	command.WriteString(strconv.Itoa(len(args)))
-	command.WriteString("\r\n")
-	for _, arg := range args {
-		command.WriteString("$")
-		command.WriteString(strconv.Itoa(len(arg)))
+	for _, args := range commands {
+		command.WriteString("*")
+		command.WriteString(strconv.Itoa(len(args)))
 		command.WriteString("\r\n")
-		command.WriteString(arg)
-		command.WriteString("\r\n")
+		for _, arg := range args {
+			command.WriteString("$")
+			command.WriteString(strconv.Itoa(len(arg)))
+			command.WriteString("\r\n")
+			command.WriteString(arg)
+			command.WriteString("\r\n")
+		}
 	}
 	certificate := &x509.Certificate{
 		Raw:     []byte("subscription-test-certificate"),

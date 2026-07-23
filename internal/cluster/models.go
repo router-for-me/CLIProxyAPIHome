@@ -131,6 +131,100 @@ func (ConfigRecord) TableName() string {
 	return "config"
 }
 
+// LifecycleConfigRecord stores the singleton credential concurrency lifecycle configuration.
+type LifecycleConfigRecord struct {
+	ID                   int           `gorm:"column:id;primaryKey"`
+	Revision             int64         `gorm:"column:revision;not null"`
+	NodeHeartbeatTimeout time.Duration `gorm:"column:node_heartbeat_timeout;not null"`
+	Payload              JSONB         `gorm:"column:payload;not null"`
+	UpdatedAt            time.Time     `gorm:"column:updated_at"`
+}
+
+func (LifecycleConfigRecord) TableName() string {
+	return "lifecycle_config"
+}
+
+// ConcurrencyActivationGateRecord serializes legacy admission and policy activation.
+type ConcurrencyActivationGateRecord struct {
+	ID                int   `gorm:"column:id;primaryKey"`
+	ActivePolicyCount int64 `gorm:"column:active_policy_count;not null"`
+}
+
+func (ConcurrencyActivationGateRecord) TableName() string {
+	return "concurrency_activation_gate"
+}
+
+// HomeProcessIncarnationRecord stores an append-only Home process incarnation.
+type HomeProcessIncarnationRecord struct {
+	HomeIP       string     `gorm:"column:home_ip;primaryKey"`
+	HomePort     int        `gorm:"column:home_port;primaryKey"`
+	StartedAt    time.Time  `gorm:"column:started_at;primaryKey"`
+	LastSeenAt   time.Time  `gorm:"column:last_seen_at;not null;index"`
+	State        string     `gorm:"column:state;not null;index"`
+	FencedAt     *time.Time `gorm:"column:fenced_at"`
+	FenceReason  string     `gorm:"column:fence_reason"`
+	Capabilities JSONB      `gorm:"column:capabilities;not null"`
+}
+
+func (HomeProcessIncarnationRecord) TableName() string {
+	return "home_process_incarnation"
+}
+
+// CPANodeMembershipRecord contains only the membership fields needed by the lifecycle gate.
+type CPANodeMembershipRecord struct {
+	CertificateFingerprint  string        `gorm:"column:certificate_fingerprint;primaryKey"`
+	NodeID                  string        `gorm:"column:node_id;not null"`
+	HomeIP                  string        `gorm:"column:home_ip;not null"`
+	HomePort                int           `gorm:"column:home_port;not null"`
+	HomeStartedAt           time.Time     `gorm:"column:home_started_at;not null"`
+	ProtocolVersion         int           `gorm:"column:protocol_version;not null"`
+	State                   string        `gorm:"column:state;not null;index"`
+	CancelRevision          int64         `gorm:"column:cancel_revision;not null"`
+	CancelStartedAt         *time.Time    `gorm:"column:cancel_started_at"`
+	ExpectedQuiescenceCount int64         `gorm:"column:expected_quiescence_count;not null"`
+	ConnectedAt             time.Time     `gorm:"column:connected_at;not null"`
+	LifecycleConfigRevision int64         `gorm:"column:lifecycle_config_revision;not null"`
+	CPAHeartbeatTimeout     time.Duration `gorm:"column:cpa_heartbeat_timeout;not null"`
+	CPACancelBound          time.Duration `gorm:"column:cpa_cancel_bound;not null"`
+	ReclaimGrace            time.Duration `gorm:"column:reclaim_grace;not null"`
+	LastSeenAt              time.Time     `gorm:"column:last_seen_at;not null"`
+	UpdatedAt               time.Time     `gorm:"column:updated_at;not null"`
+}
+
+func (CPANodeMembershipRecord) TableName() string {
+	return "cpa_node_membership"
+}
+
+// CPANodeParticipationRecord identifies a Home's connection to a membership lifetime.
+type CPANodeParticipationRecord struct {
+	CertificateFingerprint string    `gorm:"column:certificate_fingerprint;primaryKey"`
+	MembershipConnectedAt  time.Time `gorm:"column:membership_connected_at;primaryKey"`
+	HomeIP                 string    `gorm:"column:home_ip;primaryKey"`
+	HomePort               int       `gorm:"column:home_port;primaryKey"`
+	HomeStartedAt          time.Time `gorm:"column:home_started_at;primaryKey"`
+	CreatedAt              time.Time `gorm:"column:created_at;not null"`
+}
+
+func (CPANodeParticipationRecord) TableName() string {
+	return "cpa_node_participation"
+}
+
+// CPANodeQuiescenceRecord records one Home incarnation's fence acknowledgement.
+type CPANodeQuiescenceRecord struct {
+	CertificateFingerprint string    `gorm:"column:certificate_fingerprint;primaryKey"`
+	MembershipConnectedAt  time.Time `gorm:"column:membership_connected_at;primaryKey"`
+	CancelRevision         int64     `gorm:"column:cancel_revision;primaryKey"`
+	HomeIP                 string    `gorm:"column:home_ip;primaryKey"`
+	HomePort               int       `gorm:"column:home_port;primaryKey"`
+	HomeStartedAt          time.Time `gorm:"column:home_started_at;primaryKey"`
+	Status                 string    `gorm:"column:status;not null"`
+	UpdatedAt              time.Time `gorm:"column:updated_at;not null"`
+}
+
+func (CPANodeQuiescenceRecord) TableName() string {
+	return "cpa_node_quiescence"
+}
+
 type KVRecord struct {
 	Key       string     `gorm:"column:key;primaryKey"`
 	Value     []byte     `gorm:"column:value;not null"`
@@ -407,16 +501,21 @@ func (ClusterNodeRecord) TableName() string {
 }
 
 type CPANodeRecord struct {
-	HomeIP      string    `gorm:"column:home_ip;primaryKey;index:idx_cpa_node_home_live,priority:1;index:idx_cpa_node_live,priority:3"`
-	HomePort    int       `gorm:"column:home_port;primaryKey;index:idx_cpa_node_home_live,priority:2;index:idx_cpa_node_live,priority:4"`
-	NodeKey     string    `gorm:"column:node_key;primaryKey;size:256"`
-	NodeID      string    `gorm:"column:node_id;index"`
-	ClientIP    string    `gorm:"column:client_ip;index"`
-	ClientCount int       `gorm:"column:client_count"`
-	ConnectedAt time.Time `gorm:"column:connected_at"`
-	LastSeenAt  time.Time `gorm:"column:last_seen_at;index:idx_cpa_node_home_live,priority:3;index:idx_cpa_node_live,priority:1"`
-	CreatedAt   time.Time `gorm:"column:created_at"`
-	UpdatedAt   time.Time `gorm:"column:updated_at"`
+	HomeIP                 string    `gorm:"column:home_ip;primaryKey;index:idx_cpa_node_home_live,priority:1;index:idx_cpa_node_live,priority:3"`
+	HomePort               int       `gorm:"column:home_port;primaryKey;index:idx_cpa_node_home_live,priority:2;index:idx_cpa_node_live,priority:4"`
+	HomeStartedAt          time.Time `gorm:"column:home_started_at;primaryKey"`
+	NodeKey                string    `gorm:"column:node_key;primaryKey;size:256"`
+	NodeID                 string    `gorm:"column:node_id;index"`
+	ClientIP               string    `gorm:"column:client_ip;index"`
+	ClientCount            int       `gorm:"column:client_count"`
+	CertificateFingerprint string    `gorm:"column:certificate_fingerprint"`
+	OpenConnections        int       `gorm:"column:open_connections"`
+	ActiveHandlers         int       `gorm:"column:active_handlers"`
+	LatestCancelRevision   int64     `gorm:"column:latest_cancel_revision"`
+	ConnectedAt            time.Time `gorm:"column:connected_at"`
+	LastSeenAt             time.Time `gorm:"column:last_seen_at;index:idx_cpa_node_home_live,priority:3;index:idx_cpa_node_live,priority:1"`
+	CreatedAt              time.Time `gorm:"column:created_at"`
+	UpdatedAt              time.Time `gorm:"column:updated_at"`
 }
 
 // TableName returns the database table name.

@@ -65,6 +65,36 @@ user-email:
   verification-token-ttl: "24h"
   reset-token-ttl: "30m"
 
+# Credential concurrency is database-backed and authoritative at runtime. Lifecycle, liveness,
+# timeout, connected_at, and expiration decisions use database time, never a Home host clock.
+# Multi-Home deployments require every Home to use the same database time authority. Upgrade all
+# Home nodes while policies are unlimited, then upgrade all CPA nodes and confirm protocol 1 before
+# enabling any limit. An older Home is unsupported while a limit is active and must be removed.
+credential-concurrency:
+  lifecycle-config-revision: 1
+  observation-barrier-revision: 0
+  cpa-heartbeat-timeout: "3s"
+  cpa-cancel-bound: "5s"
+  reclaim-grace: "5s"
+  cleanup-interval: "5s"
+  release-flush-interval: 250ms
+  release-max-backoff: 2s
+  busy-retry-min: 250ms
+  busy-retry-max: 1s
+  max-limit: 1000000
+
+# Credential in-flight observation snapshot contract.
+credential-in-flight:
+  snapshot-interval: 2s
+  stale-after: 10s
+  max-part-bytes: 262144
+  max-part-count: 64
+  max-revision-bytes: 16777216
+  max-aggregate-groups: 100000
+  max-details: 10000
+  max-string-bytes: 256
+  staging-retention: 1m
+
 # Authentication directory used by explicit import/export file format (supports ~ for home directory).
 # Runtime state is stored in the database after importing.
 auth-dir: "~/.cli-proxy-api"

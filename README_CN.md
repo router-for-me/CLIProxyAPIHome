@@ -56,6 +56,10 @@ docker compose -f "$COMPOSE_FILE" run --rm \
   home ./CLIProxyAPIHome -import
 ```
 
+## 严格凭证并发限制
+
+启用 credential concurrency policy 前，必须遵循[严格凭证并发限制部署运行手册](docs/CN.md)。手册规定了 SQLite 和 PostgreSQL 所需的拓扑、certificate identity 要求、capability 检查和 fail-closed mixed-version 发布方式。
+
 ## 贡献
 
 欢迎贡献！请随时提交 Pull Request。

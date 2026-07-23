@@ -17,5 +17,18 @@ node:
   # external-port: 443
   port: 8327
   heartbeat-interval: "5s"
+  # Keep this at 20s for the lifecycle foundation. It must satisfy:
+  # heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound.
   heartbeat-timeout: "20s"
   event-poll-interval: "3s"
+
+# Database time is authoritative for lifecycle, liveness, timeout, connected_at, and expiration
+# decisions; never use an individual Home host clock. Every Home in a multi-Home deployment must
+# use the same database time authority.
+# Credential lifecycle upgrade order: first upgrade every Home while no limits are active;
+# then upgrade every CPA, confirm protocol 1 membership, and verify the concurrency limiter
+# capability before enabling limits. The in-flight snapshot capability is optional diagnostics.
+# Do not mix in an older Home.
+# Each CPA must use a unique mTLS client certificate; never share a certificate between CPAs.
+# If a Home loses database liveness, it stops sending pong. A CPA that cannot cancel within its
+# cancel bound closes its service rather than continuing with an unsafe lifecycle.

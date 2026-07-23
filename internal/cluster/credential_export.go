@@ -155,6 +155,7 @@ func isOpenAICompatConfigAuth(auth *coreauth.Auth) bool {
 // credentialGeminiKey builds a Gemini key config from an auth record.
 func credentialGeminiKey(auth *coreauth.Auth) appconfig.GeminiKey {
 	return appconfig.GeminiKey{
+		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
 		Priority:       credentialPriority(auth),
 		Prefix:         strings.TrimSpace(auth.Prefix),
@@ -170,6 +171,7 @@ func credentialGeminiKey(auth *coreauth.Auth) appconfig.GeminiKey {
 // credentialVertexKey builds a Vertex key config from an auth record.
 func credentialVertexKey(auth *coreauth.Auth) appconfig.VertexCompatKey {
 	return appconfig.VertexCompatKey{
+		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
 		Priority:       credentialPriority(auth),
 		Prefix:         strings.TrimSpace(auth.Prefix),
@@ -184,6 +186,7 @@ func credentialVertexKey(auth *coreauth.Auth) appconfig.VertexCompatKey {
 // credentialCodexKey builds a Codex key config from an auth record.
 func credentialCodexKey(auth *coreauth.Auth) appconfig.CodexKey {
 	return appconfig.CodexKey{
+		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
 		Priority:       credentialPriority(auth),
 		Prefix:         strings.TrimSpace(auth.Prefix),
@@ -200,6 +203,7 @@ func credentialCodexKey(auth *coreauth.Auth) appconfig.CodexKey {
 // credentialXAIKey builds an xAI key config from an auth record.
 func credentialXAIKey(auth *coreauth.Auth) appconfig.XAIKey {
 	return appconfig.XAIKey{
+		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
 		Priority:       credentialPriority(auth),
 		Prefix:         strings.TrimSpace(auth.Prefix),
@@ -216,6 +220,7 @@ func credentialXAIKey(auth *coreauth.Auth) appconfig.XAIKey {
 // credentialClaudeKey builds a Claude key config from an auth record.
 func credentialClaudeKey(auth *coreauth.Auth) appconfig.ClaudeKey {
 	return appconfig.ClaudeKey{
+		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
 		Priority:       credentialPriority(auth),
 		Prefix:         strings.TrimSpace(auth.Prefix),
@@ -246,6 +251,12 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 	priority := credentialPriority(auth)
 	headers := credentialHeaders(auth)
 	disableCooling := credentialDisableCooling(auth)
+	apiKey := authAttribute(auth, "api_key")
+	proxyURL := strings.TrimSpace(auth.ProxyURL)
+	representation := "nested"
+	if apiKey == "" && proxyURL == "" {
+		representation = "fallback:" + strings.TrimSpace(auth.ID)
+	}
 	groupKey := strings.Join([]string{
 		strings.ToLower(name),
 		baseURL,
@@ -253,12 +264,14 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 		strconv.Itoa(priority),
 		credentialHeadersKey(headers),
 		strconv.FormatBool(disableCooling),
+		representation,
 	}, "\x00")
 
 	group := groups[groupKey]
 	if group == nil {
 		group = &credentialOpenAICompatGroup{
 			Config: appconfig.OpenAICompatibility{
+				ID:             openAICompatFallbackID(auth),
 				Name:           name,
 				Priority:       priority,
 				Prefix:         prefix,
@@ -274,20 +287,26 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 		groups[groupKey] = group
 	}
 
-	apiKey := authAttribute(auth, "api_key")
-	proxyURL := strings.TrimSpace(auth.ProxyURL)
 	if apiKey == "" && proxyURL == "" {
 		return
 	}
-	entryKey := apiKey + "\x00" + proxyURL
+	entryKey := strings.TrimSpace(auth.ID) + "\x00" + apiKey + "\x00" + proxyURL
 	if _, ok := group.SeenEntry[entryKey]; ok {
 		return
 	}
 	group.SeenEntry[entryKey] = struct{}{}
 	group.Config.APIKeyEntries = append(group.Config.APIKeyEntries, appconfig.OpenAICompatibilityAPIKey{
+		ID:       strings.TrimSpace(auth.ID),
 		APIKey:   apiKey,
 		ProxyURL: proxyURL,
 	})
+}
+
+func openAICompatFallbackID(auth *coreauth.Auth) string {
+	if authAttribute(auth, "api_key") != "" || strings.TrimSpace(auth.ProxyURL) != "" {
+		return ""
+	}
+	return strings.TrimSpace(auth.ID)
 }
 
 // credentialGeminiModels builds Gemini model config from stored model metadata.

@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,13 +16,15 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
 	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 )
 
 type ImportOptions struct {
-	ConfigPath string
-	AuthDir    string
-	Repository *Repository
-	Now        time.Time
+	ConfigPath           string
+	AuthDir              string
+	Repository           *Repository
+	NodeHeartbeatTimeout time.Duration
+	Now                  time.Time
 }
 
 type ImportStats struct {
@@ -33,10 +37,11 @@ type ImportStats struct {
 }
 
 type ExportOptions struct {
-	OutputDir   string
-	Repository  *Repository
-	ConfigName  string
-	AuthDirName string
+	OutputDir            string
+	Repository           *Repository
+	ConfigName           string
+	AuthDirName          string
+	NodeHeartbeatTimeout time.Duration
 }
 
 type ExportStats struct {
@@ -47,6 +52,15 @@ type ExportStats struct {
 const defaultExportAuthDirName = "~/.cli-proxy-api"
 
 var defaultImportTime = time.Unix(1, 0).UTC()
+
+type exportSnapshotConfigReadContextKey struct{}
+
+func waitForExportSnapshotConfigRead(ctx context.Context) {
+	wait, okWait := contextOrBackground(ctx).Value(exportSnapshotConfigReadContextKey{}).(func())
+	if okWait && wait != nil {
+		wait()
+	}
+}
 
 // ImportLocalState imports config.yaml and auth-dir credentials into the repository.
 func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, error) {
@@ -100,32 +114,79 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 	if errResolveAuthDir != nil {
 		return stats, errResolveAuthDir
 	}
-
-	if errImportConfig := importConfigRoot(ctx, opts.Repository, root, &stats); errImportConfig != nil {
-		return stats, errImportConfig
+	lifecycleNodeHeartbeatTimeout := opts.NodeHeartbeatTimeout
+	if lifecycleNodeHeartbeatTimeout <= 0 {
+		lifecycleNodeHeartbeatTimeout = DefaultHeartbeatTimeout()
 	}
 
 	pendingAuths := make(map[string]*coreauth.Auth)
 	authOrder := make([]string, 0, 16)
-	if errConfigAuths := collectImportConfigAuths(cfg, authDir, now, pendingAuths, &authOrder, &stats); errConfigAuths != nil {
+	if errConfigAuths := collectImportConfigAuths(ctx, opts.Repository, cfg, authDir, now, pendingAuths, &authOrder, &stats); errConfigAuths != nil {
 		return stats, errConfigAuths
 	}
 	if errFileAuths := collectImportAuthFiles(cfg, authDir, now, pendingAuths, &authOrder, &stats); errFileAuths != nil {
 		return stats, errFileAuths
 	}
-
-	for _, uuid := range authOrder {
-		auth := pendingAuths[uuid]
-		if auth == nil {
-			stats.Skipped++
-			continue
-		}
-		_, result, errUpsertAuth := opts.Repository.UpsertAuthWithResult(ctx, auth, "upsert")
-		if errUpsertAuth != nil {
-			return stats, errUpsertAuth
-		}
-		addImportResult(&stats, result)
+	if errValidate := validateImportCredentialCollisions(ctx, opts.Repository, pendingAuths, authOrder); errValidate != nil {
+		return stats, errValidate
 	}
+	db, errDB := opts.Repository.database()
+	if errDB != nil {
+		return stats, errDB
+	}
+	mutationStats := ImportStats{}
+	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		gate, errGate := lockConcurrencyActivationGate(tx)
+		if errGate != nil {
+			return errGate
+		}
+		lifecycleRevision, lifecycleChanged, errUpdateLifecycle := updateLifecycleConfigTx(ctx, tx, lifecycleNodeHeartbeatTimeout, cfg.CredentialConcurrency)
+		if errUpdateLifecycle != nil {
+			return errUpdateLifecycle
+		}
+		if lifecycleChanged {
+			if errEvent := appendEvent(tx, "config", "update", "credential-concurrency", lifecycleRevision); errEvent != nil {
+				return errEvent
+			}
+		}
+		txRepo := NewRepository(tx)
+		if errLock := txRepo.lockAllProviderAuthsForReconciliationTx(ctx, tx); errLock != nil {
+			return errLock
+		}
+		for _, key := range providerCredentialConfigKeys {
+			next := providerAuthsForConfigKey(importAuthsInOrder(pendingAuths, authOrder), key)
+			results, errResults := providerAuthImportResults(ctx, txRepo, next)
+			if errResults != nil {
+				return errResults
+			}
+			if errReconcile := txRepo.reconcileProviderAuthsWithLockedActivationGateTx(ctx, tx, key, next, ConcurrencyCredentialReferenceChecker{}); errReconcile != nil {
+				return mapCredentialConcurrencyOrphan(errReconcile)
+			}
+			for _, result := range results {
+				addImportResult(&mutationStats, result)
+			}
+		}
+		for _, credentialID := range authOrder {
+			auth := pendingAuths[credentialID]
+			if auth == nil || isAnyProviderConfigAuth(auth) {
+				continue
+			}
+			delete(auth.Attributes, "provider_credential_id_generated")
+			_, result, errUpsertAuth := txRepo.UpsertAuthWithResult(ctx, auth, "upsert")
+			if errUpsertAuth != nil {
+				return errUpsertAuth
+			}
+			addImportResult(&mutationStats, result)
+		}
+		if errImportPolicies := txRepo.importCredentialConcurrencyPoliciesWithLockedActivationGateTx(ctx, tx, gate, root); errImportPolicies != nil {
+			return errImportPolicies
+		}
+		return importConfigRoot(ctx, txRepo, root, &mutationStats)
+	})
+	if errTransaction != nil {
+		return stats, errTransaction
+	}
+	addImportStats(&stats, mutationStats)
 	return stats, nil
 }
 
@@ -135,6 +196,13 @@ func ExportLocalState(ctx context.Context, opts ExportOptions) (ExportStats, err
 	ctx = contextOrBackground(ctx)
 	if opts.Repository == nil {
 		return stats, fmt.Errorf("export repository is required")
+	}
+	lifecycleNodeHeartbeatTimeout := opts.NodeHeartbeatTimeout
+	if lifecycleNodeHeartbeatTimeout <= 0 {
+		lifecycleNodeHeartbeatTimeout = DefaultHeartbeatTimeout()
+	}
+	if _, errEnsureLifecycle := opts.Repository.EnsureLifecycleConfig(ctx, lifecycleNodeHeartbeatTimeout); errEnsureLifecycle != nil {
+		return stats, errEnsureLifecycle
 	}
 
 	outputDir := strings.TrimSpace(opts.OutputDir)
@@ -165,36 +233,53 @@ func ExportLocalState(ctx context.Context, opts ExportOptions) (ExportStats, err
 		return stats, errEnsureTargets
 	}
 
-	snapshot, errSnapshot := opts.Repository.LoadConfigSnapshot(ctx)
+	var root map[string]any
+	var auths []*coreauth.Auth
+	db, errDB := opts.Repository.database()
+	if errDB != nil {
+		return stats, errDB
+	}
+	tx := readOnlyRepeatableReadTransaction(ctx, db)
+	if tx.Error != nil {
+		return stats, tx.Error
+	}
+	errSnapshot := func() error {
+		var errLoadSnapshot error
+		root, errLoadSnapshot = loadConfigRootForExportTx(ctx, tx)
+		if errLoadSnapshot != nil {
+			return errLoadSnapshot
+		}
+		waitForExportSnapshotConfigRead(ctx)
+		lifecycleRecord := LifecycleConfigRecord{}
+		if errLifecycle := tx.WithContext(ctx).First(&lifecycleRecord, "id = ?", 1).Error; errLifecycle != nil {
+			return errLifecycle
+		}
+		lifecycleConfig, errLifecycle := lifecycleConfigFromRecord(lifecycleRecord)
+		if errLifecycle != nil {
+			return errLifecycle
+		}
+		var errListAuths error
+		auths, errListAuths = listAuthsForExportTx(ctx, tx)
+		if errListAuths != nil {
+			return errListAuths
+		}
+		sort.Slice(auths, func(i, j int) bool {
+			return auths[i].ID < auths[j].ID
+		})
+		root["auth-dir"] = authDirName
+		root["credential-concurrency"] = lifecycleConfig
+		ApplyCredentialConfigToRoot(root, auths)
+		return exportCredentialConcurrencyPoliciesForAuthsTx(ctx, tx, root, auths)
+	}()
 	if errSnapshot != nil {
+		if errRollback := tx.Rollback().Error; errRollback != nil {
+			return stats, fmt.Errorf("export snapshot: %w; rollback: %v", errSnapshot, errRollback)
+		}
 		return stats, errSnapshot
 	}
-	root, errRoot := ConfigRootFromSnapshot(snapshot)
-	if errRoot != nil {
-		return stats, errRoot
+	if errCommit := tx.Commit().Error; errCommit != nil {
+		return stats, errCommit
 	}
-	if root == nil {
-		root = make(map[string]any)
-	}
-
-	auths, errAuths := opts.Repository.ListAuths(ctx)
-	if errAuths != nil {
-		return stats, errAuths
-	}
-	sort.Slice(auths, func(i, j int) bool {
-		left := ""
-		right := ""
-		if auths[i] != nil {
-			left = auths[i].ID
-		}
-		if auths[j] != nil {
-			right = auths[j].ID
-		}
-		return left < right
-	})
-
-	root["auth-dir"] = authDirName
-	ApplyCredentialConfigToRoot(root, auths)
 	if _, errNormalizeSecret := normalizeConfigRootSecrets(root); errNormalizeSecret != nil {
 		return stats, errNormalizeSecret
 	}
@@ -217,6 +302,128 @@ func ExportLocalState(ctx context.Context, opts ExportOptions) (ExportStats, err
 	}
 	stats.AuthFiles = authFiles
 	return stats, nil
+}
+
+// readOnlyRepeatableReadTransaction starts one consistent read snapshot for PostgreSQL and SQLite.
+func readOnlyRepeatableReadTransaction(ctx context.Context, db *gorm.DB) *gorm.DB {
+	if db != nil && db.Dialector != nil && db.Dialector.Name() == "postgres" {
+		return db.WithContext(contextOrBackground(ctx)).Begin(&sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	}
+	return db.WithContext(contextOrBackground(ctx)).Begin()
+}
+
+func loadConfigRootForExportTx(ctx context.Context, tx *gorm.DB) (map[string]any, error) {
+	var records []ConfigRecord
+	if errFind := tx.WithContext(ctx).Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+	root := make(map[string]any, len(records)+1)
+	for _, record := range records {
+		if isClusterCredentialConfigKey(record.Key) || strings.TrimSpace(record.Key) == configAPIKeysRootKey {
+			continue
+		}
+		var value any
+		if len(record.Value) > 0 {
+			if errUnmarshal := json.Unmarshal(record.Value, &value); errUnmarshal != nil {
+				return nil, errUnmarshal
+			}
+		}
+		root[record.Key] = value
+	}
+	var apiKeyRecords []APIKeyRecord
+	if errFind := tx.WithContext(ctx).Order("id").Find(&apiKeyRecords).Error; errFind != nil {
+		return nil, errFind
+	}
+	keys := make([]string, 0, len(apiKeyRecords))
+	for _, record := range apiKeyRecords {
+		if key := strings.TrimSpace(record.APIKey); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	if keys = normalizeAPIKeys(keys); len(keys) > 0 {
+		root[configAPIKeysRootKey] = keys
+	}
+	return root, nil
+}
+
+func listAuthsForExportTx(ctx context.Context, tx *gorm.DB) ([]*coreauth.Auth, error) {
+	var records []AuthRecord
+	if errFind := tx.WithContext(ctx).Order("id").Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+	auths := make([]*coreauth.Auth, 0, len(records))
+	for index := range records {
+		auth, errAuth := RecordToAuth(&records[index])
+		if errAuth != nil {
+			return nil, errAuth
+		}
+		auth.ID = records[index].UUID
+		auth.Index = records[index].UUID
+		auths = append(auths, auth)
+	}
+	return auths, nil
+}
+
+func exportCredentialConcurrencyPoliciesForAuthsTx(ctx context.Context, tx *gorm.DB, root map[string]any, auths []*coreauth.Auth) error {
+	if root == nil {
+		return fmt.Errorf("config root is nil")
+	}
+	policies, errPolicies := listCredentialConcurrencyPoliciesTx(ctx, tx)
+	if errPolicies != nil {
+		return errPolicies
+	}
+	serialized := serializedCredentialIDs(auths)
+	var credentialRecords []AuthRecord
+	if errFind := tx.WithContext(ctx).Unscoped().Select("uuid").Find(&credentialRecords).Error; errFind != nil {
+		return errFind
+	}
+	knownCredentials := make(map[string]struct{}, len(credentialRecords))
+	for _, record := range credentialRecords {
+		knownCredentials[record.UUID] = struct{}{}
+	}
+	out := make(map[string]CredentialConcurrencyExchangePolicy)
+	for _, policy := range policies {
+		if _, known := knownCredentials[policy.CredentialID]; !known {
+			return fmt.Errorf("credential concurrency policy references unresolved credential %s", policy.CredentialID)
+		}
+		if _, okSerialized := serialized[policy.CredentialID]; !okSerialized || (policy.MaxInFlight == nil && len(policy.MaxInFlightByModel) == 0) {
+			continue
+		}
+		item := CredentialConcurrencyExchangePolicy{MaxInFlightByModel: cloneConcurrencyModelLimits(policy.MaxInFlightByModel)}
+		if policy.MaxInFlight != nil && *policy.MaxInFlight > 0 {
+			value := *policy.MaxInFlight
+			item.MaxInFlight = &value
+		}
+		out[policy.CredentialID] = item
+	}
+	root[credentialConcurrencyPoliciesRootKey] = out
+	return nil
+}
+
+func serializedCredentialIDs(auths []*coreauth.Auth) map[string]struct{} {
+	ids := make(map[string]struct{}, len(auths))
+	seenFiles := make(map[string]struct{}, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		if credentialConfigAuthKind(auth) != "" {
+			ids[auth.ID] = struct{}{}
+		}
+		if !isExportOAuthAuth(auth) {
+			continue
+		}
+		fileName := exportAuthFileName(auth)
+		if fileName == "" {
+			continue
+		}
+		if _, exists := seenFiles[fileName]; exists {
+			continue
+		}
+		seenFiles[fileName] = struct{}{}
+		ids[auth.ID] = struct{}{}
+	}
+	return ids
 }
 
 func validateExportRelativePath(field string, value string) (string, error) {
@@ -323,7 +530,7 @@ func importConfigRoot(ctx context.Context, repo *Repository, root map[string]any
 			addImportAPIKeyStats(stats, apiKeyStats)
 			continue
 		}
-		if isClusterCredentialConfigKey(normalizedKey) {
+		if isClusterCredentialConfigKey(normalizedKey) || normalizedKey == "credential-concurrency" || normalizedKey == credentialConcurrencyPoliciesRootKey {
 			stats.Skipped++
 			continue
 		}
@@ -336,24 +543,33 @@ func importConfigRoot(ctx context.Context, repo *Repository, root map[string]any
 	return nil
 }
 
-func collectImportConfigAuths(cfg *appconfig.Config, authDir string, now time.Time, pending map[string]*coreauth.Auth, order *[]string, stats *ImportStats) error {
+func collectImportConfigAuths(ctx context.Context, repo *Repository, cfg *appconfig.Config, authDir string, now time.Time, pending map[string]*coreauth.Auth, order *[]string, stats *ImportStats) error {
+	existingBySource := make(map[string]string)
+	if repo != nil {
+		existing, errList := repo.ListAuths(ctx)
+		if errList != nil {
+			return errList
+		}
+		for _, auth := range existing {
+			if auth == nil || auth.Attributes == nil {
+				continue
+			}
+			source := strings.TrimSpace(auth.Attributes["source"])
+			if source != "" {
+				existingBySource[auth.Provider+"\\x00"+source] = auth.ID
+			}
+		}
+	}
 	sctx := &synthesizer.SynthesisContext{
 		Config:      cfg,
 		AuthDir:     authDir,
 		Now:         now,
 		IDGenerator: synthesizer.NewStableIDGenerator(),
-		ClusterMode: true,
 		UUIDForAuth: func(auth *coreauth.Auth) string {
 			if auth == nil || auth.Attributes == nil {
 				return ""
 			}
-			return DeterministicAPIKeyUUID(
-				auth.Provider,
-				auth.Attributes["base_url"],
-				APIKeyHash(auth.Attributes["api_key"]),
-				auth.Attributes["compat_name"],
-				auth.Attributes["provider_key"],
-			)
+			return existingBySource[auth.Provider+"\\x00"+strings.TrimSpace(auth.Attributes["source"])]
 		},
 	}
 	auths, errSynthesize := synthesizer.NewConfigSynthesizer().Synthesize(sctx)
@@ -361,7 +577,9 @@ func collectImportConfigAuths(cfg *appconfig.Config, authDir string, now time.Ti
 		return errSynthesize
 	}
 	for _, auth := range auths {
-		addImportAuth(pending, order, stats, auth)
+		if errAdd := addImportAuth(pending, order, stats, auth); errAdd != nil {
+			return errAdd
+		}
 	}
 	return nil
 }
@@ -417,28 +635,166 @@ func collectImportAuthFiles(cfg *appconfig.Config, authDir string, now time.Time
 		}
 		ApplyOriginalAuthFileName(auths, entry.Name())
 		for _, auth := range auths {
-			addImportAuth(pending, order, stats, auth)
+			if errAdd := addImportAuth(pending, order, stats, auth); errAdd != nil {
+				return errAdd
+			}
 		}
 	}
 	return nil
 }
 
-func addImportAuth(pending map[string]*coreauth.Auth, order *[]string, stats *ImportStats, auth *coreauth.Auth) {
+func addImportAuth(pending map[string]*coreauth.Auth, order *[]string, stats *ImportStats, auth *coreauth.Auth) error {
 	if auth == nil {
 		stats.Skipped++
-		return
+		return nil
 	}
-	uuid := strings.TrimSpace(auth.ID)
-	if uuid == "" {
+	credentialID := strings.TrimSpace(auth.ID)
+	if credentialID == "" {
 		stats.Skipped++
-		return
+		return nil
 	}
-	if _, exists := pending[uuid]; exists {
-		stats.Overwritten++
-	} else {
-		*order = append(*order, uuid)
+	if _, exists := pending[credentialID]; exists {
+		return fmt.Errorf("%w: duplicate imported credential id: %s", ErrCredentialIdentityConflict, credentialID)
 	}
-	pending[uuid] = auth
+	*order = append(*order, credentialID)
+	pending[credentialID] = auth
+	return nil
+}
+
+var providerCredentialConfigKeys = []string{
+	"gemini-api-key",
+	"vertex-api-key",
+	"codex-api-key",
+	"xai-api-key",
+	"claude-api-key",
+	"openai-compatibility",
+}
+
+func importAuthsInOrder(pending map[string]*coreauth.Auth, order []string) []*coreauth.Auth {
+	auths := make([]*coreauth.Auth, 0, len(order))
+	for _, credentialID := range order {
+		if auth := pending[credentialID]; auth != nil {
+			auths = append(auths, auth)
+		}
+	}
+	return auths
+}
+
+func validateImportCredentialCollisions(ctx context.Context, repo *Repository, pending map[string]*coreauth.Auth, order []string) error {
+	existing, errList := repo.ListAuthsUnscoped(ctx, nil)
+	if errList != nil {
+		return errList
+	}
+	existingByID := make(map[string]*coreauth.Auth, len(existing))
+	for _, auth := range existing {
+		if auth != nil {
+			existingByID[auth.ID] = auth
+		}
+	}
+	for _, credentialID := range order {
+		incoming := pending[credentialID]
+		previous := existingByID[credentialID]
+		if incoming == nil || previous == nil || sameImportedCredentialLineage(previous, incoming) {
+			continue
+		}
+		return fmt.Errorf("%w: imported credential id belongs to another auth: %s", ErrCredentialIdentityConflict, credentialID)
+	}
+	return nil
+}
+
+func sameImportedCredentialLineage(previous *coreauth.Auth, incoming *coreauth.Auth) bool {
+	previousKey := providerConfigKeyForAuth(previous)
+	incomingKey := providerConfigKeyForAuth(incoming)
+	if previousKey != "" || incomingKey != "" {
+		return previousKey != "" && previousKey == incomingKey && previous.Provider == incoming.Provider
+	}
+	if previous == nil || incoming == nil || previous.Provider != incoming.Provider || previous.Attributes == nil || incoming.Attributes == nil {
+		return false
+	}
+	return strings.TrimSpace(previous.Attributes["source"]) == strings.TrimSpace(incoming.Attributes["source"])
+}
+
+func isAnyProviderConfigAuth(auth *coreauth.Auth) bool {
+	return providerConfigKeyForAuth(auth) != ""
+}
+
+func providerConfigKeyForAuth(auth *coreauth.Auth) string {
+	for _, key := range providerCredentialConfigKeys {
+		if isProviderAuthForConfigKey(auth, key) {
+			return key
+		}
+	}
+	return ""
+}
+
+func providerAuthImportResults(ctx context.Context, repo *Repository, next []*coreauth.Auth) ([]UpsertResult, error) {
+	if len(next) == 0 {
+		return nil, nil
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	ids := make([]string, 0, len(next))
+	for _, auth := range next {
+		if auth != nil {
+			ids = append(ids, auth.ID)
+		}
+	}
+	var records []AuthRecord
+	if errFind := db.WithContext(contextOrBackground(ctx)).Unscoped().Where("uuid IN ?", ids).Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+	existingByID := make(map[string]*AuthRecord, len(records))
+	for i := range records {
+		existingByID[records[i].UUID] = &records[i]
+	}
+	results := make([]UpsertResult, 0, len(next))
+	for _, auth := range next {
+		if auth == nil {
+			continue
+		}
+		existing := existingByID[auth.ID]
+		if existing == nil {
+			results = append(results, UpsertResultCreated)
+			continue
+		}
+		if existing.DeletedAt.Valid {
+			results = append(results, UpsertResultRestored)
+			continue
+		}
+		current, errCurrent := RecordToAuth(existing)
+		if errCurrent != nil {
+			return nil, errCurrent
+		}
+		candidate := auth.Clone()
+		candidate.Disabled = current.Disabled
+		candidate.Status = current.Status
+		candidate.StatusMessage = current.StatusMessage
+		candidateRecord, errRecord := AuthToRecord(candidate)
+		if errRecord != nil {
+			return nil, errRecord
+		}
+		sameJSON, errJSONEqual := semanticJSONEqual([]byte(existing.AuthJSON), []byte(candidateRecord.AuthJSON))
+		if errJSONEqual != nil {
+			return nil, errJSONEqual
+		}
+		if sameJSON {
+			results = append(results, UpsertResultUnchanged)
+		} else {
+			results = append(results, UpsertResultUpdated)
+		}
+	}
+	return results, nil
+}
+
+func addImportStats(stats *ImportStats, next ImportStats) {
+	stats.Created += next.Created
+	stats.Updated += next.Updated
+	stats.Unchanged += next.Unchanged
+	stats.Restored += next.Restored
+	stats.Overwritten += next.Overwritten
+	stats.Skipped += next.Skipped
 }
 
 func addImportResult(stats *ImportStats, result UpsertResult) {

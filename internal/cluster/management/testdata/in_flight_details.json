@@ -1,0 +1,19 @@
+{
+  "observed_at": "2026-07-21T12:00:00Z",
+  "stale": false,
+  "coverage_complete": true,
+  "aggregates_complete": true,
+  "protocol_coverage_complete": true,
+  "minimum_processed_barrier_revision": 0,
+  "details_truncated": false,
+  "items": [
+    {
+      "request_id": "req-1",
+      "credential_id": "cred-a",
+      "model": "gpt-5",
+      "request_kind": "sse",
+      "started_at": "2026-07-21T11:59:58Z",
+      "limiter": null
+    }
+  ]
+}

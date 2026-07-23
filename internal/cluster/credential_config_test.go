@@ -32,6 +32,9 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	if !ok || len(geminiKeys) != 1 || geminiKeys[0].APIKey != "gemini-key" {
 		t.Fatalf("unexpected gemini-api-key root value: %#v", root["gemini-api-key"])
 	}
+	if geminiKeys[0].ID != "gemini-id" || geminiKeys[0].UUID != "" {
+		t.Fatalf("gemini credential identity = %#v, want exported id only", geminiKeys[0])
+	}
 	vertexKeys, ok := root["vertex-api-key"].([]appconfig.VertexCompatKey)
 	if !ok || len(vertexKeys) != 1 || vertexKeys[0].APIKey != "vertex-key" {
 		t.Fatalf("unexpected vertex-api-key root value: %#v", root["vertex-api-key"])
@@ -47,6 +50,9 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	claudeKeys, ok := root["claude-api-key"].([]appconfig.ClaudeKey)
 	if !ok || len(claudeKeys) != 1 || claudeKeys[0].APIKey != "claude-key" {
 		t.Fatalf("unexpected claude-api-key root value: %#v", root["claude-api-key"])
+	}
+	if vertexKeys[0].ID != "vertex-id" || codexKeys[0].ID != "codex-id" || xaiKeys[0].ID != "xai-id" || claudeKeys[0].ID != "claude-id" {
+		t.Fatalf("provider credential IDs were not exported")
 	}
 }
 

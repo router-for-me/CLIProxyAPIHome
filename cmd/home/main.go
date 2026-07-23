@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -51,6 +52,59 @@ func main() {
 	os.Exit(run())
 }
 
+type inFlightConfigApplier interface {
+	ApplyInFlightConfig(config.CredentialInFlightConfig) error
+}
+
+func applyRESPInFlightConfig(applier inFlightConfigApplier, cfg *config.Config) error {
+	if applier == nil || cfg == nil {
+		return nil
+	}
+	return applier.ApplyInFlightConfig(cfg.CredentialInFlight)
+}
+
+func applyConfigEvent(ctx context.Context, runtime *home.Runtime, respApplier inFlightConfigApplier, cfg *config.Config, payload []byte) error {
+	if reflect.DeepEqual(runtime.Config(), cfg) {
+		return applyRESPInFlightConfig(respApplier, cfg)
+	}
+	if errApply := runtime.ApplyConfigFromCluster(ctx, cfg); errApply != nil {
+		return errApply
+	}
+	if errApplyInFlight := applyRESPInFlightConfig(respApplier, cfg); errApplyInFlight != nil {
+		return errApplyInFlight
+	}
+	runtime.PublishConfigYAML(payload)
+	return nil
+}
+
+type concurrencyAdmissionRepository interface {
+	AdmitCredentialConcurrency(context.Context, cluster.ConcurrencyAdmissionRequest) (cluster.ConcurrencyAdmissionResult, error)
+}
+
+func newRuntimeConcurrencyAdmitter(repo concurrencyAdmissionRepository, currentHome func() (cluster.HomeIncarnationID, bool)) home.ConcurrencyAdmitter {
+	return home.ConcurrencyAdmitterFunc(func(admitCtx context.Context, req home.ConcurrencyAdmissionRequest) (home.ConcurrencyAdmissionResult, error) {
+		if repo == nil || currentHome == nil {
+			return home.ConcurrencyAdmissionResult{}, cluster.ErrConcurrencyNodeUnavailable
+		}
+		homeID, initialized := currentHome()
+		if !initialized {
+			return home.ConcurrencyAdmissionResult{}, cluster.ErrConcurrencyNodeUnavailable
+		}
+		result, errAdmit := repo.AdmitCredentialConcurrency(admitCtx, cluster.ConcurrencyAdmissionRequest{
+			CredentialID: req.CredentialID,
+			Model:        req.Model,
+			Lifetime: cluster.ConnectionLifetime{
+				Fingerprint: req.Fingerprint,
+				ConnectedAt: req.ConnectedAt,
+				Controlled:  req.Controlled,
+				Home:        homeID,
+			},
+			ProtocolVersion: req.ProtocolVersion,
+		})
+		return home.ConcurrencyAdmissionResult{Accounted: result.Accounted, CredentialID: result.CredentialID, Model: result.Model}, errAdmit
+	})
+}
+
 // run executes the home command and returns the process exit code.
 func run() int {
 	// Keep validation before state changes so failures leave existing data intact.
@@ -86,7 +140,6 @@ func run() int {
 	defer stop()
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	startedAt := time.Now().UTC()
 	var databaseSnapshot *cluster.ValidatedDatabaseSnapshot
 	if databaseImportPath != "" {
 		var errSnapshot error
@@ -127,6 +180,7 @@ func run() int {
 	var eventWatcherErrCh <-chan error
 	var clusterRESPHandler *cluster.RESPHandler
 	var clusterTLSConfig *tls.Config
+	var respSrv *respserver.Server
 	clusterDB, dbBackend, errClusterOpen := openRuntimeDatabase(runCtx, clusterCfg, clusterExists, sqlitePath)
 	if errClusterOpen != nil {
 		log.Errorf("failed to open database: %v", errClusterOpen)
@@ -176,12 +230,17 @@ func run() int {
 	}
 	repo := cluster.NewRepository(clusterDB)
 	clusterRepo = repo
-
+	nodeCfg := resolveDatabaseNodeConfig(clusterCfg, clusterExists)
+	if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
+		log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
+		return 1
+	}
 	if importState {
 		stats, errImport := cluster.ImportLocalState(runCtx, cluster.ImportOptions{
-			ConfigPath: configPath,
-			AuthDir:    authDir,
-			Repository: repo,
+			ConfigPath:           configPath,
+			AuthDir:              authDir,
+			Repository:           repo,
+			NodeHeartbeatTimeout: nodeCfg.HeartbeatTimeout,
 		})
 		if errImport != nil {
 			log.Errorf("failed to import local state: %v", errImport)
@@ -199,7 +258,7 @@ func run() int {
 		return 0
 	}
 	if exportState {
-		stats, errExport := cluster.ExportLocalState(runCtx, exportOptionsForDir(exportDir, repo))
+		stats, errExport := cluster.ExportLocalState(runCtx, exportOptionsForDir(exportDir, repo, nodeCfg.HeartbeatTimeout))
 		if errExport != nil {
 			log.Errorf("failed to export local state: %v", errExport)
 			return 1
@@ -257,7 +316,12 @@ func run() int {
 	adapter := cluster.NewRuntimeAdapter(repo, clusterClientAddr)
 	clusterAdapter = adapter
 	rt.SetClusterAdapter(adapter)
-	nodeCfg := resolveDatabaseNodeConfig(clusterCfg, clusterExists)
+	rt.SetConcurrencyAdmitter(newRuntimeConcurrencyAdmitter(repo, func() (cluster.HomeIncarnationID, bool) {
+		if coordinator == nil {
+			return cluster.HomeIncarnationID{}, false
+		}
+		return coordinator.HomeIncarnation()
+	}))
 	eventWatcher = cluster.NewEventWatcherFrom(repo, nodeCfg.EventPollInterval, lastSeenID, func(eventCtx context.Context, event cluster.ClusterEventRecord) error {
 		scope := strings.TrimSpace(event.Scope)
 		if strings.EqualFold(scope, "plugin-store-auth") {
@@ -273,14 +337,10 @@ func run() int {
 			if errConfig != nil {
 				return errConfig
 			}
-			if reflect.DeepEqual(rt.Config(), nextConfig) {
-				return nil
-			}
-			if errApply := rt.ApplyConfigFromCluster(eventCtx, nextConfig); errApply != nil {
-				return errApply
-			}
-			rt.PublishConfigYAML(payload)
-			return nil
+			return applyConfigEvent(eventCtx, rt, respSrv, nextConfig, payload)
+		}
+		if strings.EqualFold(scope, "cpa-fence") {
+			return handleCPAFenceEvent(eventCtx, event, clusterRepo, coordinator, respSrv)
 		}
 		if strings.EqualFold(scope, "plugin-task") {
 			_, payload, errConfig := repo.LoadConfigAsRuntimeConfig(eventCtx)
@@ -322,12 +382,14 @@ func run() int {
 
 	if clusterRepo != nil {
 		coordinator = cluster.NewCoordinator(clusterRepo, cluster.NodeIdentity{
-			IP:        clusterClientAddr,
-			Port:      clusterAdvertisedPort,
-			StartedAt: startedAt,
+			IP:   clusterClientAddr,
+			Port: clusterAdvertisedPort,
 		}, cluster.CoordinatorOptions{
 			HeartbeatInterval: nodeCfg.HeartbeatInterval,
 			HeartbeatTimeout:  nodeCfg.HeartbeatTimeout,
+			StartupRecovery: func(recoveryCtx context.Context, incarnation cluster.HomeIncarnationID) error {
+				return recoverCPAFences(recoveryCtx, clusterRepo, incarnation, respSrv)
+			},
 		})
 		refreshController := cluster.NewRefreshController(coordinator, rt, clusterRepo, clusterTLSConfig)
 		coordinator.SetOnMasterChanged(refreshController.OnMasterChanged)
@@ -378,8 +440,14 @@ func run() int {
 	})
 	quotaCollector.Start(runCtx)
 
-	respSrv := respserver.New(addr, rt)
+	respSrv = respserver.New(addr, rt)
 	respSrv.SetClusterHandler(clusterRESPHandler)
+	respSrv.SetInFlightSnapshotStore(repo)
+	respSrv.SetConcurrencyReleaseStore(repo)
+	if errApplyInFlight := applyRESPInFlightConfig(respSrv, cfg); errApplyInFlight != nil {
+		log.Errorf("failed to apply in-flight observation config: %v", errApplyInFlight)
+		return 1
+	}
 
 	cfgPath := strings.TrimSpace(rt.ConfigPath())
 	if cfgPath == "" {
@@ -407,6 +475,18 @@ func run() int {
 		Addr:              addr,
 		Handler:           mgmtBuild.Engine,
 		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	if errInitialize := initializeCoordinatorBeforeListen(runCtx, coordinator); errInitialize != nil {
+		log.Errorf("failed to initialize cluster coordinator: %v", errInitialize)
+		return 1
+	}
+	if coordinator != nil {
+		defer func() {
+			if errRetire := coordinator.RetireHomeIncarnation(context.Background()); errRetire != nil && !errors.Is(errRetire, cluster.ErrHomeIncarnationFenced) {
+				log.Warnf("failed to retire Home incarnation: %v", errRetire)
+			}
+		}()
 	}
 
 	baseListener, errListen := net.Listen("tcp", addr)
@@ -490,6 +570,7 @@ func run() int {
 	}()
 	go runUsageDerivedColumnBackfillMaintenance(runCtx, repo)
 	go runUsageCacheReadBackfillMaintenance(runCtx, repo)
+	go runInFlightStagingCleanupMaintenance(runCtx, repo, rt)
 
 	go func() {
 		<-ctx.Done()
@@ -561,6 +642,13 @@ func run() int {
 }
 
 // resolveSQLitePath resolves the SQLite database path from flag and config values.
+func initializeCoordinatorBeforeListen(ctx context.Context, coordinator *cluster.Coordinator) error {
+	if coordinator == nil {
+		return nil
+	}
+	return coordinator.Initialize(ctx)
+}
+
 func resolveSQLitePath(flagPath string, configPath string) string {
 	flagPath = strings.TrimSpace(flagPath)
 	if flagPath != "" {
@@ -741,6 +829,37 @@ func runUsageDerivedColumnBackfillMaintenance(ctx context.Context, repo *cluster
 	}
 }
 
+func runInFlightStagingCleanupMaintenance(ctx context.Context, repo *cluster.Repository, runtime *home.Runtime) {
+	if repo == nil || runtime == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		cfg := runtime.Config()
+		if cfg == nil {
+			log.Warn("in-flight staging cleanup skipped: runtime config is unavailable")
+		} else {
+			_, _, retention, errDurations := cfg.CredentialInFlight.Durations()
+			if errDurations != nil {
+				log.WithError(errDurations).Warn("in-flight staging cleanup skipped: invalid retention")
+			} else {
+				cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				errCleanup := repo.CleanupExpiredInFlightStaging(cleanupCtx, retention)
+				cancel()
+				if errCleanup != nil && ctx.Err() == nil {
+					log.WithError(errCleanup).Warn("in-flight staging cleanup failed")
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func runUsageCacheReadBackfillMaintenance(ctx context.Context, repo *cluster.Repository) {
 	if repo == nil {
 		return
@@ -784,10 +903,11 @@ func collectServeError(ch <-chan error, timeout time.Duration) error {
 	}
 }
 
-func exportOptionsForDir(exportDir string, repo *cluster.Repository) cluster.ExportOptions {
+func exportOptionsForDir(exportDir string, repo *cluster.Repository, nodeHeartbeatTimeout time.Duration) cluster.ExportOptions {
 	options := cluster.ExportOptions{
-		OutputDir:  exportDir,
-		Repository: repo,
+		OutputDir:            exportDir,
+		Repository:           repo,
+		NodeHeartbeatTimeout: nodeHeartbeatTimeout,
 	}
 	if strings.TrimSpace(exportDir) != "" {
 		options.AuthDirName = "auths"

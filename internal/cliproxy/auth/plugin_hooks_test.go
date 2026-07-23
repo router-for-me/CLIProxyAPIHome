@@ -13,6 +13,15 @@ func (s *unhandledSchedulerPlugin) PickAuth(context.Context, pluginapi.Scheduler
 	return pluginapi.SchedulerPickResponse{}, false, nil
 }
 
+type delegatingSchedulerPlugin struct{}
+
+func (s *delegatingSchedulerPlugin) PickAuth(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
+	return pluginapi.SchedulerPickResponse{
+		Handled:         true,
+		DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst,
+	}, true, nil
+}
+
 func TestDispatchPluginUnhandledPreservesBuiltinScheduler(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	first := geminiAPIKeyAuth("plugin-fallback-a", "first-key", "1")
@@ -35,6 +44,45 @@ func TestDispatchPluginUnhandledPreservesBuiltinScheduler(t *testing.T) {
 	}
 	if decision == nil || decision.Auth == nil || decision.Auth.ID != second.ID {
 		t.Fatalf("second Dispatch() auth = %#v, want builtin scheduler to continue with %s", decision, second.ID)
+	}
+}
+
+func TestDispatchPluginDelegateBuiltinUsesConcurrencyFilteredCandidates(t *testing.T) {
+	tests := []struct {
+		name     string
+		excluded ExcludedConcurrencyCandidate
+	}{
+		{
+			name:     "saturated credential",
+			excluded: ExcludedConcurrencyCandidate{CredentialID: "plugin-delegate-a", Model: "plugin-delegate-model"},
+		},
+		{
+			name:     "protocol required credential",
+			excluded: ExcludedConcurrencyCandidate{CredentialID: "plugin-delegate-a"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, &FillFirstSelector{}, nil)
+			first := geminiAPIKeyAuth("plugin-delegate-a", "first-key", "1")
+			second := geminiAPIKeyAuth("plugin-delegate-b", "second-key", "1")
+			registerDispatchTestAuth(t, manager, first, "plugin-delegate-model")
+			registerDispatchTestAuth(t, manager, second, "plugin-delegate-model")
+			manager.SetPluginScheduler(&delegatingSchedulerPlugin{})
+
+			decision, errDispatch := manager.Dispatch(context.Background(), []string{"gemini"}, "plugin-delegate-model", Options{
+				Metadata: map[string]any{
+					ExcludedConcurrencyCandidatesMetadataKey: []ExcludedConcurrencyCandidate{test.excluded},
+				},
+			})
+			if errDispatch != nil {
+				t.Fatalf("Dispatch() error = %v", errDispatch)
+			}
+			if decision == nil || decision.Auth == nil || decision.Auth.ID != second.ID {
+				t.Fatalf("Dispatch() auth = %#v, want %s", decision, second.ID)
+			}
+		})
 	}
 }
 

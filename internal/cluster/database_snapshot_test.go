@@ -67,10 +67,52 @@ func TestDatabaseSnapshotModelRegistryMatchesMigrationModels(t *testing.T) {
 		&UserSecurityTokenRecord{},
 		&UserMailJobRecord{},
 		&UserSecurityThrottleRecord{},
+		&LifecycleConfigRecord{},
+		&ConcurrencyActivationGateRecord{},
+		&CredentialConcurrencyPolicyRecord{},
+		&CredentialConcurrencyModelPolicyRecord{},
+		&CredentialConcurrencyCounterRecord{},
+		&ConcurrencyObservationBarrierRecord{},
+		&HomeProcessIncarnationRecord{},
+		&CPANodeMembershipRecord{},
+		&CPANodeParticipationRecord{},
+		&CPANodeQuiescenceRecord{},
+		&CPAInFlightSnapshotRecord{},
+		&CPAInFlightSnapshotAttemptRecord{},
+		&CPAInFlightSnapshotPartRecord{},
 	} {
 		requiredType := reflect.TypeOf(required)
 		if _, exists := seenTypes[requiredType]; !exists {
 			t.Errorf("required migration model %v is not registered", requiredType)
+		}
+	}
+}
+
+func TestDatabaseSnapshotV1RegistryRemainsCompatible(t *testing.T) {
+	t.Parallel()
+
+	models, okModels := databaseSnapshotModels(1)
+	if !okModels {
+		t.Fatal("databaseSnapshotModels(1) is unsupported")
+	}
+	if len(models) >= len(homeDatabaseModels) {
+		t.Fatalf("v1 model count = %d, current model count = %d", len(models), len(homeDatabaseModels))
+	}
+	for index, model := range models {
+		if model.name != homeDatabaseModels[index].name {
+			t.Fatalf("v1 model %d = %q, current prefix = %q", index, model.name, homeDatabaseModels[index].name)
+		}
+		if model.name != "cpa_node" {
+			continue
+		}
+		if gotType := reflect.TypeOf(model.newRecord()); gotType != reflect.TypeOf(&databaseSnapshotV1CPANodeRecord{}) {
+			t.Fatalf("v1 cpa_node type = %v", gotType)
+		}
+		if gotOrder := strings.Join(model.orderBy, ","); gotOrder != "home_ip,home_port,node_key" {
+			t.Fatalf("v1 cpa_node order = %q", gotOrder)
+		}
+		if gotOrder := strings.Join(homeDatabaseModels[index].orderBy, ","); gotOrder != "home_ip,home_port,home_started_at,node_key" {
+			t.Fatalf("current cpa_node order = %q", gotOrder)
 		}
 	}
 }
@@ -89,7 +131,7 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	if errExport != nil {
 		t.Fatalf("ExportDatabaseSnapshot() error = %v", errExport)
 	}
-	if manifest.SourceBackend != DatabaseBackendSQLite || manifest.HomeVersion != "test-version" || manifest.HomeCommit != "test-commit" {
+	if manifest.FormatVersion != databaseSnapshotFormatVersion || manifest.SourceBackend != DatabaseBackendSQLite || manifest.HomeVersion != "test-version" || manifest.HomeCommit != "test-commit" {
 		t.Fatalf("export manifest = %#v", manifest)
 	}
 	if len(manifest.Tables) != len(homeDatabaseModels) {
@@ -132,6 +174,20 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	}
 	if auth.CreatedAt.Location() != time.UTC || auth.UpdatedAt.Location() != time.UTC {
 		t.Fatalf("imported auth timestamps are not UTC: created=%v updated=%v", auth.CreatedAt, auth.UpdatedAt)
+	}
+	var concurrencyPolicy CredentialConcurrencyPolicyRecord
+	if errFirst := target.First(&concurrencyPolicy, "credential_id = ?", want.authUUID).Error; errFirst != nil {
+		t.Fatalf("load imported concurrency policy: %v", errFirst)
+	}
+	if concurrencyPolicy.MaxInFlight == nil || *concurrencyPolicy.MaxInFlight != 2 || concurrencyPolicy.ObservationBarrierRevision != 1 {
+		t.Fatalf("imported concurrency policy = %#v", concurrencyPolicy)
+	}
+	var activationGate ConcurrencyActivationGateRecord
+	if errFirst := target.First(&activationGate, "id = ?", 1).Error; errFirst != nil {
+		t.Fatalf("load imported concurrency activation gate: %v", errFirst)
+	}
+	if activationGate.ActivePolicyCount != 1 {
+		t.Fatalf("imported active policy count = %d, want 1", activationGate.ActivePolicyCount)
 	}
 	var pluginAuth PluginStoreAuthRecord
 	if errFirst := target.First(&pluginAuth, want.pluginAuthID).Error; errFirst != nil {
@@ -839,6 +895,78 @@ func TestDatabaseSnapshotImportRejectsCrossRecordViolations(t *testing.T) {
 			wantError: "relationship plugin_store_auth.key_version",
 		},
 		{
+			name:  "missing concurrency policy credential",
+			table: "credential_concurrency_policies",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := CredentialConcurrencyPolicyRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode concurrency policy row: %v", errDecode)
+				}
+				record.CredentialID = "missing-auth"
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode concurrency policy row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "relationship credential_concurrency_policies.credential_id",
+		},
+		{
+			name:  "missing concurrency model policy parent",
+			table: "credential_concurrency_model_policies",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := CredentialConcurrencyModelPolicyRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode concurrency model policy row: %v", errDecode)
+				}
+				record.CredentialID = "missing-policy"
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode concurrency model policy row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "relationship credential_concurrency_model_policies.credential_id",
+		},
+		{
+			name:  "mismatched concurrency activation gate",
+			table: "concurrency_activation_gate",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := ConcurrencyActivationGateRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode concurrency activation gate row: %v", errDecode)
+				}
+				record.ActivePolicyCount = 0
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode concurrency activation gate row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "active policy count is 0, want 1",
+		},
+		{
+			name:  "stale concurrency observation barrier",
+			table: "credential_concurrency_observation_barrier",
+			mutate: func(t *testing.T, raw []byte) []byte {
+				t.Helper()
+				record := ConcurrencyObservationBarrierRecord{}
+				if errDecode := json.Unmarshal(raw, &record); errDecode != nil {
+					t.Fatalf("decode concurrency observation barrier row: %v", errDecode)
+				}
+				record.Revision = 0
+				updated, errMarshal := json.Marshal(record)
+				if errMarshal != nil {
+					t.Fatalf("encode concurrency observation barrier row: %v", errMarshal)
+				}
+				return append(updated, '\n')
+			},
+			wantError: "revision is 0, want at least 1",
+		},
+		{
 			name:  "missing api key channel group",
 			table: "api_key",
 			mutate: func(t *testing.T, raw []byte) []byte {
@@ -1009,6 +1137,11 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 	records := []any{
 		&AuthRecord{UUID: authUUID, AuthJSON: JSONB(`{"token":"secret","nested":{"ok":true}}`), Version: 3, ID: "auth-logical-id", Index: "auth-index", Provider: "codex", CreatedAt: now, UpdatedAt: now, DeletedAt: gorm.DeletedAt{Time: deletedAt, Valid: true}},
 		&ConfigRecord{Key: "server", Value: JSONB(`{"debug":true,"items":[1,null,"x"]}`), Version: 2, CreatedAt: now, UpdatedAt: now},
+		&LifecycleConfigRecord{ID: 1, Revision: 1, NodeHeartbeatTimeout: 10 * time.Second, Payload: JSONB(`{"revision":1}`), UpdatedAt: now},
+		&ConcurrencyActivationGateRecord{ID: 1, ActivePolicyCount: 1},
+		&CredentialConcurrencyPolicyRecord{CredentialID: authUUID, MaxInFlight: int64Pointer(2), Version: 1, EffectiveAt: now, ObservationBarrierRevision: 1, CreatedAt: now, UpdatedAt: now},
+		&CredentialConcurrencyModelPolicyRecord{CredentialID: authUUID, Model: "gpt-test", MaxInFlight: 1},
+		&ConcurrencyObservationBarrierRecord{ID: 1, Revision: 1, UpdatedAt: now},
 		&KVRecord{Key: "ordinary:valid", Value: []byte{0, 1, 2, 255}, Version: 1, ExpiresAt: &expiresAt, CreatedAt: now, UpdatedAt: now},
 		&KVRecord{Key: "ordinary:expired", Value: []byte("expired"), Version: 1, ExpiresAt: &expiredAt, CreatedAt: now, UpdatedAt: now},
 		&KVRecord{Key: "internal:migration:test", Value: []byte("internal"), Version: 1, CreatedAt: now, UpdatedAt: now},

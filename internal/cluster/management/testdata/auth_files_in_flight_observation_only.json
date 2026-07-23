@@ -1,0 +1,37 @@
+{
+  "in_flight_observed_at": "2026-07-21T12:00:00Z",
+  "files": [
+    {
+      "id": "cred-a",
+      "auth_index": "cred-a",
+      "name": "cred-a.json",
+      "file_name": "cred-a.json",
+      "type": "codex",
+      "provider": "codex",
+      "label": "Primary",
+      "status": "active",
+      "status_message": "",
+      "disabled": false,
+      "unavailable": false,
+      "runtime_only": false,
+      "source": "db",
+      "in_flight": 3,
+      "max_in_flight": null,
+      "max_in_flight_by_model": null,
+      "remaining": null,
+      "total_saturated": false,
+      "saturated_model_count": 0,
+      "admitted_in_flight": null,
+      "observed": {
+        "in_flight": 3,
+        "accounted": 2,
+        "unaccounted": 1,
+        "stale": false,
+        "coverage_complete": true,
+        "aggregates_complete": true,
+        "details_truncated": false
+      },
+      "limiter": null
+    }
+  ]
+}

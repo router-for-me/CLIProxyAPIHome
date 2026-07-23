@@ -9,6 +9,23 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: home_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d home_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      HOME_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/home_test?sslmode=disable
+      CLIPROXY_HOME_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/home_test?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,6 +38,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify PostgreSQL cluster behavior
+        run: go test -v ./internal/cluster
       - name: Build
         run: |
           CGO_ENABLED=1 go build -o test-output ./cmd/home

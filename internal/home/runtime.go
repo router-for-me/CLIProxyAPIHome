@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -12,12 +13,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	configaccess "github.com/router-for-me/CLIProxyAPIHome/internal/access/config_access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/concurrency"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/managementasset"
@@ -51,6 +54,7 @@ type Runtime struct {
 	pluginSyncNodeActive    func(context.Context, string, string) (bool, error)
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
 	clusterAdapter          ClusterAdapter
+	concurrencyAdmitter     ConcurrencyAdmitter
 	clusterRefresh          func(context.Context, string) ([]byte, error)
 	originalStore           coreauth.Store
 
@@ -105,6 +109,47 @@ func (r *Runtime) PluginSyncNodeActive(ctx context.Context, nodeID string, finge
 		return false, nil
 	}
 	return r.pluginSyncNodeActive(ctx, strings.TrimSpace(nodeID), strings.TrimSpace(fingerprint))
+}
+
+// ConcurrencyAdmissionRequest identifies a dispatch request for atomic admission.
+type ConcurrencyAdmissionRequest struct {
+	CredentialID    string
+	Model           string
+	Fingerprint     string
+	ConnectedAt     time.Time
+	Controlled      bool
+	ProtocolVersion int
+}
+
+// ConcurrencyAdmissionResult describes the credential and model admitted by the limiter.
+type ConcurrencyAdmissionResult struct {
+	Accounted    bool
+	CredentialID string
+	Model        string
+}
+
+// ConcurrencyAdmitter atomically reserves a credential concurrency slot.
+type ConcurrencyAdmitter interface {
+	AdmitCredentialConcurrency(context.Context, ConcurrencyAdmissionRequest) (ConcurrencyAdmissionResult, error)
+}
+
+// ConcurrencyAdmitterFunc adapts a function to ConcurrencyAdmitter.
+type ConcurrencyAdmitterFunc func(context.Context, ConcurrencyAdmissionRequest) (ConcurrencyAdmissionResult, error)
+
+func (f ConcurrencyAdmitterFunc) AdmitCredentialConcurrency(ctx context.Context, req ConcurrencyAdmissionRequest) (ConcurrencyAdmissionResult, error) {
+	return f(ctx, req)
+}
+
+// DispatchResponsePreparer prebuilds both dispatch response variants before admission.
+type DispatchResponsePreparer func(*DispatchResult) (unaccounted []byte, accounted []byte, err error)
+
+// DispatchConcurrencyContext carries the RESP connection identity required for admission.
+type DispatchConcurrencyContext struct {
+	Fingerprint     string
+	ConnectedAt     time.Time
+	Controlled      bool
+	ProtocolVersion int
+	PrepareResponse DispatchResponsePreparer
 }
 
 type ClusterAdapter interface {
@@ -201,12 +246,25 @@ func NewRuntime(cfg *config.Config) (*Runtime, error) {
 	return runtime, nil
 }
 
+// SetConcurrencyAdmitter sets the admission backend used for concurrency-aware dispatch.
+func (r *Runtime) SetConcurrencyAdmitter(admitter ConcurrencyAdmitter) {
+	if r == nil {
+		return
+	}
+	r.concurrencyAdmitter = admitter
+}
+
 // SetClusterAdapter sets a cluster adapter.
 func (r *Runtime) SetClusterAdapter(adapter ClusterAdapter) {
 	if r == nil {
 		return
 	}
 	r.clusterAdapter = adapter
+	if admitter, ok := adapter.(ConcurrencyAdmitter); ok {
+		r.concurrencyAdmitter = admitter
+	} else {
+		r.concurrencyAdmitter = nil
+	}
 	r.refreshAccessProviders()
 	if r.coreManager != nil {
 		if adapter != nil && adapter.Enabled() {
@@ -705,11 +763,24 @@ type DispatchResult struct {
 	AuthID   string
 	Provider string
 
-	Auth *coreauth.Auth
+	Auth                  *coreauth.Auth
+	Concurrency           ConcurrencyAdmissionResult
+	UnaccountedReply      []byte
+	AccountedReply        []byte
+	AdmissionFenceFailure error
 }
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
 func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string) (*DispatchResult, error) {
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, DispatchConcurrencyContext{})
+}
+
+// DispatchForAPIKeyWithConcurrency performs dispatch and atomic admission for a RESP request.
+func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, concurrencyCtx)
+}
+
+func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
 	opts := coreauth.Options{}
 	if headers != nil {
 		opts.Headers = headers.Clone()
@@ -728,10 +799,17 @@ func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, header
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
 	}
-	return r.dispatchWithOptions(ctx, reqModel, opts)
+	return r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
 }
 
-func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options) (*DispatchResult, error) {
+func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+	if !utf8.ValidString(reqModel) {
+		return nil, &coreauth.Error{
+			Code:    homeerrors.TypeModelNotFound,
+			Message: fmt.Sprintf(homeerrors.MessageModelDoesNotExistFmt, "requested model"),
+		}
+	}
+
 	// Build the candidate view before applying availability rules.
 	if r == nil || r.coreManager == nil {
 		return nil, fmt.Errorf("home runtime: core manager is nil")
@@ -756,39 +834,109 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
-	decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
-	if errDispatch != nil {
-		return nil, errDispatch
-	}
-	if decision == nil || decision.Auth == nil {
-		return nil, fmt.Errorf("home runtime: dispatch returned nil auth")
-	}
+	var lastCandidateError error
+	for {
+		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
+		if errDispatch != nil {
+			if lastCandidateError != nil {
+				return nil, lastCandidateError
+			}
+			return nil, errDispatch
+		}
+		if decision == nil || decision.Auth == nil {
+			return nil, fmt.Errorf("home runtime: dispatch returned nil auth")
+		}
 
-	auth := decision.Auth
-	upstreamModel := strings.TrimSpace(decision.UpstreamModel)
-	if upstreamModel == "" {
-		upstreamModel = strings.TrimSpace(reqModel)
+		auth := decision.Auth
+		upstreamModel := strings.TrimSpace(decision.UpstreamModel)
+		if upstreamModel == "" {
+			upstreamModel = strings.TrimSpace(reqModel)
+		}
+		concurrencyModel, validConcurrencyModel := concurrency.ValidCanonicalConcurrencyModelKey(upstreamModel)
+		if !validConcurrencyModel {
+			return nil, fmt.Errorf("home runtime: invalid canonical concurrency model key")
+		}
+		accessToken := extractAccessToken(auth)
+		baseURL := ""
+		apiKey := ""
+		if auth.Attributes != nil {
+			baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+			apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+		}
+		result := &DispatchResult{
+			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
+			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
+			AuthID: auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
+			Concurrency: ConcurrencyAdmissionResult{CredentialID: auth.ID, Model: concurrencyModel},
+		}
+		if concurrencyCtx.PrepareResponse != nil {
+			unaccounted, accounted, errPrepare := concurrencyCtx.PrepareResponse(result)
+			if errPrepare != nil {
+				return nil, errPrepare
+			}
+			result.UnaccountedReply = unaccounted
+			result.AccountedReply = accounted
+		}
+		if r.concurrencyAdmitter != nil {
+			admission, errAdmit := r.concurrencyAdmitter.AdmitCredentialConcurrency(ctx, ConcurrencyAdmissionRequest{
+				CredentialID: auth.ID, Model: concurrencyModel, Fingerprint: concurrencyCtx.Fingerprint,
+				ConnectedAt: concurrencyCtx.ConnectedAt, Controlled: concurrencyCtx.Controlled, ProtocolVersion: concurrencyCtx.ProtocolVersion,
+			})
+			if errAdmit != nil {
+				admissionType := concurrencyAdmissionErrorType(errAdmit)
+				if !concurrencyCandidateIneligible(admissionType) {
+					return nil, errAdmit
+				}
+				lastCandidateError = errAdmit
+				excluded := coreauth.ExcludedConcurrencyCandidate{CredentialID: auth.ID}
+				if admissionType == "credential_model_concurrency_exceeded" {
+					excluded.Model = concurrencyModel
+				}
+				if opts.Metadata == nil {
+					opts.Metadata = make(map[string]any)
+				}
+				candidates := append([]coreauth.ExcludedConcurrencyCandidate(nil), concurrencyExcludedCandidates(opts)...)
+				opts.Metadata[coreauth.ExcludedConcurrencyCandidatesMetadataKey] = append(candidates, excluded)
+				continue
+			}
+			if strings.TrimSpace(admission.CredentialID) != auth.ID || admission.Model != concurrencyModel {
+				if !admission.Accounted {
+					return nil, fmt.Errorf("home runtime: concurrency admission result mismatch")
+				}
+				result.Concurrency.Accounted = true
+				result.AdmissionFenceFailure = fmt.Errorf("home runtime: concurrency admission result mismatch")
+				return result, nil
+			}
+			result.Concurrency = admission
+		}
+		return result, nil
 	}
+}
 
-	accessToken := extractAccessToken(auth)
-	baseURL := ""
-	apiKey := ""
-	if auth.Attributes != nil {
-		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
-		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+func concurrencyCandidateIneligible(admissionType string) bool {
+	switch admissionType {
+	case "credential_concurrency_exceeded", "credential_model_concurrency_exceeded", "concurrency_protocol_required":
+		return true
+	default:
+		return false
 	}
+}
 
-	return &DispatchResult{
-		Model:         upstreamModel,
-		AccessToken:   accessToken,
-		BaseURL:       baseURL,
-		APIKey:        apiKey,
-		ForceMapping:  decision.ForceMapping,
-		OriginalAlias: decision.OriginalAlias,
-		AuthID:        auth.ID,
-		Provider:      decision.Provider,
-		Auth:          auth.Clone(),
-	}, nil
+func concurrencyAdmissionErrorType(errAdmission error) string {
+	type typedAdmissionError interface{ ConcurrencyType() string }
+	var typed typedAdmissionError
+	if errors.As(errAdmission, &typed) {
+		return strings.TrimSpace(typed.ConcurrencyType())
+	}
+	return ""
+}
+
+func concurrencyExcludedCandidates(opts coreauth.Options) []coreauth.ExcludedConcurrencyCandidate {
+	if opts.Metadata == nil {
+		return nil
+	}
+	candidates, _ := opts.Metadata[coreauth.ExcludedConcurrencyCandidatesMetadataKey].([]coreauth.ExcludedConcurrencyCandidate)
+	return candidates
 }
 
 func (r *Runtime) allowedAuthIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
