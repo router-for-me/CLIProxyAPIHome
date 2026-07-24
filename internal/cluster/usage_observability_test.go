@@ -989,6 +989,27 @@ func TestListUsageObservabilityAggregatesSortsBeforePagination(t *testing.T) {
 	}
 }
 
+func TestUsageObservabilityAggregateSQLOrderUsesTotalAmountExpression(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		direction string
+		want      string
+	}{
+		{name: "descending", direction: "desc", want: "COALESCE(SUM(scoped.amount), 0) DESC, last_used_at DESC, aggregate_label ASC"},
+		{name: "ascending", direction: "asc", want: "COALESCE(SUM(scoped.amount), 0) ASC, last_used_at DESC, aggregate_label ASC"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := usageObservabilityAggregateSQLOrder("total_amount", test.direction); got != test.want {
+				t.Fatalf("usageObservabilityAggregateSQLOrder() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestGetUsageObservabilityRecordReturnsRecord(t *testing.T) {
 	t.Parallel()
 
