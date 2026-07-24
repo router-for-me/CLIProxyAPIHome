@@ -1,13 +1,19 @@
 package cluster
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func TestInFlightSnapshotCursorRoundTripReadsOnlyRequestedPage(t *testing.T) {
@@ -71,6 +77,10 @@ func TestInFlightSnapshotCursorRoundTripReadsOnlyRequestedPage(t *testing.T) {
 	if _, errExpired := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 0, 1); !errors.Is(errExpired, ErrInFlightSnapshotCursorExpired) {
 		t.Fatalf("expired cursor error = %v, want %v", errExpired, ErrInFlightSnapshotCursorExpired)
 	}
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorRecord{}, created.Cursor, 1)
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute); errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() after expiry error = %v", errCreate)
+	}
 	assertInFlightCursorDeleted(t, db, created.Cursor)
 	if _, errInvalid := repo.ReadInFlightSnapshotCursorPage(t.Context(), "not-a-cursor", "", "", 0, 1); !errors.Is(errInvalid, ErrInFlightSnapshotCursorExpired) {
 		t.Fatalf("invalid cursor error = %v, want %v", errInvalid, ErrInFlightSnapshotCursorExpired)
@@ -101,7 +111,101 @@ func TestInFlightSnapshotCursorRejectsFilterAndLegacySchema(t *testing.T) {
 	if _, errLegacy := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 0, 1); !errors.Is(errLegacy, ErrInFlightSnapshotCursorExpired) {
 		t.Fatalf("legacy cursor error = %v, want %v", errLegacy, ErrInFlightSnapshotCursorExpired)
 	}
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorRecord{}, created.Cursor, 1)
+	if errExpire := db.Model(&ManagementInFlightSnapshotCursorRecord{}).
+		Where("cursor = ?", created.Cursor).
+		Update("expires_at", time.Now().UTC().Add(-time.Minute)).Error; errExpire != nil {
+		t.Fatalf("expire legacy cursor: %v", errExpire)
+	}
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute); errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() after legacy cursor error = %v", errCreate)
+	}
 	assertInFlightCursorDeleted(t, db, created.Cursor)
+}
+
+func TestInFlightSnapshotCursorConcurrentLegacyReadsDoNotDeadlockPostgres(t *testing.T) {
+	repo, db := newInFlightCursorPostgresTestRepository(t)
+	input := inFlightCursorTestInput()
+	created, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute)
+	if errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
+	}
+	if errLegacy := db.Model(&ManagementInFlightSnapshotCursorRecord{}).
+		Where("cursor = ?", created.Cursor).
+		Update("schema_version", 0).Error; errLegacy != nil {
+		t.Fatalf("mark cursor legacy: %v", errLegacy)
+	}
+
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var queryCount atomic.Int32
+	if errCallback := db.Callback().Query().After("gorm:query").Register("in_flight_cursor_legacy_read_barrier", func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != (ManagementInFlightSnapshotCursorRecord{}).TableName() || queryCount.Add(1) > 2 {
+			return
+		}
+		arrived <- struct{}{}
+		<-release
+	}); errCallback != nil {
+		t.Fatalf("register query callback: %v", errCallback)
+	}
+
+	ctx, cancelCtx := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelCtx()
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, errRead := repo.ReadInFlightSnapshotCursorPage(ctx, created.Cursor, input.CredentialID, input.Model, 0, 1)
+			results <- errRead
+		}()
+	}
+	for range 2 {
+		select {
+		case <-arrived:
+		case <-ctx.Done():
+			close(release)
+			t.Fatalf("concurrent cursor reads did not acquire shared locks: %v", ctx.Err())
+		}
+	}
+	updateStarted := make(chan struct{})
+	updateDone := make(chan error, 1)
+	go func() {
+		close(updateStarted)
+		errUpdate := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			header := ManagementInFlightSnapshotCursorRecord{}
+			return tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("cursor = ?", created.Cursor).First(&header).Error
+		})
+		updateDone <- errUpdate
+	}()
+	<-updateStarted
+	select {
+	case errUpdate := <-updateDone:
+		close(release)
+		t.Fatalf("update lock completed while shared locks were held: %v", errUpdate)
+	case <-time.After(200 * time.Millisecond):
+	case <-ctx.Done():
+		close(release)
+		t.Fatalf("waiting for blocked update lock: %v", ctx.Err())
+	}
+	close(release)
+	for range 2 {
+		select {
+		case errRead := <-results:
+			if !errors.Is(errRead, ErrInFlightSnapshotCursorExpired) {
+				t.Fatalf("concurrent legacy cursor error = %v, want %v", errRead, ErrInFlightSnapshotCursorExpired)
+			}
+		case <-ctx.Done():
+			t.Fatalf("concurrent cursor reads did not finish: %v", ctx.Err())
+		}
+	}
+	select {
+	case errUpdate := <-updateDone:
+		if errUpdate != nil {
+			t.Fatalf("update lock after shared reads error = %v", errUpdate)
+		}
+	case <-ctx.Done():
+		t.Fatalf("update lock did not finish after shared reads: %v", ctx.Err())
+	}
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorRecord{}, created.Cursor, 1)
 }
 
 func TestInFlightSnapshotCursorMigratesAndExpiresLegacyBlobRows(t *testing.T) {
@@ -148,10 +252,16 @@ func TestInFlightSnapshotCursorMigratesAndExpiresLegacyBlobRows(t *testing.T) {
 	if _, errRead := repo.ReadInFlightSnapshotCursorPage(t.Context(), legacyCursor, "", "", 0, 1); !errors.Is(errRead, ErrInFlightSnapshotCursorExpired) {
 		t.Fatalf("legacy cursor error = %v, want %v", errRead, ErrInFlightSnapshotCursorExpired)
 	}
-	assertInFlightCursorDeleted(t, db, legacyCursor)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorRecord{}, legacyCursor, 1)
+	if errExpire := db.Model(&ManagementInFlightSnapshotCursorRecord{}).
+		Where("cursor = ?", legacyCursor).
+		Update("expires_at", time.Now().UTC().Add(-time.Minute)).Error; errExpire != nil {
+		t.Fatalf("expire legacy cursor: %v", errExpire)
+	}
 	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), time.Minute); errCreate != nil {
 		t.Fatalf("CreateInFlightSnapshotCursor() after migration error = %v", errCreate)
 	}
+	assertInFlightCursorDeleted(t, db, legacyCursor)
 }
 
 func TestInFlightSnapshotCursorDetectsIncompleteRelations(t *testing.T) {
@@ -252,6 +362,41 @@ func TestCreateInFlightSnapshotCursorCleansOneExpiredBatch(t *testing.T) {
 	}
 }
 
+func TestInFlightSnapshotCursorCleanupBoundsRelationRows(t *testing.T) {
+	repo, db := newInFlightCursorTestRepository(t)
+	cursor, errToken := newInFlightSnapshotCursorToken()
+	if errToken != nil {
+		t.Fatalf("newInFlightSnapshotCursorToken() error = %v", errToken)
+	}
+	past := time.Now().UTC().Add(-time.Hour)
+	header := ManagementInFlightSnapshotCursorRecord{
+		Cursor: cursor, SchemaVersion: inFlightSnapshotCursorSchemaVersion, Payload: JSONB(`{"schema_version":1}`), ExpiresAt: past, CreatedAt: past.Add(-time.Minute),
+	}
+	if errHeader := db.Create(&header).Error; errHeader != nil {
+		t.Fatalf("seed expired cursor header: %v", errHeader)
+	}
+	items := make([]ManagementInFlightSnapshotCursorItemRecord, 0, inFlightSnapshotCursorCleanupRowBatchSize+1)
+	for index := 0; index < cap(items); index++ {
+		items = append(items, ManagementInFlightSnapshotCursorItemRecord{
+			Cursor: cursor, Ordinal: int64(index), RequestID: fmt.Sprintf("old-%04d", index), CredentialID: "cred", Model: "model", RequestKind: "sse", StartedAt: past,
+		})
+	}
+	if errItems := db.CreateInBatches(items, inFlightSnapshotCursorWriteBatchSize).Error; errItems != nil {
+		t.Fatalf("seed expired cursor items: %v", errItems)
+	}
+
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), time.Minute); errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
+	}
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorRecord{}, cursor, 1)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorItemRecord{}, cursor, 1)
+
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), time.Minute); errCreate != nil {
+		t.Fatalf("second CreateInFlightSnapshotCursor() error = %v", errCreate)
+	}
+	assertInFlightCursorDeleted(t, db, cursor)
+}
+
 func TestInFlightSnapshotCursorBatchesLargeRelationalView(t *testing.T) {
 	repo, db := newInFlightCursorTestRepository(t)
 	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
@@ -303,6 +448,57 @@ func TestCreateInFlightSnapshotCursorRejectsInvalidTTL(t *testing.T) {
 	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), 0); errCreate == nil {
 		t.Fatal("CreateInFlightSnapshotCursor() accepted a non-positive ttl")
 	}
+}
+
+func newInFlightCursorPostgresTestRepository(t *testing.T) (*Repository, *gorm.DB) {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv("CLIPROXY_HOME_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("CLIPROXY_HOME_TEST_POSTGRES_DSN is not configured")
+	}
+	adminDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	if errOpen != nil {
+		t.Fatalf("open postgres admin database: %v", errOpen)
+	}
+	adminSQLDB, errAdminDB := adminDB.DB()
+	if errAdminDB != nil {
+		t.Fatalf("get postgres admin database: %v", errAdminDB)
+	}
+	schema := "in_flight_cursor_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if errCreate := adminDB.Exec("CREATE SCHEMA " + schema).Error; errCreate != nil {
+		t.Fatalf("create postgres schema: %v", errCreate)
+	}
+	db, errSchemaOpen := gorm.Open(postgres.Open(postgresDSNWithSearchPath(dsn, schema)), databaseGORMConfig())
+	if errSchemaOpen != nil {
+		if errDrop := adminDB.Exec("DROP SCHEMA " + schema + " CASCADE").Error; errDrop != nil {
+			t.Errorf("drop postgres schema after open failure: %v", errDrop)
+		}
+		if errClose := adminSQLDB.Close(); errClose != nil {
+			t.Errorf("close postgres admin database: %v", errClose)
+		}
+		t.Fatalf("open postgres schema database: %v", errSchemaOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("get postgres database: %v", errDB)
+	}
+	sqlDB.SetMaxOpenConns(4)
+	sqlDB.SetMaxIdleConns(4)
+	t.Cleanup(func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close postgres database: %v", errClose)
+		}
+		if errDrop := adminDB.Exec("DROP SCHEMA " + schema + " CASCADE").Error; errDrop != nil {
+			t.Errorf("drop postgres schema: %v", errDrop)
+		}
+		if errClose := adminSQLDB.Close(); errClose != nil {
+			t.Errorf("close postgres admin database: %v", errClose)
+		}
+	})
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+	return NewRepository(db), db
 }
 
 func newInFlightCursorTestRepository(t *testing.T) (*Repository, *gorm.DB) {

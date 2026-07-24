@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	inFlightSnapshotCursorRandomBytes      = 24
-	inFlightSnapshotCursorSchemaVersion    = 1
-	inFlightSnapshotCursorWriteBatchSize   = 250
-	inFlightSnapshotCursorCleanupBatchSize = 250
+	inFlightSnapshotCursorRandomBytes         = 24
+	inFlightSnapshotCursorSchemaVersion       = 1
+	inFlightSnapshotCursorWriteBatchSize      = 250
+	inFlightSnapshotCursorCleanupBatchSize    = 8
+	inFlightSnapshotCursorCleanupRowBatchSize = 1000
 )
 
 var ErrInFlightSnapshotCursorExpired = errors.New("in-flight snapshot cursor expired")
@@ -284,29 +285,25 @@ func (r *Repository) ReadInFlightSnapshotCursorPage(ctx context.Context, cursor 
 	result := InFlightSnapshotCursor{}
 	expired := false
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		now, errNow := DatabaseNow(ctx, tx)
-		if errNow != nil {
-			return errNow
-		}
 		record := ManagementInFlightSnapshotCursorRecord{}
 		errFirst := tx.WithContext(ctx).
 			Clauses(clause.Locking{Strength: "SHARE"}).
-			Where("cursor = ? AND expires_at > ?", normalized, now).
+			Where("cursor = ?", normalized).
 			First(&record).Error
 		if errors.Is(errFirst, gorm.ErrRecordNotFound) {
-			if errDelete := deleteExpiredInFlightSnapshotCursor(ctx, tx, normalized, now); errDelete != nil {
-				return errDelete
-			}
 			expired = true
 			return nil
 		}
 		if errFirst != nil {
 			return errFirst
 		}
-		if record.SchemaVersion != inFlightSnapshotCursorSchemaVersion {
-			if errDelete := deleteInFlightSnapshotCursorRecords(ctx, tx, []string{normalized}); errDelete != nil {
-				return errDelete
-			}
+		now, errNow := DatabaseNow(ctx, tx)
+		if errNow != nil {
+			return errNow
+		}
+		if !record.ExpiresAt.After(now) || record.SchemaVersion != inFlightSnapshotCursorSchemaVersion {
+			// Expiry cleanup owns an update lock. Readers must not upgrade this
+			// shared lock to a delete lock because concurrent upgrades can deadlock.
 			expired = true
 			return nil
 		}
@@ -543,42 +540,183 @@ func cleanupExpiredInFlightSnapshotCursors(ctx context.Context, tx *gorm.DB, now
 		Find(&records).Error; errFind != nil {
 		return errFind
 	}
-	cursors := make([]string, 0, len(records))
+	remaining := inFlightSnapshotCursorCleanupRowBatchSize
 	for index := range records {
-		cursors = append(cursors, records[index].Cursor)
-	}
-	return deleteInFlightSnapshotCursorRecords(ctx, tx, cursors)
-}
-
-func deleteExpiredInFlightSnapshotCursor(ctx context.Context, tx *gorm.DB, cursor string, now time.Time) error {
-	var count int64
-	if errCount := tx.WithContext(ctx).
-		Model(&ManagementInFlightSnapshotCursorRecord{}).
-		Where("cursor = ? AND expires_at <= ?", cursor, now).
-		Count(&count).Error; errCount != nil {
-		return errCount
-	}
-	if count == 0 {
-		return nil
-	}
-	return deleteInFlightSnapshotCursorRecords(ctx, tx, []string{cursor})
-}
-
-func deleteInFlightSnapshotCursorRecords(ctx context.Context, tx *gorm.DB, cursors []string) error {
-	if len(cursors) == 0 {
-		return nil
-	}
-	for _, record := range []any{
-		&ManagementInFlightSnapshotCursorStateModelRecord{},
-		&ManagementInFlightSnapshotCursorStateRecord{},
-		&ManagementInFlightSnapshotCursorObservedRecord{},
-		&ManagementInFlightSnapshotCursorItemRecord{},
-	} {
-		if errDelete := tx.WithContext(ctx).Where("cursor IN ?", cursors).Delete(record).Error; errDelete != nil {
+		deleted, errDelete := deleteInFlightSnapshotCursorRecordsBatch(ctx, tx, records[index].Cursor, remaining)
+		if errDelete != nil {
 			return errDelete
 		}
+		remaining -= deleted
+		if remaining <= 0 {
+			break
+		}
 	}
-	return tx.WithContext(ctx).Where("cursor IN ?", cursors).Delete(&ManagementInFlightSnapshotCursorRecord{}).Error
+	return nil
+}
+
+func deleteInFlightSnapshotCursorRecordsBatch(ctx context.Context, tx *gorm.DB, cursor string, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	remaining := limit
+	deleted := 0
+	complete, count, errModels := deleteInFlightSnapshotCursorStateModelsBatch(ctx, tx, cursor, remaining)
+	if errModels != nil {
+		return 0, errModels
+	}
+	deleted += count
+	remaining -= count
+	if !complete || remaining <= 0 {
+		return deleted, nil
+	}
+	complete, count, errStates := deleteInFlightSnapshotCursorStatesBatch(ctx, tx, cursor, remaining)
+	if errStates != nil {
+		return 0, errStates
+	}
+	deleted += count
+	remaining -= count
+	if !complete || remaining <= 0 {
+		return deleted, nil
+	}
+	complete, count, errObserved := deleteInFlightSnapshotCursorObservedBatch(ctx, tx, cursor, remaining)
+	if errObserved != nil {
+		return 0, errObserved
+	}
+	deleted += count
+	remaining -= count
+	if !complete || remaining <= 0 {
+		return deleted, nil
+	}
+	complete, count, errItems := deleteInFlightSnapshotCursorItemsBatch(ctx, tx, cursor, remaining)
+	if errItems != nil {
+		return 0, errItems
+	}
+	deleted += count
+	remaining -= count
+	if !complete || remaining <= 0 {
+		return deleted, nil
+	}
+	result := tx.WithContext(ctx).Where("cursor = ?", cursor).Delete(&ManagementInFlightSnapshotCursorRecord{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected > 1 {
+		return 0, fmt.Errorf("deleted multiple in-flight snapshot cursor headers")
+	}
+	return deleted + int(result.RowsAffected), nil
+}
+
+func deleteInFlightSnapshotCursorStateModelsBatch(ctx context.Context, tx *gorm.DB, cursor string, limit int) (bool, int, error) {
+	var records []ManagementInFlightSnapshotCursorStateModelRecord
+	if errFind := tx.WithContext(ctx).
+		Where("cursor = ?", cursor).
+		Order("credential_id ASC, model ASC").
+		Limit(limit).
+		Find(&records).Error; errFind != nil {
+		return false, 0, errFind
+	}
+	if len(records) == 0 {
+		return true, 0, nil
+	}
+	keys := make([][]any, 0, len(records))
+	for index := range records {
+		keys = append(keys, []any{records[index].CredentialID, records[index].Model})
+	}
+	result := tx.WithContext(ctx).
+		Where("cursor = ?", cursor).
+		Where("(credential_id, model) IN ?", keys).
+		Delete(&ManagementInFlightSnapshotCursorStateModelRecord{})
+	if result.Error != nil {
+		return false, 0, result.Error
+	}
+	if result.RowsAffected != int64(len(records)) {
+		return false, 0, fmt.Errorf("in-flight snapshot cursor state model cleanup is inconsistent")
+	}
+	return len(records) < limit, len(records), nil
+}
+
+func deleteInFlightSnapshotCursorStatesBatch(ctx context.Context, tx *gorm.DB, cursor string, limit int) (bool, int, error) {
+	var records []ManagementInFlightSnapshotCursorStateRecord
+	if errFind := tx.WithContext(ctx).
+		Where("cursor = ?", cursor).
+		Order("credential_id ASC").
+		Limit(limit).
+		Find(&records).Error; errFind != nil {
+		return false, 0, errFind
+	}
+	if len(records) == 0 {
+		return true, 0, nil
+	}
+	credentialIDs := make([]string, 0, len(records))
+	for index := range records {
+		credentialIDs = append(credentialIDs, records[index].CredentialID)
+	}
+	result := tx.WithContext(ctx).
+		Where("cursor = ? AND credential_id IN ?", cursor, credentialIDs).
+		Delete(&ManagementInFlightSnapshotCursorStateRecord{})
+	if result.Error != nil {
+		return false, 0, result.Error
+	}
+	if result.RowsAffected != int64(len(records)) {
+		return false, 0, fmt.Errorf("in-flight snapshot cursor state cleanup is inconsistent")
+	}
+	return len(records) < limit, len(records), nil
+}
+
+func deleteInFlightSnapshotCursorObservedBatch(ctx context.Context, tx *gorm.DB, cursor string, limit int) (bool, int, error) {
+	var records []ManagementInFlightSnapshotCursorObservedRecord
+	if errFind := tx.WithContext(ctx).
+		Where("cursor = ?", cursor).
+		Order("credential_id ASC").
+		Limit(limit).
+		Find(&records).Error; errFind != nil {
+		return false, 0, errFind
+	}
+	if len(records) == 0 {
+		return true, 0, nil
+	}
+	credentialIDs := make([]string, 0, len(records))
+	for index := range records {
+		credentialIDs = append(credentialIDs, records[index].CredentialID)
+	}
+	result := tx.WithContext(ctx).
+		Where("cursor = ? AND credential_id IN ?", cursor, credentialIDs).
+		Delete(&ManagementInFlightSnapshotCursorObservedRecord{})
+	if result.Error != nil {
+		return false, 0, result.Error
+	}
+	if result.RowsAffected != int64(len(records)) {
+		return false, 0, fmt.Errorf("in-flight snapshot cursor observed cleanup is inconsistent")
+	}
+	return len(records) < limit, len(records), nil
+}
+
+func deleteInFlightSnapshotCursorItemsBatch(ctx context.Context, tx *gorm.DB, cursor string, limit int) (bool, int, error) {
+	var records []ManagementInFlightSnapshotCursorItemRecord
+	if errFind := tx.WithContext(ctx).
+		Where("cursor = ?", cursor).
+		Order("ordinal ASC").
+		Limit(limit).
+		Find(&records).Error; errFind != nil {
+		return false, 0, errFind
+	}
+	if len(records) == 0 {
+		return true, 0, nil
+	}
+	ordinals := make([]int64, 0, len(records))
+	for index := range records {
+		ordinals = append(ordinals, records[index].Ordinal)
+	}
+	result := tx.WithContext(ctx).
+		Where("cursor = ? AND ordinal IN ?", cursor, ordinals).
+		Delete(&ManagementInFlightSnapshotCursorItemRecord{})
+	if result.Error != nil {
+		return false, 0, result.Error
+	}
+	if result.RowsAffected != int64(len(records)) {
+		return false, 0, fmt.Errorf("in-flight snapshot cursor item cleanup is inconsistent")
+	}
+	return len(records) < limit, len(records), nil
 }
 
 func cloneInFlightCursorTime(value *time.Time) *time.Time {

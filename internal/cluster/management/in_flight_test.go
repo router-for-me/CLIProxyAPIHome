@@ -243,6 +243,92 @@ func TestGetInFlightDetailsSnapshotCursorFreshnessDegradesUsingDatabaseTime(t *t
 	}
 }
 
+func TestGetInFlightDetailsFirstStablePageUsesCursorReadTimeForFreshness(t *testing.T) {
+	handler, db, closeRepo := newInFlightManagementTestHandler(t)
+	defer closeRepo()
+	seedInFlightManagementSnapshot(t, handler.repo, db)
+	publishInFlightManagementSnapshot(t, handler.repo, 2, []cluster.InFlightRequestDetail{
+		{RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-2 * time.Second)},
+		{RequestID: "req-2", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-time.Second)},
+	})
+
+	databaseNow, errNow := cluster.DatabaseNow(t.Context(), db)
+	if errNow != nil {
+		t.Fatalf("DatabaseNow() error = %v", errNow)
+	}
+	freshUntil := databaseNow.Add(2 * time.Second)
+	updatedAt := freshUntil.Add(-handler.inFlightStaleAfter())
+	if errUpdate := db.Model(&cluster.CPAInFlightSnapshotRecord{}).
+		Where("certificate_fingerprint = ?", "in-flight-management-fingerprint").
+		Update("updated_at", updatedAt).Error; errUpdate != nil {
+		t.Fatalf("update snapshot freshness: %v", errUpdate)
+	}
+	preflight, errRead := handler.repo.ReadInFlightObservation(t.Context(), handler.inFlightStaleAfter())
+	if errRead != nil {
+		t.Fatalf("ReadInFlightObservation() error = %v", errRead)
+	}
+	if preflight.Stale {
+		t.Fatalf("preflight observation = %#v", preflight)
+	}
+
+	if errCallback := db.Callback().Create().Before("gorm:create").Register("in_flight_cursor_wait_until_stale", func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != (cluster.ManagementInFlightSnapshotCursorRecord{}).TableName() {
+			return
+		}
+		for {
+			readAt, errReadAt := cluster.DatabaseNow(tx.Statement.Context, tx)
+			if errReadAt != nil {
+				tx.AddError(errReadAt)
+				return
+			}
+			if readAt.After(freshUntil) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}); errCallback != nil {
+		t.Fatalf("register create callback: %v", errCallback)
+	}
+
+	response := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&stable_snapshot=true")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Stale                bool   `json:"stale"`
+		CoverageComplete     bool   `json:"coverage_complete"`
+		SnapshotCursorReadAt string `json:"snapshot_cursor_read_at"`
+	}
+	if errDecode := json.Unmarshal(response.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	readAt, errParse := time.Parse(time.RFC3339Nano, payload.SnapshotCursorReadAt)
+	if errParse != nil {
+		t.Fatalf("parse snapshot cursor read time %q: %v", payload.SnapshotCursorReadAt, errParse)
+	}
+	if !readAt.After(freshUntil) || !payload.Stale || payload.CoverageComplete {
+		t.Fatalf("first stable page read_at=%s fresh_until=%s payload=%#v", readAt, freshUntil, payload)
+	}
+}
+
+func TestUpdateInFlightDetailsFreshnessUsesCursorReadTime(t *testing.T) {
+	freshUntil := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	read := cluster.InFlightObservationReadModel{
+		FreshUntil:       &freshUntil,
+		CoverageComplete: true,
+	}
+
+	fresh := updateInFlightDetailsFreshness(read, freshUntil)
+	if fresh.Stale || !fresh.CoverageComplete {
+		t.Fatalf("fresh read = %#v", fresh)
+	}
+
+	stale := updateInFlightDetailsFreshness(read, freshUntil.Add(time.Nanosecond))
+	if !stale.Stale || stale.CoverageComplete {
+		t.Fatalf("stale read = %#v", stale)
+	}
+}
+
 func TestFilterInFlightDetailsStatesUsesDetailCredentialIDs(t *testing.T) {
 	read := cluster.InFlightObservationReadModel{
 		Details: []cluster.InFlightRequestDetail{{CredentialID: "cred-a"}},

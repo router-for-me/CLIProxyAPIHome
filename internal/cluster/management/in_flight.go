@@ -162,6 +162,7 @@ func (h *Handler) readInFlightDetailsSnapshot(c *gin.Context, query inFlightDeta
 		expiresAt := cursor.ExpiresAt
 		readAt := cursor.ReadAt
 		cursorPage = inFlightDetailsCursorPage{Cursor: cursor.Cursor, ReadAt: &readAt, ExpiresAt: &expiresAt}
+		read = updateInFlightDetailsFreshness(read, cursor.ReadAt)
 	}
 	read = sliceInFlightDetailsSnapshot(read, start, nextOffset)
 	states = filterInFlightDetailsStates(states, read)
@@ -186,11 +187,7 @@ func (h *Handler) readInFlightDetailsCursor(c *gin.Context, query inFlightDetail
 		respondError(c, http.StatusInternalServerError, "in_flight_snapshot_cursor_load_failed", errCursor)
 		return inFlightDetailsSnapshot{}, false
 	}
-	read := cursor.Observation
-	if !read.Stale && (read.FreshUntil == nil || cursor.ReadAt.After(*read.FreshUntil)) {
-		read.Stale = true
-		read.CoverageComplete = false
-	}
+	read := updateInFlightDetailsFreshness(cursor.Observation, cursor.ReadAt)
 	_, nextOffset := inFlightDetailsPageBounds(cursor.Total, query.Offset, query.Limit)
 	expiresAt := cursor.ExpiresAt
 	readAt := cursor.ReadAt
@@ -201,6 +198,14 @@ func (h *Handler) readInFlightDetailsCursor(c *gin.Context, query inFlightDetail
 		NextOffset: nextOffset,
 		CursorPage: inFlightDetailsCursorPage{Cursor: cursor.Cursor, ReadAt: &readAt, ExpiresAt: &expiresAt},
 	}, true
+}
+
+func updateInFlightDetailsFreshness(read cluster.InFlightObservationReadModel, readAt time.Time) cluster.InFlightObservationReadModel {
+	if !read.Stale && (read.FreshUntil == nil || readAt.After(*read.FreshUntil)) {
+		read.Stale = true
+		read.CoverageComplete = false
+	}
+	return read
 }
 
 func parseInFlightPaginationValue(raw string, defaultValue int, minValue int, maxValue int, field string) (int, error) {
