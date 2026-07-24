@@ -2214,8 +2214,11 @@ Query 参数：
       "runtime_only": false,
       "source": "db",
       "email": "user@example.com",
+      "prefix": "team-a",
+      "proxy_url": "socks5://127.0.0.1:1080",
       "priority": 10,
       "note": "operator note",
+      "websockets": true,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2223,6 +2226,16 @@ Query 参数：
   ]
 }
 ```
+
+列表项会投影可编辑元数据，Management 客户端无需下载凭证 JSON 即可展示并更新当前值：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `prefix` | string | 模型命名空间前缀；未设置时为空字符串。 |
+| `proxy_url` | string | 凭证级代理 URL；未设置时为空字符串。 |
+| `priority` | integer | 凭证选择优先级；未设置时省略。 |
+| `note` | string | 运维备注；为空时省略。 |
+| `websockets` | boolean | 实际生效的运行时 WebSocket 标志。 |
 
 ### GET `/auth-files/models?name=<name-or-id>`
 

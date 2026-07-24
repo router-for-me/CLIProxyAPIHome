@@ -558,6 +558,9 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 		"unavailable":    auth.Unavailable,
 		"runtime_only":   auth.Attributes != nil && strings.EqualFold(auth.Attributes["runtime_only"], "true"),
 		"source":         "db",
+		"prefix":         prefixFromAuth(auth),
+		"proxy_url":      proxyURLFromAuth(auth),
+		"websockets":     websocketsFromAuth(auth),
 	}
 	if email := stringFromAny(auth.Metadata["email"]); email != "" {
 		entry["email"] = email
@@ -972,6 +975,52 @@ func priorityFromAuth(auth *coreauth.Auth) *int {
 		}
 	}
 	return nil
+}
+
+func prefixFromAuth(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if prefix := strings.TrimSpace(auth.Prefix); prefix != "" {
+		return prefix
+	}
+	if auth.Metadata != nil {
+		return stringFromAny(auth.Metadata["prefix"])
+	}
+	return ""
+}
+
+func proxyURLFromAuth(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		return proxyURL
+	}
+	if auth.Metadata != nil {
+		if proxyURL := stringFromAny(auth.Metadata["proxy_url"]); proxyURL != "" {
+			return proxyURL
+		}
+		return stringFromAny(auth.Metadata["proxy-url"])
+	}
+	return ""
+}
+
+func websocketsFromAuth(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if websockets, ok := oauthBoolValue(auth.Attributes["websockets"]); ok {
+			return websockets
+		}
+	}
+	if auth.Metadata != nil {
+		if websockets, ok := oauthBoolValue(auth.Metadata["websockets"]); ok {
+			return websockets
+		}
+	}
+	return false
 }
 
 // noteFromAuth derives note from auth.

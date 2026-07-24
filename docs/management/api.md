@@ -2214,8 +2214,11 @@ Example response:
       "runtime_only": false,
       "source": "db",
       "email": "user@example.com",
+      "prefix": "team-a",
+      "proxy_url": "socks5://127.0.0.1:1080",
       "priority": 10,
       "note": "operator note",
+      "websockets": true,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2223,6 +2226,17 @@ Example response:
   ]
 }
 ```
+
+Editable metadata is projected with each list item so management clients can display and update
+the current value without downloading the credential JSON:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `prefix` | string | Model namespace prefix; empty when unset. |
+| `proxy_url` | string | Per-auth proxy URL; empty when unset. |
+| `priority` | integer | Credential selection priority; omitted when unset. |
+| `note` | string | Operator note; omitted when empty. |
+| `websockets` | boolean | Effective runtime websocket flag. |
 
 ### GET `/auth-files/models?name=<name-or-id>`
 
