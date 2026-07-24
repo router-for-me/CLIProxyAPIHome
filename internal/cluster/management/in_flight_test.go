@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,176 @@ func TestGetInFlightDetailsFiltersAndBoundsPagination(t *testing.T) {
 	response = performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?limit=0")
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("invalid limit status = %d body=%s, want %d", response.Code, response.Body.String(), http.StatusBadRequest)
+	}
+}
+
+func TestGetInFlightDetailsStableSnapshotCursorPinsPages(t *testing.T) {
+	handler, db, closeRepo := newInFlightManagementTestHandler(t)
+	defer closeRepo()
+	seedInFlightManagementSnapshot(t, handler.repo, db)
+	publishInFlightManagementSnapshot(t, handler.repo, 2, []cluster.InFlightRequestDetail{
+		{RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-2 * time.Second)},
+		{RequestID: "req-2", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "websocket", StartedAt: inFlightManagementConnectedAt().Add(-time.Second)},
+	})
+
+	first := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&offset=0&stable_snapshot=true")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstPayload struct {
+		Items []struct {
+			RequestID string `json:"request_id"`
+		} `json:"items"`
+		Total             int     `json:"total"`
+		NextOffset        *int    `json:"next_offset"`
+		SnapshotCursor    *string `json:"snapshot_cursor"`
+		SnapshotExpiresAt *string `json:"snapshot_expires_at"`
+	}
+	if errDecode := json.Unmarshal(first.Body.Bytes(), &firstPayload); errDecode != nil {
+		t.Fatalf("decode first response: %v", errDecode)
+	}
+	if len(firstPayload.Items) != 1 || firstPayload.Items[0].RequestID != "req-1" || firstPayload.Total != 2 || firstPayload.NextOffset == nil || *firstPayload.NextOffset != 1 || firstPayload.SnapshotCursor == nil || *firstPayload.SnapshotCursor == "" || firstPayload.SnapshotExpiresAt == nil {
+		t.Fatalf("first payload = %#v", firstPayload)
+	}
+
+	publishInFlightManagementSnapshot(t, handler.repo, 3, []cluster.InFlightRequestDetail{
+		{RequestID: "req-new", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt()},
+	})
+	secondPath := "/credentials/in-flight?credential_id=cred-a&limit=1&offset=1&snapshot_cursor=" + *firstPayload.SnapshotCursor
+	second := performManagementGET(t, handler.GetInFlightDetails, secondPath)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d body=%s", second.Code, second.Body.String())
+	}
+	var secondPayload struct {
+		Items []struct {
+			RequestID string `json:"request_id"`
+		} `json:"items"`
+		Total          int     `json:"total"`
+		NextOffset     *int    `json:"next_offset"`
+		SnapshotCursor *string `json:"snapshot_cursor"`
+	}
+	if errDecode := json.Unmarshal(second.Body.Bytes(), &secondPayload); errDecode != nil {
+		t.Fatalf("decode second response: %v", errDecode)
+	}
+	if len(secondPayload.Items) != 1 || secondPayload.Items[0].RequestID != "req-2" || secondPayload.Total != 2 || secondPayload.NextOffset != nil || secondPayload.SnapshotCursor == nil || *secondPayload.SnapshotCursor != *firstPayload.SnapshotCursor {
+		t.Fatalf("second payload = %#v", secondPayload)
+	}
+
+	latest := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&stable_snapshot=true")
+	if latest.Code != http.StatusOK || !strings.Contains(latest.Body.String(), `"request_id":"req-new"`) {
+		t.Fatalf("latest response = %d %s", latest.Code, latest.Body.String())
+	}
+}
+
+func TestGetInFlightDetailsSnapshotCursorRejectsMismatchAndExpiry(t *testing.T) {
+	handler, db, closeRepo := newInFlightManagementTestHandler(t)
+	defer closeRepo()
+	seedInFlightManagementSnapshot(t, handler.repo, db)
+	publishInFlightManagementSnapshot(t, handler.repo, 2, []cluster.InFlightRequestDetail{
+		{RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-2 * time.Second)},
+		{RequestID: "req-2", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-time.Second)},
+	})
+	first := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&stable_snapshot=true")
+	var payload struct {
+		SnapshotCursor string `json:"snapshot_cursor"`
+	}
+	if errDecode := json.Unmarshal(first.Body.Bytes(), &payload); errDecode != nil || payload.SnapshotCursor == "" {
+		t.Fatalf("decode cursor response: %v payload=%#v", errDecode, payload)
+	}
+
+	mismatch := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-b&limit=1&offset=1&snapshot_cursor="+payload.SnapshotCursor)
+	assertInFlightCursorError(t, mismatch, http.StatusConflict, "in_flight_snapshot_cursor_expired")
+	modelMismatch := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&model=gpt-5.5&limit=1&offset=1&snapshot_cursor="+payload.SnapshotCursor)
+	assertInFlightCursorError(t, modelMismatch, http.StatusConflict, "in_flight_snapshot_cursor_expired")
+
+	past := time.Now().UTC().Add(-time.Minute)
+	if errExpire := db.Model(&cluster.ManagementInFlightSnapshotCursorRecord{}).
+		Where("cursor = ?", payload.SnapshotCursor).
+		Update("expires_at", past).Error; errExpire != nil {
+		t.Fatalf("expire snapshot cursor: %v", errExpire)
+	}
+	expired := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&offset=1&snapshot_cursor="+payload.SnapshotCursor)
+	assertInFlightCursorError(t, expired, http.StatusConflict, "in_flight_snapshot_cursor_expired")
+}
+
+func TestGetInFlightDetailsSnapshotCursorFreshnessDegradesUsingDatabaseTime(t *testing.T) {
+	handler, db, closeRepo := newInFlightManagementTestHandler(t)
+	defer closeRepo()
+	seedInFlightManagementSnapshot(t, handler.repo, db)
+	publishInFlightManagementSnapshot(t, handler.repo, 2, []cluster.InFlightRequestDetail{
+		{RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-2 * time.Second)},
+		{RequestID: "req-2", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-time.Second)},
+	})
+	first := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&stable_snapshot=true")
+	var firstPayload struct {
+		SnapshotCursor string `json:"snapshot_cursor"`
+	}
+	if errDecode := json.Unmarshal(first.Body.Bytes(), &firstPayload); errDecode != nil || firstPayload.SnapshotCursor == "" {
+		t.Fatalf("decode cursor response: %v payload=%#v", errDecode, firstPayload)
+	}
+	var cursorRecord cluster.ManagementInFlightSnapshotCursorRecord
+	if errCursor := db.Where("cursor = ?", firstPayload.SnapshotCursor).First(&cursorRecord).Error; errCursor != nil {
+		t.Fatalf("read snapshot cursor: %v", errCursor)
+	}
+	cursorPayload := inFlightDetailsCursorPayload{}
+	if errDecode := json.Unmarshal(cursorRecord.Payload, &cursorPayload); errDecode != nil {
+		t.Fatalf("decode stored snapshot cursor: %v", errDecode)
+	}
+	past := time.Now().UTC().Add(-time.Minute)
+	cursorPayload.Observation.FreshUntil = &past
+	updatedPayload, errEncode := json.Marshal(cursorPayload)
+	if errEncode != nil {
+		t.Fatalf("encode stored snapshot cursor: %v", errEncode)
+	}
+	future := time.Now().UTC().Add(time.Minute)
+	if errAge := db.Model(&cluster.ManagementInFlightSnapshotCursorRecord{}).
+		Where("cursor = ?", firstPayload.SnapshotCursor).
+		Updates(map[string]any{"payload": cluster.JSONB(updatedPayload), "expires_at": future}).Error; errAge != nil {
+		t.Fatalf("update snapshot cursor freshness: %v", errAge)
+	}
+	second := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&offset=1&snapshot_cursor="+firstPayload.SnapshotCursor)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d body=%s", second.Code, second.Body.String())
+	}
+	var secondPayload struct {
+		Stale            bool `json:"stale"`
+		CoverageComplete bool `json:"coverage_complete"`
+	}
+	if errDecode := json.Unmarshal(second.Body.Bytes(), &secondPayload); errDecode != nil {
+		t.Fatalf("decode second response: %v", errDecode)
+	}
+	if !secondPayload.Stale || secondPayload.CoverageComplete {
+		t.Fatalf("second payload = %#v", secondPayload)
+	}
+}
+
+func TestFilterInFlightDetailsStatesUsesDetailCredentialIDs(t *testing.T) {
+	read := cluster.InFlightObservationReadModel{
+		Details: []cluster.InFlightRequestDetail{{CredentialID: "cred-a"}},
+	}
+	states := []cluster.CredentialConcurrencyState{
+		{CredentialID: "cred-a"},
+		{CredentialID: "cred-b"},
+	}
+	filtered := filterInFlightDetailsStates(states, read)
+	if len(filtered) != 1 || filtered[0].CredentialID != "cred-a" {
+		t.Fatalf("filtered states = %#v", filtered)
+	}
+}
+
+func assertInFlightCursorError(t *testing.T, response *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if response.Code != status {
+		t.Fatalf("status = %d body=%s, want %d", response.Code, response.Body.String(), status)
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if errDecode := json.Unmarshal(response.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode error response: %v", errDecode)
+	}
+	if payload.Error != code {
+		t.Fatalf("error = %q, want %q", payload.Error, code)
 	}
 }
 
@@ -184,6 +355,9 @@ func TestGetCapabilitiesReturnsIndependentInFlightCapability(t *testing.T) {
 	if !payload.Capabilities["credential_in_flight_snapshots"] {
 		t.Fatalf("capabilities = %#v", payload.Capabilities)
 	}
+	if !payload.Capabilities["credential_in_flight_snapshot_cursor"] {
+		t.Fatalf("capabilities = %#v", payload.Capabilities)
+	}
 	if !payload.Capabilities["credential_concurrency_limits_v2"] {
 		t.Fatalf("capabilities = %#v", payload.Capabilities)
 	}
@@ -215,7 +389,7 @@ func newInFlightManagementTestHandler(t *testing.T) (*Handler, *gorm.DB, func())
 func seedInFlightManagementSnapshot(t *testing.T, repo *cluster.Repository, db *gorm.DB) {
 	t.Helper()
 
-	connectedAt := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	connectedAt := inFlightManagementConnectedAt()
 	member := cluster.CPANodeMembershipRecord{
 		CertificateFingerprint: "in-flight-management-fingerprint",
 		NodeID:                 "in-flight-management-node",
@@ -237,35 +411,48 @@ func seedInFlightManagementSnapshot(t *testing.T, repo *cluster.Repository, db *
 	if _, errUpsert := repo.UpsertAuth(context.Background(), auth, "test"); errUpsert != nil {
 		t.Fatalf("UpsertAuth() error = %v", errUpsert)
 	}
+	publishInFlightManagementSnapshotWithAggregates(t, repo, 1, []cluster.InFlightAggregate{
+		{CredentialID: "cred-a", Model: "gpt-5", Status: cluster.InFlightAccounted, Count: 2},
+		{CredentialID: "cred-a", Model: "gpt-5", Status: cluster.InFlightUnaccounted, Count: 1},
+	}, []cluster.InFlightRequestDetail{{
+		RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: connectedAt.Add(-2 * time.Second),
+	}})
+}
+
+func inFlightManagementConnectedAt() time.Time {
+	return time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+}
+
+func publishInFlightManagementSnapshot(t *testing.T, repo *cluster.Repository, revision int64, details []cluster.InFlightRequestDetail) {
+	t.Helper()
+	publishInFlightManagementSnapshotWithAggregates(t, repo, revision, []cluster.InFlightAggregate{
+		{CredentialID: "cred-a", Model: "gpt-5", Status: cluster.InFlightAccounted, Count: int64(len(details))},
+	}, details)
+}
+
+func publishInFlightManagementSnapshotWithAggregates(t *testing.T, repo *cluster.Repository, revision int64, aggregates []cluster.InFlightAggregate, details []cluster.InFlightRequestDetail) {
+	t.Helper()
+	connectedAt := inFlightManagementConnectedAt()
 	partIndex := 0
 	partCount := 1
 	frame := cluster.InFlightSnapshotFrame{
 		Kind:            cluster.InFlightFramePart,
-		Revision:        1,
-		ObservedAt:      connectedAt,
+		Revision:        revision,
+		ObservedAt:      connectedAt.Add(time.Duration(revision-1) * time.Second),
 		BarrierRevision: 0,
 		PartIndex:       &partIndex,
 		PartCount:       &partCount,
-		Aggregates: []cluster.InFlightAggregate{
-			{CredentialID: "cred-a", Model: "gpt-5", Status: cluster.InFlightAccounted, Count: 2},
-			{CredentialID: "cred-a", Model: "gpt-5", Status: cluster.InFlightUnaccounted, Count: 1},
-		},
-		Details: []cluster.InFlightRequestDetail{{
-			RequestID:    "req-1",
-			CredentialID: "cred-a",
-			Model:        "gpt-5",
-			RequestKind:  "sse",
-			StartedAt:    connectedAt.Add(-2 * time.Second),
-		}},
+		Aggregates:      aggregates,
+		Details:         details,
 	}
 	raw, errMarshal := json.Marshal(frame)
 	if errMarshal != nil {
 		t.Fatalf("json.Marshal() error = %v", errMarshal)
 	}
 	result, errIngest := repo.IngestInFlightFrame(context.Background(), cluster.InFlightIngestIdentity{
-		CertificateFingerprint: member.CertificateFingerprint,
-		NodeID:                 member.NodeID,
-		MembershipConnectedAt:  member.ConnectedAt,
+		CertificateFingerprint: "in-flight-management-fingerprint",
+		NodeID:                 "in-flight-management-node",
+		MembershipConnectedAt:  connectedAt,
 	}, raw, cluster.DefaultInFlightLimits())
 	if errIngest != nil || !result.Published {
 		t.Fatalf("IngestInFlightFrame() result = %#v error = %v", result, errIngest)

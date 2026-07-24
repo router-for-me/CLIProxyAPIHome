@@ -51,3 +51,16 @@ type CPAInFlightSnapshotPartRecord struct {
 func (CPAInFlightSnapshotPartRecord) TableName() string {
 	return "cpa_in_flight_snapshot_parts"
 }
+
+// ManagementInFlightSnapshotCursorRecord stores a short-lived immutable
+// Management API view used to keep offset pagination on one observation.
+type ManagementInFlightSnapshotCursorRecord struct {
+	Cursor    string    `gorm:"column:cursor;primaryKey;size:64"`
+	Payload   JSONB     `gorm:"column:payload;not null"`
+	ExpiresAt time.Time `gorm:"column:expires_at;not null;index"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
+}
+
+func (ManagementInFlightSnapshotCursorRecord) TableName() string {
+	return "management_in_flight_snapshot_cursors"
+}

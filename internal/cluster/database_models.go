@@ -74,7 +74,14 @@ var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[CertificateRecord]("certificate", []string{"id"}, false, true),
 }
 
+// homeDatabaseModels is the frozen database snapshot format v2 registry.
+// Runtime-only tables added after v2 must use databaseMigrationOnlyModels so
+// existing v2 archives remain importable.
 var homeDatabaseModels = currentDatabaseModels()
+
+var databaseMigrationOnlyModels = []databaseModel{
+	newDatabaseModel[ManagementInFlightSnapshotCursorRecord]("management_in_flight_snapshot_cursors", []string{"cursor"}, false, false),
+}
 
 func currentDatabaseModels() []databaseModel {
 	models := append([]databaseModel(nil), databaseSnapshotV1Models...)
@@ -113,8 +120,11 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 }
 
 func databaseMigrationModels() []any {
-	models := make([]any, 0, len(homeDatabaseModels))
+	models := make([]any, 0, len(homeDatabaseModels)+len(databaseMigrationOnlyModels))
 	for _, model := range homeDatabaseModels {
+		models = append(models, model.newRecord())
+	}
+	for _, model := range databaseMigrationOnlyModels {
 		models = append(models, model.newRecord())
 	}
 	return models

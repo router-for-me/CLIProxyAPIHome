@@ -2600,7 +2600,11 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 
 ### Credential in-flight observation
 
-`GET /credentials/in-flight` 只返回从最新完整 CPA snapshot 派生的有界请求详情。它支持可选的精确匹配 `credential_id`、`model` 过滤，以及 `limit` 和 `offset`。`limit` 默认 100，范围为 1 到 1000；`offset` 默认 0。每项包含 `request_id`、`credential_id`、规范化上游 `model`、`request_kind` 和 `started_at`。带有策略的凭证还会包含权威 `limiter` 状态。接口绝不暴露 CPA 身份、token 或请求 payload。
+`GET /credentials/in-flight` 只返回从最新完整 CPA snapshot 派生的有界请求详情。它支持可选的精确匹配 `credential_id`、`model` 过滤，以及 `limit` 和 `offset`。`limit` 默认 100，范围为 1 到 1000；`offset` 默认 0。每项包含 `request_id`、`credential_id`、规范化上游 `model`、`request_kind` 和 `started_at`。`request_id` 只是展示和关联字段，不保证每行唯一；即使 request ID 重复，客户端也必须保留后端返回的不同记录。带有策略的凭证还会包含权威 `limiter` 状态。接口绝不暴露 CPA 身份、token 或请求 payload。每个响应还会返回 `total`、可空的 `next_offset`、可空的 `snapshot_cursor` 和可空的 `snapshot_expires_at`。当 `offset + 本页返回条数 < total` 时，`next_offset` 必须等于该和值；否则 `next_offset` 为 `null`。
+
+当 `capabilities.credential_in_flight_snapshot_cursor=true` 时，客户端可以进行稳定的多页读取。第一页发送 `stable_snapshot=true`；如果仍有下一页，Home 会把过滤后的 observation 和已联结 limiter state 作为短期不可变数据库视图保存，并返回不透明的 `snapshot_cursor` 与 RFC 3339 格式的 `snapshot_expires_at`。cursor 有效期为 2 分钟，共享同一数据库的任意 Home 实例都可读取。后续每一页必须携带与第一页完全相同的 `credential_id`、`model` 以及该 `snapshot_cursor`；`offset` 应使用上一页的 `next_offset`，`limit` 可以调整。客户端还必须保证所有页面的 `total` 和 `snapshot_expires_at` 与第一页一致。若第一页没有下一页，则不返回 cursor。即使底层已摄取更新的 CPA snapshot，cursor 中的 items 和 limiter 值仍保持不变。freshness 诊断不会被冻结：截止时间继续基于原始 CPA snapshot 在 Home 数据库中的摄取时间，创建 cursor 不会重新获得一段 freshness。超过该截止时间后，后续 cursor 页会返回 `stale=true`、`coverage_complete=false`。
+
+无效、已过期或过滤条件不匹配的 cursor 返回 HTTP `409` 和 `error: "in_flight_snapshot_cursor_expired"`；客户端必须丢弃已经累积的全部页面并从 offset 0 重新开始。第一页 cursor 持久化失败返回 HTTP `500` 和 `error: "in_flight_snapshot_cursor_store_failed"`；cursor payload 的硬上限为 64 MiB。已保存 cursor 加载或解码失败返回 HTTP `500` 和 `error: "in_flight_snapshot_cursor_load_failed"`。创建新 cursor 时会顺带清理已经过期的 cursor 行。cursor 行属于临时的 migration-only 数据：运行时会自动迁移该表，但数据库 snapshot 导入和导出均不包含它。
 
 `GET /credentials/in-flight/summary` 返回最终一致的观测总数。对于带有并发策略的凭证，它还会联结权威的 `max_in_flight`、已准入计数、剩余容量、饱和状态和 `limiter` 对象。`in_flight` 仍然来自 snapshot；`observed` 将 accounted/unaccounted snapshot 总数与权威 limiter 状态分开。没有策略的凭证保持兼容的 `null`/`false` limiter 字段。
 
@@ -2638,7 +2642,7 @@ Management capability `credential_concurrency_limits_v2` 声明 policy 和 admit
 | 无法加载权威 limiter state | `500` | `concurrency_state_load_failed` | Database error detail。 |
 | 发生其他 policy write failure | `500` | `concurrency_policy_write_failed` | Underlying write error detail。 |
 
-`credential_in_flight_snapshots` capability 独立于 `credential_concurrency_limits_v2`。后者声明 Management concurrency policy 和权威已准入计数支持。snapshot 可用性、freshness、barrier acknowledgement、staging、overflow 和 cleanup 从不参与 admission 或 release。observation 失败仅按 best effort 处理，绝不阻塞流量。
+`credential_in_flight_snapshots` capability 独立于 `credential_concurrency_limits_v2`。后者声明 Management concurrency policy 和权威已准入计数支持。`credential_in_flight_snapshot_cursor` 独立声明 `GET /credentials/in-flight` 的数据库稳定分页契约。snapshot 可用性、freshness、barrier acknowledgement、staging、overflow 和 cleanup 从不参与 admission 或 release。observation 失败仅按 best effort 处理，绝不阻塞流量。
 
 Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-flight.snapshot-interval` 默认 `2s`；`stale-after` 默认 `10s`，且至少为三个 snapshot interval；`max-part-bytes`、`max-part-count`、`max-revision-bytes`、`max-aggregate-groups`、`max-details` 和 `max-string-bytes` 的默认值依次为 `262144`、`64`、`16777216`、`100000`、`10000` 和 `256`；`staging-retention` 默认 `1m`。cleanup 使用 Home 数据库时间。closed lifetime 仅以精确的 fingerprint 和 `membership_connected_at` 删除；stale staging 不会删除 active 或 canceling lifetime 的 watermark 或最高 revision parts。
 
@@ -2681,6 +2685,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-
 | `capabilities.access_groups` | boolean | 是否支持 `/channel-groups` 与 `/model-groups` 访问范围路由。 |
 | `capabilities.user_period_limits` | boolean | 是否支持用户周期限额配置字段，以及 `GET /users/:id/period-limits` 和 `POST /users/:id/period-limits/reset`。 |
 | `capabilities.credential_in_flight_snapshots` | boolean | 是否支持独立的 CPA in-flight observation snapshot 接口。 |
+| `capabilities.credential_in_flight_snapshot_cursor` | boolean | `GET /credentials/in-flight` 是否支持数据库支持的稳定 snapshot cursor 多页读取。 |
 | `capabilities.credential_concurrency_limits_v2` | boolean | 是否支持 concurrency policy 和权威已准入计数接口。 |
 | `server_info.home_version` | string | Home 构建版本。 |
 | `server_info.home_commit` | string | Home 构建 commit。 |

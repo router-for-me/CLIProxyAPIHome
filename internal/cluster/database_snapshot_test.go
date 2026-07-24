@@ -26,12 +26,14 @@ func TestDatabaseSnapshotModelRegistryMatchesMigrationModels(t *testing.T) {
 	t.Parallel()
 
 	migrationModels := databaseMigrationModels()
-	if len(migrationModels) != len(homeDatabaseModels) {
-		t.Fatalf("migration model count = %d, snapshot model count = %d", len(migrationModels), len(homeDatabaseModels))
+	managedModels := append([]databaseModel(nil), homeDatabaseModels...)
+	managedModels = append(managedModels, databaseMigrationOnlyModels...)
+	if len(migrationModels) != len(managedModels) {
+		t.Fatalf("migration model count = %d, managed model count = %d", len(migrationModels), len(managedModels))
 	}
-	seenNames := make(map[string]struct{}, len(homeDatabaseModels))
-	seenTypes := make(map[reflect.Type]struct{}, len(homeDatabaseModels))
-	for index, model := range homeDatabaseModels {
+	seenNames := make(map[string]struct{}, len(managedModels))
+	seenTypes := make(map[reflect.Type]struct{}, len(managedModels))
+	for index, model := range managedModels {
 		if model.name == "" || model.newRecord == nil || model.newBatch == nil || len(model.orderBy) == 0 {
 			t.Fatalf("database model %d is incomplete: %#v", index, model)
 		}
@@ -80,10 +82,35 @@ func TestDatabaseSnapshotModelRegistryMatchesMigrationModels(t *testing.T) {
 		&CPAInFlightSnapshotRecord{},
 		&CPAInFlightSnapshotAttemptRecord{},
 		&CPAInFlightSnapshotPartRecord{},
+		&ManagementInFlightSnapshotCursorRecord{},
 	} {
 		requiredType := reflect.TypeOf(required)
 		if _, exists := seenTypes[requiredType]; !exists {
 			t.Errorf("required migration model %v is not registered", requiredType)
+		}
+	}
+}
+
+func TestDatabaseSnapshotV2RegistryExcludesMigrationOnlyModels(t *testing.T) {
+	t.Parallel()
+
+	models, okModels := databaseSnapshotModels(2)
+	if !okModels {
+		t.Fatal("databaseSnapshotModels(2) is unsupported")
+	}
+	if len(models) != len(homeDatabaseModels) {
+		t.Fatalf("v2 model count = %d, frozen registry count = %d", len(models), len(homeDatabaseModels))
+	}
+	snapshotNames := make(map[string]struct{}, len(models))
+	for index, model := range models {
+		if model.name != homeDatabaseModels[index].name {
+			t.Fatalf("v2 model %d = %q, frozen registry = %q", index, model.name, homeDatabaseModels[index].name)
+		}
+		snapshotNames[model.name] = struct{}{}
+	}
+	for _, model := range databaseMigrationOnlyModels {
+		if _, exists := snapshotNames[model.name]; exists {
+			t.Fatalf("migration-only table %q is present in snapshot format v2", model.name)
 		}
 	}
 }
@@ -1196,6 +1223,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 		&CPANodeRecord{HomeIP: "127.0.0.1", HomePort: 18327, NodeKey: "node-key", NodeID: "node-1", ConnectedAt: now, LastSeenAt: now, CreatedAt: now, UpdatedAt: now},
 		&ClusterEventRecord{ID: 1001, Scope: "config", Op: "update", EntityUUID: "server", Version: 1, CreatedAt: now},
 		&OAuthSessionRecord{State: "oauth-state", Provider: "codex", Status: "pending", Data: JSONB(`{"safe":true}`), CreatedAt: now, UpdatedAt: now, ExpiresAt: expiresAt},
+		&ManagementInFlightSnapshotCursorRecord{Cursor: "c25hcHNob3QtdGVzdC1jdXJzb3ItMTIzNDU", Payload: JSONB(`{"transient":true}`), CreatedAt: now, ExpiresAt: expiresAt},
 	}
 	for _, record := range records {
 		if errCreate := db.Unscoped().Create(record).Error; errCreate != nil {
@@ -1287,7 +1315,9 @@ func assertDatabaseSnapshotResultCounts(t *testing.T, result DatabaseSnapshotImp
 
 func assertDatabaseSnapshotRuntimeTablesEmpty(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	for _, model := range homeDatabaseModels {
+	models := append([]databaseModel(nil), homeDatabaseModels...)
+	models = append(models, databaseMigrationOnlyModels...)
+	for _, model := range models {
 		if model.restore {
 			continue
 		}
@@ -1404,9 +1434,11 @@ func float64Pointer(value float64) *float64 {
 
 func dropDatabaseSnapshotPostgresTables(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	for index := len(homeDatabaseModels) - 1; index >= 0; index-- {
-		if errDrop := db.Migrator().DropTable(homeDatabaseModels[index].newRecord()); errDrop != nil {
-			t.Fatalf("drop postgres snapshot table %s: %v", homeDatabaseModels[index].name, errDrop)
+	models := append([]databaseModel(nil), homeDatabaseModels...)
+	models = append(models, databaseMigrationOnlyModels...)
+	for index := len(models) - 1; index >= 0; index-- {
+		if errDrop := db.Migrator().DropTable(models[index].newRecord()); errDrop != nil {
+			t.Fatalf("drop postgres managed table %s: %v", models[index].name, errDrop)
 		}
 	}
 }

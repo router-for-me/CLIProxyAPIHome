@@ -31,6 +31,7 @@ type InFlightObservedCredentialItem struct {
 // InFlightObservationReadModel is the active-membership view of in-flight snapshots.
 type InFlightObservationReadModel struct {
 	ObservedAt                      *time.Time
+	FreshUntil                      *time.Time
 	Stale                           bool
 	CoverageComplete                bool
 	AggregatesComplete              bool
@@ -139,6 +140,10 @@ func readInFlightObservationSnapshot(ctx context.Context, tx *gorm.DB, staleAfte
 			read.CoverageComplete = false
 			read.AggregatesComplete = false
 			continue
+		}
+		freshUntil := snapshot.UpdatedAt.Add(staleAfter).UTC()
+		if read.FreshUntil == nil || freshUntil.Before(*read.FreshUntil) {
+			read.FreshUntil = &freshUntil
 		}
 		if snapshotUpdatedAtStale(now, snapshot.UpdatedAt, staleAfter) {
 			read.Stale = true

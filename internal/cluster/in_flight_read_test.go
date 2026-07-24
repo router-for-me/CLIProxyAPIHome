@@ -98,6 +98,14 @@ func TestReadInFlightObservationUsesDatabaseIngestTimeForFreshness(t *testing.T)
 	if read.Stale || !read.CoverageComplete {
 		t.Fatalf("fresh read = %#v", read)
 	}
+	var snapshot CPAInFlightSnapshotRecord
+	if errSnapshot := repo.db.Where("certificate_fingerprint = ?", identity.CertificateFingerprint).First(&snapshot).Error; errSnapshot != nil {
+		t.Fatalf("read in-flight snapshot: %v", errSnapshot)
+	}
+	wantFreshUntil := snapshot.UpdatedAt.Add(10 * time.Second).UTC()
+	if read.FreshUntil == nil || !read.FreshUntil.Equal(wantFreshUntil) {
+		t.Fatalf("FreshUntil = %v, want %s", read.FreshUntil, wantFreshUntil)
+	}
 
 	makeInFlightSnapshotUpdatedAt(t, repo, databaseNowForInFlightTest(t, repo).Add(-11*time.Second))
 	read, errRead = repo.ReadInFlightObservation(context.Background(), 10*time.Second)

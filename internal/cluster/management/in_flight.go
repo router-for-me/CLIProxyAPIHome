@@ -1,6 +1,8 @@
 package management
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -14,13 +16,28 @@ import (
 const (
 	defaultInFlightDetailsLimit = 100
 	maxInFlightDetailsLimit     = 1000
+	inFlightSnapshotCursorTTL   = 2 * time.Minute
 )
 
 type inFlightDetailsQuery struct {
-	CredentialID string
-	Model        string
-	Limit        int
-	Offset       int
+	CredentialID   string
+	Model          string
+	Limit          int
+	Offset         int
+	StableSnapshot bool
+	SnapshotCursor string
+}
+
+type inFlightDetailsCursorPayload struct {
+	CredentialID string                               `json:"credential_id"`
+	Model        string                               `json:"model"`
+	Observation  cluster.InFlightObservationReadModel `json:"observation"`
+	States       []cluster.CredentialConcurrencyState `json:"states"`
+}
+
+type inFlightDetailsCursorPage struct {
+	Cursor    string
+	ExpiresAt *time.Time
 }
 
 func (h *Handler) inFlightStaleAfter() time.Duration {
@@ -44,14 +61,11 @@ func (h *Handler) GetInFlightDetails(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid_in_flight_pagination", errQuery)
 		return
 	}
-	read, ok := h.readInFlightObservation(c)
+	read, states, cursorPage, ok := h.readInFlightDetailsSnapshot(c, query)
 	if !ok {
 		return
 	}
-	ctx, cancel := h.requestContext(c)
-	defer cancel()
-	states, _ := h.repo.ReadConcurrencyState(ctx)
-	c.JSON(http.StatusOK, inFlightDetailsResponseWithConcurrency(read, query, states))
+	c.JSON(http.StatusOK, inFlightDetailsPageResponse(read, query, states, cursorPage))
 }
 
 func (h *Handler) GetInFlightSummary(c *gin.Context) {
@@ -87,6 +101,18 @@ func parseInFlightDetailsQuery(c *gin.Context) (inFlightDetailsQuery, error) {
 	}
 	query.CredentialID = strings.TrimSpace(c.Query("credential_id"))
 	query.Model = strings.TrimSpace(c.Query("model"))
+	query.SnapshotCursor = strings.TrimSpace(c.Query("snapshot_cursor"))
+	stableSnapshot := strings.TrimSpace(c.Query("stable_snapshot"))
+	if stableSnapshot != "" {
+		parsed, errParse := strconv.ParseBool(stableSnapshot)
+		if errParse != nil {
+			return inFlightDetailsQuery{}, fmt.Errorf("stable_snapshot must be a boolean")
+		}
+		query.StableSnapshot = parsed
+	}
+	if query.SnapshotCursor != "" {
+		query.StableSnapshot = true
+	}
 
 	limit, errLimit := parseInFlightPaginationValue(c.Query("limit"), defaultInFlightDetailsLimit, 1, maxInFlightDetailsLimit, "limit")
 	if errLimit != nil {
@@ -99,6 +125,77 @@ func parseInFlightDetailsQuery(c *gin.Context) (inFlightDetailsQuery, error) {
 	query.Limit = limit
 	query.Offset = offset
 	return query, nil
+}
+
+func (h *Handler) readInFlightDetailsSnapshot(c *gin.Context, query inFlightDetailsQuery) (cluster.InFlightObservationReadModel, []cluster.CredentialConcurrencyState, inFlightDetailsCursorPage, bool) {
+	if h == nil || h.repo == nil {
+		respondError(c, http.StatusInternalServerError, "in_flight_observation_load_failed", fmt.Errorf("in-flight observation repository is unavailable"))
+		return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+	}
+	if query.SnapshotCursor != "" {
+		return h.readInFlightDetailsCursor(c, query)
+	}
+	read, ok := h.readInFlightObservation(c)
+	if !ok {
+		return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+	}
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+	states, _ := h.repo.ReadConcurrencyState(ctx)
+	read = filterInFlightDetailsSnapshot(read, query)
+	states = filterInFlightDetailsStates(states, read)
+	cursorPage := inFlightDetailsCursorPage{}
+	_, nextOffset := inFlightDetailsPageBounds(len(read.Details), query.Offset, query.Limit)
+	if query.StableSnapshot && nextOffset != nil {
+		payload, errMarshal := json.Marshal(inFlightDetailsCursorPayload{
+			CredentialID: query.CredentialID,
+			Model:        query.Model,
+			Observation:  read,
+			States:       states,
+		})
+		if errMarshal != nil {
+			respondError(c, http.StatusInternalServerError, "in_flight_snapshot_cursor_store_failed", errMarshal)
+			return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+		}
+		cursor, errCursor := h.repo.CreateInFlightSnapshotCursor(ctx, payload, inFlightSnapshotCursorTTL)
+		if errCursor != nil {
+			respondError(c, http.StatusInternalServerError, "in_flight_snapshot_cursor_store_failed", errCursor)
+			return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+		}
+		expiresAt := cursor.ExpiresAt
+		cursorPage = inFlightDetailsCursorPage{Cursor: cursor.Cursor, ExpiresAt: &expiresAt}
+	}
+	return read, states, cursorPage, true
+}
+
+func (h *Handler) readInFlightDetailsCursor(c *gin.Context, query inFlightDetailsQuery) (cluster.InFlightObservationReadModel, []cluster.CredentialConcurrencyState, inFlightDetailsCursorPage, bool) {
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+	cursor, errCursor := h.repo.ReadInFlightSnapshotCursor(ctx, query.SnapshotCursor)
+	if errors.Is(errCursor, cluster.ErrInFlightSnapshotCursorExpired) {
+		respondError(c, http.StatusConflict, "in_flight_snapshot_cursor_expired", errCursor)
+		return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+	}
+	if errCursor != nil {
+		respondError(c, http.StatusInternalServerError, "in_flight_snapshot_cursor_load_failed", errCursor)
+		return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+	}
+	payload := inFlightDetailsCursorPayload{}
+	if errUnmarshal := json.Unmarshal(cursor.Payload, &payload); errUnmarshal != nil {
+		respondError(c, http.StatusInternalServerError, "in_flight_snapshot_cursor_load_failed", errUnmarshal)
+		return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+	}
+	if payload.CredentialID != query.CredentialID || payload.Model != query.Model {
+		respondError(c, http.StatusConflict, "in_flight_snapshot_cursor_expired", cluster.ErrInFlightSnapshotCursorExpired)
+		return cluster.InFlightObservationReadModel{}, nil, inFlightDetailsCursorPage{}, false
+	}
+	read := payload.Observation
+	if !read.Stale && (read.FreshUntil == nil || cursor.ReadAt.After(*read.FreshUntil)) {
+		read.Stale = true
+		read.CoverageComplete = false
+	}
+	expiresAt := cursor.ExpiresAt
+	return read, payload.States, inFlightDetailsCursorPage{Cursor: cursor.Cursor, ExpiresAt: &expiresAt}, true
 }
 
 func parseInFlightPaginationValue(raw string, defaultValue int, minValue int, maxValue int, field string) (int, error) {
@@ -121,29 +218,26 @@ func inFlightDetailsResponse(read cluster.InFlightObservationReadModel, query in
 }
 
 func inFlightDetailsResponseWithConcurrency(read cluster.InFlightObservationReadModel, query inFlightDetailsQuery, states []cluster.CredentialConcurrencyState) gin.H {
+	read = filterInFlightDetailsSnapshot(read, query)
+	states = filterInFlightDetailsStates(states, read)
+	return inFlightDetailsPageResponse(read, query, states, inFlightDetailsCursorPage{})
+}
+
+func inFlightDetailsPageResponse(read cluster.InFlightObservationReadModel, query inFlightDetailsQuery, states []cluster.CredentialConcurrencyState, cursorPage inFlightDetailsCursorPage) gin.H {
 	statesByCredential := make(map[string]cluster.CredentialConcurrencyState, len(states))
 	for index := range states {
 		state := states[index]
 		statesByCredential[state.CredentialID] = state
 	}
 	observed := observedCredentialsByID(read)
-	items := make([]gin.H, 0, minInFlightDetailsCapacity(len(read.Details), query.Limit))
-	skipped := 0
-	for index := range read.Details {
+	start, nextOffset := inFlightDetailsPageBounds(len(read.Details), query.Offset, query.Limit)
+	end := len(read.Details)
+	if nextOffset != nil {
+		end = *nextOffset
+	}
+	items := make([]gin.H, 0, minInFlightDetailsCapacity(end-start, query.Limit))
+	for index := start; index < end; index++ {
 		detail := read.Details[index]
-		if query.CredentialID != "" && detail.CredentialID != query.CredentialID {
-			continue
-		}
-		if query.Model != "" && detail.Model != query.Model {
-			continue
-		}
-		if skipped < query.Offset {
-			skipped++
-			continue
-		}
-		if len(items) >= query.Limit {
-			break
-		}
 		entry := gin.H{
 			"request_id":    detail.RequestID,
 			"credential_id": detail.CredentialID,
@@ -158,7 +252,68 @@ func inFlightDetailsResponseWithConcurrency(read cluster.InFlightObservationRead
 		}
 		items = append(items, entry)
 	}
-	return inFlightObservationResponse(read, items)
+	response := inFlightObservationResponse(read, items)
+	response["total"] = len(read.Details)
+	response["next_offset"] = nextOffset
+	response["snapshot_cursor"] = nil
+	response["snapshot_expires_at"] = nil
+	if cursorPage.Cursor != "" && cursorPage.ExpiresAt != nil {
+		response["snapshot_cursor"] = cursorPage.Cursor
+		response["snapshot_expires_at"] = cursorPage.ExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	return response
+}
+
+func inFlightDetailsPageBounds(total int, offset int, limit int) (int, *int) {
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end < start || end >= total {
+		return start, nil
+	}
+	next := end
+	return start, &next
+}
+
+func filterInFlightDetailsSnapshot(read cluster.InFlightObservationReadModel, query inFlightDetailsQuery) cluster.InFlightObservationReadModel {
+	filtered := read
+	filtered.Details = make([]cluster.InFlightRequestDetail, 0, len(read.Details))
+	credentialIDs := make(map[string]struct{})
+	for index := range read.Details {
+		detail := read.Details[index]
+		if query.CredentialID != "" && detail.CredentialID != query.CredentialID {
+			continue
+		}
+		if query.Model != "" && detail.Model != query.Model {
+			continue
+		}
+		filtered.Details = append(filtered.Details, detail)
+		credentialIDs[detail.CredentialID] = struct{}{}
+	}
+	filtered.Credentials = make([]cluster.InFlightObservedCredentialItem, 0, len(credentialIDs))
+	for index := range read.Credentials {
+		item := read.Credentials[index]
+		if _, exists := credentialIDs[item.CredentialID]; exists {
+			filtered.Credentials = append(filtered.Credentials, item)
+		}
+	}
+	return filtered
+}
+
+func filterInFlightDetailsStates(states []cluster.CredentialConcurrencyState, read cluster.InFlightObservationReadModel) []cluster.CredentialConcurrencyState {
+	credentialIDs := make(map[string]struct{}, len(read.Details))
+	for index := range read.Details {
+		credentialIDs[read.Details[index].CredentialID] = struct{}{}
+	}
+	filtered := make([]cluster.CredentialConcurrencyState, 0, len(credentialIDs))
+	for index := range states {
+		if _, exists := credentialIDs[states[index].CredentialID]; exists {
+			filtered = append(filtered, states[index])
+		}
+	}
+	return filtered
 }
 
 func minInFlightDetailsCapacity(detailsCount int, limit int) int {
