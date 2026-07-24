@@ -38,8 +38,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify PostgreSQL cluster behavior
-        run: go test -v ./internal/cluster
+      - name: Verify cluster and management behavior
+        run: go test -v ./internal/cluster/...
       - name: Build
         run: |
           CGO_ENABLED=1 go build -o test-output ./cmd/home

@@ -152,7 +152,7 @@ func TestUserPeriodLimit1dCalendarAndRolling(t *testing.T) {
 	loc := loadUserLocation(tz)
 	now := time.Now().In(loc)
 	today := startOfDayInLocation(now, loc)
-	createCharge(t, repo, ctx, user.ID, 5, today.Add(2*time.Hour))
+	createCharge(t, repo, ctx, user.ID, 5, today)
 
 	key := "key-1d"
 	if _, errKey := repo.CreateAPIKeyForUser(ctx, user.ID, APIKeyUserUpdate{APIKey: &key}); errKey != nil {
@@ -163,7 +163,7 @@ func TestUserPeriodLimit1dCalendarAndRolling(t *testing.T) {
 		t.Fatalf("expected 1d calendar block, got %v", errBlocked)
 	}
 
-	// Switch to rolling and put spend just outside 24h so it should pass.
+	// Switch to rolling; today's charge is still inside the 24-hour window.
 	rolling := PeriodWindowModeRolling
 	if _, errUpdate := repo.UpdateUser(ctx, user.ID, UserUpdate{WindowMode1d: &rolling}); errUpdate != nil {
 		t.Fatalf("UpdateUser(rolling) error = %v", errUpdate)
