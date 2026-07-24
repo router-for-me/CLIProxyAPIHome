@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
@@ -40,6 +41,9 @@ func (l parameterizedGORMLogger) Error(ctx context.Context, message string, data
 }
 
 func (l parameterizedGORMLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		err = nil
+	}
 	l.inner.Trace(ctx, begin, fc, err)
 }
 

@@ -28,6 +28,41 @@ func TestDatabaseGORMConfigRedactsParameters(t *testing.T) {
 	}
 }
 
+func TestParameterizedGORMLoggerIgnoresRecordNotFoundAsError(t *testing.T) {
+	tests := []struct {
+		name          string
+		slowThreshold time.Duration
+		elapsed       time.Duration
+		wantSlow      bool
+	}{
+		{name: "fast query", slowThreshold: time.Hour, wantSlow: false},
+		{name: "slow query", slowThreshold: time.Millisecond, elapsed: time.Second, wantSlow: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			inner := gormlogger.New(stdlog.New(&output, "", 0), gormlogger.Config{
+				SlowThreshold: test.slowThreshold,
+				LogLevel:      gormlogger.Warn,
+				Colorful:      false,
+			})
+			redacted := newParameterizedGORMLogger(inner)
+			redacted.Trace(context.Background(), time.Now().Add(-test.elapsed), func() (string, int64) {
+				return "SELECT * FROM records WHERE id = ?", 0
+			}, gorm.ErrRecordNotFound)
+
+			logs := output.Bytes()
+			if bytes.Contains(logs, []byte("record not found")) {
+				t.Fatal("record-not-found error was emitted")
+			}
+			if gotSlow := bytes.Contains(logs, []byte("SLOW SQL")); gotSlow != test.wantSlow {
+				t.Fatalf("slow SQL emitted = %t, want %t", gotSlow, test.wantSlow)
+			}
+		})
+	}
+}
+
 func TestParameterizedGORMLoggerRedactsSensitiveTraceValues(t *testing.T) {
 	var output bytes.Buffer
 	inner := gormlogger.New(stdlog.New(&output, "", 0), gormlogger.Config{
