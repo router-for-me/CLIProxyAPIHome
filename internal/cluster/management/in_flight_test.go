@@ -93,16 +93,22 @@ func TestGetInFlightDetailsStableSnapshotCursorPinsPages(t *testing.T) {
 		Items []struct {
 			RequestID string `json:"request_id"`
 		} `json:"items"`
-		Total             int     `json:"total"`
-		NextOffset        *int    `json:"next_offset"`
-		SnapshotCursor    *string `json:"snapshot_cursor"`
-		SnapshotExpiresAt *string `json:"snapshot_expires_at"`
+		Total                int     `json:"total"`
+		NextOffset           *int    `json:"next_offset"`
+		SnapshotCursor       *string `json:"snapshot_cursor"`
+		SnapshotCursorReadAt *string `json:"snapshot_cursor_read_at"`
+		SnapshotExpiresAt    *string `json:"snapshot_expires_at"`
 	}
 	if errDecode := json.Unmarshal(first.Body.Bytes(), &firstPayload); errDecode != nil {
 		t.Fatalf("decode first response: %v", errDecode)
 	}
-	if len(firstPayload.Items) != 1 || firstPayload.Items[0].RequestID != "req-1" || firstPayload.Total != 2 || firstPayload.NextOffset == nil || *firstPayload.NextOffset != 1 || firstPayload.SnapshotCursor == nil || *firstPayload.SnapshotCursor == "" || firstPayload.SnapshotExpiresAt == nil {
+	if len(firstPayload.Items) != 1 || firstPayload.Items[0].RequestID != "req-1" || firstPayload.Total != 2 || firstPayload.NextOffset == nil || *firstPayload.NextOffset != 1 || firstPayload.SnapshotCursor == nil || *firstPayload.SnapshotCursor == "" || firstPayload.SnapshotCursorReadAt == nil || firstPayload.SnapshotExpiresAt == nil {
 		t.Fatalf("first payload = %#v", firstPayload)
+	}
+	firstReadAt, errFirstReadAt := time.Parse(time.RFC3339Nano, *firstPayload.SnapshotCursorReadAt)
+	firstExpiresAt, errFirstExpiresAt := time.Parse(time.RFC3339Nano, *firstPayload.SnapshotExpiresAt)
+	if errFirstReadAt != nil || errFirstExpiresAt != nil || !firstExpiresAt.After(firstReadAt) || firstExpiresAt.Sub(firstReadAt) > inFlightSnapshotCursorTTL {
+		t.Fatalf("first cursor times read_at=%q expires_at=%q errors=(%v, %v)", *firstPayload.SnapshotCursorReadAt, *firstPayload.SnapshotExpiresAt, errFirstReadAt, errFirstExpiresAt)
 	}
 
 	publishInFlightManagementSnapshot(t, handler.repo, 3, []cluster.InFlightRequestDetail{
@@ -117,15 +123,21 @@ func TestGetInFlightDetailsStableSnapshotCursorPinsPages(t *testing.T) {
 		Items []struct {
 			RequestID string `json:"request_id"`
 		} `json:"items"`
-		Total          int     `json:"total"`
-		NextOffset     *int    `json:"next_offset"`
-		SnapshotCursor *string `json:"snapshot_cursor"`
+		Total                int     `json:"total"`
+		NextOffset           *int    `json:"next_offset"`
+		SnapshotCursor       *string `json:"snapshot_cursor"`
+		SnapshotCursorReadAt *string `json:"snapshot_cursor_read_at"`
+		SnapshotExpiresAt    *string `json:"snapshot_expires_at"`
 	}
 	if errDecode := json.Unmarshal(second.Body.Bytes(), &secondPayload); errDecode != nil {
 		t.Fatalf("decode second response: %v", errDecode)
 	}
-	if len(secondPayload.Items) != 1 || secondPayload.Items[0].RequestID != "req-2" || secondPayload.Total != 2 || secondPayload.NextOffset != nil || secondPayload.SnapshotCursor == nil || *secondPayload.SnapshotCursor != *firstPayload.SnapshotCursor {
+	if len(secondPayload.Items) != 1 || secondPayload.Items[0].RequestID != "req-2" || secondPayload.Total != 2 || secondPayload.NextOffset != nil || secondPayload.SnapshotCursor == nil || *secondPayload.SnapshotCursor != *firstPayload.SnapshotCursor || secondPayload.SnapshotCursorReadAt == nil || secondPayload.SnapshotExpiresAt == nil || *secondPayload.SnapshotExpiresAt != *firstPayload.SnapshotExpiresAt {
 		t.Fatalf("second payload = %#v", secondPayload)
+	}
+	secondReadAt, errSecondReadAt := time.Parse(time.RFC3339Nano, *secondPayload.SnapshotCursorReadAt)
+	if errSecondReadAt != nil || secondReadAt.Before(firstReadAt) || !firstExpiresAt.After(secondReadAt) {
+		t.Fatalf("second cursor read_at=%q error=%v first_read_at=%s expires_at=%s", *secondPayload.SnapshotCursorReadAt, errSecondReadAt, firstReadAt, firstExpiresAt)
 	}
 
 	latest := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&stable_snapshot=true")

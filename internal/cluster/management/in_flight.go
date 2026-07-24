@@ -29,6 +29,7 @@ type inFlightDetailsQuery struct {
 
 type inFlightDetailsCursorPage struct {
 	Cursor    string
+	ReadAt    *time.Time
 	ExpiresAt *time.Time
 }
 
@@ -159,7 +160,8 @@ func (h *Handler) readInFlightDetailsSnapshot(c *gin.Context, query inFlightDeta
 			return inFlightDetailsSnapshot{}, false
 		}
 		expiresAt := cursor.ExpiresAt
-		cursorPage = inFlightDetailsCursorPage{Cursor: cursor.Cursor, ExpiresAt: &expiresAt}
+		readAt := cursor.ReadAt
+		cursorPage = inFlightDetailsCursorPage{Cursor: cursor.Cursor, ReadAt: &readAt, ExpiresAt: &expiresAt}
 	}
 	read = sliceInFlightDetailsSnapshot(read, start, nextOffset)
 	states = filterInFlightDetailsStates(states, read)
@@ -191,12 +193,13 @@ func (h *Handler) readInFlightDetailsCursor(c *gin.Context, query inFlightDetail
 	}
 	_, nextOffset := inFlightDetailsPageBounds(cursor.Total, query.Offset, query.Limit)
 	expiresAt := cursor.ExpiresAt
+	readAt := cursor.ReadAt
 	return inFlightDetailsSnapshot{
 		Read:       read,
 		States:     cursor.States,
 		Total:      cursor.Total,
 		NextOffset: nextOffset,
-		CursorPage: inFlightDetailsCursorPage{Cursor: cursor.Cursor, ExpiresAt: &expiresAt},
+		CursorPage: inFlightDetailsCursorPage{Cursor: cursor.Cursor, ReadAt: &readAt, ExpiresAt: &expiresAt},
 	}, true
 }
 
@@ -262,9 +265,11 @@ func inFlightDetailsPageResponse(snapshot inFlightDetailsSnapshot) gin.H {
 	response["total"] = snapshot.Total
 	response["next_offset"] = snapshot.NextOffset
 	response["snapshot_cursor"] = nil
+	response["snapshot_cursor_read_at"] = nil
 	response["snapshot_expires_at"] = nil
-	if snapshot.CursorPage.Cursor != "" && snapshot.CursorPage.ExpiresAt != nil {
+	if snapshot.CursorPage.Cursor != "" && snapshot.CursorPage.ReadAt != nil && snapshot.CursorPage.ExpiresAt != nil {
 		response["snapshot_cursor"] = snapshot.CursorPage.Cursor
+		response["snapshot_cursor_read_at"] = snapshot.CursorPage.ReadAt.UTC().Format(time.RFC3339Nano)
 		response["snapshot_expires_at"] = snapshot.CursorPage.ExpiresAt.UTC().Format(time.RFC3339Nano)
 	}
 	return response

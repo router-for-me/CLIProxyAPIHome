@@ -18,7 +18,7 @@ func TestInFlightSnapshotCursorRoundTripReadsOnlyRequestedPage(t *testing.T) {
 	if errCreate != nil {
 		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
 	}
-	if created.Cursor == "" || created.Total != len(input.Observation.Details) || !created.ExpiresAt.After(created.CreatedAt) {
+	if created.Cursor == "" || created.Total != len(input.Observation.Details) || created.ReadAt.Before(created.CreatedAt) || !created.ExpiresAt.After(created.ReadAt) || created.ExpiresAt.Sub(created.ReadAt) > time.Minute {
 		t.Fatalf("created cursor = %#v", created)
 	}
 

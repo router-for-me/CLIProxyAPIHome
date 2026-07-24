@@ -83,6 +83,13 @@ func (r *Repository) CreateInFlightSnapshotCursor(ctx context.Context, input InF
 		if errStates := createInFlightSnapshotCursorStates(ctx, tx, cursor, input); errStates != nil {
 			return errStates
 		}
+		readAt, errReadAt := DatabaseNow(ctx, tx)
+		if errReadAt != nil {
+			return errReadAt
+		}
+		if !expiresAt.After(readAt) {
+			return fmt.Errorf("in-flight snapshot cursor expired while being persisted")
+		}
 		result = InFlightSnapshotCursor{
 			Cursor:       cursor,
 			CredentialID: input.CredentialID,
@@ -90,7 +97,7 @@ func (r *Repository) CreateInFlightSnapshotCursor(ctx context.Context, input InF
 			Total:        len(input.Observation.Details),
 			CreatedAt:    now.UTC(),
 			ExpiresAt:    expiresAt.UTC(),
-			ReadAt:       now.UTC(),
+			ReadAt:       readAt.UTC(),
 		}
 		return nil
 	})

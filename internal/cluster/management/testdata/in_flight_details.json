@@ -9,6 +9,7 @@
   "total": 1,
   "next_offset": null,
   "snapshot_cursor": null,
+  "snapshot_cursor_read_at": null,
   "snapshot_expires_at": null,
   "items": [
     {
