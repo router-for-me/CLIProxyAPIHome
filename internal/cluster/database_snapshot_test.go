@@ -83,6 +83,10 @@ func TestDatabaseSnapshotModelRegistryMatchesMigrationModels(t *testing.T) {
 		&CPAInFlightSnapshotAttemptRecord{},
 		&CPAInFlightSnapshotPartRecord{},
 		&ManagementInFlightSnapshotCursorRecord{},
+		&ManagementInFlightSnapshotCursorItemRecord{},
+		&ManagementInFlightSnapshotCursorObservedRecord{},
+		&ManagementInFlightSnapshotCursorStateRecord{},
+		&ManagementInFlightSnapshotCursorStateModelRecord{},
 	} {
 		requiredType := reflect.TypeOf(required)
 		if _, exists := seenTypes[requiredType]; !exists {
@@ -1224,6 +1228,10 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 		&ClusterEventRecord{ID: 1001, Scope: "config", Op: "update", EntityUUID: "server", Version: 1, CreatedAt: now},
 		&OAuthSessionRecord{State: "oauth-state", Provider: "codex", Status: "pending", Data: JSONB(`{"safe":true}`), CreatedAt: now, UpdatedAt: now, ExpiresAt: expiresAt},
 		&ManagementInFlightSnapshotCursorRecord{Cursor: "c25hcHNob3QtdGVzdC1jdXJzb3ItMTIzNDU", Payload: JSONB(`{"transient":true}`), CreatedAt: now, ExpiresAt: expiresAt},
+		&ManagementInFlightSnapshotCursorItemRecord{Cursor: "c25hcHNob3QtdGVzdC1jdXJzb3ItMTIzNDU", Ordinal: 0, RequestID: "transient-request", CredentialID: "transient-credential", Model: "transient-model", RequestKind: "sse", StartedAt: now},
+		&ManagementInFlightSnapshotCursorObservedRecord{Cursor: "c25hcHNob3QtdGVzdC1jdXJzb3ItMTIzNDU", CredentialID: "transient-credential", ObservedInFlight: 1, ObservedAccounted: 1},
+		&ManagementInFlightSnapshotCursorStateRecord{Cursor: "c25hcHNob3QtdGVzdC1jdXJzb3ItMTIzNDU", CredentialID: "transient-credential", PolicyVersion: 1, EffectiveAt: now, ModelCount: 1},
+		&ManagementInFlightSnapshotCursorStateModelRecord{Cursor: "c25hcHNob3QtdGVzdC1jdXJzb3ItMTIzNDU", CredentialID: "transient-credential", Model: "transient-model", MaxInFlight: 1},
 	}
 	for _, record := range records {
 		if errCreate := db.Unscoped().Create(record).Error; errCreate != nil {

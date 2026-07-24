@@ -2,54 +2,64 @@ package cluster
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
-func TestInFlightSnapshotCursorRoundTripAndExpiry(t *testing.T) {
-	db, errOpen := OpenSQLite(t.Context(), t.TempDir()+"/home.db")
-	if errOpen != nil {
-		t.Fatalf("OpenSQLite() error = %v", errOpen)
-	}
-	sqlDB, errDB := db.DB()
-	if errDB != nil {
-		t.Fatalf("db.DB() error = %v", errDB)
-	}
-	defer func() {
-		if errClose := sqlDB.Close(); errClose != nil {
-			t.Errorf("close sqlite db: %v", errClose)
-		}
-	}()
-	if errMigrate := AutoMigrate(db); errMigrate != nil {
-		t.Fatalf("AutoMigrate() error = %v", errMigrate)
-	}
-	repo := NewRepository(db)
-	if _, errInvalidPayload := repo.CreateInFlightSnapshotCursor(t.Context(), []byte(`not-json`), time.Minute); errInvalidPayload == nil {
-		t.Fatal("CreateInFlightSnapshotCursor() accepted invalid JSON")
-	}
+func TestInFlightSnapshotCursorRoundTripReadsOnlyRequestedPage(t *testing.T) {
+	repo, db := newInFlightCursorTestRepository(t)
+	input := inFlightCursorTestInput()
 
-	created, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), []byte(`{"safe":true}`), time.Minute)
+	created, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute)
 	if errCreate != nil {
 		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
 	}
-	if created.Cursor == "" || !created.ExpiresAt.After(created.CreatedAt) {
+	if created.Cursor == "" || created.Total != len(input.Observation.Details) || !created.ExpiresAt.After(created.CreatedAt) {
 		t.Fatalf("created cursor = %#v", created)
 	}
 
-	read, errRead := repo.ReadInFlightSnapshotCursor(t.Context(), created.Cursor)
+	var header ManagementInFlightSnapshotCursorRecord
+	if errHeader := db.Where("cursor = ?", created.Cursor).First(&header).Error; errHeader != nil {
+		t.Fatalf("read cursor header: %v", errHeader)
+	}
+	if header.SchemaVersion != inFlightSnapshotCursorSchemaVersion || len(header.Payload) > 64 || strings.Contains(string(header.Payload), "req-") {
+		t.Fatalf("cursor header = %#v", header)
+	}
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorItemRecord{}, created.Cursor, 3)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorObservedRecord{}, created.Cursor, 2)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorStateRecord{}, created.Cursor, 2)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorStateModelRecord{}, created.Cursor, 2)
+
+	page, errRead := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 1, 1)
 	if errRead != nil {
-		t.Fatalf("ReadInFlightSnapshotCursor() error = %v", errRead)
+		t.Fatalf("ReadInFlightSnapshotCursorPage() error = %v", errRead)
 	}
-	if string(read.Payload) != `{"safe":true}` || !read.ExpiresAt.Equal(created.ExpiresAt) {
-		t.Fatalf("read cursor = %#v", read)
+	if page.Total != 3 || len(page.Observation.Details) != 1 || page.Observation.Details[0].RequestID != "req-2" {
+		t.Fatalf("page = %#v", page)
 	}
-	read.Payload[0] = 'x'
-	readAgain, errReadAgain := repo.ReadInFlightSnapshotCursor(t.Context(), created.Cursor)
-	if errReadAgain != nil {
-		t.Fatalf("second ReadInFlightSnapshotCursor() error = %v", errReadAgain)
+	if len(page.Observation.Credentials) != 1 || page.Observation.Credentials[0].CredentialID != "cred-b" {
+		t.Fatalf("page credentials = %#v", page.Observation.Credentials)
 	}
-	if string(readAgain.Payload) != `{"safe":true}` {
-		t.Fatalf("stored payload mutated = %q", readAgain.Payload)
+	if page.Observation.Credentials[0].ObservedInFlight != 1 || page.Observation.Credentials[0].ObservedAccounted != 1 || page.Observation.Credentials[0].ObservedUnaccounted != 0 {
+		t.Fatalf("page observed projection = %#v", page.Observation.Credentials[0])
+	}
+	if len(page.States) != 1 || page.States[0].CredentialID != "cred-b" || page.States[0].AdmittedInFlight != 1 || page.States[0].PolicyVersion != 2 || page.States[0].ObservationBarrier != 5 || len(page.States[0].Models) != 1 || page.States[0].Models[0].Model != "claude" || page.States[0].Models[0].MaxInFlight != 1 || page.States[0].Models[0].AdmittedInFlight != 1 {
+		t.Fatalf("page states = %#v", page.States)
+	}
+	if page.Observation.ObservedAt == nil || input.Observation.ObservedAt == nil || !page.Observation.ObservedAt.Equal(*input.Observation.ObservedAt) || page.Observation.FreshUntil == nil || input.Observation.FreshUntil == nil || !page.Observation.FreshUntil.Equal(*input.Observation.FreshUntil) {
+		t.Fatalf("page freshness = %#v", page.Observation)
+	}
+
+	lastPage, errLast := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 2, 10)
+	if errLast != nil {
+		t.Fatalf("last ReadInFlightSnapshotCursorPage() error = %v", errLast)
+	}
+	if len(lastPage.Observation.Details) != 1 || lastPage.Observation.Details[0].RequestID != "req-3" || len(lastPage.Observation.Credentials) != 1 || lastPage.Observation.Credentials[0].CredentialID != "cred-a" {
+		t.Fatalf("last page = %#v", lastPage)
 	}
 
 	past := time.Now().UTC().Add(-time.Minute)
@@ -58,30 +68,43 @@ func TestInFlightSnapshotCursorRoundTripAndExpiry(t *testing.T) {
 		Update("expires_at", past).Error; errExpire != nil {
 		t.Fatalf("expire cursor: %v", errExpire)
 	}
-	if _, errExpired := repo.ReadInFlightSnapshotCursor(t.Context(), created.Cursor); !errors.Is(errExpired, ErrInFlightSnapshotCursorExpired) {
+	if _, errExpired := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 0, 1); !errors.Is(errExpired, ErrInFlightSnapshotCursorExpired) {
 		t.Fatalf("expired cursor error = %v, want %v", errExpired, ErrInFlightSnapshotCursorExpired)
 	}
-	if _, errInvalid := repo.ReadInFlightSnapshotCursor(t.Context(), "not-a-cursor"); !errors.Is(errInvalid, ErrInFlightSnapshotCursorExpired) {
+	assertInFlightCursorDeleted(t, db, created.Cursor)
+	if _, errInvalid := repo.ReadInFlightSnapshotCursorPage(t.Context(), "not-a-cursor", "", "", 0, 1); !errors.Is(errInvalid, ErrInFlightSnapshotCursorExpired) {
 		t.Fatalf("invalid cursor error = %v, want %v", errInvalid, ErrInFlightSnapshotCursorExpired)
 	}
 }
 
-func TestValidateInFlightSnapshotCursorPayloadBounds(t *testing.T) {
-	if errEmpty := validateInFlightSnapshotCursorPayload(nil, 16); errEmpty == nil {
-		t.Fatal("validateInFlightSnapshotCursorPayload() accepted an empty payload")
+func TestInFlightSnapshotCursorRejectsFilterAndLegacySchema(t *testing.T) {
+	repo, db := newInFlightCursorTestRepository(t)
+	input := inFlightCursorTestInput()
+	created, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute)
+	if errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
 	}
-	if errInvalid := validateInFlightSnapshotCursorPayload([]byte(`not-json`), 16); errInvalid == nil {
-		t.Fatal("validateInFlightSnapshotCursorPayload() accepted invalid JSON")
+
+	if _, errMismatch := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, "wrong", input.Model, 0, 1); !errors.Is(errMismatch, ErrInFlightSnapshotCursorExpired) {
+		t.Fatalf("filter mismatch error = %v, want %v", errMismatch, ErrInFlightSnapshotCursorExpired)
 	}
-	if errLarge := validateInFlightSnapshotCursorPayload([]byte(`{"value":"large"}`), 8); errLarge == nil {
-		t.Fatal("validateInFlightSnapshotCursorPayload() accepted an oversized payload")
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorRecord{}, created.Cursor, 1)
+	if _, errRead := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 0, 1); errRead != nil {
+		t.Fatalf("cursor read after filter mismatch error = %v", errRead)
 	}
-	if errValid := validateInFlightSnapshotCursorPayload([]byte(`{"ok":true}`), 16); errValid != nil {
-		t.Fatalf("validateInFlightSnapshotCursorPayload() error = %v", errValid)
+
+	if errLegacy := db.Model(&ManagementInFlightSnapshotCursorRecord{}).
+		Where("cursor = ?", created.Cursor).
+		Update("schema_version", 0).Error; errLegacy != nil {
+		t.Fatalf("mark cursor legacy: %v", errLegacy)
 	}
+	if _, errLegacy := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 0, 1); !errors.Is(errLegacy, ErrInFlightSnapshotCursorExpired) {
+		t.Fatalf("legacy cursor error = %v, want %v", errLegacy, ErrInFlightSnapshotCursorExpired)
+	}
+	assertInFlightCursorDeleted(t, db, created.Cursor)
 }
 
-func TestCreateInFlightSnapshotCursorPurgesExpiredRows(t *testing.T) {
+func TestInFlightSnapshotCursorMigratesAndExpiresLegacyBlobRows(t *testing.T) {
 	db, errOpen := OpenSQLite(t.Context(), t.TempDir()+"/home.db")
 	if errOpen != nil {
 		t.Fatalf("OpenSQLite() error = %v", errOpen)
@@ -90,36 +113,271 @@ func TestCreateInFlightSnapshotCursorPurgesExpiredRows(t *testing.T) {
 	if errDB != nil {
 		t.Fatalf("db.DB() error = %v", errDB)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		if errClose := sqlDB.Close(); errClose != nil {
 			t.Errorf("close sqlite db: %v", errClose)
 		}
-	}()
-	if errMigrate := AutoMigrate(db); errMigrate != nil {
-		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	})
+	if errTable := db.Exec(`CREATE TABLE management_in_flight_snapshot_cursors (
+		cursor text PRIMARY KEY,
+		payload blob NOT NULL,
+		expires_at datetime NOT NULL,
+		created_at datetime NOT NULL
+	)`).Error; errTable != nil {
+		t.Fatalf("create legacy cursor table: %v", errTable)
 	}
-	repo := NewRepository(db)
-
-	expiredToken, errToken := newInFlightSnapshotCursorToken()
+	legacyCursor, errToken := newInFlightSnapshotCursorToken()
 	if errToken != nil {
 		t.Fatalf("newInFlightSnapshotCursorToken() error = %v", errToken)
 	}
-	past := time.Now().UTC().Add(-time.Minute)
-	if errSeed := db.Create(&ManagementInFlightSnapshotCursorRecord{
-		Cursor: expiredToken, Payload: JSONB(`{"old":true}`), CreatedAt: past.Add(-time.Minute), ExpiresAt: past,
-	}).Error; errSeed != nil {
-		t.Fatalf("seed expired cursor: %v", errSeed)
+	now := time.Now().UTC()
+	if errSeed := db.Exec(
+		"INSERT INTO management_in_flight_snapshot_cursors (cursor, payload, expires_at, created_at) VALUES (?, ?, ?, ?)",
+		legacyCursor,
+		[]byte(`{"observation":{"details":[]}}`),
+		now.Add(time.Minute),
+		now,
+	).Error; errSeed != nil {
+		t.Fatalf("seed legacy cursor: %v", errSeed)
 	}
-	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), []byte(`{"new":true}`), time.Minute); errCreate != nil {
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+
+	repo := NewRepository(db)
+	if _, errRead := repo.ReadInFlightSnapshotCursorPage(t.Context(), legacyCursor, "", "", 0, 1); !errors.Is(errRead, ErrInFlightSnapshotCursorExpired) {
+		t.Fatalf("legacy cursor error = %v, want %v", errRead, ErrInFlightSnapshotCursorExpired)
+	}
+	assertInFlightCursorDeleted(t, db, legacyCursor)
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), time.Minute); errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() after migration error = %v", errCreate)
+	}
+}
+
+func TestInFlightSnapshotCursorDetectsIncompleteRelations(t *testing.T) {
+	testCases := []struct {
+		name      string
+		remove    func(*gorm.DB, string) error
+		wantError string
+	}{
+		{
+			name: "item",
+			remove: func(db *gorm.DB, cursor string) error {
+				return db.Where("cursor = ? AND ordinal = ?", cursor, 0).Delete(&ManagementInFlightSnapshotCursorItemRecord{}).Error
+			},
+			wantError: "page ordinal is invalid",
+		},
+		{
+			name: "observed",
+			remove: func(db *gorm.DB, cursor string) error {
+				return db.Where("cursor = ? AND credential_id = ?", cursor, "cred-a").Delete(&ManagementInFlightSnapshotCursorObservedRecord{}).Error
+			},
+			wantError: "observed state is incomplete",
+		},
+		{
+			name: "state",
+			remove: func(db *gorm.DB, cursor string) error {
+				return db.Where("cursor = ? AND credential_id = ?", cursor, "cred-a").Delete(&ManagementInFlightSnapshotCursorStateRecord{}).Error
+			},
+			wantError: "limiter state is incomplete",
+		},
+		{
+			name: "state model",
+			remove: func(db *gorm.DB, cursor string) error {
+				return db.Where("cursor = ? AND credential_id = ?", cursor, "cred-a").Delete(&ManagementInFlightSnapshotCursorStateModelRecord{}).Error
+			},
+			wantError: "limiter models are incomplete",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			repo, db := newInFlightCursorTestRepository(t)
+			input := inFlightCursorTestInput()
+			created, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute)
+			if errCreate != nil {
+				t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
+			}
+			if errRemove := testCase.remove(db, created.Cursor); errRemove != nil {
+				t.Fatalf("remove relation row: %v", errRemove)
+			}
+			_, errRead := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, input.CredentialID, input.Model, 0, 1)
+			if errRead == nil || !strings.Contains(errRead.Error(), testCase.wantError) {
+				t.Fatalf("ReadInFlightSnapshotCursorPage() error = %v, want %q", errRead, testCase.wantError)
+			}
+		})
+	}
+}
+
+func TestCreateInFlightSnapshotCursorCleansOneExpiredBatch(t *testing.T) {
+	repo, db := newInFlightCursorTestRepository(t)
+	past := time.Now().UTC().Add(-time.Hour)
+	headers := make([]ManagementInFlightSnapshotCursorRecord, 0, inFlightSnapshotCursorCleanupBatchSize+1)
+	items := make([]ManagementInFlightSnapshotCursorItemRecord, 0, cap(headers))
+	for index := 0; index < cap(headers); index++ {
+		cursor, errToken := newInFlightSnapshotCursorToken()
+		if errToken != nil {
+			t.Fatalf("newInFlightSnapshotCursorToken() error = %v", errToken)
+		}
+		headers = append(headers, ManagementInFlightSnapshotCursorRecord{
+			Cursor: cursor, SchemaVersion: inFlightSnapshotCursorSchemaVersion, Payload: JSONB(`{"schema_version":1}`), ExpiresAt: past, CreatedAt: past.Add(-time.Minute),
+		})
+		items = append(items, ManagementInFlightSnapshotCursorItemRecord{
+			Cursor: cursor, Ordinal: 0, RequestID: "old", CredentialID: "cred", Model: "model", RequestKind: "sse", StartedAt: past,
+		})
+	}
+	if errHeaders := db.CreateInBatches(headers, 100).Error; errHeaders != nil {
+		t.Fatalf("seed expired cursor headers: %v", errHeaders)
+	}
+	if errItems := db.CreateInBatches(items, 100).Error; errItems != nil {
+		t.Fatalf("seed expired cursor items: %v", errItems)
+	}
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), time.Minute); errCreate != nil {
 		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
 	}
-	var count int64
-	if errCount := db.Model(&ManagementInFlightSnapshotCursorRecord{}).
-		Where("cursor = ?", expiredToken).
-		Count(&count).Error; errCount != nil {
-		t.Fatalf("count expired cursor: %v", errCount)
+
+	var expiredHeaders int64
+	if errCount := db.Model(&ManagementInFlightSnapshotCursorRecord{}).Where("expires_at <= ?", time.Now().UTC()).Count(&expiredHeaders).Error; errCount != nil {
+		t.Fatalf("count expired headers: %v", errCount)
 	}
-	if count != 0 {
-		t.Fatalf("expired cursor count = %d, want 0", count)
+	if expiredHeaders != 1 {
+		t.Fatalf("expired header count = %d, want 1", expiredHeaders)
+	}
+	var expiredItems int64
+	if errCount := db.Model(&ManagementInFlightSnapshotCursorItemRecord{}).Where("request_id = ?", "old").Count(&expiredItems).Error; errCount != nil {
+		t.Fatalf("count expired items: %v", errCount)
+	}
+	if expiredItems != 1 {
+		t.Fatalf("expired item count = %d, want 1", expiredItems)
+	}
+}
+
+func TestInFlightSnapshotCursorBatchesLargeRelationalView(t *testing.T) {
+	repo, db := newInFlightCursorTestRepository(t)
+	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	input := InFlightSnapshotCursorInput{
+		Observation: InFlightObservationReadModel{
+			ObservedAt:       &now,
+			CoverageComplete: true,
+			Credentials:      make([]InFlightObservedCredentialItem, 0, 1001),
+			Details:          make([]InFlightRequestDetail, 0, 1001),
+		},
+		States: make([]CredentialConcurrencyState, 0, 1001),
+	}
+	for index := 0; index < 1001; index++ {
+		credentialID := fmt.Sprintf("cred-%04d", index)
+		model := fmt.Sprintf("model-%04d", index)
+		input.Observation.Credentials = append(input.Observation.Credentials, InFlightObservedCredentialItem{
+			CredentialID: credentialID, ObservedInFlight: 1, ObservedAccounted: 1,
+		})
+		input.Observation.Details = append(input.Observation.Details, InFlightRequestDetail{
+			RequestID: fmt.Sprintf("req-%04d-%s", index, strings.Repeat("x", 240)), CredentialID: credentialID, Model: model, RequestKind: "sse", StartedAt: now,
+		})
+		input.States = append(input.States, CredentialConcurrencyState{
+			CredentialID: credentialID, PolicyVersion: 1, EffectiveAt: now, Models: []CredentialConcurrencyModelState{{Model: model, MaxInFlight: 2, AdmittedInFlight: 1}},
+		})
+	}
+
+	created, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), input, time.Minute)
+	if errCreate != nil {
+		t.Fatalf("CreateInFlightSnapshotCursor() error = %v", errCreate)
+	}
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorItemRecord{}, created.Cursor, 1001)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorObservedRecord{}, created.Cursor, 1001)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorStateRecord{}, created.Cursor, 1001)
+	assertInFlightCursorRowCount(t, db, &ManagementInFlightSnapshotCursorStateModelRecord{}, created.Cursor, 1001)
+	page, errRead := repo.ReadInFlightSnapshotCursorPage(t.Context(), created.Cursor, "", "", 1, 1000)
+	if errRead != nil {
+		t.Fatalf("ReadInFlightSnapshotCursorPage() error = %v", errRead)
+	}
+	if page.Total != 1001 || len(page.Observation.Details) != 1000 || len(page.Observation.Credentials) != 1000 || len(page.States) != 1000 || len(page.States[0].Models) != 1 {
+		t.Fatalf("large cursor page = total %d details %d credentials %d states %d", page.Total, len(page.Observation.Details), len(page.Observation.Credentials), len(page.States))
+	}
+	if page.Observation.Details[0].CredentialID != "cred-0001" || page.Observation.Details[999].CredentialID != "cred-1000" {
+		t.Fatalf("large cursor detail bounds = %#v ... %#v", page.Observation.Details[0], page.Observation.Details[999])
+	}
+}
+
+func TestCreateInFlightSnapshotCursorRejectsInvalidTTL(t *testing.T) {
+	repo, _ := newInFlightCursorTestRepository(t)
+	if _, errCreate := repo.CreateInFlightSnapshotCursor(t.Context(), inFlightCursorTestInput(), 0); errCreate == nil {
+		t.Fatal("CreateInFlightSnapshotCursor() accepted a non-positive ttl")
+	}
+}
+
+func newInFlightCursorTestRepository(t *testing.T) (*Repository, *gorm.DB) {
+	t.Helper()
+	db, errOpen := OpenSQLite(t.Context(), t.TempDir()+"/home.db")
+	if errOpen != nil {
+		t.Fatalf("OpenSQLite() error = %v", errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("db.DB() error = %v", errDB)
+	}
+	t.Cleanup(func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sqlite db: %v", errClose)
+		}
+	})
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	}
+	return NewRepository(db), db
+}
+
+func inFlightCursorTestInput() InFlightSnapshotCursorInput {
+	observedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
+	freshUntil := observedAt.Add(10 * time.Minute)
+	barrier := int64(7)
+	maxA := int64(3)
+	return InFlightSnapshotCursorInput{
+		CredentialID: "filter-credential",
+		Model:        "filter-model",
+		Observation: InFlightObservationReadModel{
+			ObservedAt:                      &observedAt,
+			FreshUntil:                      &freshUntil,
+			CoverageComplete:                true,
+			AggregatesComplete:              true,
+			ProtocolCoverageComplete:        true,
+			MinimumProcessedBarrierRevision: &barrier,
+			Credentials: []InFlightObservedCredentialItem{
+				{CredentialID: "cred-a", ObservedInFlight: 2, ObservedAccounted: 1, ObservedUnaccounted: 1},
+				{CredentialID: "cred-b", ObservedInFlight: 1, ObservedAccounted: 1},
+			},
+			Details: []InFlightRequestDetail{
+				{RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: observedAt.Add(-3 * time.Second)},
+				{RequestID: "req-2", CredentialID: "cred-b", Model: "claude", RequestKind: "websocket", StartedAt: observedAt.Add(-2 * time.Second)},
+				{RequestID: "req-3", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: observedAt.Add(-time.Second)},
+			},
+		},
+		States: []CredentialConcurrencyState{
+			{CredentialID: "cred-a", MaxInFlight: &maxA, AdmittedInFlight: 2, PolicyVersion: 4, EffectiveAt: observedAt, ObservationBarrier: 7, Models: []CredentialConcurrencyModelState{{Model: "gpt-5", MaxInFlight: 2, AdmittedInFlight: 1}}},
+			{CredentialID: "cred-b", AdmittedInFlight: 1, PolicyVersion: 2, EffectiveAt: observedAt, ObservationBarrier: 5, Models: []CredentialConcurrencyModelState{{Model: "claude", MaxInFlight: 1, AdmittedInFlight: 1}}},
+		},
+	}
+}
+
+func assertInFlightCursorRowCount(t *testing.T, db *gorm.DB, model any, cursor string, want int64) {
+	t.Helper()
+	var count int64
+	if errCount := db.Model(model).Where("cursor = ?", cursor).Count(&count).Error; errCount != nil {
+		t.Fatalf("count cursor rows: %v", errCount)
+	}
+	if count != want {
+		t.Fatalf("cursor row count = %d, want %d", count, want)
+	}
+}
+
+func assertInFlightCursorDeleted(t *testing.T, db *gorm.DB, cursor string) {
+	t.Helper()
+	for _, model := range []any{
+		&ManagementInFlightSnapshotCursorRecord{},
+		&ManagementInFlightSnapshotCursorItemRecord{},
+		&ManagementInFlightSnapshotCursorObservedRecord{},
+		&ManagementInFlightSnapshotCursorStateRecord{},
+		&ManagementInFlightSnapshotCursorStateModelRecord{},
+	} {
+		assertInFlightCursorRowCount(t, db, model, cursor, 0)
 	}
 }

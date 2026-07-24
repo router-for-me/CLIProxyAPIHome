@@ -16,7 +16,16 @@ func TestInFlightAutoMigrateCreatesObservationTables(t *testing.T) {
 		t.Fatalf("AutoMigrate() error = %v", errMigrate)
 	}
 	migrator := db.Migrator()
-	for _, table := range []string{"cpa_in_flight_snapshots", "cpa_in_flight_snapshot_attempts", "cpa_in_flight_snapshot_parts"} {
+	for _, table := range []string{
+		"cpa_in_flight_snapshots",
+		"cpa_in_flight_snapshot_attempts",
+		"cpa_in_flight_snapshot_parts",
+		"management_in_flight_snapshot_cursors",
+		"management_in_flight_snapshot_cursor_items",
+		"management_in_flight_snapshot_cursor_observed",
+		"management_in_flight_snapshot_cursor_states",
+		"management_in_flight_snapshot_cursor_state_models",
+	} {
 		if !migrator.HasTable(table) {
 			t.Fatalf("missing table %s", table)
 		}

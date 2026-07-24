@@ -165,6 +165,30 @@ func TestGetInFlightDetailsSnapshotCursorRejectsMismatchAndExpiry(t *testing.T) 
 	assertInFlightCursorError(t, expired, http.StatusConflict, "in_flight_snapshot_cursor_expired")
 }
 
+func TestGetInFlightDetailsSnapshotCursorReportsRelationalLoadFailure(t *testing.T) {
+	handler, db, closeRepo := newInFlightManagementTestHandler(t)
+	defer closeRepo()
+	seedInFlightManagementSnapshot(t, handler.repo, db)
+	publishInFlightManagementSnapshot(t, handler.repo, 2, []cluster.InFlightRequestDetail{
+		{RequestID: "req-1", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-2 * time.Second)},
+		{RequestID: "req-2", CredentialID: "cred-a", Model: "gpt-5", RequestKind: "sse", StartedAt: inFlightManagementConnectedAt().Add(-time.Second)},
+	})
+	first := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&stable_snapshot=true")
+	var payload struct {
+		SnapshotCursor string `json:"snapshot_cursor"`
+	}
+	if errDecode := json.Unmarshal(first.Body.Bytes(), &payload); errDecode != nil || payload.SnapshotCursor == "" {
+		t.Fatalf("decode cursor response: %v payload=%#v", errDecode, payload)
+	}
+	if errDelete := db.Where("cursor = ? AND ordinal = ?", payload.SnapshotCursor, 1).
+		Delete(&cluster.ManagementInFlightSnapshotCursorItemRecord{}).Error; errDelete != nil {
+		t.Fatalf("delete cursor item: %v", errDelete)
+	}
+
+	second := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&offset=1&snapshot_cursor="+payload.SnapshotCursor)
+	assertInFlightCursorError(t, second, http.StatusInternalServerError, "in_flight_snapshot_cursor_load_failed")
+}
+
 func TestGetInFlightDetailsSnapshotCursorFreshnessDegradesUsingDatabaseTime(t *testing.T) {
 	handler, db, closeRepo := newInFlightManagementTestHandler(t)
 	defer closeRepo()
@@ -184,20 +208,11 @@ func TestGetInFlightDetailsSnapshotCursorFreshnessDegradesUsingDatabaseTime(t *t
 	if errCursor := db.Where("cursor = ?", firstPayload.SnapshotCursor).First(&cursorRecord).Error; errCursor != nil {
 		t.Fatalf("read snapshot cursor: %v", errCursor)
 	}
-	cursorPayload := inFlightDetailsCursorPayload{}
-	if errDecode := json.Unmarshal(cursorRecord.Payload, &cursorPayload); errDecode != nil {
-		t.Fatalf("decode stored snapshot cursor: %v", errDecode)
-	}
 	past := time.Now().UTC().Add(-time.Minute)
-	cursorPayload.Observation.FreshUntil = &past
-	updatedPayload, errEncode := json.Marshal(cursorPayload)
-	if errEncode != nil {
-		t.Fatalf("encode stored snapshot cursor: %v", errEncode)
-	}
 	future := time.Now().UTC().Add(time.Minute)
 	if errAge := db.Model(&cluster.ManagementInFlightSnapshotCursorRecord{}).
 		Where("cursor = ?", firstPayload.SnapshotCursor).
-		Updates(map[string]any{"payload": cluster.JSONB(updatedPayload), "expires_at": future}).Error; errAge != nil {
+		Updates(map[string]any{"fresh_until": past, "expires_at": future}).Error; errAge != nil {
 		t.Fatalf("update snapshot cursor freshness: %v", errAge)
 	}
 	second := performManagementGET(t, handler.GetInFlightDetails, "/credentials/in-flight?credential_id=cred-a&limit=1&offset=1&snapshot_cursor="+firstPayload.SnapshotCursor)

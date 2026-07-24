@@ -81,6 +81,10 @@ var homeDatabaseModels = currentDatabaseModels()
 
 var databaseMigrationOnlyModels = []databaseModel{
 	newDatabaseModel[ManagementInFlightSnapshotCursorRecord]("management_in_flight_snapshot_cursors", []string{"cursor"}, false, false),
+	newDatabaseModel[ManagementInFlightSnapshotCursorItemRecord]("management_in_flight_snapshot_cursor_items", []string{"cursor", "ordinal"}, false, false),
+	newDatabaseModel[ManagementInFlightSnapshotCursorObservedRecord]("management_in_flight_snapshot_cursor_observed", []string{"cursor", "credential_id"}, false, false),
+	newDatabaseModel[ManagementInFlightSnapshotCursorStateRecord]("management_in_flight_snapshot_cursor_states", []string{"cursor", "credential_id"}, false, false),
+	newDatabaseModel[ManagementInFlightSnapshotCursorStateModelRecord]("management_in_flight_snapshot_cursor_state_models", []string{"cursor", "credential_id", "model"}, false, false),
 }
 
 func currentDatabaseModels() []databaseModel {
