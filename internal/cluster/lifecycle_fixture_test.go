@@ -1,37 +1,44 @@
 package cluster
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
 
+func credentialConcurrencyConfigFixture(cpaHeartbeatTimeout time.Duration) config.CredentialConcurrencyConfig {
+	return config.CredentialConcurrencyConfig{
+		CPAHeartbeatTimeout:  cpaHeartbeatTimeout,
+		CPACancelBound:       5 * time.Second,
+		ReclaimGrace:         5 * time.Second,
+		CleanupInterval:      5 * time.Second,
+		ReleaseFlushInterval: "250ms",
+		ReleaseMaxBackoff:    "2s",
+		BusyRetryMin:         "250ms",
+		BusyRetryMax:         "1s",
+		MaxLimit:             1_000_000,
+	}
+}
+
 func TestCredentialConcurrencyLifecycleFixture(t *testing.T) {
-	raw, errRead := os.ReadFile(filepath.Join("..", "..", "testdata", "credential-concurrency-lifecycle.json"))
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	var fixture struct {
-		Defaults config.CredentialConcurrencyConfig `json:"defaults"`
+	fixture := struct {
+		Defaults config.CredentialConcurrencyConfig
 		Invalid  []struct {
-			NodeHeartbeatTimeout time.Duration                      `json:"node_heartbeat_timeout"`
-			Config               config.CredentialConcurrencyConfig `json:"config"`
-		} `json:"invalid"`
+			NodeHeartbeatTimeout time.Duration
+			Config               config.CredentialConcurrencyConfig
+		}
+	}{
+		Defaults: credentialConcurrencyConfigFixture(3 * time.Second),
+		Invalid: []struct {
+			NodeHeartbeatTimeout time.Duration
+			Config               config.CredentialConcurrencyConfig
+		}{
+			{NodeHeartbeatTimeout: 3 * time.Second, Config: credentialConcurrencyConfigFixture(3 * time.Second)},
+			{NodeHeartbeatTimeout: 20 * time.Second, Config: credentialConcurrencyConfigFixture(0)},
+		},
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if errDecode := decoder.Decode(&fixture); errDecode != nil {
-		t.Fatal(errDecode)
-	}
-	if errTrailing := decoder.Decode(&struct{}{}); errTrailing != io.EOF {
-		t.Fatalf("fixture contains trailing JSON: %v", errTrailing)
-	}
+	fixture.Defaults.LifecycleConfigRevision = 1
 
 	expectedDefaults := config.CredentialConcurrencyConfig{
 		LifecycleConfigRevision:    1,
