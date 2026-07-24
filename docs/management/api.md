@@ -3237,7 +3237,7 @@ Example response:
 
 ### DELETE `/logs`
 
-Deletes rotated log files and truncates the active log.
+Deletes all application log records from the shared database `log` table. In a cluster deployment, this clears records for every Home and CPA node; it does not delete or truncate local log files. The `removed` response field is the number of deleted database rows.
 
 Input: none.
 
