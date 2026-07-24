@@ -2031,7 +2031,7 @@ func usageObservabilityAggregateSQLOrder(metric string, direction string) string
 	case "total_tokens":
 		metricColumn = "accounting_total_tokens"
 	case "total_amount":
-		metricColumn = "COALESCE(total_amount, 0)"
+		metricColumn = "COALESCE(SUM(scoped.amount), 0)"
 	case "failed_count":
 		metricColumn = "failed_count"
 	case "avg_latency_ms":
