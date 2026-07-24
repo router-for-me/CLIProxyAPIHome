@@ -177,6 +177,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPut, "/logging-to-file", handler.PutLoggingToFile)
 	r.Set(http.MethodPatch, "/logging-to-file", handler.PutLoggingToFile)
 	r.Set(http.MethodGet, "/logs", handler.GetLogs)
+	r.Set(http.MethodDelete, "/logs", handler.DeleteLogs)
 	r.Set(http.MethodGet, "/logs-max-total-size-mb", handler.GetLogsMaxTotalSizeMB)
 	r.Set(http.MethodPut, "/logs-max-total-size-mb", handler.PutLogsMaxTotalSizeMB)
 	r.Set(http.MethodPatch, "/logs-max-total-size-mb", handler.PutLogsMaxTotalSizeMB)

@@ -3,11 +3,14 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
 	stdlog "log"
 	"testing"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	homelogging "github.com/router-for-me/CLIProxyAPIHome/internal/logging"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
@@ -25,6 +28,82 @@ func TestDatabaseGORMConfigRedactsParameters(t *testing.T) {
 	}
 	if _, okInfo := config.Logger.LogMode(gormlogger.Info).(gorm.ParamsFilter); !okInfo {
 		t.Fatal("database GORM logger lost parameter filtering after LogMode")
+	}
+}
+
+func TestHomeGORMLoggerUsesApplicationFormat(t *testing.T) {
+	tests := []struct {
+		name        string
+		elapsed     time.Duration
+		err         error
+		wantLevel   string
+		wantMessage string
+	}{
+		{name: "slow query", elapsed: time.Second, wantLevel: "[warn ]", wantMessage: "SLOW SQL >= 200ms"},
+		{name: "query error", err: errors.New("database\nunavailable"), wantLevel: "[error]", wantMessage: "error=database unavailable"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			baseLogger := log.New()
+			baseLogger.SetOutput(&output)
+			baseLogger.SetFormatter(&homelogging.LogFormatter{})
+
+			logger := newParameterizedGORMLogger(newHomeGORMLogger(baseLogger))
+			logger.Trace(context.Background(), time.Now().Add(-test.elapsed), func() (string, int64) {
+				return "SELECT *\nFROM records", 0
+			}, test.err)
+
+			logs := output.Bytes()
+			if !bytes.HasPrefix(logs, []byte(homelogging.FormatLogSourcePrefix("CLIProxyAPIHome"))) {
+				t.Fatalf("GORM log = %q, want application source prefix", logs)
+			}
+			if !bytes.Contains(logs, []byte(test.wantLevel)) {
+				t.Fatalf("GORM log = %q, want level %q", logs, test.wantLevel)
+			}
+			if !bytes.Contains(logs, []byte(test.wantMessage)) {
+				t.Fatalf("GORM log = %q, want message %q", logs, test.wantMessage)
+			}
+			if bytes.Count(logs, []byte{'\n'}) != 1 {
+				t.Fatalf("GORM log = %q, want one formatted line", logs)
+			}
+		})
+	}
+}
+
+func TestParameterizedGORMLoggerIgnoresRecordNotFoundAsError(t *testing.T) {
+	tests := []struct {
+		name          string
+		slowThreshold time.Duration
+		elapsed       time.Duration
+		wantSlow      bool
+	}{
+		{name: "fast query", slowThreshold: time.Hour, wantSlow: false},
+		{name: "slow query", slowThreshold: time.Millisecond, elapsed: time.Second, wantSlow: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			inner := gormlogger.New(stdlog.New(&output, "", 0), gormlogger.Config{
+				SlowThreshold: test.slowThreshold,
+				LogLevel:      gormlogger.Warn,
+				Colorful:      false,
+			})
+			redacted := newParameterizedGORMLogger(inner)
+			redacted.Trace(context.Background(), time.Now().Add(-test.elapsed), func() (string, int64) {
+				return "SELECT * FROM records WHERE id = ?", 0
+			}, gorm.ErrRecordNotFound)
+
+			logs := output.Bytes()
+			if bytes.Contains(logs, []byte("record not found")) {
+				t.Fatal("record-not-found error was emitted")
+			}
+			if gotSlow := bytes.Contains(logs, []byte("SLOW SQL")); gotSlow != test.wantSlow {
+				t.Fatalf("slow SQL emitted = %t, want %t", gotSlow, test.wantSlow)
+			}
+		})
 	}
 }
 

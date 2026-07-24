@@ -127,6 +127,35 @@ func TestClusterManagementAPIKeyUsageRouteRegistered(t *testing.T) {
 	}
 }
 
+func TestClusterManagementLogRoutesRegistered(t *testing.T) {
+	reg := newRouteRegistry()
+	legacyDeleteCalled := false
+	reg.Set(http.MethodDelete, "/logs", func(c *gin.Context) {
+		legacyDeleteCalled = true
+		c.Status(http.StatusTeapot)
+	})
+	handler := clustermanagement.NewHandler(nil, nil, "", 0)
+	registerClusterManagementRoutes(reg, handler)
+
+	for _, route := range []RouteKey{
+		{Method: http.MethodGet, Path: "/logs"},
+		{Method: http.MethodDelete, Path: "/logs"},
+	} {
+		if reg.routes[route] == nil {
+			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
+		}
+	}
+
+	engine := gin.New()
+	engine.DELETE("/logs", reg.routes[RouteKey{Method: http.MethodDelete, Path: "/logs"}])
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/logs", nil)
+	engine.ServeHTTP(resp, req)
+	if legacyDeleteCalled || resp.Code == http.StatusTeapot {
+		t.Fatal("database DELETE /logs did not replace the legacy file-log handler")
+	}
+}
+
 func TestClusterManagementInFlightRoutesRegistered(t *testing.T) {
 	reg := newRouteRegistry()
 	handler := clustermanagement.NewHandler(nil, nil, "", 0)
