@@ -70,6 +70,74 @@ func TestGetLogsReturnsDatabaseAppLogs(t *testing.T) {
 	}
 }
 
+func TestDeleteLogsClearsDatabaseAppLogs(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	now := time.Date(2026, 5, 29, 1, 2, 3, 0, time.UTC)
+	records := []cluster.AppLogRecord{
+		{Timestamp: now, ClientIP: "10.0.0.5", RequestID: "req-1", HomeIP: "192.0.2.10", Level: "info", Line: "first", CreatedAt: now},
+		{Timestamp: now.Add(time.Second), ClientIP: "10.0.0.6", RequestID: "req-2", HomeIP: "192.0.2.11", Level: "warn", Line: "second", CreatedAt: now.Add(time.Second)},
+	}
+	if errCreate := db.Create(&records).Error; errCreate != nil {
+		t.Fatalf("create logs: %v", errCreate)
+	}
+
+	handler := NewHandler(cluster.NewRepository(db), nil, "192.0.2.10", 0)
+	engine := gin.New()
+	engine.GET("/logs", handler.GetLogs)
+	engine.DELETE("/logs", handler.DeleteLogs)
+
+	type deleteLogsResponse struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Removed int64  `json:"removed"`
+	}
+	deleteLogs := func() deleteLogsResponse {
+		t.Helper()
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/logs", nil)
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("DELETE status = %d, body = %s", resp.Code, resp.Body.String())
+		}
+		var body deleteLogsResponse
+		if errDecode := json.Unmarshal(resp.Body.Bytes(), &body); errDecode != nil {
+			t.Fatalf("decode DELETE response: %v", errDecode)
+		}
+		return body
+	}
+
+	first := deleteLogs()
+	if !first.Success || first.Message != "Logs cleared successfully" || first.Removed != 2 {
+		t.Fatalf("first DELETE response = %+v, want success with 2 removed", first)
+	}
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	engine.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET after DELETE status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var listed struct {
+		Logs  []json.RawMessage `json:"logs"`
+		Total int64             `json:"total"`
+	}
+	if errDecode := json.Unmarshal(resp.Body.Bytes(), &listed); errDecode != nil {
+		t.Fatalf("decode GET response: %v", errDecode)
+	}
+	if listed.Total != 0 || len(listed.Logs) != 0 {
+		t.Fatalf("GET after DELETE = total %d logs %d, want empty", listed.Total, len(listed.Logs))
+	}
+
+	second := deleteLogs()
+	if !second.Success || second.Removed != 0 {
+		t.Fatalf("second DELETE response = %+v, want idempotent success", second)
+	}
+}
+
 func TestDownloadRequestLogByIDUsesRequestIDOnlyForFileMatch(t *testing.T) {
 	db, cleanup := openManagementLogTestDB(t)
 	defer cleanup()

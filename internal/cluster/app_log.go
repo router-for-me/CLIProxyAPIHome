@@ -92,6 +92,20 @@ func (r *Repository) AppendAppLog(ctx context.Context, clientIP string, homeIP s
 	return record, nil
 }
 
+// DeleteAppLogs deletes all CPA application log records.
+func (r *Repository) DeleteAppLogs(ctx context.Context) (int64, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return 0, errDB
+	}
+
+	result := db.WithContext(contextOrBackground(ctx)).Where("1 = 1").Delete(&AppLogRecord{})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
+}
+
 // ListAppLogs returns application log records from the database.
 func (r *Repository) ListAppLogs(ctx context.Context, opts AppLogQuery) (AppLogQueryResult, error) {
 	db, errDB := r.database()

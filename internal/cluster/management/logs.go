@@ -97,6 +97,29 @@ func (h *Handler) GetLogs(c *gin.Context) {
 	})
 }
 
+// DeleteLogs deletes all app log records stored in the shared database.
+func (h *Handler) DeleteLogs(c *gin.Context) {
+	if h == nil || h.repo == nil {
+		respondError(c, http.StatusInternalServerError, "repository_unavailable", nil)
+		return
+	}
+
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+
+	removed, errDelete := h.repo.DeleteAppLogs(ctx)
+	if errDelete != nil {
+		respondError(c, http.StatusInternalServerError, "logs_clear_failed", errDelete)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Logs cleared successfully",
+		"removed": removed,
+	})
+}
+
 // DownloadRequestLogByID downloads a request log file by path request ID and optional query Home identity.
 func (h *Handler) DownloadRequestLogByID(c *gin.Context) {
 	requestID := strings.TrimSpace(c.Param("id"))
