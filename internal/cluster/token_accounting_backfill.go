@@ -165,7 +165,7 @@ func runUsageTokenAccountingBackfillBatchTx(ctx context.Context, tx *gorm.DB, ba
 
 func firstPendingUsageTokenAccountingRecord(ctx context.Context, tx *gorm.DB) (*UsageRecord, error) {
 	var record UsageRecord
-	result := tx.WithContext(contextOrBackground(ctx)).Select("id").
+	result := tx.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "usage.token_accounting.pending")).Select("id").
 		Where("token_accounting_version <> ?", UsageTokenAccountingSchemaVersion).
 		Order("id ASC").
 		Limit(1).

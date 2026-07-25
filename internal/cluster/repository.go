@@ -255,7 +255,7 @@ func (r *Repository) GetAuth(ctx context.Context, uuid string) (*coreauth.Auth, 
 	}
 
 	record := &AuthRecord{}
-	errFirst := db.WithContext(contextOrBackground(ctx)).Where("uuid = ?", uuid).First(record).Error
+	errFirst := db.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "auth.credential.get")).Where("uuid = ?", uuid).First(record).Error
 	if errFirst != nil {
 		return nil, nil, errFirst
 	}
@@ -387,7 +387,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 	}
 
 	var records []AuthRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).Order("id").Find(&records).Error; errFind != nil {
+	if errFind := db.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "auth.index.list")).Order("id").Find(&records).Error; errFind != nil {
 		return nil, errFind
 	}
 
@@ -1190,7 +1190,7 @@ func (r *Repository) MaxEventID(ctx context.Context) (int64, error) {
 		return 0, errDB
 	}
 	var maxID int64
-	if errScan := db.WithContext(contextOrBackground(ctx)).Model(&ClusterEventRecord{}).Select("COALESCE(MAX(id), 0)").Scan(&maxID).Error; errScan != nil {
+	if errScan := db.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "cluster.events.poll")).Model(&ClusterEventRecord{}).Select("COALESCE(MAX(id), 0)").Scan(&maxID).Error; errScan != nil {
 		return 0, errScan
 	}
 	return maxID, nil

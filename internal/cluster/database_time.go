@@ -14,7 +14,7 @@ func DatabaseNow(ctx context.Context, tx *gorm.DB) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("database connection is nil")
 	}
 	var value string
-	if errScan := tx.WithContext(contextOrBackground(ctx)).Raw(databaseNowQuery(tx)).Scan(&value).Error; errScan != nil {
+	if errScan := tx.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "cluster.time.read")).Raw(databaseNowQuery(tx)).Scan(&value).Error; errScan != nil {
 		return time.Time{}, errScan
 	}
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999-07:00", "2006-01-02 15:04:05-07:00", "2006-01-02 15:04:05.999999", "2006-01-02 15:04:05"} {

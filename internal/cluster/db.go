@@ -40,6 +40,7 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	if errOpen != nil {
 		return nil, errOpen
 	}
+	configureDatabaseGORMClauseBuilders(db)
 
 	sqlDB, errDB := db.DB()
 	if errDB != nil {
@@ -68,6 +69,7 @@ func OpenSQLite(ctx context.Context, path string) (*gorm.DB, error) {
 	if errOpen != nil {
 		return nil, errOpen
 	}
+	configureDatabaseGORMClauseBuilders(db)
 	sqlDB, errDB := db.DB()
 	if errDB != nil {
 		return nil, errDB

@@ -625,12 +625,12 @@ func (r *Repository) ListUsageObservabilityRecords(ctx context.Context, query Us
 
 	scope := usageObservabilityRecordScope(db.WithContext(contextOrBackground(ctx)).Table("usage"), query)
 	var total int64
-	if errCount := scope.Session(&gorm.Session{}).Select(`COUNT(DISTINCT "usage"."id")`).Scan(&total).Error; errCount != nil {
+	if errCount := databaseQueryDB(scope.Session(&gorm.Session{}), "usage.records.count").Select(`COUNT(DISTINCT "usage"."id")`).Scan(&total).Error; errCount != nil {
 		return UsageObservabilityRecordListResult{}, errCount
 	}
 
 	var rows []usageObservabilityRecordRow
-	if errFind := scope.Session(&gorm.Session{}).
+	if errFind := databaseQueryDB(scope.Session(&gorm.Session{}), "usage.records.list").
 		Select(usageObservabilityRecordSelect()).
 		Order(usageObservabilityRecordOrder(query.Sort)).
 		Limit(query.Limit).
@@ -742,22 +742,25 @@ func (r *Repository) ListUsageObservabilityAggregates(ctx context.Context, query
 		CredentialType: query.CredentialType,
 	}
 
-	baseForCount := usageObservabilityAggregateBaseQuery(db.WithContext(contextOrBackground(ctx)), recordQuery, groupBy)
-	groupedForCount := db.WithContext(contextOrBackground(ctx)).
+	ctx = contextOrBackground(ctx)
+	countDB := databaseQueryDB(db.WithContext(ctx), "usage.aggregate.count")
+	baseForCount := usageObservabilityAggregateBaseQuery(countDB, recordQuery, groupBy)
+	groupedForCount := countDB.
 		Table("(?) AS scoped", baseForCount).
 		Select("scoped.aggregate_id").
 		Group("scoped.aggregate_id")
 	var total int64
-	if errCount := db.WithContext(contextOrBackground(ctx)).Table("(?) AS grouped", groupedForCount).Count(&total).Error; errCount != nil {
+	if errCount := countDB.Table("(?) AS grouped", groupedForCount).Count(&total).Error; errCount != nil {
 		return UsageObservabilityAggregateResult{}, errCount
 	}
 
 	includeP95ForSort := strings.TrimSpace(query.Metric) == "p95_latency_ms"
-	baseForItems := usageObservabilityAggregateBaseQuery(db.WithContext(contextOrBackground(ctx)), recordQuery, groupBy)
-	itemsQuery := db.WithContext(contextOrBackground(ctx)).
+	itemsDB := databaseQueryDB(db.WithContext(ctx), "usage.aggregate.items")
+	baseForItems := usageObservabilityAggregateBaseQuery(itemsDB, recordQuery, groupBy)
+	itemsQuery := itemsDB.
 		Table("(?) AS scoped", baseForItems)
 	if includeP95ForSort {
-		p95Query := usageObservabilityAggregateP95Query(db.WithContext(contextOrBackground(ctx)), recordQuery, groupBy)
+		p95Query := usageObservabilityAggregateP95Query(itemsDB, recordQuery, groupBy)
 		itemsQuery = itemsQuery.Joins("LEFT JOIN (?) AS p95 ON p95.aggregate_id = scoped.aggregate_id", p95Query)
 	}
 	var rows []usageObservabilityAggregateRow
@@ -771,7 +774,7 @@ func (r *Repository) ListUsageObservabilityAggregates(ctx context.Context, query
 		return UsageObservabilityAggregateResult{}, errFind
 	}
 	if !includeP95ForSort && len(rows) > 0 {
-		p95Values, errP95 := usageObservabilityAggregateP95Values(db.WithContext(contextOrBackground(ctx)), recordQuery, groupBy, usageObservabilityAggregateRowIDs(rows))
+		p95Values, errP95 := usageObservabilityAggregateP95Values(databaseQueryDB(db.WithContext(ctx), "usage.aggregate.p95"), recordQuery, groupBy, usageObservabilityAggregateRowIDs(rows))
 		if errP95 != nil {
 			return UsageObservabilityAggregateResult{}, errP95
 		}
@@ -1088,6 +1091,7 @@ func usageObservabilityLiveSQL(db *gorm.DB, query UsageObservabilityRecordQuery,
 }
 
 func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery, interval string, location *time.Location, bounds usageObservabilityOverviewBounds) ([]UsageObservabilityTrendPoint, error) {
+	db = databaseQueryDB(db, "usage.trend.points")
 	bucketExpr, bucketArgs := usageObservabilityTrendBucketUnixSQL(db, interval, location, query, bounds)
 	cacheReadTokensExpr := usageObservabilitySQLCacheReadTokens(`"usage"`)
 	accountingTotalTokensExpr := usageObservabilitySQLAccountingTotalTokens(`"usage"`)
@@ -1159,6 +1163,7 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 }
 
 func usageObservabilityTrendP95SQL(db *gorm.DB, query UsageObservabilityRecordQuery, bucketExpr string, bucketArgs []any) (map[int64]sql.NullFloat64, error) {
+	db = databaseQueryDB(db, "usage.trend.points")
 	baseSelect := fmt.Sprintf(`
 		%s AS bucket_unix,
 		"usage"."latency_ms" AS latency_ms`, bucketExpr)
@@ -1476,6 +1481,7 @@ func usageObservabilityTopSQL(db *gorm.DB, query UsageObservabilityRecordQuery) 
 }
 
 func usageObservabilityAggregateItemsSQL(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string, metric string, direction string, limit int) ([]UsageObservabilityAggregateItem, error) {
+	db = databaseQueryDB(db, "usage.aggregate.items")
 	if limit <= 0 {
 		limit = UsageObservabilityDefaultGroupLimit
 	}
@@ -1496,7 +1502,7 @@ func usageObservabilityAggregateItemsSQL(db *gorm.DB, query UsageObservabilityRe
 		return nil, errFind
 	}
 	if !includeP95ForSort && len(rows) > 0 {
-		p95Values, errP95 := usageObservabilityAggregateP95Values(db, query, groupBy, usageObservabilityAggregateRowIDs(rows))
+		p95Values, errP95 := usageObservabilityAggregateP95Values(databaseQueryDB(db, "usage.aggregate.p95"), query, groupBy, usageObservabilityAggregateRowIDs(rows))
 		if errP95 != nil {
 			return nil, errP95
 		}
@@ -1742,6 +1748,7 @@ func usageObservabilityAggregateP95Values(db *gorm.DB, query UsageObservabilityR
 	if len(aggregateIDs) == 0 {
 		return map[string]sql.NullFloat64{}, nil
 	}
+	db = databaseQueryDB(db, "usage.aggregate.p95")
 	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
 	ranked := db.Table("(?) AS scoped_latency", base).
 		Select(`

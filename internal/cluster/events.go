@@ -102,7 +102,7 @@ func (w *EventWatcher) eventsAfter(ctx context.Context, id int64) ([]ClusterEven
 		return nil, errDB
 	}
 	var events []ClusterEventRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).Where("id > ?", id).Order("id").Find(&events).Error; errFind != nil {
+	if errFind := db.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "cluster.events.poll")).Where("id > ?", id).Order("id").Find(&events).Error; errFind != nil {
 		return nil, errFind
 	}
 	return events, nil

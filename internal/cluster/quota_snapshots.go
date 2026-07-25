@@ -311,7 +311,7 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 	updated := false
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing QuotaSnapshotRecord
-		errExisting := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&existing, "credential_id = ?", input.CredentialID).Error
+		errExisting := databaseQueryDB(tx, "quota.snapshot.lock").Clauses(clause.Locking{Strength: "UPDATE"}).First(&existing, "credential_id = ?", input.CredentialID).Error
 		if errExisting != nil && !errors.Is(errExisting, gorm.ErrRecordNotFound) {
 			return errExisting
 		}
@@ -612,12 +612,13 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 	if errDB != nil {
 		return false, errDB
 	}
+	ctx = contextOrBackground(ctx)
 	claimed := false
-	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		targetCollectorVersion := quotaSnapshotSchemaVersion
 		if requireEligible {
 			var authRecord AuthRecord
-			errAuth := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&authRecord, "uuid = ?", credentialID).Error
+			errAuth := databaseQueryDB(tx, "quota.snapshot.lock").Clauses(clause.Locking{Strength: "UPDATE"}).First(&authRecord, "uuid = ?", credentialID).Error
 			if errors.Is(errAuth, gorm.ErrRecordNotFound) {
 				return nil
 			}
@@ -636,7 +637,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 			targetCollectorVersion = QuotaSnapshotVersion(provider)
 		}
 		var record QuotaSnapshotRecord
-		errFind := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "credential_id = ?", credentialID).Error
+		errFind := databaseQueryDB(tx, "quota.snapshot.lock").Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "credential_id = ?", credentialID).Error
 		if errFind != nil && !errors.Is(errFind, gorm.ErrRecordNotFound) {
 			return errFind
 		}
