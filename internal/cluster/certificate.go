@@ -337,7 +337,7 @@ func (r *Repository) peerCertificateFingerprintAllowed(ctx context.Context, cert
 		return false, errDB
 	}
 	var count int64
-	errCount := db.WithContext(contextOrBackground(ctx)).
+	errCount := db.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "cluster.certificate.peer_allowed")).
 		Model(&CertificateRecord{}).
 		Where("certificate_fingerprint = ? AND certificate_pem <> ? AND (is_client = ? OR is_server = ?)", fingerprint, "", true, true).
 		Count(&count).Error

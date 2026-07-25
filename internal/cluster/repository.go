@@ -1135,7 +1135,7 @@ func (r *Repository) LoadConfigSnapshot(ctx context.Context) (map[string]json.Ra
 	}
 
 	var records []ConfigRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).Find(&records).Error; errFind != nil {
+	if errFind := db.WithContext(WithDatabaseQueryName(contextOrBackground(ctx), "config.snapshot.load")).Find(&records).Error; errFind != nil {
 		return nil, errFind
 	}
 

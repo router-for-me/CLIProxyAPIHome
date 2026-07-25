@@ -919,7 +919,7 @@ func usageObservabilityOverviewRecordQuery(query UsageObservabilityOverviewQuery
 func usageObservabilityTotalsSQL(db *gorm.DB, query UsageObservabilityRecordQuery) (UsageObservabilityTotals, usageObservabilityOverviewBounds, error) {
 	var row usageObservabilityTotalsRow
 	scope := usageObservabilityRecordScope(db.Table("usage"), query)
-	if errScan := scope.Session(&gorm.Session{}).Select(usageObservabilityTotalsSQLSelect()).Scan(&row).Error; errScan != nil {
+	if errScan := databaseQueryDB(scope.Session(&gorm.Session{}), "usage.overview.totals").Select(usageObservabilityTotalsSQLSelect()).Scan(&row).Error; errScan != nil {
 		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errScan
 	}
 	totals := usageObservabilityTotalsFromRow(&row)

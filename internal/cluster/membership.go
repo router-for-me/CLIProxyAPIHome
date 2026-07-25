@@ -118,7 +118,7 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 		}
 
 		previous := CPANodeMembershipRecord{}
-		errPrevious := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", request.Fingerprint).First(&previous).Error
+		errPrevious := databaseQueryDB(tx, "cluster.membership.lock").Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", request.Fingerprint).First(&previous).Error
 		if errPrevious == nil && previous.State != MembershipStateClosed {
 			return ErrDuplicateCPACertificate
 		}
@@ -169,7 +169,7 @@ func (r *Repository) RecordParticipation(ctx context.Context, lifetime Connectio
 	}
 	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
 		member := CPANodeMembershipRecord{}
-		errMember := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		errMember := databaseQueryDB(tx, "cluster.membership.lock").Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("certificate_fingerprint = ?", fingerprint).
 			First(&member).Error
 		if errors.Is(errMember, gorm.ErrRecordNotFound) {

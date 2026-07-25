@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	stdlog "log"
 	"strings"
@@ -99,11 +100,28 @@ func TestDatabaseQueryNamesReachGORMLogger(t *testing.T) {
 	if _, errTrend := usageObservabilityTrendSQL(db, UsageObservabilityRecordQuery{}, "hour", time.UTC, usageObservabilityOverviewBounds{}); errTrend != nil {
 		t.Fatalf("query usage trend: %v", errTrend)
 	}
+	if _, _, errTotals := usageObservabilityTotalsSQL(db, UsageObservabilityRecordQuery{}); errTotals != nil {
+		t.Fatalf("query usage overview totals: %v", errTotals)
+	}
 	if _, _, errAuth := repo.GetAuth(ctx, "11111111-1111-4111-8111-111111111111"); !errors.Is(errAuth, gorm.ErrRecordNotFound) {
 		t.Fatalf("get missing auth error = %v", errAuth)
 	}
 	if _, errIndex := repo.ListAuthIndex(ctx); errIndex != nil {
 		t.Fatalf("list auth index: %v", errIndex)
+	}
+	if _, errSnapshot := repo.LoadConfigSnapshot(ctx); errSnapshot != nil {
+		t.Fatalf("load config snapshot: %v", errSnapshot)
+	}
+	if allowed, errAllowed := repo.peerCertificateFingerprintAllowed(ctx, &x509.Certificate{Raw: []byte("query-name-certificate")}); errAllowed != nil || allowed {
+		t.Fatalf("check missing peer certificate: allowed=%t error=%v", allowed, errAllowed)
+	}
+	errParticipation := repo.RecordParticipation(ctx, ConnectionLifetime{
+		Fingerprint: "query-name-fingerprint",
+		ConnectedAt: time.Unix(1, 0).UTC(),
+		Home:        HomeIncarnationID{IP: "192.0.2.1", Port: 8317, StartedAt: time.Unix(1, 0).UTC()},
+	})
+	if !errors.Is(errParticipation, ErrMembershipNotActive) {
+		t.Fatalf("record missing membership participation error = %v", errParticipation)
 	}
 	watcher := NewEventWatcher(repo, time.Second, func(context.Context, ClusterEventRecord) error { return nil })
 	if _, errEvents := watcher.eventsAfter(ctx, 0); errEvents != nil {
@@ -133,8 +151,12 @@ func TestDatabaseQueryNamesReachGORMLogger(t *testing.T) {
 		"usage.records.list",
 		"usage.records.count",
 		"usage.trend.points",
+		"usage.overview.totals",
 		"auth.credential.get",
 		"auth.index.list",
+		"config.snapshot.load",
+		"cluster.certificate.peer_allowed",
+		"cluster.membership.lock",
 		"cluster.events.poll",
 		"cluster.time.read",
 		"quota.snapshot.lock",
