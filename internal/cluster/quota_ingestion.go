@@ -233,9 +233,6 @@ type codexHeaderLimitFamily struct {
 
 func parseCodexQuotaHeaderWindows(headers http.Header, observedAt time.Time) []QuotaWindow {
 	headers = canonicalQuotaHeaders(headers)
-	windows := make([]QuotaWindow, 0, 4)
-	windows = appendCodexHeaderLimitWindows(windows, headers, codexQuotaHeaderPrefix, "", nil, "account", nil, 0, observedAt)
-
 	groupNames := make(map[string]struct{})
 	for key := range headers {
 		if groupName := codexQuotaHeaderGroupName(key); groupName != "" {
@@ -252,6 +249,32 @@ func parseCodexQuotaHeaderWindows(headers http.Header, observedAt time.Time) []Q
 		}
 		return families[i].groupName < families[j].groupName
 	})
+
+	activeLimitKey, activeScope, activeScopeID, activeLimitOK := codexActiveQuotaLimitFamily(firstQuotaHeaderValue(headers, "X-Codex-Active-Limit"))
+	activePriority := 0
+	var activeLabel *string
+	if activeLimitOK && activeLimitKey != "" {
+		activePriority = 20 + len(families)*10
+	}
+	if activeLimitOK {
+		for index, family := range families {
+			if family.limitKey != activeLimitKey {
+				continue
+			}
+			if activeLimitKey != "" {
+				activePriority = 20 + index*10
+			}
+			if value := firstQuotaHeaderValue(headers, codexQuotaHeaderPrefix+family.groupName+"-Limit-Name"); value != "" {
+				activeLabel = &value
+			}
+			break
+		}
+	}
+
+	windows := make([]QuotaWindow, 0, 4)
+	if activeLimitOK {
+		windows = appendCodexHeaderLimitWindows(windows, headers, codexQuotaHeaderPrefix, activeLimitKey, activeLabel, activeScope, activeScopeID, activePriority, observedAt)
+	}
 	for index, family := range families {
 		prefix := codexQuotaHeaderPrefix + family.groupName + "-"
 		var label *string
@@ -263,7 +286,68 @@ func parseCodexQuotaHeaderWindows(headers http.Header, observedAt time.Time) []Q
 			value := "codex_" + strings.ReplaceAll(family.limitKey, "-", "_")
 			scopeID = &value
 		}
-		windows = appendCodexHeaderLimitWindows(windows, headers, prefix, family.limitKey, label, "model", scopeID, 20+index*10, observedAt)
+		scope := "model"
+		if family.limitKey == "" {
+			scope = "account"
+		}
+		familyWindows := appendCodexHeaderLimitWindows(nil, headers, prefix, family.limitKey, label, scope, scopeID, 20+index*10, observedAt)
+		if activeLimitOK && family.limitKey == activeLimitKey {
+			windows = mergeCodexActiveHeaderWindows(windows, familyWindows)
+			continue
+		}
+		windows = append(windows, familyWindows...)
+	}
+	return windows
+}
+
+func codexActiveQuotaLimitFamily(value string) (string, string, *string, bool) {
+	value = strings.TrimSpace(value)
+	if !validCodexQuotaLimitIdentifier(value) {
+		return "", "", nil, false
+	}
+	switch strings.ToLower(value) {
+	case "codex", "premium":
+		return "", "account", nil, true
+	}
+	limitKey := codexQuotaLimitKey(value)
+	if limitKey == "" {
+		return "", "", nil, false
+	}
+	scopeIDValue := "codex_" + strings.ReplaceAll(limitKey, "-", "_")
+	return limitKey, "model", &scopeIDValue, true
+}
+
+func validCodexQuotaLimitIdentifier(value string) bool {
+	if value == "" || len(value) > quotaWindowTextMaxLength {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func mergeCodexActiveHeaderWindows(windows []QuotaWindow, familyWindows []QuotaWindow) []QuotaWindow {
+	for _, familyWindow := range familyWindows {
+		merged := false
+		for index := range windows {
+			window := &windows[index]
+			if window.ID != familyWindow.ID || window.WindowSeconds == nil || familyWindow.WindowSeconds == nil || *window.WindowSeconds != *familyWindow.WindowSeconds {
+				continue
+			}
+			if window.Label == nil && familyWindow.Label != nil {
+				window.Label = familyWindow.Label
+			}
+			merged = true
+			break
+		}
+		if !merged {
+			windows = append(windows, familyWindow)
+		}
 	}
 	return windows
 }
@@ -356,7 +440,7 @@ func codexHeaderWindow(headers http.Header, prefix string, label *string, scope 
 
 func codexQuotaLimitKey(value string) string {
 	key := quotaSlug(value)
-	if key == "codex" {
+	if key == "codex" || key == "premium" {
 		return ""
 	}
 	return strings.TrimPrefix(key, "codex-")
@@ -445,7 +529,7 @@ func canonicalQuotaHeaders(headers http.Header) http.Header {
 }
 
 func isCodexQuotaHeaderKey(key string) bool {
-	if key == "X-Codex-Plan-Type" {
+	if key == "X-Codex-Plan-Type" || key == "X-Codex-Active-Limit" {
 		return true
 	}
 	if !strings.HasPrefix(key, codexQuotaHeaderPrefix) {
