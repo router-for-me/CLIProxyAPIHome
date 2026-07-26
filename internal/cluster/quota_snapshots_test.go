@@ -44,9 +44,10 @@ func TestAppendUsagePersistsCodexQuotaHeaderSnapshot(t *testing.T) {
         "timestamp":"2026-07-16T01:00:00Z",
         "provider":"codex",
         "auth_type":"oauth",
-        "auth_index":"codex-auth",
-        "request_id":"req-quota-1",
+		"auth_index":"codex-auth",
+		"request_id":"req-quota-1",
 		"response_headers":{
+			  "X-Codex-Active-Limit":["premium"],
 			  "X-Codex-Primary-Used-Percent":["82"],
 			  "X-Codex-Primary-Window-Minutes":["300"],
 			  "X-Codex-Primary-Reset-After-Seconds":["600"],
@@ -59,7 +60,9 @@ func TestAppendUsagePersistsCodexQuotaHeaderSnapshot(t *testing.T) {
 	if errSanitize != nil {
 		t.Fatalf("SanitizeUsagePayloadSecrets() error = %v", errSanitize)
 	}
-	if !gjson.Get(sanitized, "quota_headers").IsObject() || gjson.Get(sanitized, "quota_headers.X-Codex-Primary-Used-Percent").String() != "82" {
+	if !gjson.Get(sanitized, "quota_headers").IsObject() ||
+		gjson.Get(sanitized, "quota_headers.X-Codex-Active-Limit").String() != "premium" ||
+		gjson.Get(sanitized, "quota_headers.X-Codex-Primary-Used-Percent").String() != "82" {
 		t.Fatalf("quota headers were not extracted: %s", sanitized)
 	}
 	_, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327, CPANodeID: "cpa-a", CPALabel: "CPA A"})
@@ -165,7 +168,7 @@ func TestSparseHeaderPreservesFreshAuthoritativeSnapshot(t *testing.T) {
 		t.Fatalf("seed active probe snapshot: %v", errSeed)
 	}
 	headerAt := probeAt.Add(time.Minute)
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-merge","request_id":"req-merge","response_headers":{"X-Codex-Primary-Used-Percent":["95"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-merge","request_id":"req-merge","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["95"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -266,6 +269,102 @@ func TestCodexSparseHeaderPreservesProbeMetadataAndDeduplicatesAdditionalWindow(
 	}
 }
 
+func TestCodexActiveLimitKeepsDefaultAndSparkQuotaSeparate(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	seedQuotaSnapshotAuth(t, repo, "codex-active-limit", "codex", "Codex Active Limit", map[string]any{"type": "codex"})
+
+	probeAt := time.Date(2026, 7, 22, 3, 0, 0, 0, time.UTC)
+	headerAt := probeAt.Add(time.Minute)
+	expiresAt := probeAt.Add(30 * time.Minute)
+	resetAt := probeAt.Add(7 * 24 * time.Hour)
+	windowSeconds := int64(7 * 24 * 60 * 60)
+	periodWeek := float64(1)
+	defaultRemaining := 0.42
+	sparkRemaining := 0.98
+	sparkScopeID := "codex_bengalfox"
+	_, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "codex-active-limit", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &probeAt, ExpiresAt: &expiresAt, LastSuccessAt: &probeAt, ReplaceWindows: true,
+		Windows: []QuotaWindow{
+			{ID: "codex-1-week", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &defaultRemaining, ResetAt: &resetAt, WindowSeconds: &windowSeconds, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: probeAt},
+			{ID: "codex-bengalfox-1-week", Priority: 20, Scope: "model", ScopeID: &sparkScopeID, Mode: "rolling", Status: "healthy", Unit: "percentage", RemainingRatio: &sparkRemaining, ResetAt: &resetAt, WindowSeconds: &windowSeconds, PeriodUnit: "week", PeriodValue: &periodWeek, Source: "active_probe", ObservedAt: probeAt},
+		},
+	})
+	if errSeed != nil {
+		t.Fatalf("seed active probe snapshot: %v", errSeed)
+	}
+
+	headerResetAt := headerAt.Add(7 * 24 * time.Hour).Unix()
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-active-limit","response_headers":{"X-Codex-Active-Limit":["codex_bengalfox"],"X-Codex-Primary-Used-Percent":["2"],"X-Codex-Primary-Window-Minutes":["10080"],"X-Codex-Primary-Reset-At":["` + fmt.Sprint(headerResetAt) + `"],"X-Codex-Bengalfox-Limit-Name":["GPT-5.3-Codex-Spark"],"X-Codex-Bengalfox-Primary-Used-Percent":["71"],"X-Codex-Bengalfox-Primary-Window-Minutes":["10080"],"X-Codex-Bengalfox-Primary-Reset-At":["` + fmt.Sprint(headerResetAt) + `"]}}`
+	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
+		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
+	}
+
+	item, errGet := repo.GetQuotaCredential(ctx, "codex-active-limit", headerAt)
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if len(item.Windows) != 2 || len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ID != "codex-1-week" || item.PrimaryWindows[1].ID != "codex-bengalfox-1-week" {
+		t.Fatalf("Codex active-limit windows = %+v, primary = %+v", item.Windows, item.PrimaryWindows)
+	}
+	windowsByID := make(map[string]QuotaWindow, len(item.Windows))
+	for _, window := range item.Windows {
+		windowsByID[window.ID] = window
+	}
+	defaultWindow := windowsByID["codex-1-week"]
+	sparkWindow := windowsByID["codex-bengalfox-1-week"]
+	if defaultWindow.RemainingRatio == nil || math.Abs(*defaultWindow.RemainingRatio-0.42) > 1e-9 || defaultWindow.Source != "active_probe" {
+		t.Fatalf("default weekly quota was overwritten: %+v", defaultWindow)
+	}
+	if sparkWindow.RemainingRatio == nil || math.Abs(*sparkWindow.RemainingRatio-0.98) > 1e-9 || sparkWindow.Source != "response_header" || sparkWindow.Label == nil || *sparkWindow.Label != "GPT-5.3-Codex-Spark" {
+		t.Fatalf("Spark weekly quota = %+v", sparkWindow)
+	}
+}
+
+func TestCodexUnprefixedHeaderWithoutActiveLimitDoesNotReplaceDefaultQuota(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	seedQuotaSnapshotAuth(t, repo, "codex-missing-active-limit", "codex", "Codex Missing Active Limit", map[string]any{"type": "codex"})
+
+	probeAt := time.Date(2026, 7, 22, 4, 0, 0, 0, time.UTC)
+	headerAt := probeAt.Add(time.Minute)
+	expiresAt := probeAt.Add(30 * time.Minute)
+	windowSeconds := int64(7 * 24 * 60 * 60)
+	periodWeek := float64(1)
+	defaultRemaining := 0.42
+	_, errSeed := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: "codex-missing-active-limit", QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &probeAt, ExpiresAt: &expiresAt, LastSuccessAt: &probeAt, ReplaceWindows: true,
+		Windows: []QuotaWindow{{
+			ID: "codex-1-week", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage",
+			RemainingRatio: &defaultRemaining, WindowSeconds: &windowSeconds, PeriodUnit: "week", PeriodValue: &periodWeek,
+			Source: "active_probe", ObservedAt: probeAt,
+		}},
+	})
+	if errSeed != nil {
+		t.Fatalf("seed active probe snapshot: %v", errSeed)
+	}
+
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-missing-active-limit","response_headers":{"X-Codex-Primary-Used-Percent":["2"],"X-Codex-Primary-Window-Minutes":["10080"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
+	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
+		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
+	}
+
+	item, errGet := repo.GetQuotaCredential(ctx, "codex-missing-active-limit", headerAt)
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if len(item.Windows) != 1 || item.Windows[0].ID != "codex-1-week" || item.Windows[0].RemainingRatio == nil || math.Abs(*item.Windows[0].RemainingRatio-0.42) > 1e-9 || item.Windows[0].Source != "active_probe" {
+		t.Fatalf("missing active limit changed default quota: %+v", item)
+	}
+	if item.ObservedAt == nil || !item.ObservedAt.Equal(probeAt) || item.Source == nil || *item.Source != "active_probe" {
+		t.Fatalf("missing active limit changed snapshot metadata: %+v", item)
+	}
+}
+
 func TestCodexSparseHeaderPreservesPartialProbeMetadata(t *testing.T) {
 	ctx := context.Background()
 	repo, closeRepo := newBillingTestRepository(t, ctx)
@@ -309,7 +408,7 @@ func TestCodexSparseHeaderPreservesPartialProbeMetadata(t *testing.T) {
 	}
 
 	resetAt := headerAt.Add(5 * time.Hour).Unix()
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-partial","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-At":["` + fmt.Sprint(resetAt) + `"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-partial","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-At":["` + fmt.Sprint(resetAt) + `"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -355,7 +454,7 @@ func TestPartialHeaderObservationPrunesExpiredWindowsOnly(t *testing.T) {
 	if errSeed != nil {
 		t.Fatalf("seed snapshot: %v", errSeed)
 	}
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-expiring-merge","request_id":"req-expiring-merge","response_headers":{"X-Codex-Primary-Used-Percent":["95"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-expiring-merge","request_id":"req-expiring-merge","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["95"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -415,7 +514,7 @@ func TestSparseHeaderKeepsExpiredAuthoritativeSnapshotPartial(t *testing.T) {
 		t.Fatalf("seed expired authoritative snapshot: %v", errSeed)
 	}
 
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-expired-authoritative","response_headers":{"X-Codex-Primary-Used-Percent":["5"],"X-Codex-Primary-Window-Minutes":["10080"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-expired-authoritative","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["5"],"X-Codex-Primary-Window-Minutes":["10080"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -449,7 +548,7 @@ func TestCodexHeaderPreservesFailedProbeBackoff(t *testing.T) {
 	}
 
 	headerAt := probeAt.Add(2 * time.Minute)
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-header-backoff","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-header-backoff","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -485,6 +584,46 @@ func TestCodexCodeReviewHeaderUsesStableModelIdentity(t *testing.T) {
 	window := windows[0]
 	if window.ID != "codex-code-review-5-hour" || window.Scope != "model" || window.ScopeID == nil || *window.ScopeID != "codex_code_review" || window.Label == nil || *window.Label != "Code Review" {
 		t.Fatalf("code-review header window = %+v", window)
+	}
+}
+
+func TestCodexHeaderRequiresValidActiveLimitForUnprefixedWindows(t *testing.T) {
+	observedAt := time.Date(2026, 7, 22, 3, 45, 0, 0, time.UTC)
+	resetAt := observedAt.Add(7 * 24 * time.Hour).Unix()
+	baseHeaders := http.Header{
+		"X-Codex-Primary-Used-Percent":             []string{"2"},
+		"X-Codex-Primary-Window-Minutes":           []string{"10080"},
+		"X-Codex-Primary-Reset-At":                 []string{strconv.FormatInt(resetAt, 10)},
+		"X-Codex-Bengalfox-Limit-Name":             []string{"GPT-5.3-Codex-Spark"},
+		"X-Codex-Bengalfox-Primary-Used-Percent":   []string{"25"},
+		"X-Codex-Bengalfox-Primary-Window-Minutes": []string{"10080"},
+		"X-Codex-Bengalfox-Primary-Reset-At":       []string{strconv.FormatInt(resetAt, 10)},
+	}
+	for name, activeLimit := range map[string]string{"missing": "", "invalid": "not valid"} {
+		t.Run(name, func(t *testing.T) {
+			headers := baseHeaders.Clone()
+			if activeLimit != "" {
+				headers.Set("X-Codex-Active-Limit", activeLimit)
+			}
+			windows := parseCodexQuotaHeaderWindows(headers, observedAt)
+			if len(windows) != 1 || windows[0].ID != "codex-bengalfox-1-week" || windows[0].RemainingRatio == nil || math.Abs(*windows[0].RemainingRatio-0.75) > 1e-9 {
+				t.Fatalf("%s active limit windows = %+v", name, windows)
+			}
+		})
+	}
+}
+
+func TestCodexUnknownActiveLimitUsesIndependentStableFamily(t *testing.T) {
+	observedAt := time.Date(2026, 7, 22, 3, 50, 0, 0, time.UTC)
+	headers := http.Header{
+		"X-Codex-Active-Limit":                []string{"codex_custom_pool"},
+		"X-Codex-Primary-Used-Percent":        []string{"15"},
+		"X-Codex-Primary-Window-Minutes":      []string{"300"},
+		"X-Codex-Primary-Reset-After-Seconds": []string{"60"},
+	}
+	windows := parseCodexQuotaHeaderWindows(headers, observedAt)
+	if len(windows) != 1 || windows[0].ID != "codex-custom-pool-5-hour" || windows[0].Scope != "model" || windows[0].ScopeID == nil || *windows[0].ScopeID != "codex_custom_pool" {
+		t.Fatalf("unknown active limit window = %+v", windows)
 	}
 }
 
@@ -677,7 +816,7 @@ func TestCodexSnapshotUpgradeSuccessReplacesLegacyWindowsAndKeepsVersion(t *test
 	}
 
 	headerAt := probeAt.Add(time.Minute)
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-upgrade-success","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"codex-upgrade-success","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -924,7 +1063,7 @@ func TestCodexHeaderPreservesInFlightProbeCompletionLease(t *testing.T) {
 		t.Fatalf("ClaimQuotaProbe() = %v, %v", claimed, errClaim)
 	}
 	headerAt := now.Add(10 * time.Second)
-	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"header-wins","request_id":"req-header-wins","response_headers":{"X-Codex-Primary-Used-Percent":["95"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+	payload := `{"timestamp":"` + headerAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"header-wins","request_id":"req-header-wins","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["95"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{CPANodeID: "cpa-new"}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -974,7 +1113,7 @@ func TestCodexDelayedHeaderDoesNotPreserveExpiredProbeLease(t *testing.T) {
 	}
 	headerObservedAt := probeAt.Add(30 * time.Second)
 	receivedAt := probeAt.Add(2 * time.Minute)
-	payload := `{"timestamp":"` + headerObservedAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"delayed-header","quota_headers":{"X-Codex-Primary-Used-Percent":"10","X-Codex-Primary-Window-Minutes":"300","X-Codex-Primary-Reset-After-Seconds":"600"}}`
+	payload := `{"timestamp":"` + headerObservedAt.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"delayed-header","quota_headers":{"X-Codex-Active-Limit":"premium","X-Codex-Primary-Used-Percent":"10","X-Codex-Primary-Window-Minutes":"300","X-Codex-Primary-Reset-After-Seconds":"600"}}`
 	input, ok := quotaSnapshotWriteFromUsagePayload(payload, UsageRuntimeMetadata{}, receivedAt)
 	if !ok {
 		t.Fatal("quotaSnapshotWriteFromUsagePayload() did not return a snapshot")
@@ -1326,7 +1465,7 @@ func TestAppendUsageMapsRuntimeAuthIndexToCredentialUUID(t *testing.T) {
 		t.Fatalf("create compatibility auth: %v", errCreate)
 	}
 
-	payload := `{"timestamp":"2026-07-16T13:00:00Z","provider":"codex","auth_type":"oauth","auth_index":"runtime-index-1","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+	payload := `{"timestamp":"2026-07-16T13:00:00Z","provider":"codex","auth_type":"oauth","auth_index":"runtime-index-1","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -1435,7 +1574,7 @@ func TestAppendUsageRejectsQuotaForMismatchedOrDeletedCredential(t *testing.T) {
 	}
 
 	for _, credentialID := range []string{"quota-provider-mismatch", "quota-deleted-observation"} {
-		payload := `{"timestamp":"2026-07-16T13:30:00Z","provider":"codex","auth_type":"oauth","auth_index":"` + credentialID + `","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+		payload := `{"timestamp":"2026-07-16T13:30:00Z","provider":"codex","auth_type":"oauth","auth_index":"` + credentialID + `","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 		if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 			t.Fatalf("AppendUsageWithRuntime(%s) error = %v", credentialID, errAppend)
 		}
@@ -1480,7 +1619,7 @@ func TestSanitizeUsagePayloadRejectsSecretLikeRequestIDs(t *testing.T) {
 
 func TestQuotaUsageObservationClampsExcessiveFutureTimestamp(t *testing.T) {
 	now := time.Date(2026, 7, 16, 14, 0, 0, 0, time.UTC)
-	payload := `{"timestamp":"2099-01-01T00:00:00Z","provider":"codex","auth_index":"future-auth","quota_headers":{"X-Codex-Primary-Used-Percent":"10","X-Codex-Primary-Window-Minutes":"300","X-Codex-Primary-Reset-After-Seconds":"60"}}`
+	payload := `{"timestamp":"2099-01-01T00:00:00Z","provider":"codex","auth_index":"future-auth","quota_headers":{"X-Codex-Active-Limit":"premium","X-Codex-Primary-Used-Percent":"10","X-Codex-Primary-Window-Minutes":"300","X-Codex-Primary-Reset-After-Seconds":"60"}}`
 	input, ok := quotaSnapshotWriteFromUsagePayload(payload, UsageRuntimeMetadata{}, now)
 	if !ok {
 		t.Fatal("quotaSnapshotWriteFromUsagePayload() did not return a snapshot")
@@ -1510,7 +1649,7 @@ func TestAppendUsageRecoversFromExistingFutureQuotaSnapshot(t *testing.T) {
 	if errFuture != nil {
 		t.Fatalf("UpsertQuotaSnapshot(future) error = %v", errFuture)
 	}
-	payload := `{"timestamp":"` + now.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"future-recovery","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+	payload := `{"timestamp":"` + now.Format(time.RFC3339) + `","provider":"codex","auth_type":"oauth","auth_index":"future-recovery","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
@@ -1687,7 +1826,7 @@ func TestAuthTypeChangeClearsAndRejectsOldQuotaObservation(t *testing.T) {
 	if _, errUpsert := repo.UpsertAuth(ctx, apiKeyAuth, "test"); errUpsert != nil {
 		t.Fatalf("UpsertAuth(API key) error = %v", errUpsert)
 	}
-	payload := `{"timestamp":"2026-07-16T14:46:00Z","provider":"codex","auth_type":"oauth","auth_index":"quota-type-change","response_headers":{"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
+	payload := `{"timestamp":"2026-07-16T14:46:00Z","provider":"codex","auth_type":"oauth","auth_index":"quota-type-change","response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["60"]}}`
 	if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{}); errAppend != nil {
 		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
