@@ -9,6 +9,7 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"gorm.io/gorm"
 )
 
 func TestUsageObservabilityAutoMigrateCreatesDashboardIndexes(t *testing.T) {
@@ -33,6 +34,279 @@ func TestUsageObservabilityAutoMigrateCreatesDashboardIndexes(t *testing.T) {
 		if !db.Migrator().HasIndex(&UsageRecord{}, indexName) {
 			t.Fatalf("usage index %s was not created", indexName)
 		}
+	}
+}
+
+func TestUsageObservabilityRecordQueryDependencies(t *testing.T) {
+	t.Parallel()
+
+	userID := uint(7)
+	clientKeyID := uint(8)
+	zeroID := uint(0)
+	amount := 1.5
+	tests := []struct {
+		name  string
+		query UsageObservabilityRecordQuery
+		want  usageObservabilityRecordQueryDependencies
+	}{
+		{
+			name: "usage fields only",
+			query: UsageObservabilityRecordQuery{
+				Provider:         "openai",
+				Model:            "gpt",
+				Status:           "failed",
+				RequestID:        "req-1",
+				CredentialType:   "oauth",
+				EventType:        "completion",
+				CPANode:          "node-a",
+				RequestLogSearch: "failed",
+			},
+		},
+		{name: "inactive related fields", query: UsageObservabilityRecordQuery{User: "  ", UserID: &zeroID, ClientKeyID: &zeroID}},
+		{
+			name:  "user text",
+			query: UsageObservabilityRecordQuery{User: "alice"},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true, APIKey: true, User: true},
+		},
+		{
+			name:  "user id",
+			query: UsageObservabilityRecordQuery{UserID: &userID},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true, APIKey: true},
+		},
+		{
+			name:  "client key",
+			query: UsageObservabilityRecordQuery{ClientKey: "client-key"},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true, APIKey: true},
+		},
+		{
+			name:  "client key id",
+			query: UsageObservabilityRecordQuery{ClientKeyID: &clientKeyID},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true, APIKey: true},
+		},
+		{
+			name:  "credential id",
+			query: UsageObservabilityRecordQuery{CredentialID: "credential-1"},
+			want:  usageObservabilityRecordQueryDependencies{Auth: true},
+		},
+		{
+			name:  "auth index",
+			query: UsageObservabilityRecordQuery{AuthIndex: "auth-1"},
+			want:  usageObservabilityRecordQueryDependencies{Auth: true},
+		},
+		{
+			name:  "minimum amount",
+			query: UsageObservabilityRecordQuery{MinAmount: &amount},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true},
+		},
+		{
+			name:  "maximum amount",
+			query: UsageObservabilityRecordQuery{MaxAmount: &amount},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true},
+		},
+		{
+			name:  "global search",
+			query: UsageObservabilityRecordQuery{Search: "needle"},
+			want:  usageObservabilityRecordQueryDependencies{Billing: true, APIKey: true, User: true, Auth: true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := usageObservabilityRecordQueryDependenciesFor(test.query); got != test.want {
+				t.Fatalf("dependencies = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestUsageObservabilityExactScopesPruneOnlyUnneededJoins(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+
+	from := time.Date(2026, time.July, 25, 0, 0, 0, 0, time.UTC)
+	to := from.Add(24 * time.Hour)
+	statusCode := 500
+	minLatency := int64(100)
+	maxLatency := int64(5000)
+	usageOnly := UsageObservabilityRecordQuery{
+		From:             &from,
+		To:               &to,
+		Provider:         "openai",
+		Model:            "gpt",
+		HomeIP:           "192.0.2.1",
+		Endpoint:         "/v1/responses",
+		CredentialType:   "oauth",
+		Status:           "failed",
+		StatusCode:       &statusCode,
+		RequestID:        "req-1",
+		ExecutorType:     "CodexExecutor",
+		EventType:        "completion",
+		CPANode:          "node-a",
+		MinLatencyMS:     &minLatency,
+		MaxLatencyMS:     &maxLatency,
+		RequestLogSearch: "failed",
+	}
+	countSQL := usageObservabilityDryRunCountSQL(t, db, usageOnly)
+	assertUsageObservabilitySQLHasNoJoins(t, countSQL)
+	if !strings.Contains(countSQL, "COUNT(*)") {
+		t.Fatalf("usage-only count SQL = %q, want COUNT(*)", countSQL)
+	}
+	optionSQL := usageObservabilityDryRunOptionSQL(t, db, usageOnly)
+	assertUsageObservabilitySQLHasNoJoins(t, optionSQL)
+
+	userID := uint(7)
+	clientKeyID := uint(8)
+	amount := 1.5
+	relatedQueries := []struct {
+		name  string
+		query UsageObservabilityRecordQuery
+	}{
+		{name: "user", query: UsageObservabilityRecordQuery{User: "alice"}},
+		{name: "user id", query: UsageObservabilityRecordQuery{UserID: &userID}},
+		{name: "client key", query: UsageObservabilityRecordQuery{ClientKey: "client-key"}},
+		{name: "client key id", query: UsageObservabilityRecordQuery{ClientKeyID: &clientKeyID}},
+		{name: "credential id", query: UsageObservabilityRecordQuery{CredentialID: "credential-1"}},
+		{name: "auth index", query: UsageObservabilityRecordQuery{AuthIndex: "auth-1"}},
+		{name: "minimum amount", query: UsageObservabilityRecordQuery{MinAmount: &amount}},
+		{name: "maximum amount", query: UsageObservabilityRecordQuery{MaxAmount: &amount}},
+		{name: "global search", query: UsageObservabilityRecordQuery{Search: "needle"}},
+	}
+	for _, test := range relatedQueries {
+		t.Run(test.name, func(t *testing.T) {
+			countSQL := usageObservabilityDryRunCountSQL(t, db, test.query)
+			if !strings.Contains(countSQL, " JOIN ") || !strings.Contains(countSQL, `COUNT(DISTINCT "usage"."id")`) {
+				t.Fatalf("related count SQL = %q, want full joins and distinct usage count", countSQL)
+			}
+			optionSQL := usageObservabilityDryRunOptionSQL(t, db, test.query)
+			if !strings.Contains(optionSQL, " JOIN ") {
+				t.Fatalf("related option SQL = %q, want full joins", optionSQL)
+			}
+		})
+	}
+}
+
+func TestUsageObservabilityExactScopesPreserveResultsWithDuplicatingJoins(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	auths := []AuthRecord{
+		{UUID: "uuid-one", AuthJSON: JSONB(`{}`), Version: 1, ID: "id-one", Index: "shared-index", Provider: "openai", CreatedAt: now, UpdatedAt: now},
+		{UUID: "uuid-two", AuthJSON: JSONB(`{}`), Version: 1, ID: "id-two", Index: "shared-index", Provider: "openai", CreatedAt: now, UpdatedAt: now},
+	}
+	if errCreate := db.Create(&auths).Error; errCreate != nil {
+		t.Fatalf("Create(auths) error = %v", errCreate)
+	}
+	usageRecords := []UsageRecord{
+		{Timestamp: now, Provider: "openai", Model: "model-a", AuthIndex: "shared-index", EventType: "completion", UpstreamStatusCode: 200, PayloadJSON: JSONB(`{}`), CreatedAt: now},
+		{Timestamp: now.Add(time.Second), Provider: "gemini", Model: "model-b", AuthIndex: "shared-index", EventType: "completion", UpstreamStatusCode: 200, PayloadJSON: JSONB(`{}`), CreatedAt: now},
+	}
+	if errCreate := db.Create(&usageRecords).Error; errCreate != nil {
+		t.Fatalf("Create(usage) error = %v", errCreate)
+	}
+
+	query := UsageObservabilityRecordQuery{EventType: "completion"}
+	var oldCount int64
+	if errCount := usageObservabilityRecordScope(db.Table("usage"), query).
+		Select(`COUNT(DISTINCT "usage"."id")`).Scan(&oldCount).Error; errCount != nil {
+		t.Fatalf("old count error = %v", errCount)
+	}
+	var newCount int64
+	if errCount := usageObservabilityRecordCountQuery(db.Table("usage"), query).Scan(&newCount).Error; errCount != nil {
+		t.Fatalf("new count error = %v", errCount)
+	}
+	if oldCount != 2 || newCount != oldCount {
+		t.Fatalf("counts old=%d new=%d, want both 2", oldCount, newCount)
+	}
+
+	type valueRow struct {
+		Value string `gorm:"column:value"`
+	}
+	var oldRows []valueRow
+	if errFind := usageObservabilityRecordScope(db.Table("usage"), query).
+		Where(`"usage"."provider" IS NOT NULL`).
+		Where(`TRIM("usage"."provider") <> ''`).
+		Select(`DISTINCT "usage"."provider" AS value`).
+		Order("value ASC").
+		Limit(500).
+		Scan(&oldRows).Error; errFind != nil {
+		t.Fatalf("old provider options error = %v", errFind)
+	}
+	oldProviders := make([]string, 0, len(oldRows))
+	for _, row := range oldRows {
+		oldProviders = append(oldProviders, row.Value)
+	}
+	newOptions, errOptions := repo.UsageObservabilityFilterOptions(ctx, query)
+	if errOptions != nil {
+		t.Fatalf("UsageObservabilityFilterOptions() error = %v", errOptions)
+	}
+	if strings.Join(newOptions.Providers, "\x00") != strings.Join(oldProviders, "\x00") {
+		t.Fatalf("provider options old=%v new=%v", oldProviders, newOptions.Providers)
+	}
+
+	relatedQuery := UsageObservabilityRecordQuery{CredentialID: "uuid-one"}
+	var oldRelatedCount int64
+	if errCount := usageObservabilityRecordScope(db.Table("usage"), relatedQuery).
+		Select(`COUNT(DISTINCT "usage"."id")`).Scan(&oldRelatedCount).Error; errCount != nil {
+		t.Fatalf("old related count error = %v", errCount)
+	}
+	var newRelatedCount int64
+	if errCount := usageObservabilityRecordCountQuery(db.Table("usage"), relatedQuery).Scan(&newRelatedCount).Error; errCount != nil {
+		t.Fatalf("new related count error = %v", errCount)
+	}
+	if newRelatedCount != oldRelatedCount {
+		t.Fatalf("related counts old=%d new=%d", oldRelatedCount, newRelatedCount)
+	}
+}
+
+func usageObservabilityDryRunCountSQL(t *testing.T, db *gorm.DB, query UsageObservabilityRecordQuery) string {
+	t.Helper()
+	var total int64
+	statement := usageObservabilityRecordCountQuery(db.Session(&gorm.Session{DryRun: true}).Table("usage"), query).Scan(&total).Statement
+	if statement == nil || statement.SQL.Len() == 0 {
+		t.Fatal("count dry-run SQL is empty")
+	}
+	return statement.SQL.String()
+}
+
+func usageObservabilityDryRunOptionSQL(t *testing.T, db *gorm.DB, query UsageObservabilityRecordQuery) string {
+	t.Helper()
+	type valueRow struct {
+		Value string `gorm:"column:value"`
+	}
+	var rows []valueRow
+	scope, _ := usageObservabilityRecordFilterScope(db.Session(&gorm.Session{DryRun: true}).Table("usage"), query)
+	statement := scope.
+		Where(`"usage"."provider" IS NOT NULL`).
+		Where(`TRIM("usage"."provider") <> ''`).
+		Select(`DISTINCT "usage"."provider" AS value`).
+		Order("value ASC").
+		Limit(500).
+		Scan(&rows).Statement
+	if statement == nil || statement.SQL.Len() == 0 {
+		t.Fatal("filter option dry-run SQL is empty")
+	}
+	return statement.SQL.String()
+}
+
+func assertUsageObservabilitySQLHasNoJoins(t *testing.T, sql string) {
+	t.Helper()
+	if strings.Contains(sql, " JOIN ") {
+		t.Fatalf("SQL = %q, want usage-only query without joins", sql)
 	}
 }
 

@@ -623,12 +623,12 @@ func (r *Repository) ListUsageObservabilityRecords(ctx context.Context, query Us
 	}
 	query.Limit, query.Offset = normalizeUsageObservabilityPagination(query.Limit, query.Offset, UsageObservabilityDefaultRecordLimit, maxLimit)
 
-	scope := usageObservabilityRecordScope(db.WithContext(contextOrBackground(ctx)).Table("usage"), query)
 	var total int64
-	if errCount := scope.Session(&gorm.Session{}).Select(`COUNT(DISTINCT "usage"."id")`).Scan(&total).Error; errCount != nil {
+	if errCount := usageObservabilityRecordCountQuery(db.WithContext(contextOrBackground(ctx)).Table("usage"), query).Scan(&total).Error; errCount != nil {
 		return UsageObservabilityRecordListResult{}, errCount
 	}
 
+	scope := usageObservabilityRecordScope(db.WithContext(contextOrBackground(ctx)).Table("usage"), query)
 	var rows []usageObservabilityRecordRow
 	if errFind := scope.Session(&gorm.Session{}).
 		Select(usageObservabilityRecordSelect()).
@@ -2170,12 +2170,69 @@ func usageObservabilityRecordScope(scope *gorm.DB, query UsageObservabilityRecor
 	return usageObservabilityApplyRecordFilters(scope, query)
 }
 
+type usageObservabilityRecordQueryDependencies struct {
+	Billing bool
+	APIKey  bool
+	User    bool
+	Auth    bool
+}
+
+func usageObservabilityRecordQueryDependenciesFor(query UsageObservabilityRecordQuery) usageObservabilityRecordQueryDependencies {
+	dependencies := usageObservabilityRecordQueryDependencies{}
+	if strings.TrimSpace(query.User) != "" {
+		dependencies.Billing = true
+		dependencies.APIKey = true
+		dependencies.User = true
+	}
+	if normalizeOptionalUint(query.UserID) != nil {
+		dependencies.Billing = true
+		dependencies.APIKey = true
+	}
+	if strings.TrimSpace(query.ClientKey) != "" || normalizeOptionalUint(query.ClientKeyID) != nil {
+		dependencies.Billing = true
+		dependencies.APIKey = true
+	}
+	if strings.TrimSpace(query.CredentialID) != "" || strings.TrimSpace(query.AuthIndex) != "" {
+		dependencies.Auth = true
+	}
+	if query.MinAmount != nil || query.MaxAmount != nil {
+		dependencies.Billing = true
+	}
+	if strings.TrimSpace(query.Search) != "" {
+		dependencies.Billing = true
+		dependencies.APIKey = true
+		dependencies.User = true
+		dependencies.Auth = true
+	}
+	return dependencies
+}
+
+func (d usageObservabilityRecordQueryDependencies) requiresRelatedRecords() bool {
+	return d.Billing || d.APIKey || d.User || d.Auth
+}
+
+func usageObservabilityRecordFilterScope(scope *gorm.DB, query UsageObservabilityRecordQuery) (*gorm.DB, bool) {
+	if usageObservabilityRecordQueryDependenciesFor(query).requiresRelatedRecords() {
+		return usageObservabilityRecordScope(scope, query), true
+	}
+	return usageObservabilityApplyRecordFilters(scope, query), false
+}
+
+func usageObservabilityRecordCountQuery(scope *gorm.DB, query UsageObservabilityRecordQuery) *gorm.DB {
+	filtered, joined := usageObservabilityRecordFilterScope(scope, query)
+	if joined {
+		return filtered.Select(`COUNT(DISTINCT "usage"."id")`)
+	}
+	return filtered.Select("COUNT(*)")
+}
+
 func usageObservabilityDistinctStrings(ctx context.Context, db *gorm.DB, query UsageObservabilityRecordQuery, expression string) ([]string, error) {
 	type valueRow struct {
 		Value string `gorm:"column:value"`
 	}
 	var rows []valueRow
-	scope := usageObservabilityRecordScope(db.WithContext(ctx).Table("usage"), query).
+	scope, _ := usageObservabilityRecordFilterScope(db.WithContext(ctx).Table("usage"), query)
+	scope = scope.
 		Where(expression + ` IS NOT NULL`).
 		Where(`TRIM(` + expression + `) <> ''`).
 		Select(`DISTINCT ` + expression + ` AS value`).
@@ -2207,7 +2264,8 @@ func usageObservabilityDistinctStatusCodes(ctx context.Context, db *gorm.DB, que
 	}
 	expression := usageObservabilityEffectiveStatusCodeSQL()
 	var rows []valueRow
-	scope := usageObservabilityRecordScope(db.WithContext(ctx).Table("usage"), query).
+	scope, _ := usageObservabilityRecordFilterScope(db.WithContext(ctx).Table("usage"), query)
+	scope = scope.
 		Where(expression + ` > 0`).
 		Select(`DISTINCT ` + expression + ` AS value`).
 		Order("value ASC").
