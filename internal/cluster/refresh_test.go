@@ -17,6 +17,24 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 )
 
+func markRefreshTestMaster(t *testing.T, repo *Repository, coordinator *Coordinator) {
+	t.Helper()
+	if repo == nil || coordinator == nil {
+		t.Fatal("refresh test master is unavailable")
+	}
+	now := time.Now().UTC()
+	if errCreate := repo.db.Create(&ClusterNodeRecord{
+		IP:         coordinator.node.IP,
+		Port:       coordinator.node.Port,
+		IsMaster:   true,
+		StartedAt:  coordinator.node.StartedAt,
+		LastSeenAt: now,
+	}).Error; errCreate != nil {
+		t.Fatalf("create refresh test master: %v", errCreate)
+	}
+	coordinator.setMaster(true)
+}
+
 func TestNewRefreshControllerStoresForwardTLSConfig(t *testing.T) {
 	t.Parallel()
 
@@ -209,7 +227,7 @@ func TestRefreshControllerMasterFailureFailsClosedWhenIndexSyncFails(t *testing.
 	t.Cleanup(runtime.Stop)
 
 	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9300, Secret: "master-secret"}, CoordinatorOptions{})
-	coordinator.setMaster(true)
+	markRefreshTestMaster(t, repo, coordinator)
 	controller := NewRefreshController(coordinator, runtime, repo, nil)
 
 	_, errRefresh := controller.RefreshNow(ctx, authID)
@@ -233,7 +251,7 @@ func TestRefreshControllerMasterInvalidGrantPersistsDisabledAuth(t *testing.T) {
 	transport := &refreshTestRoundTripper{body: `{"error":"invalid_grant","error_description":"Token has been expired or revoked.","access_token":"response-access-secret"}`}
 	runtime := newRefreshTestRuntime(t, repo, auth, transport)
 	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9301, Secret: "master-secret"}, CoordinatorOptions{})
-	coordinator.setMaster(true)
+	markRefreshTestMaster(t, repo, coordinator)
 	controller := NewRefreshController(coordinator, runtime, repo, nil)
 
 	_, errRefresh := controller.RefreshNow(ctx, authID)
@@ -295,22 +313,8 @@ func TestRefreshControllerStandbyPreservesTerminalMasterError(t *testing.T) {
 
 	masterIdentity := NodeIdentity{IP: "127.0.0.1", Port: 9401, Secret: "master-secret", StartedAt: time.Now().UTC().Add(-time.Minute)}
 	masterCoordinator := NewCoordinator(repo, masterIdentity, CoordinatorOptions{})
-	masterCoordinator.setMaster(true)
+	markRefreshTestMaster(t, repo, masterCoordinator)
 	masterController := NewRefreshController(masterCoordinator, masterRuntime, repo, nil)
-
-	db, errDB := repo.database()
-	if errDB != nil {
-		t.Fatalf("repository database: %v", errDB)
-	}
-	if errCreate := db.Create(&ClusterNodeRecord{
-		IP:         masterIdentity.IP,
-		Port:       masterIdentity.Port,
-		IsMaster:   true,
-		StartedAt:  masterIdentity.StartedAt,
-		LastSeenAt: time.Now().UTC(),
-	}).Error; errCreate != nil {
-		t.Fatalf("create master node: %v", errCreate)
-	}
 
 	standbyCoordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.2", Port: 9402, Secret: "standby-secret"}, CoordinatorOptions{})
 	standbyCoordinator.setMaster(false)

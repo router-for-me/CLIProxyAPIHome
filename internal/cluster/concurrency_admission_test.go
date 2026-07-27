@@ -255,7 +255,7 @@ func TestReadConcurrencyStateReturnsAuthoritativeCounters(t *testing.T) {
 	}
 }
 
-func TestLockActiveConcurrencyLifetimeTxUsesCurrentHomeInsteadOfSubscriptionOwner(t *testing.T) {
+func TestLockActiveConcurrencyLifetimeTxRejectsNonOwnerHome(t *testing.T) {
 	repo := newCredentialFoundationTestRepository(t)
 	seedConcurrencyAdmissionLifetime(t, repo, "fp-a", "subscription-home")
 	currentHome := HomeProcessIncarnationRecord{
@@ -272,7 +272,7 @@ func TestLockActiveConcurrencyLifetimeTxUsesCurrentHomeInsteadOfSubscriptionOwne
 			Home: HomeIncarnationID{IP: currentHome.HomeIP, Port: currentHome.HomePort, StartedAt: currentHome.StartedAt},
 		})
 	})
-	if errTransaction != nil {
-		t.Fatal(errTransaction)
+	if !errors.Is(errTransaction, ErrConcurrencyNodeUnavailable) {
+		t.Fatalf("LockActiveConcurrencyLifetimeTx() error = %v, want %v", errTransaction, ErrConcurrencyNodeUnavailable)
 	}
 }

@@ -54,6 +54,39 @@ func (r *Repository) BeginFingerprintCancellation(ctx context.Context, fingerpri
 	return revision, errTransaction
 }
 
+// BeginFingerprintCancellationForLifetime starts cancellation only when the exact connection lifetime is still active.
+func (r *Repository) BeginFingerprintCancellationForLifetime(ctx context.Context, lifetime ConnectionLifetime) (int64, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return 0, errDB
+	}
+	lifetime.Fingerprint = strings.TrimSpace(lifetime.Fingerprint)
+	lifetime.Home.IP = strings.TrimSpace(lifetime.Home.IP)
+	if !lifetime.Controlled || lifetime.Fingerprint == "" || lifetime.ConnectedAt.IsZero() || lifetime.Home.IP == "" || lifetime.Home.Port <= 0 || lifetime.Home.StartedAt.IsZero() {
+		return 0, ErrMembershipNotActive
+	}
+
+	var revision int64
+	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		membership := CPANodeMembershipRecord{}
+		errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", lifetime.Fingerprint).First(&membership).Error
+		if errors.Is(errLock, gorm.ErrRecordNotFound) {
+			return ErrMembershipNotActive
+		}
+		if errLock != nil {
+			return errLock
+		}
+		recordQuiescenceLock(ctx, "membership")
+		if membership.State != MembershipStateActive || !membership.ConnectedAt.Equal(lifetime.ConnectedAt) || !membershipOwnedByHome(membership, lifetime.Home) {
+			return ErrMembershipNotActive
+		}
+		var errBegin error
+		revision, errBegin = beginFingerprintCancellationForMembershipTx(ctx, tx, &membership, time.Time{})
+		return errBegin
+	})
+	return revision, errTransaction
+}
+
 func beginFingerprintCancellationTx(ctx context.Context, tx *gorm.DB, fingerprint string, now time.Time) (int64, error) {
 	membership := CPANodeMembershipRecord{}
 	if errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", fingerprint).First(&membership).Error; errLock != nil {
@@ -355,7 +388,7 @@ func (r *Repository) RefreshCPALiveness(ctx context.Context, lifetime Connection
 		if errMember != nil {
 			return errMember
 		}
-		if membership.State != MembershipStateActive || !membership.ConnectedAt.Equal(lifetime.ConnectedAt) {
+		if membership.State != MembershipStateActive || !membership.ConnectedAt.Equal(lifetime.ConnectedAt) || !membershipOwnedByHome(membership, lifetime.Home) {
 			return ErrMembershipNotActive
 		}
 		if errHome := verifyActiveHomeIncarnation(tx, lifetime.Home); errHome != nil {

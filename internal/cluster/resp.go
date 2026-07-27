@@ -44,15 +44,15 @@ func NewRESPHandler(coordinator *Coordinator, refresh *RefreshController, repo *
 	}
 }
 
-// UpdateClientCount stores the current active CPA client count for this node.
-// BeginFingerprintCancellation starts distributed cancellation for an ambiguous dispatch delivery.
-func (h *RESPHandler) BeginFingerprintCancellation(ctx context.Context, fingerprint string) (int64, error) {
+// BeginFingerprintCancellationForLifetime starts distributed cancellation for an ambiguous dispatch delivery.
+func (h *RESPHandler) BeginFingerprintCancellationForLifetime(ctx context.Context, lifetime ConnectionLifetime) (int64, error) {
 	if h == nil || h.repo == nil {
 		return 0, fmt.Errorf("cluster resp: membership handler is not ready")
 	}
-	return h.repo.BeginFingerprintCancellation(ctx, fingerprint)
+	return h.repo.BeginFingerprintCancellationForLifetime(ctx, lifetime)
 }
 
+// UpdateClientCount stores the current active CPA client count for this node.
 func (h *RESPHandler) UpdateClientCount(ctx context.Context, clientCount int) error {
 	if h == nil || h.coordinator == nil {
 		return nil
@@ -89,7 +89,7 @@ func (h *RESPHandler) RefreshCPALiveness(ctx context.Context, lifetime Connectio
 }
 
 // SubscribeMembership creates a membership owned by this Home incarnation.
-func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint string, nodeID string, protocolVersion int, lifecycleConfigRevision int64) (ConnectionLifetime, error) {
+func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint string, nodeID string, protocolVersion int, lifecycleConfigRevision int64, takeover bool) (ConnectionLifetime, error) {
 	if h == nil || h.repo == nil || h.coordinator == nil {
 		return ConnectionLifetime{}, fmt.Errorf("cluster resp: membership handler is not ready")
 	}
@@ -103,6 +103,7 @@ func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint strin
 		Home:                    home,
 		ProtocolVersion:         protocolVersion,
 		LifecycleConfigRevision: lifecycleConfigRevision,
+		Takeover:                takeover,
 	})
 	if errSubscribe != nil {
 		return ConnectionLifetime{}, errSubscribe

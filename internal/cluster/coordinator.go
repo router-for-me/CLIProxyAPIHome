@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -45,11 +46,14 @@ type Coordinator struct {
 	onMasterChanged   func(bool)
 	startupRecovery   StartupRecovery
 
-	mu              sync.RWMutex
-	isMaster        bool
-	masterKnown     bool
-	initialized     bool
-	homeIncarnation HomeIncarnationID
+	mu               sync.RWMutex
+	masterCallbackMu sync.Mutex
+	isMaster         bool
+	masterKnown      bool
+	masterLease      uint64
+	masterTimer      *time.Timer
+	initialized      bool
+	homeIncarnation  HomeIncarnationID
 }
 
 type NodeIdentity struct {
@@ -218,15 +222,15 @@ func (c *Coordinator) Start(ctx context.Context) error {
 				return nil
 			}
 			if errHeartbeat := c.heartbeatHomeIncarnation(ctx); errHeartbeat != nil {
+				c.setMaster(false)
 				if ctx.Err() != nil {
-					c.setMaster(false)
 					return nil
 				}
 				return errHeartbeat
 			}
 			if errBeat := c.heartbeatAndElect(ctx); errBeat != nil {
+				c.setMaster(false)
 				if ctx.Err() != nil {
-					c.setMaster(false)
 					return nil
 				}
 				return errBeat
@@ -346,19 +350,18 @@ func (c *Coordinator) CurrentMaster(ctx context.Context) (*ClusterNodeRecord, er
 	if errNow != nil {
 		return nil, errNow
 	}
-	cutoff := now.Add(-c.heartbeatTimeout)
-	var liveNodes []ClusterNodeRecord
-	errFind := db.WithContext(contextOrBackground(ctx)).
-		Where("last_seen_at >= ?", cutoff).
-		Find(&liveNodes).Error
-	if errFind != nil {
-		return nil, errFind
-	}
-	if len(liveNodes) == 0 {
+	record := ClusterNodeRecord{}
+	errFirst := db.WithContext(contextOrBackground(ctx)).
+		Where("is_master = ? AND last_seen_at >= ?", true, now.Add(-c.heartbeatTimeout)).
+		Order("started_at ASC, ip ASC, port ASC").
+		First(&record).Error
+	if errors.Is(errFirst, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
-	sortClusterNodes(liveNodes)
-	return &liveNodes[0], nil
+	if errFirst != nil {
+		return nil, errFirst
+	}
+	return &record, nil
 }
 
 // heartbeatAndElect handles a heartbeat and elect.
@@ -369,45 +372,65 @@ func (c *Coordinator) heartbeatAndElect(ctx context.Context) error {
 		return errDB
 	}
 
-	now, errNow := DatabaseNow(ctx, db)
-	if errNow != nil {
-		return errNow
-	}
-	record := ClusterNodeRecord{
-		IP:          c.node.IP,
-		Port:        c.node.Port,
-		SecretHash:  nodeSecretHash(c.node.Secret),
-		IsMaster:    c.IsMaster(),
-		ClientCount: node.GlobalRegistry().TotalCount(),
-		StartedAt:   c.node.StartedAt,
-		LastSeenAt:  now,
-	}
+	var elected ClusterNodeRecord
+	var seenAt time.Time
+	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		gate := ClusterMasterGateRecord{ID: 1}
+		if errCreate := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&gate).Error; errCreate != nil {
+			return errCreate
+		}
+		if errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&gate, "id = ?", 1).Error; errLock != nil {
+			return errLock
+		}
 
-	if errUpsert := db.WithContext(contextOrBackground(ctx)).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "ip"}, {Name: "port"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"started_at":   record.StartedAt,
-			"last_seen_at": record.LastSeenAt,
-			"secret_hash":  record.SecretHash,
-			"client_count": record.ClientCount,
-			"is_master":    record.IsMaster,
-		}),
-	}).Create(&record).Error; errUpsert != nil {
-		return errUpsert
+		now, errNow := DatabaseNow(ctx, tx)
+		if errNow != nil {
+			return errNow
+		}
+		seenAt = now
+		record := ClusterNodeRecord{
+			IP:          c.node.IP,
+			Port:        c.node.Port,
+			SecretHash:  nodeSecretHash(c.node.Secret),
+			ClientCount: node.GlobalRegistry().TotalCount(),
+			StartedAt:   c.node.StartedAt,
+			LastSeenAt:  now,
+		}
+		if errUpsert := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "ip"}, {Name: "port"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"started_at":   record.StartedAt,
+				"last_seen_at": record.LastSeenAt,
+				"secret_hash":  record.SecretHash,
+				"client_count": record.ClientCount,
+			}),
+		}).Create(&record).Error; errUpsert != nil {
+			return errUpsert
+		}
+
+		var liveNodes []ClusterNodeRecord
+		if errFind := tx.Where("last_seen_at >= ?", now.Add(-c.heartbeatTimeout)).Find(&liveNodes).Error; errFind != nil {
+			return errFind
+		}
+		if len(liveNodes) == 0 {
+			return fmt.Errorf("cluster election found no live nodes")
+		}
+		sortClusterNodes(liveNodes)
+		elected = liveNodes[0]
+		if errClear := tx.Model(&ClusterNodeRecord{}).Where("is_master = ?", true).Update("is_master", false).Error; errClear != nil {
+			return errClear
+		}
+		return tx.Model(&ClusterNodeRecord{}).
+			Where("ip = ? AND port = ? AND started_at = ?", elected.IP, elected.Port, elected.StartedAt).
+			Update("is_master", true).Error
+	})
+	if errTransaction != nil {
+		return errTransaction
 	}
-	if errSnapshot := c.syncCPANodeSnapshot(ctx, now); errSnapshot != nil {
+	c.setMaster(clusterNodeMatches(elected, c.node.IP, c.node.Port))
+	if errSnapshot := c.syncCPANodeSnapshot(ctx, seenAt); errSnapshot != nil {
 		log.Warnf("failed to sync CPA node snapshot: %v", errSnapshot)
 	}
-
-	elected, errMaster := c.CurrentMaster(ctx)
-	if errMaster != nil {
-		return errMaster
-	}
-	if elected == nil {
-		return fmt.Errorf("cluster election found no live nodes")
-	}
-
-	c.setMaster(clusterNodeMatches(*elected, c.node.IP, c.node.Port))
 	return nil
 }
 
@@ -455,11 +478,50 @@ func (c *Coordinator) setMaster(next bool) {
 	changed := !c.masterKnown || c.isMaster != next
 	c.isMaster = next
 	c.masterKnown = true
-	callback := c.onMasterChanged
+	c.masterLease++
+	lease := c.masterLease
+	if c.masterTimer != nil {
+		c.masterTimer.Stop()
+		c.masterTimer = nil
+	}
+	if next {
+		c.masterTimer = time.AfterFunc(c.heartbeatTimeout, func() {
+			c.expireMasterLease(lease)
+		})
+	}
 	c.mu.Unlock()
 
-	if changed && callback != nil {
-		callback(next)
+	if changed {
+		c.notifyMasterChanged(next)
+	}
+}
+
+func (c *Coordinator) expireMasterLease(lease uint64) {
+	c.mu.Lock()
+	if c.masterLease != lease || !c.isMaster {
+		c.mu.Unlock()
+		return
+	}
+	c.isMaster = false
+	c.masterKnown = true
+	c.masterTimer = nil
+	c.mu.Unlock()
+	c.notifyMasterChanged(false)
+}
+
+func (c *Coordinator) notifyMasterChanged(master bool) {
+	c.masterCallbackMu.Lock()
+	defer c.masterCallbackMu.Unlock()
+
+	c.mu.RLock()
+	if c.isMaster != master {
+		c.mu.RUnlock()
+		return
+	}
+	callback := c.onMasterChanged
+	c.mu.RUnlock()
+	if callback != nil {
+		callback(master)
 	}
 }
 
