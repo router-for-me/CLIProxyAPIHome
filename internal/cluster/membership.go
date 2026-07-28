@@ -158,12 +158,13 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 			}
 		}
 
-		now, errNow := DatabaseNow(ctx, tx)
+		dbNow, errNow := DatabaseNow(ctx, tx)
 		if errNow != nil {
 			return errNow
 		}
-		if !previous.ConnectedAt.IsZero() && !now.After(previous.ConnectedAt) {
-			now = previous.ConnectedAt.Add(databaseTimestampStep(tx))
+		connectedAt := dbNow
+		if !previous.ConnectedAt.IsZero() && !connectedAt.After(previous.ConnectedAt) {
+			connectedAt = previous.ConnectedAt.Add(databaseTimestampStep(tx))
 		}
 		accepted = CPANodeMembershipRecord{
 			CertificateFingerprint:  request.Fingerprint,
@@ -173,13 +174,13 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 			HomeStartedAt:           request.Home.StartedAt,
 			ProtocolVersion:         request.ProtocolVersion,
 			State:                   MembershipStateActive,
-			ConnectedAt:             now,
+			ConnectedAt:             connectedAt,
 			LifecycleConfigRevision: lifecycle.Revision,
 			CPAHeartbeatTimeout:     cfg.CPAHeartbeatTimeout,
 			CPACancelBound:          cfg.CPACancelBound,
 			ReclaimGrace:            cfg.ReclaimGrace,
-			LastSeenAt:              now,
-			UpdatedAt:               now,
+			LastSeenAt:              dbNow,
+			UpdatedAt:               dbNow,
 		}
 		return tx.Save(&accepted).Error
 	})

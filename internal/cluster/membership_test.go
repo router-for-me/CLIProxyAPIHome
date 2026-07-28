@@ -111,6 +111,60 @@ func TestSubscribeMembershipRejectsDifferentNodeAndAllowsSameNodeTakeover(t *tes
 	}
 }
 
+func TestSubscribeMembershipKeepsTakeoverLivenessAtDatabaseTime(t *testing.T) {
+	ctx := context.Background()
+	repo := newCredentialFoundationTestRepository(t)
+	home, errHome := repo.RegisterHomeIncarnation(ctx, "10.0.0.1", 8317, []string{"credential_concurrency_foundation_v1"})
+	if errHome != nil {
+		t.Fatal(errHome)
+	}
+	revision, errUpdate := repo.UpdateLifecycleConfig(ctx, 20*time.Second, config.DefaultCredentialConcurrencyConfig())
+	if errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	first, errFirst := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-a", NodeID: "cpa-a", Home: home, ProtocolVersion: 1, LifecycleConfigRevision: revision})
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+
+	futureConnectedAt := first.ConnectedAt.Add(10 * time.Minute)
+	if errFuture := repo.db.Model(&CPANodeMembershipRecord{}).
+		Where("certificate_fingerprint = ?", first.CertificateFingerprint).
+		Update("connected_at", futureConnectedAt).Error; errFuture != nil {
+		t.Fatal(errFuture)
+	}
+	dbNowBefore, errNow := DatabaseNow(ctx, repo.db)
+	if errNow != nil {
+		t.Fatal(errNow)
+	}
+
+	takenOver, errTakeover := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-a", NodeID: "cpa-a", Home: home, ProtocolVersion: 1, LifecycleConfigRevision: revision, Takeover: true})
+	if errTakeover != nil {
+		t.Fatal(errTakeover)
+	}
+	dbNowAfter, errNow := DatabaseNow(ctx, repo.db)
+	if errNow != nil {
+		t.Fatal(errNow)
+	}
+	persisted := CPANodeMembershipRecord{}
+	if errPersisted := repo.db.First(&persisted, "certificate_fingerprint = ?", takenOver.CertificateFingerprint).Error; errPersisted != nil {
+		t.Fatal(errPersisted)
+	}
+
+	if !takenOver.ConnectedAt.After(futureConnectedAt) {
+		t.Fatalf("takeover connected_at = %s, want after %s", takenOver.ConnectedAt, futureConnectedAt)
+	}
+	if !persisted.ConnectedAt.Equal(takenOver.ConnectedAt) {
+		t.Fatalf("persisted connected_at = %s, want %s", persisted.ConnectedAt, takenOver.ConnectedAt)
+	}
+	if persisted.LastSeenAt.Before(dbNowBefore) || persisted.LastSeenAt.After(dbNowAfter) {
+		t.Fatalf("persisted last_seen_at = %s, want database time between %s and %s", persisted.LastSeenAt, dbNowBefore, dbNowAfter)
+	}
+	if !persisted.LastSeenAt.Before(persisted.ConnectedAt) {
+		t.Fatalf("takeover liveness time %s was advanced to lifetime identity %s", persisted.LastSeenAt, persisted.ConnectedAt)
+	}
+}
+
 func TestClassifyConnectionOnlyControlsMembershipOwnerHome(t *testing.T) {
 	ctx := context.Background()
 	repo := newCredentialFoundationTestRepository(t)
