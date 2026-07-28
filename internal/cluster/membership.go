@@ -25,6 +25,7 @@ var (
 type ConnectionLifetime struct {
 	Fingerprint  string
 	ConnectedAt  time.Time
+	InstanceID   string
 	Home         HomeIncarnationID
 	Controlled   bool
 	Subscription bool
@@ -129,8 +130,13 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 		if request.Takeover && (errors.Is(errPrevious, gorm.ErrRecordNotFound) || (errPrevious == nil && previous.State == MembershipStateClosed)) {
 			return ErrMembershipTakeoverUnavailable
 		}
-		if errPrevious == nil && previous.State != MembershipStateClosed && (!request.Takeover || previous.NodeID != request.NodeID) {
-			return ErrDuplicateCPACertificate
+		if errPrevious == nil && previous.State != MembershipStateClosed {
+			if !request.Takeover || previous.NodeID != request.NodeID {
+				return ErrDuplicateCPACertificate
+			}
+			if previous.LifecycleConfigRevision != request.LifecycleConfigRevision {
+				return ErrMembershipTakeoverUnavailable
+			}
 		}
 		if errPrevious != nil && !errors.Is(errPrevious, gorm.ErrRecordNotFound) {
 			return errPrevious

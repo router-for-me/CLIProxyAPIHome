@@ -10,6 +10,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const testMembershipInstanceID = "550e8400-e29b-41d4-a716-446655440000"
+
 func TestSubscribeMembershipRejectsDifferentNodeAndAllowsSameNodeTakeover(t *testing.T) {
 	ctx := context.Background()
 	repo := newCredentialFoundationTestRepository(t)
@@ -41,6 +43,13 @@ func TestSubscribeMembershipRejectsDifferentNodeAndAllowsSameNodeTakeover(t *tes
 	}
 	if _, errDifferentNode := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-a", NodeID: "cpa-b", Home: homeB, ProtocolVersion: 1, LifecycleConfigRevision: revision, Takeover: true}); !errors.Is(errDifferentNode, ErrDuplicateCPACertificate) {
 		t.Fatalf("different-node takeover error = %v", errDifferentNode)
+	}
+	persistedBeforeTakeover := CPANodeMembershipRecord{}
+	if errPersisted := repo.db.First(&persistedBeforeTakeover, "certificate_fingerprint = ?", first.CertificateFingerprint).Error; errPersisted != nil {
+		t.Fatal(errPersisted)
+	}
+	if !persistedBeforeTakeover.ConnectedAt.Equal(first.ConnectedAt) {
+		t.Fatalf("failed takeover changed membership: %#v", persistedBeforeTakeover)
 	}
 	second, errSecond := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-a", NodeID: "cpa-a", Home: homeB, ProtocolVersion: 1, LifecycleConfigRevision: revision, Takeover: true})
 	if errSecond != nil {
@@ -106,8 +115,38 @@ func TestSubscribeMembershipRejectsDifferentNodeAndAllowsSameNodeTakeover(t *tes
 	if _, errTakeover := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-missing", NodeID: "cpa-a", Home: homeB, ProtocolVersion: 1, LifecycleConfigRevision: revision, Takeover: true}); !errors.Is(errTakeover, ErrMembershipTakeoverUnavailable) {
 		t.Fatalf("missing membership takeover error = %v, want %v", errTakeover, ErrMembershipTakeoverUnavailable)
 	}
-	if _, errReopen := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-a", NodeID: "cpa-a", Home: homeB, ProtocolVersion: 1, LifecycleConfigRevision: revision}); errReopen != nil {
+	_, errReopen := repo.SubscribeMembership(ctx, SubscribeMembershipRequest{Fingerprint: "fp-a", NodeID: "cpa-a", Home: homeB, ProtocolVersion: 1, LifecycleConfigRevision: revision})
+	if errReopen != nil {
 		t.Fatalf("normal closed membership reopen error = %v", errReopen)
+	}
+}
+
+func TestRESPHandlerKeepsMembershipInstanceIDRuntimeOnly(t *testing.T) {
+	ctx := context.Background()
+	repo := newCredentialFoundationTestRepository(t)
+	home, errHome := repo.RegisterHomeIncarnation(ctx, "10.0.0.1", 8317, []string{"credential_concurrency_foundation_v1"})
+	if errHome != nil {
+		t.Fatal(errHome)
+	}
+	revision, errUpdate := repo.UpdateLifecycleConfig(ctx, 20*time.Second, config.DefaultCredentialConcurrencyConfig())
+	if errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: home.IP, Port: home.Port}, CoordinatorOptions{})
+	coordinator.mu.Lock()
+	coordinator.homeIncarnation = home
+	coordinator.initialized = true
+	coordinator.mu.Unlock()
+
+	lifetime, errSubscribe := NewRESPHandler(coordinator, nil, repo).SubscribeMembership(ctx, "fp-runtime", "cpa-runtime", 1, revision, false, testMembershipInstanceID)
+	if errSubscribe != nil {
+		t.Fatal(errSubscribe)
+	}
+	if lifetime.InstanceID != testMembershipInstanceID {
+		t.Fatalf("runtime instance ID = %q, want %q", lifetime.InstanceID, testMembershipInstanceID)
+	}
+	if repo.db.Migrator().HasColumn(&CPANodeMembershipRecord{}, "instance_id") {
+		t.Fatal("membership instance ID was persisted as a database column")
 	}
 }
 

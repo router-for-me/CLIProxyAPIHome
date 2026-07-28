@@ -89,7 +89,7 @@ func (h *RESPHandler) RefreshCPALiveness(ctx context.Context, lifetime Connectio
 }
 
 // SubscribeMembership creates a membership owned by this Home incarnation.
-func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint string, nodeID string, protocolVersion int, lifecycleConfigRevision int64, takeover bool) (ConnectionLifetime, error) {
+func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint string, nodeID string, protocolVersion int, lifecycleConfigRevision int64, takeover bool, instanceID string) (ConnectionLifetime, error) {
 	if h == nil || h.repo == nil || h.coordinator == nil {
 		return ConnectionLifetime{}, fmt.Errorf("cluster resp: membership handler is not ready")
 	}
@@ -111,6 +111,7 @@ func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint strin
 	return ConnectionLifetime{
 		Fingerprint:  member.CertificateFingerprint,
 		ConnectedAt:  member.ConnectedAt,
+		InstanceID:   strings.TrimSpace(instanceID),
 		Home:         home,
 		Subscription: true,
 	}, nil

@@ -54,7 +54,7 @@ type ConnEnv struct {
 	SubscribeConfigYAML            func() (int64, error)
 	UnsubscribeConfigYAML          func() (int64, error)
 	IsSubscribed                   func() bool
-	SubscribeMembership            func(context.Context, int, int64, bool) (cluster.ConnectionLifetime, error)
+	SubscribeMembership            func(context.Context, int, int64, bool, string) (cluster.ConnectionLifetime, error)
 	AttachSubscriptionLifetimeFunc func(cluster.ConnectionLifetime) error
 	FenceFingerprint               func(context.Context, string) error
 	CloseLocalFingerprint          func()
