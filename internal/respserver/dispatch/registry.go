@@ -394,7 +394,7 @@ func commandRequiresControlledLifetime(args []string) bool {
 		return false
 	}
 	switch strings.ToUpper(strings.TrimSpace(args[0])) {
-	case "RPOP", "LPUSH", "RPUSH", "SET", "DEL", "MSET", "INCRBY", "EXPIRE":
+	case "RPOP", "LPUSH", "RPUSH", "SET", "CAS", "DEL", "MSET", "INCRBY", "EXPIRE":
 		return true
 	default:
 		return false

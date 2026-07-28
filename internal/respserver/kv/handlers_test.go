@@ -136,7 +136,57 @@ func TestKVCommandErrors(t *testing.T) {
 		{"SET", "key", "value", "EX", "bad"},
 		{"MSET", "key", "value", "dangling"},
 		{"INCRBY", "key", "bad"},
+		{"CAS", "key", "0", "", "value", "PX"},
+		{"CAS", "key", "0", ""},
+		{"CAS", "key", "2", "", "value"},
+		{"CAS", "key", "0", "", "value", "EX", "10"},
+		{"CAS", "key", "0", "", "value", "PX", "0"},
+		{"CAS", "key", "0", "", "value", "PX", "bad"},
 	} {
 		requireRedisError(t, executeKVCommand(t, rt, args...))
+	}
+}
+
+func TestKVCompareAndSwapCommand(t *testing.T) {
+	rt := newKVHandlerTestRuntime(t)
+
+	// Reserving an absent key succeeds once, mirroring the CPA replay-cache fence.
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "replay", "0", "", "reservation", "PX", "1500"), 1)
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "replay", "0", "", "other", "PX", "1500"), 0)
+
+	// A matching expected value swaps; a stale one is a no-op.
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "replay", "1", "stale", "chain", "PX", "1500"), 0)
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "replay", "1", "reservation", "chain", "PX", "1500"), 1)
+	value, found, errGet := rt.KVGet(context.Background(), "replay")
+	if errGet != nil || !found || string(value) != "chain" {
+		t.Fatalf("KVGet(replay) = %q, %v, %v, want chain, true, nil", value, found, errGet)
+	}
+	ttlReply := executeKVCommand(t, rt, "TTL", "replay")
+	if ttlReply.Kind != dispatch.ReplyKindInteger || ttlReply.Integer < 0 {
+		t.Fatalf("TTL(replay) = %#v, want non-negative integer", ttlReply)
+	}
+
+	// Omitting PX stores the value without a TTL.
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "replay", "1", "chain", "tombstone"), 1)
+	requireInteger(t, executeKVCommand(t, rt, "TTL", "replay"), -1)
+
+	// Binary values round-trip through the comparison.
+	binary := string([]byte{0x00, 0xff, 0x10})
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "binary", "0", "", binary), 1)
+	requireInteger(t, executeKVCommand(t, rt, "CAS", "binary", "1", binary, "next"), 1)
+}
+
+func TestKVCompareAndSwapRequiresControlledLifetime(t *testing.T) {
+	rt := newKVHandlerTestRuntime(t)
+
+	reg := dispatch.NewRegistry()
+	Register(reg)
+	reply := reg.Execute(context.Background(), dispatch.Env{
+		Runtime:            rt,
+		ConnectionLifetime: cluster.ConnectionLifetime{Controlled: false},
+	}, []string{"CAS", "replay", "0", "", "reservation"})
+	requireRedisError(t, reply)
+	if _, found, errGet := rt.KVGet(context.Background(), "replay"); errGet != nil || found {
+		t.Fatalf("KVGet(replay) = %v, %v, want not found, nil", found, errGet)
 	}
 }
