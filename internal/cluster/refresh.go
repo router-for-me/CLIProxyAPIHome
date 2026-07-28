@@ -67,7 +67,11 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 	if c.coordinator == nil || c.repo == nil {
 		return c.runtime.RefreshNowLocal(ctx, authIndex)
 	}
-	if c.coordinator.IsMaster() {
+	master, errMaster := c.coordinator.CurrentMaster(ctx)
+	if errMaster != nil {
+		return nil, fmt.Errorf("cluster refresh master lookup: %w", errMaster)
+	}
+	if c.isSelf(master) {
 		return c.refreshLocalWithLock(ctx, authIndex)
 	}
 
@@ -77,15 +81,10 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 			forwardAuthUUID = targetUUID
 		}
 	}
-	master, errMaster := c.coordinator.CurrentMaster(ctx)
-	if errMaster == nil && master != nil && strings.TrimSpace(master.IP) != "" && master.Port > 0 {
-		if c.isSelf(master) {
-			return c.refreshLocalWithLock(ctx, authIndex)
-		}
+	if master != nil && strings.TrimSpace(master.IP) != "" && master.Port > 0 {
 		nodeSecret := c.coordinator.NodeSecret()
 		if strings.TrimSpace(nodeSecret) == "" {
-			log.Warnf("cluster refresh node secret missing, falling back to local refresh")
-			return c.refreshLocalWithLock(ctx, authIndex)
+			return nil, fmt.Errorf("cluster refresh node secret is unavailable")
 		}
 		forwardRefresh := c.forwardRefresh
 		if forwardRefresh == nil {
@@ -106,15 +105,12 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 				}
 				return nil, errForward
 			}
-			log.Warn("cluster refresh forward failed, falling back to local refresh")
+			return nil, fmt.Errorf("cluster refresh forward to master: %w", errForward)
 		}
-	} else if errMaster != nil {
-		log.Warnf("cluster refresh master lookup failed, falling back to local refresh: %v", errMaster)
 	} else {
-		log.Warnf("cluster refresh master unavailable, falling back to local refresh")
+		return nil, fmt.Errorf("cluster refresh master is unavailable")
 	}
-
-	return c.refreshLocalWithLock(ctx, authIndex)
+	return nil, fmt.Errorf("cluster refresh master is unavailable")
 }
 
 // syncForwardedAuth applies the state already persisted by the master without

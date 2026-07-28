@@ -18,12 +18,14 @@ var (
 	ErrConcurrencyProtocolRequired     = errors.New("credential concurrency protocol version 1 is required")
 	ErrLifecycleConfigRevisionMismatch = errors.New("lifecycle configuration revision does not match")
 	ErrMembershipNotActive             = errors.New("CPA membership is not active")
+	ErrMembershipTakeoverUnavailable   = errors.New("membership_takeover_unavailable")
 )
 
 // ConnectionLifetime identifies the membership lifetime associated with a connection.
 type ConnectionLifetime struct {
 	Fingerprint  string
 	ConnectedAt  time.Time
+	InstanceID   string
 	Home         HomeIncarnationID
 	Controlled   bool
 	Subscription bool
@@ -36,6 +38,12 @@ type SubscribeMembershipRequest struct {
 	Home                    HomeIncarnationID
 	ProtocolVersion         int
 	LifecycleConfigRevision int64
+	Takeover                bool
+}
+
+func membershipOwnedByHome(member CPANodeMembershipRecord, home HomeIncarnationID) bool {
+	return strings.TrimSpace(member.HomeIP) == strings.TrimSpace(home.IP) &&
+		member.HomePort == home.Port && member.HomeStartedAt.Equal(home.StartedAt)
 }
 
 // ClassifyConnection determines whether a connection belongs to an active membership.
@@ -58,7 +66,7 @@ func (r *Repository) ClassifyConnection(ctx context.Context, fingerprint string,
 	if errFirst != nil {
 		return ConnectionLifetime{}, errFirst
 	}
-	if member.State != MembershipStateActive {
+	if member.State != MembershipStateActive || !membershipOwnedByHome(member, home) {
 		return lifetime, nil
 	}
 
@@ -119,8 +127,16 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 
 		previous := CPANodeMembershipRecord{}
 		errPrevious := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", request.Fingerprint).First(&previous).Error
+		if request.Takeover && (errors.Is(errPrevious, gorm.ErrRecordNotFound) || (errPrevious == nil && previous.State == MembershipStateClosed)) {
+			return ErrMembershipTakeoverUnavailable
+		}
 		if errPrevious == nil && previous.State != MembershipStateClosed {
-			return ErrDuplicateCPACertificate
+			if !request.Takeover || previous.NodeID != request.NodeID {
+				return ErrDuplicateCPACertificate
+			}
+			if previous.LifecycleConfigRevision != request.LifecycleConfigRevision {
+				return ErrMembershipTakeoverUnavailable
+			}
 		}
 		if errPrevious != nil && !errors.Is(errPrevious, gorm.ErrRecordNotFound) {
 			return errPrevious
@@ -128,13 +144,33 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 		if errHome := verifyActiveHomeIncarnation(tx, request.Home); errHome != nil {
 			return errHome
 		}
+		if errPrevious == nil && previous.State != MembershipStateClosed {
+			oldLifetime := "certificate_fingerprint = ? AND membership_connected_at = ?"
+			oldArgs := []any{previous.CertificateFingerprint, previous.ConnectedAt}
+			if errDelete := tx.Where(oldLifetime, oldArgs...).Delete(&CPANodeParticipationRecord{}).Error; errDelete != nil {
+				return errDelete
+			}
+			if errDelete := tx.Where(oldLifetime, oldArgs...).Delete(&CPANodeQuiescenceRecord{}).Error; errDelete != nil {
+				return errDelete
+			}
+			if errDelete := tx.Where(oldLifetime, oldArgs...).Delete(&CPAInFlightSnapshotPartRecord{}).Error; errDelete != nil {
+				return errDelete
+			}
+			if errDelete := tx.Where(oldLifetime, oldArgs...).Delete(&CPAInFlightSnapshotAttemptRecord{}).Error; errDelete != nil {
+				return errDelete
+			}
+			if errDelete := tx.Where(oldLifetime, oldArgs...).Delete(&CPAInFlightSnapshotRecord{}).Error; errDelete != nil {
+				return errDelete
+			}
+		}
 
-		now, errNow := DatabaseNow(ctx, tx)
+		dbNow, errNow := DatabaseNow(ctx, tx)
 		if errNow != nil {
 			return errNow
 		}
-		if !previous.ConnectedAt.IsZero() && !now.After(previous.ConnectedAt) {
-			now = previous.ConnectedAt.Add(databaseTimestampStep(tx))
+		connectedAt := dbNow
+		if !previous.ConnectedAt.IsZero() && !connectedAt.After(previous.ConnectedAt) {
+			connectedAt = previous.ConnectedAt.Add(databaseTimestampStep(tx))
 		}
 		accepted = CPANodeMembershipRecord{
 			CertificateFingerprint:  request.Fingerprint,
@@ -144,13 +180,13 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 			HomeStartedAt:           request.Home.StartedAt,
 			ProtocolVersion:         request.ProtocolVersion,
 			State:                   MembershipStateActive,
-			ConnectedAt:             now,
+			ConnectedAt:             connectedAt,
 			LifecycleConfigRevision: lifecycle.Revision,
 			CPAHeartbeatTimeout:     cfg.CPAHeartbeatTimeout,
 			CPACancelBound:          cfg.CPACancelBound,
 			ReclaimGrace:            cfg.ReclaimGrace,
-			LastSeenAt:              now,
-			UpdatedAt:               now,
+			LastSeenAt:              dbNow,
+			UpdatedAt:               dbNow,
 		}
 		return tx.Save(&accepted).Error
 	})

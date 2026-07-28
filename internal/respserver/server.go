@@ -25,12 +25,12 @@ import (
 )
 
 type fingerprintCancellationStarter interface {
-	BeginFingerprintCancellation(context.Context, string) (int64, error)
+	BeginFingerprintCancellationForLifetime(context.Context, cluster.ConnectionLifetime) (int64, error)
 }
 
 type clusterHandler interface {
 	ClassifyConnection(context.Context, string) (cluster.ConnectionLifetime, error)
-	SubscribeMembership(context.Context, string, string, int, int64) (cluster.ConnectionLifetime, error)
+	SubscribeMembership(context.Context, string, string, int, int64, bool, string) (cluster.ConnectionLifetime, error)
 	RefreshCPALiveness(context.Context, cluster.ConnectionLifetime) error
 	UpdateClientCount(context.Context, int) error
 	Handle(context.Context, []string, string) ([]byte, error)
@@ -423,7 +423,7 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			if !ok || starter == nil {
 				return fmt.Errorf("cluster fingerprint cancellation is unavailable")
 			}
-			_, errBegin := starter.BeginFingerprintCancellation(fenceCtx, connectionLifetime.Fingerprint)
+			_, errBegin := starter.BeginFingerprintCancellationForLifetime(fenceCtx, connectionLifetime)
 			return errBegin
 		},
 		CloseLocalFingerprint: func() {
@@ -484,8 +484,8 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 		},
 	}
 	if s.cluster != nil && clientCertificateFingerprint != "" {
-		connEnv.SubscribeMembership = func(subscriptionCtx context.Context, protocolVersion int, lifecycleConfigRevision int64) (cluster.ConnectionLifetime, error) {
-			return s.cluster.SubscribeMembership(subscriptionCtx, clientCertificateFingerprint, clientNodeID, protocolVersion, lifecycleConfigRevision)
+		connEnv.SubscribeMembership = func(subscriptionCtx context.Context, protocolVersion int, lifecycleConfigRevision int64, takeover bool, instanceID string) (cluster.ConnectionLifetime, error) {
+			return s.cluster.SubscribeMembership(subscriptionCtx, clientCertificateFingerprint, clientNodeID, protocolVersion, lifecycleConfigRevision, takeover, instanceID)
 		}
 	}
 

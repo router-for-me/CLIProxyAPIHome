@@ -249,7 +249,7 @@ func (h *blockingClusterHandler) ClassifyConnection(context.Context, string) (cl
 	return h.lifetime, nil
 }
 
-func (h *blockingClusterHandler) SubscribeMembership(context.Context, string, string, int, int64) (cluster.ConnectionLifetime, error) {
+func (h *blockingClusterHandler) SubscribeMembership(context.Context, string, string, int, int64, bool, string) (cluster.ConnectionLifetime, error) {
 	return h.lifetime, nil
 }
 

@@ -154,6 +154,15 @@ func (ConcurrencyActivationGateRecord) TableName() string {
 	return "concurrency_activation_gate"
 }
 
+// ClusterMasterGateRecord serializes the single persisted Home master selection.
+type ClusterMasterGateRecord struct {
+	ID int `gorm:"column:id;primaryKey"`
+}
+
+func (ClusterMasterGateRecord) TableName() string {
+	return "cluster_master_gate"
+}
+
 // HomeProcessIncarnationRecord stores an append-only Home process incarnation.
 type HomeProcessIncarnationRecord struct {
 	HomeIP       string     `gorm:"column:home_ip;primaryKey"`
