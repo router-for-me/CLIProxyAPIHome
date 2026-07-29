@@ -9,6 +9,7 @@ func Register(reg *dispatch.Registry) {
 	}
 	_ = reg.SetDirectDefault("SET", handleSet)
 	_ = reg.SetDirectDefault("SETNX", handleSetNX)
+	_ = reg.SetDirectDefault("CAS", handleCAS)
 	_ = reg.SetDirectDefault("DEL", handleDel)
 	_ = reg.SetDirectDefault("EXPIRE", handleExpire)
 	_ = reg.SetDirectDefault("TTL", handleTTL)

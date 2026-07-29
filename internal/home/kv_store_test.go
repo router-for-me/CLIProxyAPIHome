@@ -3,6 +3,7 @@ package home
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +53,11 @@ func (a *runtimeKVTestAdapter) KVGet(ctx context.Context, key string) ([]byte, b
 
 func (a *runtimeKVTestAdapter) KVSet(ctx context.Context, key string, value []byte, ttl time.Duration, mode string) (bool, error) {
 	a.record("KVSet:" + key + ":" + string(value) + ":" + mode)
+	return true, nil
+}
+
+func (a *runtimeKVTestAdapter) KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error) {
+	a.record("KVCompareAndSwap:" + key + ":" + string(expected) + ":" + strconv.FormatBool(expectedExists) + ":" + string(value))
 	return true, nil
 }
 
@@ -132,6 +138,9 @@ func TestRuntimeKVUnavailable(t *testing.T) {
 	if _, errSet := runtime.KVSet(context.Background(), "key", []byte("value"), 0, ""); errSet == nil || !strings.Contains(errSet.Error(), "kv store unavailable") {
 		t.Fatalf("KVSet() error = %v, want kv store unavailable", errSet)
 	}
+	if _, errCAS := runtime.KVCompareAndSwap(context.Background(), "key", nil, false, []byte("value"), 0); errCAS == nil || !strings.Contains(errCAS.Error(), "kv store unavailable") {
+		t.Fatalf("KVCompareAndSwap() error = %v, want kv store unavailable", errCAS)
+	}
 
 	runtime.SetClusterAdapter(&runtimeKVTestAdapter{enabled: false})
 	_, errDel := runtime.KVDel(context.Background(), []string{"key"})
@@ -152,6 +161,9 @@ func TestRuntimeKVDelegatesToAdapter(t *testing.T) {
 	}
 	if written, errSet := runtime.KVSet(ctx, "key", []byte("next"), time.Minute, "nx"); errSet != nil || !written {
 		t.Fatalf("KVSet() = %v, %v, want true, nil", written, errSet)
+	}
+	if swapped, errCAS := runtime.KVCompareAndSwap(ctx, "key", []byte("value"), true, []byte("next"), time.Minute); errCAS != nil || !swapped {
+		t.Fatalf("KVCompareAndSwap() = %v, %v, want true, nil", swapped, errCAS)
 	}
 	if deleted, errDel := runtime.KVDel(ctx, []string{"a", "b"}); errDel != nil || deleted != 2 {
 		t.Fatalf("KVDel() = %d, %v, want 2, nil", deleted, errDel)
@@ -176,7 +188,7 @@ func TestRuntimeKVDelegatesToAdapter(t *testing.T) {
 		t.Fatalf("KVMSet() error = %v", errMSet)
 	}
 
-	for _, prefix := range []string{"KVGet:key", "KVSet:key", "KVDel:a,b", "KVExpire:key", "KVTTL:key", "KVIncrBy:counter", "KVMGet:a,b", "KVMSet"} {
+	for _, prefix := range []string{"KVGet:key", "KVSet:key", "KVCompareAndSwap:key:value:true:next", "KVDel:a,b", "KVExpire:key", "KVTTL:key", "KVIncrBy:counter", "KVMGet:a,b", "KVMSet"} {
 		if !adapter.hasCall(prefix) {
 			t.Fatalf("adapter call %q was not recorded", prefix)
 		}

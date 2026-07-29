@@ -146,6 +146,14 @@ func (a *RuntimeAdapter) KVSet(ctx context.Context, key string, value []byte, tt
 	return a.repo.KVSet(ctx, key, value, ttl, KVSetMode(strings.ToLower(strings.TrimSpace(mode))))
 }
 
+// KVCompareAndSwap writes a KV value only when the active state matches the expected state.
+func (a *RuntimeAdapter) KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error) {
+	if !a.Enabled() {
+		return false, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.KVCompareAndSwap(ctx, key, expected, expectedExists, value, ttl)
+}
+
 // KVDel deletes active KV values.
 func (a *RuntimeAdapter) KVDel(ctx context.Context, keys []string) (int64, error) {
 	if !a.Enabled() {

@@ -176,6 +176,7 @@ type KVGetResult struct {
 type kvStore interface {
 	KVGet(ctx context.Context, key string) ([]byte, bool, error)
 	KVSet(ctx context.Context, key string, value []byte, ttl time.Duration, mode string) (bool, error)
+	KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error)
 	KVDel(ctx context.Context, keys []string) (int64, error)
 	KVExpire(ctx context.Context, key string, ttl time.Duration) (bool, error)
 	KVTTL(ctx context.Context, key string) (int64, error)
@@ -513,6 +514,16 @@ func (r *Runtime) KVSet(ctx context.Context, key string, value []byte, ttl time.
 		return false, errStore
 	}
 	return store.KVSet(ctx, key, value, ttl, mode)
+}
+
+// KVCompareAndSwap writes a KV value to the cluster store only when the active
+// state matches the expected state.
+func (r *Runtime) KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error) {
+	store, errStore := r.kvStore()
+	if errStore != nil {
+		return false, errStore
+	}
+	return store.KVCompareAndSwap(ctx, key, expected, expectedExists, value, ttl)
 }
 
 // KVDel deletes active KV values from the cluster store.

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -120,6 +121,78 @@ func (r *Repository) KVSet(ctx context.Context, key string, value []byte, ttl ti
 		}
 	})
 	return written, errTransaction
+}
+
+// KVCompareAndSwap writes a value only when the active state matches the
+// expected state, and reports whether the swap happened.
+//
+// When expectedExists is true the key must be present and active with a value
+// equal to expected. When expectedExists is false the key must be absent or
+// expired. The comparison and the write share one transaction so concurrent
+// writers cannot both observe a matching state.
+func (r *Repository) KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return false, errDB
+	}
+	key, errKey := normalizeKVKey(key)
+	if errKey != nil {
+		return false, errKey
+	}
+	copiedValue := cloneKVBytes(value)
+	expectedValue := cloneKVBytes(expected)
+	expiresAt := kvExpiresAt(ttl)
+
+	ctx = contextOrBackground(ctx)
+	swapped := false
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		record := KVRecord{}
+		errFirst := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("key = ?", key).First(&record).Error
+		now := time.Now().UTC()
+		switch {
+		case errors.Is(errFirst, gorm.ErrRecordNotFound):
+			if expectedExists {
+				return nil
+			}
+			record = KVRecord{Key: key, Value: copiedValue, Version: 1, ExpiresAt: expiresAt}
+			if errCreate := tx.Create(&record).Error; errCreate != nil {
+				return errCreate
+			}
+			swapped = true
+			return nil
+		case errFirst != nil:
+			return errFirst
+		case kvRecordExpired(record, now):
+			if errDelete := deleteExpiredKVTx(tx, key, record.ExpiresAt); errDelete != nil {
+				return errDelete
+			}
+			if expectedExists {
+				return nil
+			}
+			nextVersion := record.Version + 1
+			if nextVersion <= 1 {
+				nextVersion = 1
+			}
+			record = KVRecord{Key: key, Value: copiedValue, Version: nextVersion, ExpiresAt: expiresAt}
+			if errCreate := tx.Create(&record).Error; errCreate != nil {
+				return errCreate
+			}
+			swapped = true
+			return nil
+		case !expectedExists || !bytes.Equal(record.Value, expectedValue):
+			return nil
+		default:
+			record.Value = copiedValue
+			record.ExpiresAt = expiresAt
+			record.Version++
+			if errSave := tx.Save(&record).Error; errSave != nil {
+				return errSave
+			}
+			swapped = true
+			return nil
+		}
+	})
+	return swapped, errTransaction
 }
 
 // KVDel deletes active keys and returns the active deletion count.

@@ -57,6 +57,52 @@ func handleSetNX(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	return dispatch.Integer(0)
 }
 
+// handleCAS handles the Home-specific compare-and-swap command:
+//
+//	CAS <key> <expected-exists 0|1> <expected-value> <new-value> [PX <ttl-ms>]
+//
+// When the expected-exists flag is 1 the key must be present with a value equal
+// to expected-value; when it is 0 the key must be absent. The reply is integer 1
+// when the swap happened and integer 0 when the state did not match. Omitting PX
+// stores the new value without a TTL.
+//
+// CPA needs this primitive for its reasoning replay caches. It exists instead of
+// EVAL so Home does not have to expose general-purpose Lua execution.
+func handleCAS(ctx context.Context, env dispatch.Env, args []string) dispatch.Reply {
+	if env.Runtime == nil {
+		return dispatch.Err("runtime not ready")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(args) != 5 && len(args) != 7 {
+		return wrongArgs("cas")
+	}
+	expectedExists, errFlag := parseCASExpectedExists(args[2])
+	if errFlag != nil {
+		return dispatch.Err(errFlag.Error())
+	}
+	var ttl time.Duration
+	if len(args) == 7 {
+		if !strings.EqualFold(strings.TrimSpace(args[5]), "PX") {
+			return dispatch.Err(fmt.Sprintf("unsupported cas option %q", args[5]))
+		}
+		milliseconds, errParse := parsePositiveInt(args[6], "px value")
+		if errParse != nil {
+			return dispatch.Err(errParse.Error())
+		}
+		ttl = time.Duration(milliseconds) * time.Millisecond
+	}
+	swapped, errCAS := env.Runtime.KVCompareAndSwap(ctx, args[1], []byte(args[3]), expectedExists, []byte(args[4]), ttl)
+	if errCAS != nil {
+		return dispatch.Err(errCAS.Error())
+	}
+	if swapped {
+		return dispatch.Integer(1)
+	}
+	return dispatch.Integer(0)
+}
+
 // handleDel handles Redis-compatible DEL.
 func handleDel(ctx context.Context, env dispatch.Env, args []string) dispatch.Reply {
 	if env.Runtime == nil {
@@ -226,6 +272,17 @@ func parseSetOptions(args []string) (time.Duration, string, error) {
 		}
 	}
 	return ttl, mode, nil
+}
+
+func parseCASExpectedExists(value string) (bool, error) {
+	switch strings.TrimSpace(value) {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("cas expected-exists flag must be 0 or 1")
+	}
 }
 
 func parsePositiveInt(value string, label string) (int64, error) {

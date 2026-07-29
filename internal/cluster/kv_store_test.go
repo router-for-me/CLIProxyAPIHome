@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -93,6 +95,133 @@ func TestKVSetModes(t *testing.T) {
 	}
 	if written, errSet := repo.KVSet(ctx, "created-by-nx", []byte("value"), 0, KVSetModeNX); errSet != nil || !written {
 		t.Fatalf("KVSet(nx missing) = %v, %v, want true, nil", written, errSet)
+	}
+}
+
+func TestKVCompareAndSwapReservesAbsentKeyOnce(t *testing.T) {
+	t.Parallel()
+
+	repo, ctx := newTestKVRepository(t)
+	swapped, errFirst := repo.KVCompareAndSwap(ctx, "reserve", nil, false, []byte("reservation"), 0)
+	if errFirst != nil || !swapped {
+		t.Fatalf("KVCompareAndSwap(absent) = %v, %v, want true, nil", swapped, errFirst)
+	}
+	got, found, errGet := repo.KVGet(ctx, "reserve")
+	if errGet != nil || !found || string(got) != "reservation" {
+		t.Fatalf("KVGet() = %q, %v, %v, want reservation, true, nil", got, found, errGet)
+	}
+	swappedAgain, errSecond := repo.KVCompareAndSwap(ctx, "reserve", nil, false, []byte("second"), 0)
+	if errSecond != nil || swappedAgain {
+		t.Fatalf("KVCompareAndSwap(present, expecting absent) = %v, %v, want false, nil", swappedAgain, errSecond)
+	}
+	unchanged, foundUnchanged, errGetUnchanged := repo.KVGet(ctx, "reserve")
+	if errGetUnchanged != nil || !foundUnchanged || string(unchanged) != "reservation" {
+		t.Fatalf("KVGet() = %q, %v, %v, want reservation, true, nil", unchanged, foundUnchanged, errGetUnchanged)
+	}
+}
+
+func TestKVCompareAndSwapReplacesOnlyMatchingValue(t *testing.T) {
+	t.Parallel()
+
+	repo, ctx := newTestKVRepository(t)
+	if written, errSet := repo.KVSet(ctx, "chain", []byte("first"), 0, KVSetModeAlways); errSet != nil || !written {
+		t.Fatalf("KVSet() = %v, %v, want true, nil", written, errSet)
+	}
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "chain", []byte("stale"), true, []byte("second"), 0); errCAS != nil || swapped {
+		t.Fatalf("KVCompareAndSwap(mismatch) = %v, %v, want false, nil", swapped, errCAS)
+	}
+	got, found, errGet := repo.KVGet(ctx, "chain")
+	if errGet != nil || !found || string(got) != "first" {
+		t.Fatalf("KVGet() after mismatch = %q, %v, %v, want first, true, nil", got, found, errGet)
+	}
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "chain", []byte("first"), true, []byte("second"), 0); errCAS != nil || !swapped {
+		t.Fatalf("KVCompareAndSwap(match) = %v, %v, want true, nil", swapped, errCAS)
+	}
+	replaced, foundReplaced, errGetReplaced := repo.KVGet(ctx, "chain")
+	if errGetReplaced != nil || !foundReplaced || string(replaced) != "second" {
+		t.Fatalf("KVGet() after match = %q, %v, %v, want second, true, nil", replaced, foundReplaced, errGetReplaced)
+	}
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "missing", []byte("first"), true, []byte("value"), 0); errCAS != nil || swapped {
+		t.Fatalf("KVCompareAndSwap(absent, expecting present) = %v, %v, want false, nil", swapped, errCAS)
+	}
+}
+
+func TestKVCompareAndSwapAppliesTTL(t *testing.T) {
+	t.Parallel()
+
+	repo, ctx := newTestKVRepository(t)
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "ttl", nil, false, []byte("value"), time.Hour); errCAS != nil || !swapped {
+		t.Fatalf("KVCompareAndSwap(create with ttl) = %v, %v, want true, nil", swapped, errCAS)
+	}
+	ttl, errTTL := repo.KVTTL(ctx, "ttl")
+	if errTTL != nil || ttl <= 0 {
+		t.Fatalf("KVTTL() = %d, %v, want positive, nil", ttl, errTTL)
+	}
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "ttl", []byte("value"), true, []byte("next"), 0); errCAS != nil || !swapped {
+		t.Fatalf("KVCompareAndSwap(replace without ttl) = %v, %v, want true, nil", swapped, errCAS)
+	}
+	clearedTTL, errClearedTTL := repo.KVTTL(ctx, "ttl")
+	if errClearedTTL != nil || clearedTTL != -1 {
+		t.Fatalf("KVTTL() = %d, %v, want -1, nil", clearedTTL, errClearedTTL)
+	}
+}
+
+func TestKVCompareAndSwapTreatsExpiredRowAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	repo, ctx := newTestKVRepository(t)
+	past := time.Now().UTC().Add(-time.Minute)
+	if errCreate := repo.db.Create(&KVRecord{Key: "expired", Value: []byte("old"), Version: 4, ExpiresAt: &past}).Error; errCreate != nil {
+		t.Fatalf("create expired record: %v", errCreate)
+	}
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "expired", []byte("old"), true, []byte("value"), 0); errCAS != nil || swapped {
+		t.Fatalf("KVCompareAndSwap(expired, expecting present) = %v, %v, want false, nil", swapped, errCAS)
+	}
+	if swapped, errCAS := repo.KVCompareAndSwap(ctx, "expired", nil, false, []byte("value"), 0); errCAS != nil || !swapped {
+		t.Fatalf("KVCompareAndSwap(expired, expecting absent) = %v, %v, want true, nil", swapped, errCAS)
+	}
+	got, found, errGet := repo.KVGet(ctx, "expired")
+	if errGet != nil || !found || string(got) != "value" {
+		t.Fatalf("KVGet() = %q, %v, %v, want value, true, nil", got, found, errGet)
+	}
+}
+
+func TestKVCompareAndSwapConcurrentReservationHasOneWinner(t *testing.T) {
+	t.Parallel()
+
+	repo, ctx := newTestKVRepository(t)
+	const writers = 8
+	var wg sync.WaitGroup
+	results := make([]bool, writers)
+	errs := make([]error, writers)
+	wg.Add(writers)
+	for index := 0; index < writers; index++ {
+		go func(slot int) {
+			defer wg.Done()
+			results[slot], errs[slot] = repo.KVCompareAndSwap(ctx, "race", nil, false, []byte(strconv.Itoa(slot)), time.Hour)
+		}(index)
+	}
+	wg.Wait()
+
+	winners := 0
+	for index := 0; index < writers; index++ {
+		if errs[index] != nil {
+			t.Fatalf("KVCompareAndSwap() error = %v", errs[index])
+		}
+		if results[index] {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("winners = %d, want 1", winners)
+	}
+	got, found, errGet := repo.KVGet(ctx, "race")
+	if errGet != nil || !found {
+		t.Fatalf("KVGet() = %q, %v, %v, want a stored value", got, found, errGet)
+	}
+	slot, errParse := strconv.Atoi(string(got))
+	if errParse != nil || slot < 0 || slot >= writers || !results[slot] {
+		t.Fatalf("stored value %q does not match the single winner", got)
 	}
 }
 
