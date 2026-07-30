@@ -19,12 +19,14 @@ import (
 )
 
 const (
-	refreshCheckInterval  = 5 * time.Second
-	refreshMaxConcurrency = 16
-	refreshPendingBackoff = time.Minute
-	refreshFailureBackoff = 5 * time.Minute
-	refreshAuthErrorCode  = "authentication_error"
-	refreshAuthErrorMsg   = "credential unauthorized"
+	refreshCheckInterval      = 5 * time.Second
+	refreshMaxConcurrency     = 16
+	refreshPendingBackoff     = time.Minute
+	refreshFailureBackoff     = 5 * time.Minute
+	refreshAuthErrorCode      = "authentication_error"
+	refreshAuthErrorMsg       = "credential unauthorized"
+	refreshTransientErrorCode = "refresh_temporarily_unavailable"
+	refreshTransientErrorMsg  = "credential refresh temporarily unavailable"
 	// refreshIneffectiveBackoff throttles refresh attempts when the refresh completes
 	// successfully but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
@@ -951,7 +953,7 @@ func authRefreshDisabled(auth *Auth) bool {
 }
 
 // applyRefreshFailureState records refresh failures and permanently disables
-// credentials whose refresh token can no longer authenticate.
+// credentials only when the refresh token is explicitly known to be terminal.
 func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 	if auth == nil || errRefresh == nil {
 		return
@@ -960,8 +962,18 @@ func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 		disableAuthAfterUnauthorized(auth, nil, newUnauthorizedRefreshError(), now)
 		return
 	}
-	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
-	auth.LastError = &Error{Message: errRefresh.Error()}
+	next := now.Add(refreshFailureBackoff)
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.StatusMessage = refreshTransientErrorMsg
+	auth.NextRefreshAfter = next
+	auth.NextRetryAfter = next
+	auth.LastError = &Error{
+		Code:      refreshTransientErrorCode,
+		Message:   refreshTransientErrorMsg,
+		Retryable: true,
+	}
+	auth.UpdatedAt = now
 }
 
 // newUnauthorizedRefreshError returns the fixed wire error for failed forced refresh.
@@ -982,17 +994,14 @@ func isTerminalRefreshAuthError(errRefresh error) bool {
 	var authErr *Error
 	if errors.As(errRefresh, &authErr) && authErr != nil {
 		code := strings.ToLower(strings.TrimSpace(authErr.Code))
-		if authErr.HTTPStatus == http.StatusUnauthorized || code == refreshAuthErrorCode || code == "unauthorized" {
+		switch code {
+		case refreshAuthErrorCode, "invalid_grant", "refresh_token_expired", "refresh_token_revoked", "refresh_token_reused":
 			return true
 		}
 	}
 	raw := strings.ToLower(errRefresh.Error())
-	return strings.Contains(raw, "status 401") ||
-		strings.Contains(raw, "status: 401") ||
-		strings.Contains(raw, "status code 401") ||
-		strings.Contains(raw, "http 401") ||
-		strings.Contains(raw, "401 unauthorized") ||
-		strings.Contains(raw, "invalid_grant") ||
+	return strings.Contains(raw, "invalid_grant") ||
+		strings.Contains(raw, "refresh_token_reused") ||
 		isTerminalOAuthRefreshDescription(raw)
 }
 
@@ -1317,9 +1326,7 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 	if updated.Runtime == nil {
 		updated.Runtime = target.Runtime
 	}
-	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
+	modelsToResume := applyRefreshSuccessState(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
@@ -1327,6 +1334,7 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 	if errUpdate != nil {
 		return nil, errUpdate
 	}
+	resumeRefreshedModels(updated.ID, modelsToResume)
 	if targetIndex != authIndex {
 		refreshed, ok := m.GetByIndex(authIndex)
 		if !ok || refreshed == nil {
@@ -1378,12 +1386,11 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	if updated.Runtime == nil {
 		updated.Runtime = target.Runtime
 	}
-	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
+	modelsToResume := applyRefreshSuccessState(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
+	resumeRefreshedModels(updated.ID, modelsToResume)
 	return updated, nil
 }
 
@@ -1453,14 +1460,67 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 	if updated.Runtime == nil {
 		updated.Runtime = current.Runtime
 	}
-	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
-	updated.UpdatedAt = now
+	modelsToResume := applyRefreshSuccessState(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
 	_, _ = m.Update(ctx, updated)
+	resumeRefreshedModels(updated.ID, modelsToResume)
+}
+
+// applyRefreshSuccessState clears transient refresh and unauthorized execution state.
+func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
+	if auth == nil {
+		return nil
+	}
+	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
+	auth.LastRefreshedAt = now
+	auth.NextRefreshAfter = time.Time{}
+	auth.NextRetryAfter = time.Time{}
+	auth.Unavailable = false
+	auth.LastError = nil
+	auth.StatusMessage = ""
+	auth.UpdatedAt = now
+
+	resumed := make([]string, 0)
+	for model, state := range auth.ModelStates {
+		if !isUnauthorizedModelState(state) {
+			continue
+		}
+		resetModelState(state, now)
+		resumed = append(resumed, model)
+	}
+	if len(auth.ModelStates) > 0 {
+		updateAggregatedAvailability(auth, now)
+	}
+	if wasDisabled {
+		auth.Status = StatusDisabled
+		auth.Unavailable = true
+	} else if hasModelError(auth, now) {
+		auth.Status = StatusError
+	} else {
+		auth.Status = StatusActive
+	}
+	return resumed
+}
+
+func isUnauthorizedModelState(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(state.StatusMessage), "unauthorized") {
+		return true
+	}
+	if state.LastError == nil {
+		return false
+	}
+	return state.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(strings.TrimSpace(state.LastError.Code), "unauthorized")
+}
+
+func resumeRefreshedModels(authID string, models []string) {
+	for _, model := range models {
+		registry.GetGlobalRegistry().ResumeClientModel(authID, model)
+	}
 }
 
 // logEntryWithRequestID returns a logrus entry with request_id field if available in context.
