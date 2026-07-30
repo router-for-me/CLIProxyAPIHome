@@ -558,8 +558,10 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 			item.Index = item.UUID
 		}
 		item.Status = auth.Status
+		item.StatusMessage = auth.StatusMessage
 		item.Disabled = auth.Disabled
 		item.Unavailable = auth.Unavailable
+		item.NextRefreshAfter = auth.NextRefreshAfter
 		item.NextRetryAfter = auth.NextRetryAfter
 		item.Quota = auth.Quota
 		item.ModelStates = auth.ModelStates
@@ -592,19 +594,21 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 	}
 	metadata := cloneModelMetadata(item.ModelMetadata)
 	return &coreauth.Auth{
-		ID:             uuid,
-		Index:          uuid,
-		Provider:       item.Provider,
-		Label:          item.Label,
-		Prefix:         item.Prefix,
-		Status:         item.Status,
-		Disabled:       item.Disabled,
-		Unavailable:    item.Unavailable,
-		NextRetryAfter: item.NextRetryAfter,
-		Quota:          item.Quota,
-		ModelStates:    cloneModelStateMap(item.ModelStates),
-		Attributes:     attrs,
-		Metadata:       metadata,
+		ID:               uuid,
+		Index:            uuid,
+		Provider:         item.Provider,
+		Label:            item.Label,
+		Prefix:           item.Prefix,
+		Status:           item.Status,
+		StatusMessage:    item.StatusMessage,
+		Disabled:         item.Disabled,
+		Unavailable:      item.Unavailable,
+		NextRefreshAfter: item.NextRefreshAfter,
+		NextRetryAfter:   item.NextRetryAfter,
+		Quota:            item.Quota,
+		ModelStates:      cloneModelStateMap(item.ModelStates),
+		Attributes:       attrs,
+		Metadata:         metadata,
 	}
 }
 

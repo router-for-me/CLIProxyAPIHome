@@ -55,7 +55,7 @@ type Runtime struct {
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
 	clusterAdapter          ClusterAdapter
 	concurrencyAdmitter     ConcurrencyAdmitter
-	clusterRefresh          func(context.Context, string) ([]byte, error)
+	clusterRefresh          func(context.Context, string, time.Time, string) ([]byte, error)
 	originalStore           coreauth.Store
 
 	clusterUsageQueueMu sync.Mutex
@@ -285,7 +285,7 @@ func (r *Runtime) SetClusterAdapter(adapter ClusterAdapter) {
 }
 
 // SetClusterRefreshHandler sets a cluster refresh handler.
-func (r *Runtime) SetClusterRefreshHandler(handler func(context.Context, string) ([]byte, error)) {
+func (r *Runtime) SetClusterRefreshHandler(handler func(context.Context, string, time.Time, string) ([]byte, error)) {
 	if r == nil {
 		return
 	}
@@ -428,21 +428,31 @@ func (r *Runtime) CoreManager() *coreauth.Manager {
 
 // RefreshNow refreshes refresh now.
 func (r *Runtime) RefreshNow(ctx context.Context, authIndex string) ([]byte, error) {
+	return r.RefreshNowObserved(ctx, authIndex, time.Time{}, "")
+}
+
+// RefreshNowObserved refreshes unless Home already replaced the dispatched token.
+func (r *Runtime) RefreshNowObserved(ctx context.Context, authIndex string, observedRefreshAt time.Time, accessTokenSHA256 string) ([]byte, error) {
 	if r == nil {
 		return nil, fmt.Errorf("home runtime: runtime is nil")
 	}
 	if r.clusterRefresh != nil {
-		return r.clusterRefresh(ctx, authIndex)
+		return r.clusterRefresh(ctx, authIndex, observedRefreshAt, accessTokenSHA256)
 	}
-	return r.RefreshNowLocal(ctx, authIndex)
+	return r.RefreshNowLocalObserved(ctx, authIndex, observedRefreshAt, accessTokenSHA256)
 }
 
 // RefreshNowLocal refreshes refresh now local.
 func (r *Runtime) RefreshNowLocal(ctx context.Context, authIndex string) ([]byte, error) {
+	return r.RefreshNowLocalObserved(ctx, authIndex, time.Time{}, "")
+}
+
+// RefreshNowLocalObserved refreshes a local credential unless it is already newer.
+func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex string, observedRefreshAt time.Time, accessTokenSHA256 string) ([]byte, error) {
 	if r == nil || r.coreManager == nil {
 		return nil, fmt.Errorf("home runtime: runtime not ready")
 	}
-	updated, errRefresh := r.coreManager.RefreshNow(ctx, authIndex)
+	updated, errRefresh := r.coreManager.RefreshNowObserved(ctx, authIndex, observedRefreshAt, accessTokenSHA256)
 	if errRefresh != nil {
 		return nil, errRefresh
 	}

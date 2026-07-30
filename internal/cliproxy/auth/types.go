@@ -213,7 +213,7 @@ func (a *Auth) Clone() *Auth {
 	if len(a.Metadata) > 0 {
 		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
 		for key, value := range a.Metadata {
-			copyAuth.Metadata[key] = value
+			copyAuth.Metadata[key] = cloneAuthMetadataValue(value)
 		}
 	}
 	if len(a.ModelStates) > 0 {
@@ -224,6 +224,35 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+func cloneAuthMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			cloned[key] = cloneAuthMetadataValue(nested)
+		}
+		return cloned
+	case map[string]string:
+		cloned := make(map[string]string, len(typed))
+		for key, nested := range typed {
+			cloned[key] = nested
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, nested := range typed {
+			cloned[index] = cloneAuthMetadataValue(nested)
+		}
+		return cloned
+	case []string:
+		return append([]string(nil), typed...)
+	case []byte:
+		return append([]byte(nil), typed...)
+	default:
+		return value
+	}
 }
 
 // stableAuthIndex handles a stable auth index.

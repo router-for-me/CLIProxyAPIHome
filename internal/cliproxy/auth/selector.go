@@ -312,6 +312,19 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if RefreshBackoffOpen(auth, now) {
+		return true, blockReasonOther, auth.NextRetryAfter
+	}
+	if auth.Unavailable && auth.NextRetryAfter.After(now) && !authUnavailableAggregatedFromModels(auth, now) {
+		next := auth.NextRetryAfter
+		if auth.Quota.NextRecoverAt.After(next) {
+			next = auth.Quota.NextRecoverAt
+		}
+		if auth.Quota.Exceeded {
+			return true, blockReasonCooldown, next
+		}
+		return true, blockReasonOther, next
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]
@@ -362,6 +375,59 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+func authScopedBackoffOpen(auth *Auth, now time.Time) bool {
+	if RefreshBackoffOpen(auth, now) {
+		return true
+	}
+	if auth == nil || !auth.Unavailable || !auth.NextRetryAfter.After(now) {
+		return false
+	}
+	switch authCooldownScope(auth) {
+	case cooldownScopeAuth:
+		return true
+	case cooldownScopeModel:
+		return false
+	default:
+		return !authUnavailableAggregatedFromModels(auth, now)
+	}
+}
+
+func authUnavailableAggregatedFromModels(auth *Auth, now time.Time) bool {
+	if auth == nil || !auth.Unavailable {
+		return false
+	}
+	switch authCooldownScope(auth) {
+	case cooldownScopeAuth:
+		return false
+	case cooldownScopeModel:
+		return true
+	}
+	if len(auth.ModelStates) == 0 {
+		return false
+	}
+	hasState := false
+	allUnavailable := true
+	earliestRetry := time.Time{}
+	matchingModelQuota := !auth.Quota.Exceeded
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		hasState = true
+		stateUnavailable := state.Status == StatusDisabled || (state.Unavailable && state.NextRetryAfter.After(now))
+		if !stateUnavailable {
+			allUnavailable = false
+		}
+		if stateUnavailable && state.NextRetryAfter.After(now) && (earliestRetry.IsZero() || state.NextRetryAfter.Before(earliestRetry)) {
+			earliestRetry = state.NextRetryAfter
+		}
+		if auth.Quota.Exceeded && state.Quota.Exceeded && state.Quota.NextRecoverAt.Equal(auth.Quota.NextRecoverAt) && state.Quota.BackoffLevel == auth.Quota.BackoffLevel {
+			matchingModelQuota = true
+		}
+	}
+	return hasState && allUnavailable && matchingModelQuota && !earliestRetry.IsZero() && auth.NextRetryAfter.Equal(earliestRetry)
 }
 
 // sessionPattern matches Claude Code user_id format:

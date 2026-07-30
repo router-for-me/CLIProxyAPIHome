@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +45,18 @@ func refreshCredential(ctx context.Context, cfg *config.Config, auth *Auth, rt h
 		return refreshXAI(ctx, cfg, auth)
 	default:
 		return auth, nil
+	}
+}
+
+func authSupportsBuiltInRefresh(auth *Auth) bool {
+	if auth == nil || metaStringValue(auth.Metadata, "refresh_token") == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "codex", "claude", "kimi", "antigravity", "xai":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -113,6 +126,9 @@ func refreshKimi(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, er
 	client := kimiauth.NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg, resolveKimiDeviceID(auth), auth.ProxyURL)
 	td, err := client.RefreshToken(ctx, refreshToken)
 	if err != nil {
+		if errors.Is(err, kimiauth.ErrRefreshTokenRejected) {
+			return nil, newUnauthorizedRefreshError()
+		}
 		return nil, err
 	}
 	if auth.Metadata == nil {

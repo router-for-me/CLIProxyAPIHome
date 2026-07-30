@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
@@ -81,7 +82,9 @@ func handleDefaultRefresh(ctx context.Context, env dispatch.Env, jsonArg string)
 		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageMissingAuthIndex)))
 	}
 
-	payload, errRefresh := env.Runtime.RefreshNow(ctx, authIndex)
+	observedRefreshAt := parseObservedRefreshAt(gjson.Get(jsonArg, "last_refreshed_at").String())
+	observedAccessTokenSHA256 := strings.TrimSpace(gjson.Get(jsonArg, "access_token_sha256").String())
+	payload, errRefresh := env.Runtime.RefreshNowObserved(ctx, authIndex, observedRefreshAt, observedAccessTokenSHA256)
 	if errRefresh != nil {
 		return dispatch.BulkString([]byte(buildErrorJSON(errRefresh.Error())))
 	}
@@ -89,6 +92,18 @@ func handleDefaultRefresh(ctx context.Context, env dispatch.Env, jsonArg string)
 		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageAuthNotFound)))
 	}
 	return dispatch.BulkString(payload)
+}
+
+func parseObservedRefreshAt(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	observedAt, errParse := time.Parse(time.RFC3339Nano, value)
+	if errParse != nil {
+		return time.Time{}
+	}
+	return observedAt.UTC()
 }
 
 func looksLikeJSONObject(value string) bool {
