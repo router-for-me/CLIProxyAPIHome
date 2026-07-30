@@ -2,11 +2,15 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
@@ -14,23 +18,66 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	refreshLeaseAttribute = "__home_refresh_lease"
+	refreshLeaseDuration  = 5 * time.Minute
+)
+
 type RefreshController struct {
 	coordinator      *Coordinator
 	runtime          *home.Runtime
 	repo             *Repository
 	forwardTLSConfig *tls.Config
-	forwardRefresh   func(context.Context, *ClusterNodeRecord, string, string, *tls.Config) ([]byte, error)
+	forwardRefresh   func(context.Context, *ClusterNodeRecord, string, string, time.Time, string, *tls.Config) ([]byte, error)
+	refreshLocks     sync.Map
+}
+
+type contextRefreshLock struct {
+	semaphore chan struct{}
+}
+
+func newContextRefreshLock() *contextRefreshLock {
+	lock := &contextRefreshLock{semaphore: make(chan struct{}, 1)}
+	lock.semaphore <- struct{}{}
+	return lock
+}
+
+func (l *contextRefreshLock) Lock(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-l.semaphore:
+		return nil
+	}
+}
+
+func (l *contextRefreshLock) Unlock() {
+	l.semaphore <- struct{}{}
 }
 
 // NewRefreshController creates a new refresh controller.
 func NewRefreshController(coordinator *Coordinator, runtime *home.Runtime, repo *Repository, forwardTLSConfig *tls.Config) *RefreshController {
-	return &RefreshController{
+	controller := &RefreshController{
 		coordinator:      coordinator,
 		runtime:          runtime,
 		repo:             repo,
 		forwardTLSConfig: forwardTLSConfig,
 		forwardRefresh:   ForwardRefreshToMaster,
 	}
+	if runtime != nil && runtime.CoreManager() != nil {
+		runtime.CoreManager().SetAutoRefreshHandler(func(ctx context.Context, auth *coreauth.Auth) error {
+			if auth == nil {
+				return coreauth.ErrRefreshUnsupported
+			}
+			authIndex := strings.TrimSpace(auth.Index)
+			if authIndex == "" {
+				authIndex = strings.TrimSpace(auth.ID)
+			}
+			_, errRefresh := controller.refreshLocalWithLock(ctx, authIndex, auth.LastRefreshedAt, coreauth.AccessTokenSHA256(auth))
+			return errRefresh
+		})
+	}
+	return controller
 }
 
 // OnMasterChanged handles an on master changed.
@@ -57,6 +104,11 @@ func (c *RefreshController) CanAutoRefresh() bool {
 
 // RefreshNow refreshes refresh now.
 func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([]byte, error) {
+	return c.RefreshNowObserved(ctx, authIndex, time.Time{}, "")
+}
+
+// RefreshNowObserved refreshes unless the master already stored a newer token.
+func (c *RefreshController) RefreshNowObserved(ctx context.Context, authIndex string, observedRefreshAt time.Time, observedAccessTokenSHA256 string) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if c == nil || c.runtime == nil {
 		return nil, fmt.Errorf("cluster refresh: runtime is nil")
@@ -65,14 +117,14 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 		ctx = context.Background()
 	}
 	if c.coordinator == nil || c.repo == nil {
-		return c.runtime.RefreshNowLocal(ctx, authIndex)
+		return c.runtime.RefreshNowLocalObserved(ctx, authIndex, observedRefreshAt, observedAccessTokenSHA256)
 	}
 	master, errMaster := c.coordinator.CurrentMaster(ctx)
 	if errMaster != nil {
 		return nil, fmt.Errorf("cluster refresh master lookup: %w", errMaster)
 	}
 	if c.isSelf(master) {
-		return c.refreshLocalWithLock(ctx, authIndex)
+		return c.refreshLocalWithLock(ctx, authIndex, observedRefreshAt, observedAccessTokenSHA256)
 	}
 
 	forwardAuthUUID := strings.TrimSpace(authIndex)
@@ -90,7 +142,7 @@ func (c *RefreshController) RefreshNow(ctx context.Context, authIndex string) ([
 		if forwardRefresh == nil {
 			forwardRefresh = ForwardRefreshToMaster
 		}
-		if payload, errForward := forwardRefresh(ctx, master, forwardAuthUUID, nodeSecret, c.forwardTLSConfig); errForward == nil {
+		if payload, errForward := forwardRefresh(ctx, master, forwardAuthUUID, nodeSecret, observedRefreshAt, observedAccessTokenSHA256, c.forwardTLSConfig); errForward == nil {
 			return payload, nil
 		} else {
 			var authErr *coreauth.Error
@@ -188,9 +240,9 @@ func (c *RefreshController) isSelf(node *ClusterNodeRecord) bool {
 	return strings.TrimSpace(node.IP) == strings.TrimSpace(c.coordinator.node.IP) && node.Port == c.coordinator.node.Port
 }
 
-// refreshLocalWithLock refreshes a local with lock.
-func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex string) ([]byte, error) {
-	// Resolve credential context before calling upstream OAuth services.
+// refreshLocalWithLock claims a short database lease, performs OAuth outside
+// the transaction, then applies the result only if the lease is still owned.
+func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex string, observedRefreshAt time.Time, observedAccessTokenSHA256 string) ([]byte, error) {
 	if c == nil || c.runtime == nil || c.repo == nil {
 		return nil, fmt.Errorf("cluster refresh: controller is not ready")
 	}
@@ -208,35 +260,131 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex 
 		return nil, errTarget
 	}
 
-	var refreshErr error
-	updated, errLock := c.repo.WithAuthRefreshLock(ctx, targetUUID, func(tx *Repository, auth *coreauth.Auth) (*coreauth.Auth, error) {
-		refreshed, errRefresh := core.RefreshAuthCredential(ctx, auth)
-		refreshErr = errRefresh
-		if refreshed == nil {
-			return nil, errRefresh
-		}
-		if _, errSave := tx.UpsertAuth(ctx, refreshed, "update"); errSave != nil {
-			return nil, errSave
-		}
-		return refreshed, nil
-	})
-	if errLock != nil {
+	lockValue, _ := c.refreshLocks.LoadOrStore(targetUUID, newContextRefreshLock())
+	refreshLock := lockValue.(*contextRefreshLock)
+	if errLock := refreshLock.Lock(ctx); errLock != nil {
 		return nil, errLock
 	}
+	defer refreshLock.Unlock()
+
+	now := time.Now().UTC()
+	leaseID := newRefreshLeaseID()
+	var refreshErr error
+	var beforeClaim *coreauth.Auth
+	skipRefresh := false
+	leased, _, leaseClaimed, errClaim := c.repo.MutateAuth(ctx, targetUUID, "refresh-claim", func(auth *coreauth.Auth) bool {
+		if coreauth.AuthIsNewerThanObserved(auth, observedRefreshAt, observedAccessTokenSHA256) {
+			skipRefresh = true
+			return false
+		}
+		if coreauth.RefreshBackoffOpen(auth, now) || refreshLeaseActive(auth, now) {
+			refreshErr = coreauth.NewTransientRefreshError()
+			skipRefresh = true
+			return false
+		}
+		beforeClaim = auth.Clone()
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes[refreshLeaseAttribute] = leaseID
+		coreauth.ApplyRefreshPendingState(auth, now, now.Add(refreshLeaseDuration))
+		return true
+	})
+	if errClaim != nil {
+		return nil, errClaim
+	}
+	updated := leased
+	if !skipRefresh && leaseClaimed {
+		if _, errUpdate := c.runtime.UpdateAuthInMemory(context.WithoutCancel(ctx), leased); errUpdate != nil {
+			return nil, errUpdate
+		}
+		refreshed, errRefresh := core.RefreshAuthCredential(ctx, leased.Clone())
+		refreshErr = errRefresh
+		if refreshed == nil {
+			refreshed = leased.Clone()
+		}
+
+		refreshSuperseded := false
+		finalizeCtx, cancelFinalize := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		var finalized *coreauth.Auth
+		var finalizedLease bool
+		var errFinalize error
+		for {
+			refreshSuperseded = false
+			finalizedAttempt, _, finalizedLeaseAttempt, errAttempt := c.repo.MutateAuth(finalizeCtx, targetUUID, "refresh-finalize", func(current *coreauth.Auth) bool {
+				if current.Attributes == nil || current.Attributes[refreshLeaseAttribute] != leaseID {
+					return false
+				}
+				if current.Disabled || current.Status == coreauth.StatusDisabled {
+					delete(current.Attributes, refreshLeaseAttribute)
+					refreshErr = &coreauth.Error{Code: "authentication_error", Message: "credential unauthorized", HTTPStatus: http.StatusUnauthorized}
+					return true
+				}
+				if errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+					delete(current.Attributes, refreshLeaseAttribute)
+					restoreRefreshClaimState(current, beforeClaim, time.Now().UTC())
+					return true
+				}
+				if coreauth.AuthIsNewerThanObserved(current, leased.LastRefreshedAt, coreauth.AccessTokenSHA256(leased)) {
+					delete(current.Attributes, refreshLeaseAttribute)
+					current.NextRefreshAfter = time.Time{}
+					refreshSuperseded = true
+					return true
+				}
+				if errors.Is(errRefresh, coreauth.ErrRefreshUnsupported) {
+					delete(current.Attributes, refreshLeaseAttribute)
+					coreauth.ApplyUnsupportedRefreshBackoff(current, time.Now().UTC())
+					return true
+				}
+				merged := mergeClusterRefreshOutcome(current, leased, refreshed, errRefresh, time.Now().UTC())
+				if merged.Attributes != nil {
+					delete(merged.Attributes, refreshLeaseAttribute)
+				}
+				*current = *merged
+				return true
+			})
+			finalized = finalizedAttempt
+			finalizedLease = finalizedLeaseAttempt
+			errFinalize = errAttempt
+			if errFinalize == nil {
+				break
+			}
+			select {
+			case <-finalizeCtx.Done():
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+			break
+		}
+		cancelFinalize()
+		if errFinalize != nil {
+			go c.continueRefreshFinalize(targetUUID, leaseID, leased.Clone(), beforeClaim.Clone(), refreshed.Clone(), errRefresh, now.Add(refreshLeaseDuration))
+			return nil, errFinalize
+		}
+		updated = finalized
+		if refreshSuperseded {
+			refreshErr = nil
+		} else if !finalizedLease {
+			refreshErr = coreauth.NewTransientRefreshError()
+		}
+	}
+
 	if updated == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	if errIndex := c.runtime.RefreshClusterAuthIndex(ctx, targetUUID); errIndex != nil {
+	syncCtx, cancelSync := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancelSync()
+	if errIndex := c.runtime.RefreshClusterAuthIndex(syncCtx, targetUUID); errIndex != nil {
 		if refreshErr != nil {
 			log.Warnf("cluster refresh index sync failed after persisted refresh failure | auth=%s err=%v", targetUUID, errIndex)
-			if _, errFailClosed := c.runtime.UpdateAuthInMemory(ctx, updated); errFailClosed != nil {
+			if _, errFailClosed := c.runtime.UpdateAuthInMemory(context.WithoutCancel(ctx), updated); errFailClosed != nil {
 				log.Warnf("cluster refresh fail-closed memory update failed | auth=%s err=%v", targetUUID, errFailClosed)
 			}
 			return nil, refreshErr
 		}
 		return nil, errIndex
 	}
-	if _, errUpdate := c.runtime.UpdateAuthInMemory(ctx, updated); errUpdate != nil {
+	if _, errUpdate := c.runtime.UpdateAuthInMemory(syncCtx, updated); errUpdate != nil {
 		if refreshErr != nil {
 			log.Warnf("cluster refresh memory sync failed after persisted refresh failure | auth=%s err=%v", targetUUID, errUpdate)
 			return nil, refreshErr
@@ -253,6 +401,197 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex 
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
 	return home.BuildRefreshPayload(updated)
+}
+
+func (c *RefreshController) continueRefreshFinalize(targetUUID, leaseID string, leased, beforeClaim, refreshed *coreauth.Auth, errRefresh error, deadline time.Time) {
+	if c == nil || c.repo == nil || c.runtime == nil || leased == nil || refreshed == nil {
+		return
+	}
+	for time.Now().UTC().Before(deadline) {
+		attemptCtx, cancelAttempt := context.WithTimeout(context.Background(), 5*time.Second)
+		finalized, _, _, errFinalize := c.repo.MutateAuth(attemptCtx, targetUUID, "refresh-finalize-retry", func(current *coreauth.Auth) bool {
+			if current.Attributes == nil || current.Attributes[refreshLeaseAttribute] != leaseID {
+				return false
+			}
+			if current.Disabled || current.Status == coreauth.StatusDisabled {
+				delete(current.Attributes, refreshLeaseAttribute)
+				return true
+			}
+			if errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+				delete(current.Attributes, refreshLeaseAttribute)
+				restoreRefreshClaimState(current, beforeClaim, time.Now().UTC())
+				return true
+			}
+			if coreauth.AuthIsNewerThanObserved(current, leased.LastRefreshedAt, coreauth.AccessTokenSHA256(leased)) {
+				delete(current.Attributes, refreshLeaseAttribute)
+				current.NextRefreshAfter = time.Time{}
+				return true
+			}
+			if errors.Is(errRefresh, coreauth.ErrRefreshUnsupported) {
+				delete(current.Attributes, refreshLeaseAttribute)
+				coreauth.ApplyUnsupportedRefreshBackoff(current, time.Now().UTC())
+				return true
+			}
+			merged := mergeClusterRefreshOutcome(current, leased, refreshed, errRefresh, time.Now().UTC())
+			if merged.Attributes != nil {
+				delete(merged.Attributes, refreshLeaseAttribute)
+			}
+			*current = *merged
+			return true
+		})
+		cancelAttempt()
+		if errFinalize == nil {
+			if finalized != nil {
+				syncCtx, cancelSync := context.WithTimeout(context.Background(), 10*time.Second)
+				if errSync := c.syncForwardedAuth(syncCtx, targetUUID); errSync != nil {
+					log.Warnf("cluster refresh background finalization sync failed | auth=%s err=%v", targetUUID, errSync)
+				}
+				cancelSync()
+			}
+			return
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		<-timer.C
+	}
+	log.Warnf("cluster refresh background finalization expired | auth=%s", targetUUID)
+}
+
+func restoreRefreshClaimState(current, beforeClaim *coreauth.Auth, now time.Time) {
+	if current == nil || beforeClaim == nil {
+		return
+	}
+	current.Unavailable = beforeClaim.Unavailable
+	current.Status = beforeClaim.Status
+	current.StatusMessage = beforeClaim.StatusMessage
+	current.LastError = beforeClaim.LastError
+	current.NextRefreshAfter = beforeClaim.NextRefreshAfter
+	current.NextRetryAfter = beforeClaim.NextRetryAfter
+	current.UpdatedAt = now
+}
+
+func newRefreshLeaseID() string {
+	var raw [16]byte
+	if _, errRead := rand.Read(raw[:]); errRead == nil {
+		return hex.EncodeToString(raw[:])
+	}
+	return fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+}
+
+func refreshLeaseActive(auth *coreauth.Auth, now time.Time) bool {
+	return auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes[refreshLeaseAttribute]) != "" && auth.NextRefreshAfter.After(now)
+}
+
+func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefresh error, now time.Time) *coreauth.Auth {
+	if current == nil {
+		return refreshed
+	}
+	merged := current.Clone()
+	if refreshed == nil {
+		return merged
+	}
+	refreshed = refreshed.Clone()
+	if errRefresh == nil {
+		if base == nil {
+			base = &coreauth.Auth{}
+		}
+		merged.Provider = mergeRefreshString(current.Provider, base.Provider, refreshed.Provider)
+		merged.Prefix = mergeRefreshString(current.Prefix, base.Prefix, refreshed.Prefix)
+		merged.Label = mergeRefreshString(current.Label, base.Label, refreshed.Label)
+		merged.ProxyURL = mergeRefreshString(current.ProxyURL, base.ProxyURL, refreshed.ProxyURL)
+		merged.Attributes = mergeRefreshStringMap(current.Attributes, base.Attributes, refreshed.Attributes)
+		merged.Metadata = mergeRefreshMetadata(current.Metadata, base.Metadata, refreshed.Metadata)
+		merged.Runtime = refreshed.Runtime
+		coreauth.ApplyRefreshSuccessState(merged, now)
+		if refreshed.NextRefreshAfter.After(now) {
+			merged.NextRefreshAfter = refreshed.NextRefreshAfter
+		}
+		return merged
+	}
+	merged.Disabled = refreshed.Disabled
+	merged.Unavailable = refreshed.Unavailable
+	merged.Status = refreshed.Status
+	merged.StatusMessage = refreshed.StatusMessage
+	merged.LastError = refreshed.LastError
+	merged.LastRefreshedAt = refreshed.LastRefreshedAt
+	merged.NextRefreshAfter = refreshed.NextRefreshAfter
+	merged.NextRetryAfter = refreshed.NextRetryAfter
+	merged.UpdatedAt = refreshed.UpdatedAt
+	return merged
+}
+
+func mergeRefreshString(current, base, refreshed string) string {
+	if current == base && refreshed != base {
+		return refreshed
+	}
+	return current
+}
+
+func mergeRefreshStringMap(current, base, refreshed map[string]string) map[string]string {
+	merged := make(map[string]string, len(current)+len(refreshed))
+	for key, value := range current {
+		merged[key] = value
+	}
+	keys := make(map[string]struct{}, len(base)+len(refreshed))
+	for key := range base {
+		keys[key] = struct{}{}
+	}
+	for key := range refreshed {
+		keys[key] = struct{}{}
+	}
+	for key := range keys {
+		baseValue, baseOK := base[key]
+		refreshedValue, refreshedOK := refreshed[key]
+		if baseOK == refreshedOK && baseValue == refreshedValue {
+			continue
+		}
+		currentValue, currentOK := current[key]
+		if currentOK != baseOK || currentValue != baseValue {
+			continue
+		}
+		if refreshedOK {
+			merged[key] = refreshedValue
+		} else {
+			delete(merged, key)
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func mergeRefreshMetadata(current, base, refreshed map[string]any) map[string]any {
+	merged := make(map[string]any, len(current)+len(refreshed))
+	for key, value := range current {
+		merged[key] = value
+	}
+	keys := make(map[string]struct{}, len(base)+len(refreshed))
+	for key := range base {
+		keys[key] = struct{}{}
+	}
+	for key := range refreshed {
+		keys[key] = struct{}{}
+	}
+	for key := range keys {
+		baseValue, baseOK := base[key]
+		refreshedValue, refreshedOK := refreshed[key]
+		if baseOK == refreshedOK && reflect.DeepEqual(baseValue, refreshedValue) {
+			continue
+		}
+		currentValue, currentOK := current[key]
+		if currentOK != baseOK || !reflect.DeepEqual(currentValue, baseValue) {
+			continue
+		}
+		if refreshedOK {
+			merged[key] = refreshedValue
+		} else {
+			delete(merged, key)
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 // refreshTarget refreshes a target.

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
@@ -66,9 +67,12 @@ func TestHandleDefaultGETPlainKeyMissingReturnsNullBulk(t *testing.T) {
 
 func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
 	rt := newGetTestRuntime(t)
-	rt.SetClusterRefreshHandler(func(ctx context.Context, authIndex string) ([]byte, error) {
+	rt.SetClusterRefreshHandler(func(ctx context.Context, authIndex string, observedRefreshAt time.Time, accessTokenSHA256 string) ([]byte, error) {
 		if authIndex != "auth-1" {
 			t.Fatalf("authIndex = %q, want auth-1", authIndex)
+		}
+		if !observedRefreshAt.IsZero() || accessTokenSHA256 != "" {
+			t.Fatalf("observed version = %v/%q, want zero/empty for legacy request", observedRefreshAt, accessTokenSHA256)
 		}
 		return []byte(`{"ok":true}`), nil
 	})
@@ -79,9 +83,26 @@ func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
 	}
 }
 
+func TestHandleDefaultGETRefreshPassesObservedVersion(t *testing.T) {
+	rt := newGetTestRuntime(t)
+	observedRefreshAt := time.Now().UTC().Round(0)
+	rt.SetClusterRefreshHandler(func(_ context.Context, authIndex string, observed time.Time, accessTokenSHA256 string) ([]byte, error) {
+		if authIndex != "auth-1" || !observed.Equal(observedRefreshAt) || accessTokenSHA256 != "token-hash" {
+			t.Fatalf("refresh request = %q/%v/%q, want auth-1/%v/token-hash", authIndex, observed, accessTokenSHA256, observedRefreshAt)
+		}
+		return []byte(`{"ok":true}`), nil
+	})
+
+	request := `{"type":"refresh","auth_index":"auth-1","last_refreshed_at":"` + observedRefreshAt.Format(time.RFC3339Nano) + `","access_token_sha256":"token-hash"}`
+	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", request})
+	if reply.Kind != dispatch.ReplyKindBulkString || string(reply.BulkString) != `{"ok":true}` {
+		t.Fatalf("handleDefault(refresh) = %#v, want refresh payload", reply)
+	}
+}
+
 func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
 	rt := newGetTestRuntime(t)
-	rt.SetClusterRefreshHandler(func(context.Context, string) ([]byte, error) {
+	rt.SetClusterRefreshHandler(func(context.Context, string, time.Time, string) ([]byte, error) {
 		return nil, &coreauth.Error{
 			Code:       "authentication_error",
 			Message:    "credential unauthorized",

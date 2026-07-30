@@ -187,6 +187,39 @@ func TestMarkResultUnauthorizedMutatesPersistedStateWithoutReplacingTokens(t *te
 	}
 }
 
+func TestMarkResultIgnoresUnauthorizedFromOlderAccessToken(t *testing.T) {
+	const authID = "auth-cluster-stale-unauthorized"
+	store := &fakeMutatorStore{
+		persisted: &Auth{
+			ID:              authID,
+			Index:           authID,
+			Provider:        "codex",
+			Status:          StatusActive,
+			LastRefreshedAt: time.Now().UTC(),
+			Metadata:        map[string]any{"access_token": "fresh-access-token"},
+		},
+	}
+	node := newHomeNodeManager(t, store, authID)
+	stale := &Auth{Metadata: map[string]any{"access_token": "stale-access-token"}}
+
+	node.MarkResult(context.Background(), Result{
+		AuthID:            authID,
+		Provider:          "codex",
+		Model:             "gpt-5",
+		Success:           false,
+		AccessTokenSHA256: AccessTokenSHA256(stale),
+		Error:             &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+	})
+
+	persisted := store.persistedSnapshot()
+	if persisted.ModelStates["gpt-5"] != nil || persisted.Status != StatusActive || persisted.Unavailable {
+		t.Fatalf("stale unauthorized result changed persisted auth: %#v", persisted)
+	}
+	if store.mutationCount() != 0 || store.saves != 0 {
+		t.Fatalf("persistence calls = mutations %d saves %d, want 0/0", store.mutationCount(), store.saves)
+	}
+}
+
 func TestMarkResultQuotaEscalatesFromPersistedLevelAfterExpiry(t *testing.T) {
 	const authID = "auth-cluster-expired"
 	expired := time.Now().Add(-time.Second)

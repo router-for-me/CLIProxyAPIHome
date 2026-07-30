@@ -274,7 +274,7 @@ func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken st
 		}
 
 		lastErr = err
-		log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
+		log.Warnf("Token refresh attempt %d failed with a provider response", attempt+1)
 		if !isClaudeRefreshRetryable(err) {
 			break
 		}
