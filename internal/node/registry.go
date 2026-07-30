@@ -138,7 +138,7 @@ func (r *Registry) updateFingerprintState(fingerprint string, nodeID string, ip 
 	if revision > entry.latestCancelRevision {
 		entry.latestCancelRevision = revision
 	}
-	if entry.count == 0 && entry.openConnections == 0 && entry.activeHandlers == 0 && entry.latestCancelRevision == 0 {
+	if entry.count == 0 && entry.openConnections == 0 && entry.activeHandlers == 0 {
 		delete(r.nodes, key)
 	} else {
 		r.nodes[key] = entry

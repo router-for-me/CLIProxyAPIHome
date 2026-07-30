@@ -552,7 +552,7 @@ func (r *Repository) replaceCPANodeSnapshot(ctx context.Context, home HomeIncarn
 		} else {
 			connectedAt = connectedAt.UTC()
 		}
-		if clientCount <= 0 && item.OpenConnections <= 0 && item.ActiveHandlers <= 0 && item.LatestCancelRevision <= 0 {
+		if clientCount <= 0 && item.OpenConnections <= 0 && item.ActiveHandlers <= 0 {
 			continue
 		}
 		records = append(records, CPANodeRecord{
@@ -586,6 +586,41 @@ func (r *Repository) replaceCPANodeSnapshot(ctx context.Context, home HomeIncarn
 		}
 		return tx.Create(&records).Error
 	})
+}
+
+// DeleteExpiredCPANodeSnapshots removes derived snapshots after the retention window.
+func (r *Repository) DeleteExpiredCPANodeSnapshots(ctx context.Context, retention time.Duration) error {
+	db, errDB := r.database()
+	if errDB != nil {
+		return errDB
+	}
+	if retention <= 0 {
+		return fmt.Errorf("CPA node snapshot retention must be greater than 0")
+	}
+	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		now, errNow := DatabaseNow(ctx, tx)
+		if errNow != nil {
+			return errNow
+		}
+		return tx.Where("last_seen_at < ?", now.Add(-retention)).Delete(&CPANodeRecord{}).Error
+	})
+}
+
+// ListActiveCPAMemberships returns the authoritative active CPA owners.
+func (r *Repository) ListActiveCPAMemberships(ctx context.Context) ([]CPANodeMembershipRecord, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	var records []CPANodeMembershipRecord
+	errFind := db.WithContext(contextOrBackground(ctx)).
+		Where("state = ?", MembershipStateActive).
+		Order("certificate_fingerprint ASC").
+		Find(&records).Error
+	if errFind != nil {
+		return nil, errFind
+	}
+	return records, nil
 }
 
 // ListLiveCPANodes returns live CPA node snapshots reported by active Home nodes.

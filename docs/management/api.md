@@ -595,15 +595,15 @@ Example response:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `nodes` | array | Active CPA node list aggregated from connection snapshots written by all live Home nodes into the shared database. |
+| `nodes` | array | Authoritative active CPA list. A snapshot is returned only when it has a config subscription and its certificate fingerprint and complete Home incarnation match an active `cpa_node_membership` owner. Draining and revision-only snapshots are excluded. |
 | `plugin_report_required` | boolean | Whether the current Home config expects CPA plugin reports because at least one enabled plugin has a pinned store manifest. |
 | `plugin_report_statuses` | array | Latest plugin reports stored in the shared database, grouped by reporting node and report metadata. Delete reports for one plugin can coexist with preserved status rows for other plugins. These are retained until the node reports again or is explicitly cleaned up; they do not expire by TTL and are self-reported observations, not authoritative install proof. |
 | `nodes[].node_id` | string | CPA node ID derived from the Home client certificate when available. |
 | `nodes[].ip` | string | Node IP address. |
 | `nodes[].connected_time` | string | First connection time for the active node entry. |
-| `nodes[].last_seen_at` | string | Time when the serving Home node last refreshed this CPA connection snapshot in the shared database. |
+| `nodes[].last_seen_at` | string | Time when the serving Home last refreshed the derived `cpa_node` snapshot. |
 | `nodes[].client_count` | integer | Active RESP subscription connection count from this IP. |
-| `nodes[].healthy` | boolean | Whether the node has an active RESP subscription connection. Plugin reports do not make this field unhealthy. |
+| `nodes[].healthy` | boolean | Whether the CPA membership heartbeat and its exact serving Home incarnation are both healthy. Plugin reports do not affect this field. |
 | `nodes[].home_id` | string | Home node identity serving this CPA node, formatted as `home_ip:home_port`. |
 | `nodes[].home_ip` | string | Home node IP or advertised cluster identity serving this CPA node. |
 | `nodes[].home_port` | integer | Home node RESP/cluster port serving this CPA node. |
@@ -618,7 +618,7 @@ Example response:
 
 ### GET `/topology`
 
-Returns a Home + CPA topology snapshot for the database-backed Home runtime. Unlike `GET /nodes`, this route is cluster-wide and topology-oriented: Home nodes are read from the shared cluster heartbeat table, and CPA nodes are read from the shared CPA snapshot table written by each Home process, including stale snapshots that are classified by the configured heartbeat timeout.
+Returns a Home + CPA topology snapshot for the database-backed Home runtime. Active ownership comes from `cpa_node_membership`; `cpa_node` is a derived diagnostic snapshot. Subscription snapshots that do not match the membership fingerprint and complete `(HomeIP, HomePort, HomeStartedAt)` owner are shown as `draining`, not as active CPAs.
 
 Input: none.
 
@@ -689,8 +689,9 @@ Example response:
       "connected_time": "2026-05-27T10:05:00Z",
       "last_seen_at": "2026-05-27T10:30:02Z",
       "client_count": 1,
-      "healthy": true,
+      "state": "active",
       "health": "healthy",
+      "healthy": true,
       "home_id": "10.0.0.10:8327",
       "home_ip": "10.0.0.10",
       "home_port": 8327,
@@ -707,14 +708,14 @@ Example response:
 | `summary.healthy_home_count` | integer | Home nodes whose `last_seen_at` is within `stale_after_seconds`. |
 | `summary.stale_home_count` | integer | Home nodes known to the database but past the stale cutoff. |
 | `summary.unknown_home_count` | integer | Home nodes whose health cannot be determined because required identity or heartbeat data is missing. |
-| `summary.cpa_count` | integer | Number of CPA node snapshots known to the cluster. |
-| `summary.healthy_cpa_count` | integer | CPA snapshots attached to a healthy Home and seen within the stale cutoff. |
-| `summary.stale_cpa_count` | integer | CPA snapshots whose Home or own heartbeat is stale. |
-| `summary.unknown_cpa_count` | integer | CPA snapshots whose serving Home identity or health cannot be determined. |
+| `summary.cpa_count` | integer | Logical CPA count, deduplicated by certificate fingerprint across active and draining snapshots. |
+| `summary.healthy_cpa_count` | integer | Active CPAs whose membership heartbeat and exact Home incarnation are healthy. |
+| `summary.stale_cpa_count` | integer | Active CPAs whose membership heartbeat or exact Home incarnation is stale. |
+| `summary.unknown_cpa_count` | integer | Active CPAs whose exact serving Home incarnation cannot be determined. |
 | `summary.plugin_attention_count` | integer | CPA nodes with missing, partial, or failed plugin reports when plugin reports are required. |
 | `summary.attention_count` | integer | Combined operational attention count: stale/unknown Home nodes, CPA nodes needing attention counted once each, plus missing master. |
 | `summary.missing_master` | boolean | Whether no healthy Home can currently be selected as master. |
-| `summary.stale_after_seconds` | integer | Heartbeat timeout used for topology health classification. |
+| `summary.stale_after_seconds` | integer | Home heartbeat timeout used to classify Home health and select the current master. CPA health additionally uses each membership's CPA heartbeat timeout. |
 | `summary.retention_after_seconds` | integer | Topology snapshot retention window. Records older than this are omitted from `homes[]` and `cpas[]`. |
 | `management.home_id` | string | Current Management runtime Home identity, formatted as `home_ip:home_port`. |
 | `management.home_ip` | string | Current Management runtime Home IP or advertised cluster identity. |
@@ -732,18 +733,19 @@ Example response:
 | `homes[].client_count` | integer | Total active CPA config subscriptions reported by that Home. |
 | `homes[].started_at` | string | Home process start time. |
 | `homes[].last_seen_at` | string | Last Home heartbeat stored in the shared database. |
-| `homes[].cpa_count` | integer | CPA snapshots currently associated with this Home. |
-| `homes[].healthy_cpa_count` | integer | Healthy CPA snapshots associated with this Home. |
-| `homes[].stale_cpa_count` | integer | Stale CPA snapshots associated with this Home. |
-| `homes[].unknown_cpa_count` | integer | Unknown-health CPA snapshots associated with this Home. |
-| `cpas[]` | array | CPA node snapshots with their serving Home identity. |
+| `homes[].cpa_count` | integer | Active CPA count owned by this exact Home incarnation. |
+| `homes[].healthy_cpa_count` | integer | Healthy active CPAs owned by this Home incarnation. |
+| `homes[].stale_cpa_count` | integer | Stale active CPAs owned by this Home incarnation. |
+| `homes[].unknown_cpa_count` | integer | Unknown-health active CPAs owned by this Home incarnation. |
+| `cpas[]` | array | Active and draining CPA diagnostic snapshots. Revision-only snapshots are omitted. |
 | `cpas[].node_id` | string | CPA node ID derived from the client certificate when available. |
 | `cpas[].ip` | string | CPA node IP address observed by its serving Home. |
 | `cpas[].connected_time` | string | First observed active connection time for this CPA snapshot on its serving Home. |
-| `cpas[].last_seen_at` | string | Last time the serving Home refreshed this CPA snapshot. |
+| `cpas[].last_seen_at` | string | Last time the serving Home refreshed this derived snapshot. |
 | `cpas[].client_count` | integer | Active RESP subscription count represented by this CPA snapshot. |
-| `cpas[].healthy` | boolean | Whether `cpas[].health` is `healthy`. |
+| `cpas[].state` | string | `active` when the subscription and authoritative membership owner match; otherwise `draining`. |
 | `cpas[].health` | string | `healthy`, `stale`, or `unknown`. |
+| `cpas[].healthy` | boolean | Whether `cpas[].health` is `healthy`; retained for backward compatibility. |
 | `cpas[].home_id` | string | Serving Home identity, formatted as `home_ip:home_port`. |
 | `cpas[].home_ip` | string | Serving Home IP or advertised cluster identity. |
 | `cpas[].home_port` | integer | Serving Home cluster/RESP port. |

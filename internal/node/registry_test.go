@@ -59,17 +59,14 @@ func TestRegistryKeepsOpenHandlerAfterSubscriptionDrains(t *testing.T) {
 	}
 }
 
-func TestRegistryKeepsFingerprintStateAfterConnectionsDrain(t *testing.T) {
+func TestRegistryDropsFingerprintStateAfterConnectionsDrainDespiteRevision(t *testing.T) {
 	registry := NewRegistry()
 	registry.UpdateFingerprintState("fp-a", "node-a", "127.0.0.1", 1, 1, 9)
 	registry.UpdateFingerprintState("fp-a", "node-a", "127.0.0.1", -1, -1, 9)
 
 	nodes := registry.List()
-	if len(nodes) != 1 {
-		t.Fatalf("nodes = %d, want state retained for latest cancellation revision", len(nodes))
-	}
-	if nodes[0].OpenConnections != 0 || nodes[0].ActiveHandlers != 0 || nodes[0].LatestCancelRevision != 9 {
-		t.Fatalf("node = %#v", nodes[0])
+	if len(nodes) != 0 {
+		t.Fatalf("nodes = %#v, want revision-only state removed", nodes)
 	}
 }
 

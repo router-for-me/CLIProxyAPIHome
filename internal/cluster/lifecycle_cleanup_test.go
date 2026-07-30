@@ -72,6 +72,59 @@ func TestCoordinatorRunsLifecycleCleanupContinuously(t *testing.T) {
 	}
 }
 
+func TestCoordinatorLifecycleCleanupOwnsCPANodeSnapshotRetention(t *testing.T) {
+	ctx := context.Background()
+	repo := newCredentialFoundationTestRepository(t)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "10.0.0.1", Port: 8317}, CoordinatorOptions{
+		HeartbeatTimeout: 20 * time.Second,
+	})
+	if errInitialize := coordinator.Initialize(ctx); errInitialize != nil {
+		t.Fatal(errInitialize)
+	}
+	defer coordinator.setMaster(false)
+
+	databaseNow, errNow := DatabaseNow(ctx, repo.db)
+	if errNow != nil {
+		t.Fatal(errNow)
+	}
+	expired := CPANodeRecord{
+		HomeIP:                 "10.0.0.2",
+		HomePort:               8317,
+		HomeStartedAt:          databaseNow.Add(-time.Hour),
+		NodeKey:                "fingerprint:expired",
+		NodeID:                 "cpa-expired",
+		CertificateFingerprint: "expired",
+		ClientCount:            1,
+		ConnectedAt:            databaseNow.Add(-time.Hour),
+		LastSeenAt:             databaseNow.Add(-cpaNodeSnapshotRetention(coordinator.heartbeatTimeout) - time.Second),
+	}
+	if errCreate := repo.db.Create(&expired).Error; errCreate != nil {
+		t.Fatal(errCreate)
+	}
+
+	if errUpdate := coordinator.UpdateClientCount(ctx, 0); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	var countAfterUpdate int64
+	if errCount := repo.db.Model(&CPANodeRecord{}).Where("node_key = ?", expired.NodeKey).Count(&countAfterUpdate).Error; errCount != nil {
+		t.Fatal(errCount)
+	}
+	if countAfterUpdate != 1 {
+		t.Fatalf("snapshot count after UpdateClientCount() = %d, want 1", countAfterUpdate)
+	}
+
+	if errCleanup := coordinator.runLifecycleCleanup(ctx); errCleanup != nil {
+		t.Fatal(errCleanup)
+	}
+	var countAfterCleanup int64
+	if errCount := repo.db.Model(&CPANodeRecord{}).Where("node_key = ?", expired.NodeKey).Count(&countAfterCleanup).Error; errCount != nil {
+		t.Fatal(errCount)
+	}
+	if countAfterCleanup != 0 {
+		t.Fatalf("snapshot count after runLifecycleCleanup() = %d, want 0", countAfterCleanup)
+	}
+}
+
 func TestCoordinatorReloadsLifecycleCleanupInterval(t *testing.T) {
 	ctx := context.Background()
 	repo := newCredentialFoundationTestRepository(t)

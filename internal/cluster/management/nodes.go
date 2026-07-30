@@ -4,11 +4,11 @@ import (
 	"context"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 )
 
@@ -28,6 +28,7 @@ type activeCPANode struct {
 	HomeIP      string
 	HomePort    int
 	LastSeenAt  time.Time
+	Health      string
 }
 
 // ListNodes returns a nodes.
@@ -63,7 +64,7 @@ func (h *Handler) ListNodes(c *gin.Context) {
 			"connected_time":         activeNode.Connected,
 			"last_seen_at":           activeNode.LastSeenAt,
 			"client_count":           activeNode.ClientCount,
-			"healthy":                activeNode.ClientCount > 0,
+			"healthy":                activeNode.Health == topologyHealthHealthy,
 			"home_id":                homeID,
 			"home_ip":                activeNode.HomeIP,
 			"home_port":              activeNode.HomePort,
@@ -81,16 +82,41 @@ func (h *Handler) ListNodes(c *gin.Context) {
 func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 	nodesByKey := make(map[string]activeCPANode)
 	if h != nil && h.repo != nil {
+		now := time.Now().UTC()
 		cutoff := time.Time{}
 		if h.heartbeatTimeout > 0 {
-			cutoff = time.Now().UTC().Add(-h.heartbeatTimeout)
+			cutoff = now.Add(-topologySnapshotRetention(h.heartbeatTimeout))
 		}
-		records, errRecords := h.repo.ListLiveCPANodes(ctx, cutoff)
+		records, errRecords := h.repo.ListCPANodeSnapshots(ctx, cutoff)
 		if errRecords != nil {
 			return nil, errRecords
 		}
+		memberships, errMemberships := h.repo.ListActiveCPAMemberships(ctx)
+		if errMemberships != nil {
+			return nil, errMemberships
+		}
+		membershipsByFingerprint := make(map[string]cluster.CPANodeMembershipRecord, len(memberships))
+		for _, membership := range memberships {
+			membershipsByFingerprint[strings.TrimSpace(membership.CertificateFingerprint)] = membership
+		}
+		homeRecords, errHomes := h.repo.ListClusterNodes(ctx, cutoff)
+		if errHomes != nil {
+			return nil, errHomes
+		}
+		healthCutoff := now.Add(-h.heartbeatTimeout)
+		homeHealth := make(map[string]string, len(homeRecords))
+		for _, homeRecord := range homeRecords {
+			homeKey := topologyHomeIncarnationKey(homeRecord.IP, homeRecord.Port, homeRecord.StartedAt)
+			homeHealth[homeKey] = topologyHealth(homeRecord.LastSeenAt, healthCutoff)
+		}
 		for _, record := range records {
-			key := activeCPANodeKey(record.HomeIP, record.HomePort, record.NodeID, record.ClientIP)
+			fingerprint := strings.TrimSpace(record.CertificateFingerprint)
+			membership, hasMembership := membershipsByFingerprint[fingerprint]
+			if topologyCPASnapshotState(record, membership, hasMembership) != topologyCPAActive {
+				continue
+			}
+			homeKey := topologyHomeIncarnationKey(record.HomeIP, record.HomePort, record.HomeStartedAt)
+			key := fingerprint
 			if key == "" {
 				continue
 			}
@@ -102,29 +128,8 @@ func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 				HomeIP:      strings.TrimSpace(record.HomeIP),
 				HomePort:    record.HomePort,
 				LastSeenAt:  record.LastSeenAt,
+				Health:      topologyCPASnapshotHealth(topologyCPAActive, membership, homeHealth[homeKey], healthCutoff),
 			}
-		}
-	}
-
-	localHomeIP := ""
-	localHomePort := 0
-	if h != nil {
-		localHomeIP = strings.TrimSpace(h.nodeIP)
-		localHomePort = h.nodePort
-	}
-	for _, localNode := range node.GlobalRegistry().List() {
-		key := activeCPANodeKey(localHomeIP, localHomePort, localNode.NodeID, localNode.IP)
-		if key == "" {
-			continue
-		}
-		nodesByKey[key] = activeCPANode{
-			NodeID:      strings.TrimSpace(localNode.NodeID),
-			IP:          strings.TrimSpace(localNode.IP),
-			Connected:   localNode.Connected,
-			ClientCount: localNode.ClientCount,
-			HomeIP:      localHomeIP,
-			HomePort:    localHomePort,
-			LastSeenAt:  time.Now().UTC(),
 		}
 	}
 
@@ -148,22 +153,6 @@ func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 		return nodes[i].Connected.Before(nodes[j].Connected)
 	})
 	return nodes, nil
-}
-
-func activeCPANodeKey(homeIP string, homePort int, nodeID string, clientIP string) string {
-	homeIP = strings.TrimSpace(homeIP)
-	nodeID = strings.TrimSpace(nodeID)
-	clientIP = strings.TrimSpace(clientIP)
-	nodeKey := ""
-	if nodeID != "" {
-		nodeKey = "node:" + nodeID
-	} else if clientIP != "" {
-		nodeKey = "ip:" + clientIP
-	}
-	if nodeKey == "" {
-		return ""
-	}
-	return homeIP + ":" + strconv.Itoa(homePort) + "/" + nodeKey
 }
 
 func (h *Handler) pluginTaskStatuses(ctx context.Context) ([]node.PluginTaskStatus, error) {

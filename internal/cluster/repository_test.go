@@ -209,7 +209,7 @@ func TestReplaceCPANodeSnapshotConcurrentSameHome(t *testing.T) {
 	}
 }
 
-func TestReplaceCPANodeSnapshotPersistsRevisionAndHandlerOnlyStates(t *testing.T) {
+func TestReplaceCPANodeSnapshotPersistsHandlerButNotRevisionOnlyState(t *testing.T) {
 	db, errOpenSQLite := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
 	if errOpenSQLite != nil {
 		t.Fatalf("OpenSQLite failed: %v", errOpenSQLite)
@@ -240,14 +240,53 @@ func TestReplaceCPANodeSnapshotPersistsRevisionAndHandlerOnlyStates(t *testing.T
 	if errList != nil {
 		t.Fatalf("ListLiveCPANodes() error = %v", errList)
 	}
-	if len(records) != 2 {
-		t.Fatalf("snapshot records = %d, want 2", len(records))
+	if len(records) != 1 {
+		t.Fatalf("snapshot records = %d, want only handler state", len(records))
 	}
 	if records[0].NodeID != "handler-only" || records[0].ActiveHandlers != 1 {
 		t.Fatalf("handler-only record = %+v, want active handler state", records[0])
 	}
-	if records[1].NodeID != "revision-only" || records[1].LatestCancelRevision != 1 {
-		t.Fatalf("revision-only record = %+v, want cancellation revision state", records[1])
+}
+
+func TestDeleteExpiredCPANodeSnapshotsUsesRetention(t *testing.T) {
+	db, errOpenSQLite := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
+	if errOpenSQLite != nil {
+		t.Fatalf("OpenSQLite failed: %v", errOpenSQLite)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("get sql db: %v", errDB)
+	}
+	defer func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sql db: %v", errClose)
+		}
+	}()
+	if errMigrate := AutoMigrate(db); errMigrate != nil {
+		t.Fatalf("AutoMigrate failed: %v", errMigrate)
+	}
+
+	repo := NewRepository(db)
+	databaseNow, errNow := DatabaseNow(context.Background(), db)
+	if errNow != nil {
+		t.Fatalf("DatabaseNow() error = %v", errNow)
+	}
+	records := []CPANodeRecord{
+		{HomeIP: "home-old", HomePort: 8327, HomeStartedAt: databaseNow.Add(-time.Hour), NodeKey: "fingerprint:old", CertificateFingerprint: "old", ClientCount: 1, LastSeenAt: databaseNow.Add(-time.Minute)},
+		{HomeIP: "home-new", HomePort: 8327, HomeStartedAt: databaseNow, NodeKey: "fingerprint:new", CertificateFingerprint: "new", ClientCount: 1, LastSeenAt: databaseNow},
+	}
+	if errCreate := db.Create(&records).Error; errCreate != nil {
+		t.Fatalf("create snapshots: %v", errCreate)
+	}
+	if errDelete := repo.DeleteExpiredCPANodeSnapshots(context.Background(), 30*time.Second); errDelete != nil {
+		t.Fatalf("DeleteExpiredCPANodeSnapshots() error = %v", errDelete)
+	}
+	var remaining []CPANodeRecord
+	if errFind := db.Order("node_key").Find(&remaining).Error; errFind != nil {
+		t.Fatalf("find remaining snapshots: %v", errFind)
+	}
+	if len(remaining) != 1 || remaining[0].CertificateFingerprint != "new" {
+		t.Fatalf("remaining snapshots = %+v, want only new", remaining)
 	}
 }
 
