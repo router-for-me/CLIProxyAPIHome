@@ -26,6 +26,26 @@ func TestDatabaseNowQueryKeepsCurrentTimestampForSQLite(t *testing.T) {
 	}
 }
 
+func TestRepositoryCurrentDatabaseTime(t *testing.T) {
+	repo := newCredentialFoundationTestRepository(t)
+
+	before, errBefore := DatabaseNow(context.Background(), repo.db)
+	if errBefore != nil {
+		t.Fatal(errBefore)
+	}
+	got, errNow := repo.CurrentDatabaseTime(context.Background())
+	if errNow != nil {
+		t.Fatal(errNow)
+	}
+	after, errAfter := DatabaseNow(context.Background(), repo.db)
+	if errAfter != nil {
+		t.Fatal(errAfter)
+	}
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("CurrentDatabaseTime() = %s, want between %s and %s", got, before, after)
+	}
+}
+
 func TestDatabaseNowAdvancesWithinPostgresTransaction(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("CLIPROXY_HOME_TEST_POSTGRES_DSN"))
 	if dsn == "" {

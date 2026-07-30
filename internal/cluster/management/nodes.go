@@ -82,7 +82,10 @@ func (h *Handler) ListNodes(c *gin.Context) {
 func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 	nodesByKey := make(map[string]activeCPANode)
 	if h != nil && h.repo != nil {
-		now := time.Now().UTC()
+		now, errNow := h.repo.CurrentDatabaseTime(ctx)
+		if errNow != nil {
+			return nil, errNow
+		}
 		cutoff := time.Time{}
 		if h.heartbeatTimeout > 0 {
 			cutoff = now.Add(-topologySnapshotRetention(h.heartbeatTimeout))
@@ -128,7 +131,7 @@ func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 				HomeIP:      strings.TrimSpace(record.HomeIP),
 				HomePort:    record.HomePort,
 				LastSeenAt:  record.LastSeenAt,
-				Health:      topologyCPASnapshotHealth(topologyCPAActive, membership, homeHealth[homeKey], healthCutoff),
+				Health:      topologyCPASnapshotHealth(topologyCPAActive, membership, homeHealth[homeKey], now),
 			}
 		}
 	}

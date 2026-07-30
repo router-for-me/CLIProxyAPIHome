@@ -50,7 +50,11 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now, errNow := h.repo.CurrentDatabaseTime(ctx)
+	if errNow != nil {
+		respondError(c, http.StatusInternalServerError, "database_time_load_failed", errNow)
+		return
+	}
 	heartbeatTimeout := h.heartbeatTimeout
 	if heartbeatTimeout <= 0 {
 		heartbeatTimeout = cluster.DefaultHeartbeatTimeout()
@@ -107,7 +111,7 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		if logicalKey != "" {
 			logicalCPAs[logicalKey] = struct{}{}
 		}
-		health := topologyCPASnapshotHealth(state, membership, homeHealth[homeKey], cutoff)
+		health := topologyCPASnapshotHealth(state, membership, homeHealth[homeKey], now)
 		healthy := health == topologyHealthHealthy
 		if stats := homeStats[homeKey]; stats != nil && state == topologyCPAActive {
 			stats.ActiveCPA++
@@ -312,7 +316,7 @@ func topologyCPASnapshotState(record cluster.CPANodeRecord, membership cluster.C
 	return topologyCPADraining
 }
 
-func topologyCPASnapshotHealth(state string, membership cluster.CPANodeMembershipRecord, homeHealth string, cutoff time.Time) string {
+func topologyCPASnapshotHealth(state string, membership cluster.CPANodeMembershipRecord, homeHealth string, now time.Time) string {
 	if homeHealth == "" {
 		return topologyHealthUnknown
 	}
@@ -325,7 +329,10 @@ func topologyCPASnapshotHealth(state string, membership cluster.CPANodeMembershi
 	if state != topologyCPAActive {
 		return topologyHealthStale
 	}
-	return topologyHealth(membership.LastSeenAt, cutoff)
+	if membership.CPAHeartbeatTimeout <= 0 || now.IsZero() {
+		return topologyHealthUnknown
+	}
+	return topologyHealth(membership.LastSeenAt, now.Add(-membership.CPAHeartbeatTimeout))
 }
 
 func topologyLogicalCPAKey(record cluster.CPANodeRecord) string {

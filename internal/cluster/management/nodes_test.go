@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	"gorm.io/gorm"
 )
@@ -169,6 +170,7 @@ func seedActiveManagementCPA(t *testing.T, db *gorm.DB, home cluster.ClusterNode
 		HomeStartedAt:          home.StartedAt,
 		ProtocolVersion:        1,
 		State:                  cluster.MembershipStateActive,
+		CPAHeartbeatTimeout:    config.DefaultCPAHeartbeatTimeout,
 		ConnectedAt:            connectedAt,
 		LastSeenAt:             lastSeenAt,
 		UpdatedAt:              lastSeenAt,
@@ -197,6 +199,41 @@ func seedManagementCPASnapshot(t *testing.T, db *gorm.DB, home cluster.ClusterNo
 	}
 	if errCreate := db.Create(&record).Error; errCreate != nil {
 		t.Fatalf("create CPA snapshot %s: %v", fingerprint, errCreate)
+	}
+}
+
+func TestTopologyCPASnapshotHealthUsesMembershipHeartbeatTimeout(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name       string
+		lastSeen   time.Time
+		timeout    time.Duration
+		wantHealth string
+	}{
+		{
+			name:       "expired default membership timeout",
+			lastSeen:   now.Add(-config.DefaultCPAHeartbeatTimeout - time.Second),
+			timeout:    config.DefaultCPAHeartbeatTimeout,
+			wantHealth: topologyHealthStale,
+		},
+		{
+			name:       "live custom membership timeout",
+			lastSeen:   now.Add(-30 * time.Second),
+			timeout:    time.Minute,
+			wantHealth: topologyHealthHealthy,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			membership := cluster.CPANodeMembershipRecord{
+				LastSeenAt:          test.lastSeen,
+				CPAHeartbeatTimeout: test.timeout,
+			}
+			gotHealth := topologyCPASnapshotHealth(topologyCPAActive, membership, topologyHealthHealthy, now)
+			if gotHealth != test.wantHealth {
+				t.Fatalf("health = %q, want %q", gotHealth, test.wantHealth)
+			}
+		})
 	}
 }
 
