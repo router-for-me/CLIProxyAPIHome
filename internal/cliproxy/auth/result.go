@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	quotaBackoffBase = time.Second
-	quotaBackoffMax  = 30 * time.Minute
+	quotaBackoffBase         = time.Second
+	quotaBackoffMax          = 30 * time.Minute
+	unauthorizedRetryBackoff = time.Minute
 )
 
 var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
@@ -172,7 +173,6 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		}
 
 		statusCode := statusCodeFromResult(result.Error)
-		disableAuth := false
 		if isModelSupportResultError(result.Error) {
 			next := now.Add(12 * time.Hour)
 			state.NextRetryAfter = next
@@ -181,7 +181,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		} else {
 			switch statusCode {
 			case http.StatusUnauthorized:
-				disableAuth = true
+				state.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
 				transition.suspendReason = "unauthorized"
 				transition.shouldSuspendModel = true
 			case http.StatusPaymentRequired, http.StatusForbidden:
@@ -227,13 +227,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 			}
 		}
 
-		if disableAuth {
-			disableAuthAfterUnauthorized(auth, state, result.Error, now)
-		} else {
-			auth.Status = StatusError
-			auth.UpdatedAt = now
-			updateAggregatedAvailability(auth, now)
-		}
+		auth.Status = StatusError
+		auth.UpdatedAt = now
+		updateAggregatedAvailability(auth, now)
 		return transition
 	}
 
@@ -243,9 +239,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 
 // resultNeedsGlobalTransition reports whether the result must be applied to
 // the persisted auth through the store's StateMutator so the transition stays
-// atomic across Home nodes. Only quota (429) transitions and successes that
-// clear existing availability state need the shared row; everything else
-// stays on the local in-memory path.
+// atomic across Home nodes. Unauthorized transitions must preserve credentials
+// that may be refreshed concurrently, while quota (429) and clearing successes
+// need shared availability state. Other failures stay on the local path.
 func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultModel string, now time.Time) bool {
 	if auth == nil {
 		return false
@@ -253,7 +249,11 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	if result.Success {
 		return authHasClearableAvailabilityState(auth, resultModel, now)
 	}
-	if statusCodeFromResult(result.Error) != http.StatusTooManyRequests {
+	statusCode := statusCodeFromResult(result.Error)
+	if statusCode == http.StatusUnauthorized {
+		return true
+	}
+	if statusCode != http.StatusTooManyRequests {
 		return false
 	}
 	if isModelSupportResultError(result.Error) {
@@ -715,7 +715,8 @@ func applyAuthFailureState(m *Manager, auth *Auth, resultErr *Error, retryAfter 
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
 	case http.StatusUnauthorized:
-		disableAuthAfterUnauthorized(auth, nil, resultErr, now)
+		auth.StatusMessage = "unauthorized"
+		auth.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
 	case http.StatusPaymentRequired, http.StatusForbidden:
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
@@ -752,7 +753,7 @@ func applyAuthFailureState(m *Manager, auth *Auth, resultErr *Error, retryAfter 
 	}
 }
 
-// disableAuthAfterUnauthorized removes a credential from request and refresh retries.
+// disableAuthAfterUnauthorized permanently disables a credential after a terminal refresh failure.
 func disableAuthAfterUnauthorized(auth *Auth, state *ModelState, resultErr *Error, now time.Time) {
 	if auth == nil {
 		return

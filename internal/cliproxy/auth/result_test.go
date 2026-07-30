@@ -115,3 +115,62 @@ func TestMarkResultDoesNotHoldManagerLockWhilePersisting(t *testing.T) {
 
 	close(store.unblock)
 }
+
+func TestMarkResultUnauthorizedUsesRecoverableCooldown(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-401",
+		Index:    "auth-401",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "expired"},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	before := time.Now()
+	manager.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   "gpt-5",
+		Success: false,
+		Error: &Error{
+			Message:    "expired access token",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth not found")
+	}
+	if updated.Disabled || updated.Status == StatusDisabled {
+		t.Fatalf("execution 401 permanently disabled auth: %#v", updated)
+	}
+	state := updated.ModelStates["gpt-5"]
+	if state == nil || !state.Unavailable || state.Status != StatusError {
+		t.Fatalf("401 model state = %#v, want recoverable unavailable error", state)
+	}
+	if state.NextRetryAfter.Before(before.Add(unauthorizedRetryBackoff - time.Second)) {
+		t.Fatalf("NextRetryAfter = %v, want about %v after failure", state.NextRetryAfter, unauthorizedRetryBackoff)
+	}
+	if blocked, reason, _ := isAuthBlockedForModel(updated, "gpt-5", time.Now()); !blocked || reason == blockReasonDisabled {
+		t.Fatalf("isAuthBlockedForModel() = blocked %v reason %v, want non-disabled cooldown", blocked, reason)
+	}
+}
+
+func TestAuthRefreshBackoffBlocksEveryModel(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:             "auth-refresh-backoff",
+		Provider:       "codex",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(refreshFailureBackoff),
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
+	if !blocked || reason != blockReasonOther || !next.Equal(auth.NextRetryAfter) {
+		t.Fatalf("isAuthBlockedForModel() = %v, %v, %v; want true, other, %v", blocked, reason, next, auth.NextRetryAfter)
+	}
+}
