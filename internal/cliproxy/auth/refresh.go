@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -113,6 +114,9 @@ func refreshKimi(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, er
 	client := kimiauth.NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg, resolveKimiDeviceID(auth), auth.ProxyURL)
 	td, err := client.RefreshToken(ctx, refreshToken)
 	if err != nil {
+		if errors.Is(err, kimiauth.ErrRefreshTokenRejected) {
+			return nil, newUnauthorizedRefreshError()
+		}
 		return nil, err
 	}
 	if auth.Metadata == nil {

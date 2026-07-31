@@ -286,7 +286,18 @@ func (r *Repository) WithAuthRefreshLock(ctx context.Context, uuid string, fn fu
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(txDB *gorm.DB) error {
 		record := &AuthRecord{}
-		errFirst := txDB.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ?", uuid).First(record).Error
+		query := txDB.Where("uuid = ?", uuid)
+		if txDB.Dialector != nil && txDB.Dialector.Name() == "sqlite" {
+			// SQLite ignores SELECT FOR UPDATE. A no-op write acquires its
+			// database writer lock before the credential is read, preventing
+			// another Home process from rotating the same refresh token.
+			if errLock := txDB.Exec(`UPDATE "auth" SET "version" = "version" WHERE "uuid" = ?`, uuid).Error; errLock != nil {
+				return errLock
+			}
+		} else {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		errFirst := query.First(record).Error
 		if errFirst != nil {
 			return errFirst
 		}

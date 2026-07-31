@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,9 @@ const (
 	kimiTokenURL    = kimiOAuthHost + "/api/oauth/token"
 	kimiHTTPTimeout = 30 * time.Second
 )
+
+// ErrRefreshTokenRejected marks an explicit terminal OAuth refresh response.
+var ErrRefreshTokenRejected = errors.New("kimi refresh token rejected")
 
 // DeviceFlowClient is a minimal Kimi OAuth client used for refresh-token exchange.
 type DeviceFlowClient struct {
@@ -153,11 +157,8 @@ func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string
 		return nil, fmt.Errorf("kimi: failed to read refresh response: %w", errRead)
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("kimi: refresh token rejected (status %d)", resp.StatusCode)
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kimi: refresh failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, kimiRefreshResponseError(resp.StatusCode, bodyBytes)
 	}
 
 	var tokenResp struct {
@@ -186,4 +187,30 @@ func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string
 		ExpiresAt:    expiresAt,
 		Scope:        tokenResp.Scope,
 	}, nil
+}
+
+func kimiRefreshResponseError(statusCode int, body []byte) error {
+	var oauthErr struct {
+		Error            string `json:"error"`
+		Code             string `json:"code"`
+		ErrorDescription string `json:"error_description"`
+		Message          string `json:"message"`
+		Detail           string `json:"detail"`
+	}
+	_ = json.Unmarshal(body, &oauthErr)
+	code := strings.ToLower(strings.TrimSpace(oauthErr.Error))
+	if code == "" {
+		code = strings.ToLower(strings.TrimSpace(oauthErr.Code))
+	}
+	switch code {
+	case "invalid_grant", "refresh_token_expired", "refresh_token_revoked", "refresh_token_reused":
+		return fmt.Errorf("%w (status %d)", ErrRefreshTokenRejected, statusCode)
+	}
+	description := strings.ToLower(strings.Join([]string{oauthErr.ErrorDescription, oauthErr.Message, oauthErr.Detail}, " "))
+	if strings.Contains(description, "refresh token") || strings.Contains(description, "refresh_token") {
+		if strings.Contains(description, "expired") || strings.Contains(description, "revoked") || strings.Contains(description, "reused") {
+			return fmt.Errorf("%w (status %d)", ErrRefreshTokenRejected, statusCode)
+		}
+	}
+	return fmt.Errorf("kimi: refresh failed with status %d", statusCode)
 }

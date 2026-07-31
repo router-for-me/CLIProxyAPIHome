@@ -95,6 +95,35 @@ func TestRecordUsagePayloadUsesRetryDelayFromFailBody(t *testing.T) {
 	}
 }
 
+func TestRecordUsagePayloadIgnoresUnauthorizedFromOlderToken(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-stale-auth",
+		Index:    "usage-stale-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "current-access-token"},
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+	oldHash := coreauth.AccessTokenSHA256(&coreauth.Auth{Metadata: map[string]any{"access_token": "old-access-token"}})
+
+	rt.RecordUsagePayload(context.Background(), `{
+		"auth_index": "usage-stale-index",
+		"provider": "codex",
+		"model": "gpt-5",
+		"access_token_sha256": "`+oldHash+`",
+		"failed": true,
+		"fail": {"status_code": 401, "body": "expired access token"}
+	}`)
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	if state := got.ModelStates["gpt-5"]; state != nil && state.Unavailable {
+		t.Fatalf("late 401 from an older token changed current state: %#v", state)
+	}
+}
+
 func TestRecordUsagePayloadFallsBackToAliasWhenModelEmpty(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-alias-auth",

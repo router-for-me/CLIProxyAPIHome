@@ -5,6 +5,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,21 @@ const (
 // exchanging authorization codes for tokens, and refreshing access tokens.
 type CodexAuth struct {
 	httpClient *http.Client
+}
+
+type codexRefreshResponseError struct {
+	statusCode   int
+	terminalCode string
+}
+
+func (e *codexRefreshResponseError) Error() string {
+	if e != nil && e.terminalCode != "" {
+		return "token refresh failed: " + e.terminalCode
+	}
+	if e == nil {
+		return "token refresh failed"
+	}
+	return fmt.Sprintf("token refresh failed with status %d", e.statusCode)
 }
 
 // NewCodexAuthWithProxyURL creates a new CodexAuth service instance.
@@ -86,7 +102,7 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, newCodexRefreshResponseError(resp.StatusCode, body)
 	}
 
 	var tokenResp struct {
@@ -145,15 +161,55 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 			return tokenData, nil
 		}
 		if isNonRetryableRefreshErr(err) {
-			log.Warnf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
+			log.Warnf("Token refresh attempt %d failed with a non-retryable provider response", attempt+1)
 			return nil, err
 		}
 
 		lastErr = err
-		log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
+		log.Warnf("Token refresh attempt %d failed with a retryable provider response", attempt+1)
 	}
 
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+func newCodexRefreshResponseError(statusCode int, body []byte) error {
+	var oauthErr struct {
+		Error            string `json:"error"`
+		Code             string `json:"code"`
+		ErrorDescription string `json:"error_description"`
+		Message          string `json:"message"`
+	}
+	_ = json.Unmarshal(body, &oauthErr)
+	code := strings.ToLower(strings.TrimSpace(oauthErr.Error))
+	if code == "" {
+		code = strings.ToLower(strings.TrimSpace(oauthErr.Code))
+	}
+	terminalCode := codexTerminalRefreshCode(code, strings.Join([]string{oauthErr.ErrorDescription, oauthErr.Message}, " "))
+	return &codexRefreshResponseError{statusCode: statusCode, terminalCode: terminalCode}
+}
+
+func codexTerminalRefreshCode(code, description string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_grant", "refresh_token_expired", "refresh_token_revoked", "refresh_token_reused":
+		return strings.ToLower(strings.TrimSpace(code))
+	}
+	normalized := strings.ToLower(strings.TrimSpace(description))
+	normalized = strings.NewReplacer("_", " ", "-", " ").Replace(normalized)
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	mentionsRefreshToken := strings.Contains(normalized, "refresh token")
+	if !mentionsRefreshToken && !strings.Contains(normalized, "token has been expired or revoked") {
+		return ""
+	}
+	switch {
+	case strings.Contains(normalized, "reused"):
+		return "refresh_token_reused"
+	case strings.Contains(normalized, "revoked"):
+		return "refresh_token_revoked"
+	case strings.Contains(normalized, "expired"):
+		return "refresh_token_expired"
+	default:
+		return ""
+	}
 }
 
 // isNonRetryableRefreshErr reports whether non retryable refresh err.
@@ -161,6 +217,11 @@ func isNonRetryableRefreshErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	var responseErr *codexRefreshResponseError
+	if errors.As(err, &responseErr) && responseErr != nil {
+		return responseErr.terminalCode != ""
+	}
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	return strings.Contains(raw, "invalid_grant") || strings.Contains(raw, "refresh_token_expired") ||
+		strings.Contains(raw, "refresh_token_revoked") || strings.Contains(raw, "refresh_token_reused")
 }

@@ -19,7 +19,7 @@ import (
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 )
 
-const clusterRESPTimeout = 30 * time.Second
+const clusterRESPTimeout = 35 * time.Second
 
 type RESPHandler struct {
 	coordinator *Coordinator
@@ -164,7 +164,7 @@ func (h *RESPHandler) Handle(ctx context.Context, args []string, remoteIP string
 		}
 		return h.nodePayload(ctx)
 	case "REFRESH":
-		if len(args) != 4 {
+		if len(args) < 4 || len(args) > 5 {
 			return nil, fmt.Errorf("cluster resp: wrong number of arguments for 'cluster refresh'")
 		}
 		if _, errNode := h.authorizeNode(ctx, remoteIP, args[3]); errNode != nil {
@@ -173,7 +173,11 @@ func (h *RESPHandler) Handle(ctx context.Context, args []string, remoteIP string
 		if h.refresh == nil {
 			return nil, fmt.Errorf("cluster resp: refresh controller is nil")
 		}
-		return h.refresh.RefreshNow(ctx, args[2])
+		observedAccessTokenSHA256 := ""
+		if len(args) == 5 {
+			observedAccessTokenSHA256 = strings.TrimSpace(args[4])
+		}
+		return h.refresh.RefreshNowObserved(ctx, args[2], observedAccessTokenSHA256)
 	default:
 		return nil, fmt.Errorf("cluster resp: unsupported subcommand")
 	}
@@ -317,8 +321,13 @@ func (h *RESPHandler) nodePayload(ctx context.Context) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-// ForwardRefreshToMaster converts forward refresh to master.
+// ForwardRefreshToMaster forwards a legacy refresh request to the master.
 func ForwardRefreshToMaster(ctx context.Context, master *ClusterNodeRecord, authUUID string, secret string, tlsConfig *tls.Config) ([]byte, error) {
+	return ForwardRefreshToMasterObserved(ctx, master, authUUID, secret, "", tlsConfig)
+}
+
+// ForwardRefreshToMasterObserved forwards a token-versioned refresh request.
+func ForwardRefreshToMasterObserved(ctx context.Context, master *ClusterNodeRecord, authUUID string, secret string, observedAccessTokenSHA256 string, tlsConfig *tls.Config) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if ctx == nil {
 		ctx = context.Background()
@@ -361,10 +370,19 @@ func ForwardRefreshToMaster(ctx context.Context, master *ClusterNodeRecord, auth
 		return nil, errHandshake
 	}
 
-	if _, errWrite := tlsConn.Write(encodeRESPArray("CLUSTER", "REFRESH", authUUID, secret)); errWrite != nil {
+	args := []string{"CLUSTER", "REFRESH", authUUID, secret}
+	observedAccessTokenSHA256 = strings.TrimSpace(observedAccessTokenSHA256)
+	if observedAccessTokenSHA256 != "" {
+		args = append(args, observedAccessTokenSHA256)
+	}
+	if _, errWrite := tlsConn.Write(encodeRESPArray(args...)); errWrite != nil {
 		return nil, errWrite
 	}
-	return readRESPBulk(bufio.NewReader(tlsConn))
+	payload, errRead := readRESPBulk(bufio.NewReader(tlsConn))
+	if errRead != nil && len(args) == 5 && strings.Contains(strings.ToLower(errRead.Error()), "wrong number of arguments") {
+		return ForwardRefreshToMaster(ctx, master, authUUID, secret, tlsConfig)
+	}
+	return payload, errRead
 }
 
 func respClientTLSConfig(tlsConfig *tls.Config, serverName string) (*tls.Config, error) {

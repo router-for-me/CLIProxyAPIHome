@@ -109,10 +109,14 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			if errSOCKS5 != nil {
 				return nil, setting.Mode, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
 			}
+			contextDialer, ok := dialer.(proxy.ContextDialer)
+			if !ok {
+				return nil, setting.Mode, fmt.Errorf("SOCKS5 dialer does not support context cancellation")
+			}
 			transport := cloneDefaultTransport()
 			transport.Proxy = nil
-			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return contextDialer.DialContext(ctx, network, addr)
 			}
 			return transport, setting.Mode, nil
 		}

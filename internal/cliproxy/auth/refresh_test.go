@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -87,17 +88,133 @@ func TestApplyRefreshFailureStateRedactsTerminalProviderError(t *testing.T) {
 	}
 }
 
-func TestApplyRefreshFailureStateKeepsOtherBadRequestsRetryable(t *testing.T) {
+func TestTerminalRefreshClassificationRequiresExplicitOAuthSignal(t *testing.T) {
 	t.Parallel()
 
-	auth := &Auth{ID: "auth-1", Provider: "antigravity", Status: StatusActive}
-	now := time.Now().UTC()
-	applyRefreshFailureState(auth, errors.New("oauth refresh failed with status 400"), now)
-
-	if auth.Disabled || auth.Status == StatusDisabled {
-		t.Fatalf("ordinary HTTP 400 disabled auth: %#v", auth)
+	if isTerminalRefreshAuthError(&Error{Code: "unauthorized", Message: "refresh endpoint returned 401", HTTPStatus: http.StatusUnauthorized}) {
+		t.Fatal("generic refresh HTTP 401 was classified as terminal")
 	}
-	if want := now.Add(refreshFailureBackoff); !auth.NextRefreshAfter.Equal(want) {
-		t.Fatalf("NextRefreshAfter = %v, want %v", auth.NextRefreshAfter, want)
+	if isTerminalRefreshAuthError(&Error{Code: "authentication_error", Message: "proxy authentication failed", HTTPStatus: http.StatusUnauthorized}) {
+		t.Fatal("generic proxy authentication error was classified as terminal")
+	}
+	if !isTerminalRefreshAuthError(&Error{Code: "invalid_grant", Message: "refresh token rejected"}) {
+		t.Fatal("invalid_grant was not classified as terminal")
+	}
+}
+
+func TestBackgroundRefreshUsesConfiguredHandler(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-auto-handler",
+		Index:    "auth-auto-handler",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "access", "refresh_token": "refresh"},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	calls := 0
+	manager.SetAutoRefreshHandler(func(_ context.Context, selected *Auth) error {
+		calls++
+		if selected == nil || selected.ID != auth.ID {
+			t.Fatalf("selected auth = %#v, want %s", selected, auth.ID)
+		}
+		return nil
+	})
+
+	manager.refreshAuth(context.Background(), auth.ID)
+
+	if calls != 1 {
+		t.Fatalf("auto refresh handler calls = %d, want 1", calls)
+	}
+}
+
+func TestApplyRefreshPendingStateDoesNotBlockDispatch(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{ID: "auth-1", Provider: "codex", Status: StatusActive}
+
+	ApplyRefreshPendingState(auth, now)
+
+	if auth.Disabled || auth.Unavailable || auth.Status != StatusActive || !auth.NextRetryAfter.IsZero() {
+		t.Fatalf("refresh pending blocked credential dispatch: %#v", auth)
+	}
+	if !RefreshRetryBackoffOpen(auth, now) {
+		t.Fatal("refresh pending did not open refresh-only backoff")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, "gpt-5", now); blocked {
+		t.Fatal("refresh pending blocked a model using the still-valid access token")
+	}
+}
+
+func TestApplyRefreshFailureStateKeepsTransientFailuresRetryable(t *testing.T) {
+	t.Parallel()
+
+	for _, message := range []string{
+		"oauth refresh failed with status 400",
+		"oauth refresh failed with status 401",
+		"proxy connection refused",
+	} {
+		t.Run(message, func(t *testing.T) {
+			auth := &Auth{ID: "auth-1", Provider: "antigravity", Status: StatusActive}
+			now := time.Now().UTC()
+			applyRefreshFailureState(auth, errors.New(message), now)
+
+			if auth.Disabled || auth.Status == StatusDisabled {
+				t.Fatalf("transient refresh failure disabled auth: %#v", auth)
+			}
+			if auth.Unavailable || auth.Status != StatusActive {
+				t.Fatalf("transient refresh failure blocked dispatch: %#v", auth)
+			}
+			want := now.Add(refreshFailureBackoff)
+			if !auth.NextRefreshAfter.Equal(want) || !auth.NextRetryAfter.IsZero() {
+				t.Fatalf("refresh/retry deadlines = %v/%v, want %v/zero", auth.NextRefreshAfter, auth.NextRetryAfter, want)
+			}
+			if auth.LastError == nil || auth.LastError.Code != refreshTransientErrorCode || !auth.LastError.Retryable {
+				t.Fatalf("LastError = %#v, want retryable transient refresh error", auth.LastError)
+			}
+		})
+	}
+}
+
+func TestApplyRefreshSuccessStateClearsUnauthorizedCooldown(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	retryAt := now.Add(time.Minute)
+	auth := &Auth{
+		ID:               "auth-1",
+		Provider:         "codex",
+		Status:           StatusError,
+		StatusMessage:    refreshTransientErrorMsg,
+		Unavailable:      true,
+		NextRetryAfter:   retryAt,
+		NextRefreshAfter: retryAt,
+		LastError:        &Error{Code: refreshTransientErrorCode, Message: refreshTransientErrorMsg, Retryable: true},
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				StatusMessage:  "unauthorized",
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+				LastError:      &Error{HTTPStatus: http.StatusUnauthorized, Message: "expired"},
+			},
+		},
+	}
+
+	resumed := applyRefreshSuccessState(auth, now)
+
+	if len(resumed) != 1 || resumed[0] != "gpt-5" {
+		t.Fatalf("resumed models = %v, want [gpt-5]", resumed)
+	}
+	if auth.Disabled || auth.Unavailable || auth.Status != StatusActive || auth.LastError != nil {
+		t.Fatalf("refreshed auth state = %#v, want active", auth)
+	}
+	if !auth.NextRefreshAfter.IsZero() || !auth.NextRetryAfter.IsZero() {
+		t.Fatalf("refresh/retry deadlines = %v/%v, want zero", auth.NextRefreshAfter, auth.NextRetryAfter)
+	}
+	state := auth.ModelStates["gpt-5"]
+	if state == nil || state.Unavailable || state.Status != StatusActive || state.LastError != nil {
+		t.Fatalf("refreshed model state = %#v, want active", state)
 	}
 }

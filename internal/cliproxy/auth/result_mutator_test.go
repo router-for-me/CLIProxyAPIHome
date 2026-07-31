@@ -144,6 +144,83 @@ func TestMarkResultQuotaEscalationIsAtomicAcrossManagers(t *testing.T) {
 	}
 }
 
+func TestMarkResultUnauthorizedMutatesPersistedStateWithoutReplacingTokens(t *testing.T) {
+	const authID = "auth-cluster-unauthorized"
+	store := &fakeMutatorStore{
+		persisted: &Auth{
+			ID:       authID,
+			Index:    authID,
+			Provider: "codex",
+			Status:   StatusActive,
+			Metadata: map[string]any{
+				"access_token":  "current-access-token",
+				"refresh_token": "current-refresh-token",
+			},
+		},
+	}
+	node := newHomeNodeManager(t, store, authID)
+
+	node.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    "gpt-5",
+		Success:  false,
+		Error:    &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+	})
+
+	persisted := store.persistedSnapshot()
+	if persisted.Disabled || persisted.Status == StatusDisabled {
+		t.Fatalf("execution 401 disabled persisted auth: %#v", persisted)
+	}
+	if got := persisted.Metadata["access_token"]; got != "current-access-token" {
+		t.Fatalf("access_token = %v, want current token preserved", got)
+	}
+	if got := persisted.Metadata["refresh_token"]; got != "current-refresh-token" {
+		t.Fatalf("refresh_token = %v, want current token preserved", got)
+	}
+	state := persisted.ModelStates["gpt-5"]
+	if state == nil || !state.Unavailable || state.Status != StatusError || state.NextRetryAfter.IsZero() {
+		t.Fatalf("persisted unauthorized cooldown = %#v", state)
+	}
+	if store.mutationCount() != 1 || store.saves != 0 {
+		t.Fatalf("persistence calls = mutations %d saves %d, want 1/0", store.mutationCount(), store.saves)
+	}
+}
+
+func TestMarkResultIgnoresUnauthorizedFromOlderAccessToken(t *testing.T) {
+	const authID = "auth-cluster-stale-unauthorized"
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "new-access-token"},
+	}}
+	node := newHomeNodeManager(t, store, authID)
+	oldTokenHash := AccessTokenSHA256(&Auth{Metadata: map[string]any{"access_token": "old-access-token"}})
+
+	node.MarkResult(context.Background(), Result{
+		AuthID:            authID,
+		Provider:          "codex",
+		Model:             "gpt-5",
+		AccessTokenSHA256: oldTokenHash,
+		Success:           false,
+		Error:             &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+	})
+
+	persisted := store.persistedSnapshot()
+	if state := persisted.ModelStates["gpt-5"]; state != nil && state.Unavailable {
+		t.Fatalf("late 401 from an older token changed current state: %#v", state)
+	}
+	local, ok := node.GetByID(authID)
+	if !ok || local == nil || local.Metadata["access_token"] != "new-access-token" {
+		t.Fatalf("reporting node did not adopt authoritative token: %#v", local)
+	}
+	if store.mutationCount() != 0 {
+		t.Fatalf("late 401 persisted %d mutations, want 0", store.mutationCount())
+	}
+}
+
 func TestMarkResultQuotaEscalatesFromPersistedLevelAfterExpiry(t *testing.T) {
 	const authID = "auth-cluster-expired"
 	expired := time.Now().Add(-time.Second)

@@ -3,6 +3,7 @@ package get
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -66,14 +67,17 @@ func TestHandleDefaultGETPlainKeyMissingReturnsNullBulk(t *testing.T) {
 
 func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
 	rt := newGetTestRuntime(t)
-	rt.SetClusterRefreshHandler(func(ctx context.Context, authIndex string) ([]byte, error) {
+	rt.SetClusterRefreshHandler(func(ctx context.Context, authIndex, observedAccessTokenSHA256 string) ([]byte, error) {
 		if authIndex != "auth-1" {
 			t.Fatalf("authIndex = %q, want auth-1", authIndex)
+		}
+		if observedAccessTokenSHA256 != "token-hash" {
+			t.Fatalf("access token hash = %q, want token-hash", observedAccessTokenSHA256)
 		}
 		return []byte(`{"ok":true}`), nil
 	})
 
-	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"refresh","auth_index":"auth-1"}`})
+	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"refresh","auth_index":"auth-1","access_token_sha256":"token-hash"}`})
 	if reply.Kind != dispatch.ReplyKindBulkString || string(reply.BulkString) != `{"ok":true}` {
 		t.Fatalf("handleDefault(refresh) = %#v, want refresh payload", reply)
 	}
@@ -81,7 +85,7 @@ func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
 
 func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
 	rt := newGetTestRuntime(t)
-	rt.SetClusterRefreshHandler(func(context.Context, string) ([]byte, error) {
+	rt.SetClusterRefreshHandler(func(context.Context, string, string) ([]byte, error) {
 		return nil, &coreauth.Error{
 			Code:       "authentication_error",
 			Message:    "credential unauthorized",
@@ -98,6 +102,21 @@ func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
 	}
 	if got := gjson.GetBytes(reply.BulkString, "error.message").String(); got != "credential unauthorized" {
 		t.Fatalf("error.message = %q, want redacted authentication message; body=%s", got, string(reply.BulkString))
+	}
+}
+
+func TestHandleDefaultGETRefreshRedactsTransientInfrastructureError(t *testing.T) {
+	rt := newGetTestRuntime(t)
+	rt.SetClusterRefreshHandler(func(context.Context, string, string) ([]byte, error) {
+		return nil, errors.New("database unavailable: provider-secret")
+	})
+
+	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"refresh","auth_index":"auth-1"}`})
+	if got := gjson.GetBytes(reply.BulkString, "error.type").String(); got != "refresh_temporarily_unavailable" {
+		t.Fatalf("error.type = %q, want refresh_temporarily_unavailable; body=%s", got, string(reply.BulkString))
+	}
+	if strings.Contains(string(reply.BulkString), "provider-secret") {
+		t.Fatalf("refresh error leaked infrastructure detail: %s", string(reply.BulkString))
 	}
 }
 
