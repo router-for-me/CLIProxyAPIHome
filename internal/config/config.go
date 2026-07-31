@@ -463,6 +463,9 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// AlphaSearch allows this Codex API key to serve the Alpha Search endpoint.
+	AlphaSearch bool `yaml:"alpha-search,omitempty" json:"alpha-search,omitempty"`
+
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -1037,6 +1040,9 @@ func (cfg *Config) SanitizeXAIKeys() {
 		return
 	}
 	cfg.XAIKey = sanitizeCodexKeyEntries(cfg.XAIKey)
+	for i := range cfg.XAIKey {
+		cfg.XAIKey[i].AlphaSearch = false
+	}
 }
 
 func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {

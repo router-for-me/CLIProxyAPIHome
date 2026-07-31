@@ -167,7 +167,7 @@ func normalizedAllowedModelID(modelID string) string {
 	return strings.ToLower(modelID)
 }
 
-func schedulerPredicate(tried map[string]struct{}, allowed map[string]struct{}) func(*scheduledAuth) bool {
+func schedulerPredicate(tried map[string]struct{}, allowed map[string]struct{}, credentialPolicy string) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
 			return false
@@ -177,7 +177,7 @@ func schedulerPredicate(tried map[string]struct{}, allowed map[string]struct{}) 
 				return false
 			}
 		}
-		return authAllowedByID(entry.auth.ID, allowed)
+		return authAllowedByID(entry.auth.ID, allowed) && credentialPolicyAllows(credentialPolicy, entry.auth)
 	}
 }
 

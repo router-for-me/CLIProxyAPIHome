@@ -787,15 +787,15 @@ type DispatchResult struct {
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
 func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string) (*DispatchResult, error) {
-	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, DispatchConcurrencyContext{})
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, "", DispatchConcurrencyContext{})
 }
 
 // DispatchForAPIKeyWithConcurrency performs dispatch and atomic admission for a RESP request.
-func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
-	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, concurrencyCtx)
+func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, credentialPolicy, concurrencyCtx)
 }
 
-func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
 	opts := coreauth.Options{}
 	if headers != nil {
 		opts.Headers = headers.Clone()
@@ -810,6 +810,9 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	if allowedModelIDs != nil {
 		metadata[coreauth.AllowedModelIDsMetadataKey] = allowedModelIDs
+	}
+	if credentialPolicy = strings.TrimSpace(credentialPolicy); credentialPolicy != "" {
+		metadata[coreauth.CredentialPolicyMetadataKey] = credentialPolicy
 	}
 	if len(metadata) > 0 {
 		opts.Metadata = metadata

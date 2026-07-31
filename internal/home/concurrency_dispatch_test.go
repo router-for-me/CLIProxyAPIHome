@@ -20,6 +20,39 @@ func (s *dispatchSpySelector) Pick(_ context.Context, _ string, _ string, _ core
 	return auths[0], nil
 }
 
+func TestCredentialPolicyFiltersBeforeConcurrencyAdmission(t *testing.T) {
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	ordinary := &coreauth.Auth{ID: "ordinary-codex", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"api_key": "ordinary"}}
+	oauth := &coreauth.Auth{ID: "oauth-codex", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"auth_kind": "oauth"}}
+	for _, auth := range []*coreauth.Auth{ordinary, oauth} {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+
+	admittedIDs := make([]string, 0, 1)
+	runtime := &Runtime{coreManager: manager}
+	runtime.SetConcurrencyAdmitter(ConcurrencyAdmitterFunc(func(_ context.Context, req ConcurrencyAdmissionRequest) (ConcurrencyAdmissionResult, error) {
+		admittedIDs = append(admittedIDs, req.CredentialID)
+		return ConcurrencyAdmissionResult{CredentialID: req.CredentialID, Model: req.Model}, nil
+	}))
+
+	result, errDispatch := runtime.dispatchWithOptions(context.Background(), "gpt", coreauth.Options{Metadata: map[string]any{
+		coreauth.CredentialPolicyMetadataKey: coreauth.CredentialPolicyCodexAlphaSearchV1,
+	}}, DispatchConcurrencyContext{})
+	if errDispatch != nil {
+		t.Fatalf("dispatchWithOptions() error = %v", errDispatch)
+	}
+	if result == nil || result.AuthID != oauth.ID {
+		t.Fatalf("dispatch result = %#v, want %s", result, oauth.ID)
+	}
+	if len(admittedIDs) != 1 || admittedIDs[0] != oauth.ID {
+		t.Fatalf("admitted credentials = %#v, ordinary key must not consume concurrency", admittedIDs)
+	}
+}
+
 func TestDispatchRejectsMalformedUTF8BeforeSchedulingOrAdmitting(t *testing.T) {
 	requestedModel := "mapped-model(HIGH\xff)"
 	routeModel := "mapped-model"
