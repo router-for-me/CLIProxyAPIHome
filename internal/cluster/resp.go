@@ -164,7 +164,7 @@ func (h *RESPHandler) Handle(ctx context.Context, args []string, remoteIP string
 		}
 		return h.nodePayload(ctx)
 	case "REFRESH":
-		if len(args) < 4 || len(args) > 6 {
+		if len(args) != 4 {
 			return nil, fmt.Errorf("cluster resp: wrong number of arguments for 'cluster refresh'")
 		}
 		if _, errNode := h.authorizeNode(ctx, remoteIP, args[3]); errNode != nil {
@@ -173,15 +173,7 @@ func (h *RESPHandler) Handle(ctx context.Context, args []string, remoteIP string
 		if h.refresh == nil {
 			return nil, fmt.Errorf("cluster resp: refresh controller is nil")
 		}
-		observedRefreshAt := time.Time{}
-		if len(args) >= 5 {
-			observedRefreshAt = parseClusterRefreshObservedAt(args[4])
-		}
-		observedAccessTokenSHA256 := ""
-		if len(args) == 6 {
-			observedAccessTokenSHA256 = strings.TrimSpace(args[5])
-		}
-		return h.refresh.RefreshNowObserved(ctx, args[2], observedRefreshAt, observedAccessTokenSHA256)
+		return h.refresh.RefreshNow(ctx, args[2])
 	default:
 		return nil, fmt.Errorf("cluster resp: unsupported subcommand")
 	}
@@ -326,7 +318,7 @@ func (h *RESPHandler) nodePayload(ctx context.Context) ([]byte, error) {
 }
 
 // ForwardRefreshToMaster converts forward refresh to master.
-func ForwardRefreshToMaster(ctx context.Context, master *ClusterNodeRecord, authUUID string, secret string, observedRefreshAt time.Time, observedAccessTokenSHA256 string, tlsConfig *tls.Config) ([]byte, error) {
+func ForwardRefreshToMaster(ctx context.Context, master *ClusterNodeRecord, authUUID string, secret string, tlsConfig *tls.Config) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if ctx == nil {
 		ctx = context.Background()
@@ -369,38 +361,10 @@ func ForwardRefreshToMaster(ctx context.Context, master *ClusterNodeRecord, auth
 		return nil, errHandshake
 	}
 
-	args := []string{"CLUSTER", "REFRESH", authUUID, secret}
-	observedAccessTokenSHA256 = strings.TrimSpace(observedAccessTokenSHA256)
-	if !observedRefreshAt.IsZero() || observedAccessTokenSHA256 != "" {
-		observedValue := ""
-		if !observedRefreshAt.IsZero() {
-			observedValue = observedRefreshAt.UTC().Format(time.RFC3339Nano)
-		}
-		args = append(args, observedValue)
-	}
-	if observedAccessTokenSHA256 != "" {
-		args = append(args, observedAccessTokenSHA256)
-	}
-	if _, errWrite := tlsConn.Write(encodeRESPArray(args...)); errWrite != nil {
+	if _, errWrite := tlsConn.Write(encodeRESPArray("CLUSTER", "REFRESH", authUUID, secret)); errWrite != nil {
 		return nil, errWrite
 	}
-	payload, errRead := readRESPBulk(bufio.NewReader(tlsConn))
-	if errRead != nil && len(args) > 4 && strings.Contains(strings.ToLower(errRead.Error()), "wrong number of arguments") {
-		return ForwardRefreshToMaster(ctx, master, authUUID, secret, time.Time{}, "", tlsConfig)
-	}
-	return payload, errRead
-}
-
-func parseClusterRefreshObservedAt(value string) time.Time {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return time.Time{}
-	}
-	observedAt, errParse := time.Parse(time.RFC3339Nano, value)
-	if errParse != nil {
-		return time.Time{}
-	}
-	return observedAt.UTC()
+	return readRESPBulk(bufio.NewReader(tlsConn))
 }
 
 func respClientTLSConfig(tlsConfig *tls.Config, serverName string) (*tls.Config, error) {

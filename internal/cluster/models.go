@@ -590,22 +590,20 @@ func (CertificateRecord) TableName() string {
 }
 
 type AuthIndex struct {
-	UUID             string
-	ID               string
-	Index            string
-	Provider         string
-	Label            string
-	Prefix           string
-	Status           coreauth.Status
-	StatusMessage    string
-	Disabled         bool
-	Unavailable      bool
-	NextRefreshAfter time.Time
-	NextRetryAfter   time.Time
-	Quota            coreauth.QuotaState
-	ModelStates      map[string]*coreauth.ModelState
-	BaseURL          string
-	ModelsHash       string
-	Attributes       map[string]string
-	ModelMetadata    map[string]any
+	UUID           string
+	ID             string
+	Index          string
+	Provider       string
+	Label          string
+	Prefix         string
+	Status         coreauth.Status
+	Disabled       bool
+	Unavailable    bool
+	NextRetryAfter time.Time
+	Quota          coreauth.QuotaState
+	ModelStates    map[string]*coreauth.ModelState
+	BaseURL        string
+	ModelsHash     string
+	Attributes     map[string]string
+	ModelMetadata  map[string]any
 }

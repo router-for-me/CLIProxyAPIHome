@@ -393,7 +393,7 @@ func run() int {
 		})
 		refreshController := cluster.NewRefreshController(coordinator, rt, clusterRepo, clusterTLSConfig)
 		coordinator.SetOnMasterChanged(refreshController.OnMasterChanged)
-		rt.SetClusterRefreshHandler(refreshController.RefreshNowObserved)
+		rt.SetClusterRefreshHandler(refreshController.RefreshNow)
 		clusterRESPHandler = cluster.NewRESPHandler(coordinator, refreshController, clusterRepo)
 		if clusterAdapter == nil {
 			log.Errorf("failed to init cluster runtime adapter")

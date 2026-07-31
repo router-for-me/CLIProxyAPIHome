@@ -19,7 +19,6 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth) *coreauth.Auth {
 	if out.Attributes != nil {
 		delete(out.Attributes, "refresh_token")
 		delete(out.Attributes, "service_account")
-		delete(out.Attributes, "__home_cooldown_scope")
 	}
 
 	if out.Metadata != nil {

@@ -26,12 +26,8 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	if existing, ok := r.coreManager.GetByID(auth.ID); ok && existing != nil {
 		auth.CreatedAt = existing.CreatedAt
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
-			existingRefreshStateIsNewer := existing.LastRefreshedAt.After(auth.LastRefreshedAt) ||
-				(existing.LastRefreshedAt.Equal(auth.LastRefreshedAt) && existing.UpdatedAt.After(auth.UpdatedAt))
-			if existingRefreshStateIsNewer {
-				auth.LastRefreshedAt = existing.LastRefreshedAt
-				auth.NextRefreshAfter = existing.NextRefreshAfter
-			}
+			auth.LastRefreshedAt = existing.LastRefreshedAt
+			auth.NextRefreshAfter = existing.NextRefreshAfter
 			auth.ModelStates = mergeModelStates(auth.ModelStates, existing.ModelStates)
 		}
 		op = "update"
