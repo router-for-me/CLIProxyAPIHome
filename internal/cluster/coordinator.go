@@ -150,7 +150,10 @@ func (c *Coordinator) runLifecycleCleanup(ctx context.Context) error {
 	if !initialized {
 		return fmt.Errorf("cluster coordinator is not initialized")
 	}
-	return c.runStartupRecovery(ctx, home)
+	if errRecovery := c.runStartupRecovery(ctx, home); errRecovery != nil {
+		return errRecovery
+	}
+	return c.repo.DeleteExpiredCPANodeSnapshots(ctx, cpaNodeSnapshotRetention(c.heartbeatTimeout))
 }
 
 func (c *Coordinator) retireFailedInitialization(ctx context.Context, incarnation HomeIncarnationID, initializationErr error) error {
@@ -470,6 +473,13 @@ func (c *Coordinator) syncCPANodeSnapshot(ctx context.Context, seenAt time.Time)
 		return fmt.Errorf("cluster coordinator is not initialized")
 	}
 	return c.repo.ReplaceCPANodeSnapshotForIncarnation(ctx, home, node.GlobalRegistry().List(), seenAt)
+}
+
+func cpaNodeSnapshotRetention(heartbeatTimeout time.Duration) time.Duration {
+	if heartbeatTimeout <= 0 {
+		heartbeatTimeout = defaultHeartbeatTimeout
+	}
+	return heartbeatTimeout * 6
 }
 
 // setMaster sets a master.

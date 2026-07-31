@@ -26,6 +26,15 @@ func DatabaseNow(ctx context.Context, tx *gorm.DB) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("parse database timestamp %q", value)
 }
 
+// CurrentDatabaseTime returns the current UTC timestamp reported by the repository database.
+func (r *Repository) CurrentDatabaseTime(ctx context.Context) (time.Time, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return time.Time{}, errDB
+	}
+	return DatabaseNow(ctx, db)
+}
+
 func databaseNowQuery(tx *gorm.DB) string {
 	if tx != nil && tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
 		return "SELECT clock_timestamp()"

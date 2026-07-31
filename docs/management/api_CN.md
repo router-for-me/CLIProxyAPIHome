@@ -595,15 +595,15 @@ openai-compatibility
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `nodes` | array | 当前活跃 CPA 节点列表，聚合自所有 live Home 节点写入共享数据库的连接快照。 |
+| `nodes` | array | 权威活动 CPA 列表。只有存在 config subscription，且证书 fingerprint 与完整 Home incarnation 都匹配 active `cpa_node_membership` owner 的快照才会返回；draining 和 revision-only 快照不会进入此列表。 |
 | `plugin_report_required` | boolean | 当前 Home 配置是否期望 CPA 上报插件状态；至少一个已启用插件带有固定的 store manifest 时为 `true`。 |
 | `plugin_report_statuses` | array | 共享数据库中保存的最新插件上报，按上报节点和上报元数据分组；单插件删除上报可以和其他插件保留的状态行同时存在。它们会一直保留到节点再次上报或被显式清理，不按 TTL 自动过期。这是 CPA 自报告的观测信息，不是强可信安装事实。 |
 | `nodes[].node_id` | string | 从 Home 客户端证书得到的 CPA node ID。 |
 | `nodes[].ip` | string | 节点 IP 地址。 |
 | `nodes[].connected_time` | string | 当前活跃节点条目的首次连接时间。 |
-| `nodes[].last_seen_at` | string | 该 CPA 节点连接快照最近一次由对应 Home 节点刷新到共享数据库的时间。 |
+| `nodes[].last_seen_at` | string | 服务 Home 最近一次刷新派生 `cpa_node` 快照的时间。 |
 | `nodes[].client_count` | integer | 当前 IP 下活跃 RESP 订阅连接数。 |
-| `nodes[].healthy` | boolean | 节点是否存在活跃 RESP 配置订阅连接；插件上报不会直接让该字段变为不健康。 |
+| `nodes[].healthy` | boolean | CPA membership heartbeat 与精确服务 Home incarnation 是否都健康；插件上报不影响此字段。 |
 | `nodes[].home_id` | string | 当前服务此 CPA 的 Home 节点身份，格式为 `home_ip:home_port`。 |
 | `nodes[].home_ip` | string | 当前服务此 CPA 的 Home 节点 IP 或集群广播身份。 |
 | `nodes[].home_port` | integer | 当前服务此 CPA 的 Home 节点 RESP/cluster 端口。 |
@@ -618,7 +618,7 @@ openai-compatibility
 
 ### GET `/topology`
 
-返回数据库态 Home runtime 的 Home + CPA 拓扑快照。与 `GET /nodes` 不同，此接口是面向拓扑的集群视角：Home 节点来自共享 cluster heartbeat 表，CPA 节点来自每个 Home 写入共享数据库的 CPA 快照表，包括会按已配置 heartbeat timeout 分类的 stale 快照。
+返回数据库态 Home runtime 的 Home + CPA 拓扑快照。活动 owner 以 `cpa_node_membership` 为准，`cpa_node` 仅是派生诊断快照。subscription 快照若没有同时匹配 membership fingerprint 和完整 `(HomeIP, HomePort, HomeStartedAt)` owner，只会显示为 `draining`，不会计为活动 CPA。
 
 输入：无。
 
@@ -689,8 +689,9 @@ openai-compatibility
       "connected_time": "2026-05-27T10:05:00Z",
       "last_seen_at": "2026-05-27T10:30:02Z",
       "client_count": 1,
-      "healthy": true,
+      "state": "active",
       "health": "healthy",
+      "healthy": true,
       "home_id": "10.0.0.10:8327",
       "home_ip": "10.0.0.10",
       "home_port": 8327,
@@ -707,14 +708,14 @@ openai-compatibility
 | `summary.healthy_home_count` | integer | `last_seen_at` 未超过 `stale_after_seconds` 的 Home 节点数量。 |
 | `summary.stale_home_count` | integer | 数据库已知但已超过 stale cutoff 的 Home 节点数量。 |
 | `summary.unknown_home_count` | integer | 因身份或 heartbeat 数据缺失而无法判断健康状态的 Home 节点数量。 |
-| `summary.cpa_count` | integer | 集群已知的 CPA 节点快照数量。 |
-| `summary.healthy_cpa_count` | integer | 连接到健康 Home 且自身未超过 stale cutoff 的 CPA 快照数量。 |
-| `summary.stale_cpa_count` | integer | Home 或自身心跳已过期的 CPA 快照数量。 |
-| `summary.unknown_cpa_count` | integer | 无法判断服务 Home 身份或健康状态的 CPA 快照数量。 |
+| `summary.cpa_count` | integer | 按证书 fingerprint 对 active 和 draining 快照去重后的逻辑 CPA 数。 |
+| `summary.healthy_cpa_count` | integer | membership heartbeat 与精确 Home incarnation 都健康的活动 CPA 数。 |
+| `summary.stale_cpa_count` | integer | membership heartbeat 或精确 Home incarnation 已 stale 的活动 CPA 数。 |
+| `summary.unknown_cpa_count` | integer | 无法确认精确服务 Home incarnation 的活动 CPA 数。 |
 | `summary.plugin_attention_count` | integer | 插件上报为必需时，插件状态缺失、部分上报或失败的 CPA 节点数量。 |
 | `summary.attention_count` | integer | 合计关注数量：stale/unknown Home 节点、需要关注的 CPA 节点各计一次，再加缺失 master。 |
 | `summary.missing_master` | boolean | 当前是否无法选出健康 Home master。 |
-| `summary.stale_after_seconds` | integer | 拓扑健康判断使用的 heartbeat timeout。 |
+| `summary.stale_after_seconds` | integer | 用于判断 Home 节点健康状态及选择当前 master 的 heartbeat timeout；CPA 健康状态还会使用各 membership 自身的 CPA heartbeat timeout。 |
 | `summary.retention_after_seconds` | integer | 拓扑快照保留窗口；早于该窗口的记录不会出现在 `homes[]` 和 `cpas[]` 中。 |
 | `management.home_id` | string | 当前 Management runtime 的 Home 身份，格式为 `home_ip:home_port`。 |
 | `management.home_ip` | string | 当前 Management runtime 的 Home IP 或集群广播身份。 |
@@ -732,18 +733,19 @@ openai-compatibility
 | `homes[].client_count` | integer | 此 Home 上报的活跃 CPA config subscription 总数。 |
 | `homes[].started_at` | string | Home 进程启动时间。 |
 | `homes[].last_seen_at` | string | 共享数据库中保存的最后一次 Home heartbeat 时间。 |
-| `homes[].cpa_count` | integer | 当前关联到此 Home 的 CPA 快照数量。 |
-| `homes[].healthy_cpa_count` | integer | 当前关联到此 Home 的健康 CPA 快照数量。 |
-| `homes[].stale_cpa_count` | integer | 当前关联到此 Home 的 stale CPA 快照数量。 |
-| `homes[].unknown_cpa_count` | integer | 当前关联到此 Home 的未知健康状态 CPA 快照数量。 |
-| `cpas[]` | array | CPA 节点快照，并包含服务它的 Home 身份。 |
+| `homes[].cpa_count` | integer | 此精确 Home incarnation 当前拥有的活动 CPA 数。 |
+| `homes[].healthy_cpa_count` | integer | 此 Home incarnation 拥有的健康活动 CPA 数。 |
+| `homes[].stale_cpa_count` | integer | 此 Home incarnation 拥有的 stale 活动 CPA 数。 |
+| `homes[].unknown_cpa_count` | integer | 此 Home incarnation 拥有的未知健康活动 CPA 数。 |
+| `cpas[]` | array | active 与 draining CPA 诊断快照；revision-only 快照不会返回。 |
 | `cpas[].node_id` | string | 从客户端证书得到的 CPA node ID。 |
 | `cpas[].ip` | string | 服务它的 Home 观测到的 CPA 节点 IP。 |
 | `cpas[].connected_time` | string | 此 CPA 快照在服务它的 Home 上首次观测到活跃连接的时间。 |
-| `cpas[].last_seen_at` | string | 服务它的 Home 最近一次刷新此 CPA 快照的时间。 |
+| `cpas[].last_seen_at` | string | 服务 Home 最近一次刷新此派生快照的时间。 |
 | `cpas[].client_count` | integer | 此 CPA 快照代表的活跃 RESP 订阅数。 |
-| `cpas[].healthy` | boolean | `cpas[].health` 是否为 `healthy`。 |
+| `cpas[].state` | string | subscription 与权威 membership owner 匹配时为 `active`，否则为 `draining`。 |
 | `cpas[].health` | string | `healthy`、`stale` 或 `unknown`。 |
+| `cpas[].healthy` | boolean | `cpas[].health` 是否为 `healthy`；为保持向后兼容而保留。 |
 | `cpas[].home_id` | string | 服务此 CPA 的 Home 身份，格式为 `home_ip:home_port`。 |
 | `cpas[].home_ip` | string | 服务此 CPA 的 Home IP 或集群广播身份。 |
 | `cpas[].home_port` | integer | 服务此 CPA 的 Home cluster/RESP 端口。 |

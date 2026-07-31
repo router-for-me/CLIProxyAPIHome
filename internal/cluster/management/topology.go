@@ -16,6 +16,8 @@ const (
 	topologyHealthHealthy = "healthy"
 	topologyHealthStale   = "stale"
 	topologyHealthUnknown = "unknown"
+	topologyCPAActive     = "active"
+	topologyCPADraining   = "draining"
 	topologyRoleMaster    = "master"
 	topologyRoleFollower  = "follower"
 	topologyRoleUnknown   = "unknown"
@@ -24,7 +26,7 @@ const (
 )
 
 type topologyHomeStats struct {
-	CPA        int
+	ActiveCPA  int
 	HealthyCPA int
 	StaleCPA   int
 	UnknownCPA int
@@ -48,7 +50,11 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now, errNow := h.repo.CurrentDatabaseTime(ctx)
+	if errNow != nil {
+		respondError(c, http.StatusInternalServerError, "database_time_load_failed", errNow)
+		return
+	}
 	heartbeatTimeout := h.heartbeatTimeout
 	if heartbeatTimeout <= 0 {
 		heartbeatTimeout = cluster.DefaultHeartbeatTimeout()
@@ -66,18 +72,28 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "cpa_nodes_load_failed", errCPAs)
 		return
 	}
+	memberships, errMemberships := h.repo.ListActiveCPAMemberships(ctx)
+	if errMemberships != nil {
+		respondError(c, http.StatusInternalServerError, "cpa_memberships_load_failed", errMemberships)
+		return
+	}
 	requiredPluginIDs := h.pluginTaskRequiredIDs(ctx)
 	statusesByNodeID, statusesByIP := pluginStatusesByNode(taskStatuses)
 
 	homeStats := make(map[string]*topologyHomeStats, len(homeRecords))
 	homeHealth := make(map[string]string, len(homeRecords))
 	for _, homeRecord := range homeRecords {
-		homeID := topologyHomeID(homeRecord.IP, homeRecord.Port)
-		homeStats[homeID] = &topologyHomeStats{}
-		homeHealth[homeID] = topologyHealth(homeRecord.LastSeenAt, cutoff)
+		homeKey := topologyHomeIncarnationKey(homeRecord.IP, homeRecord.Port, homeRecord.StartedAt)
+		homeStats[homeKey] = &topologyHomeStats{}
+		homeHealth[homeKey] = topologyHealth(homeRecord.LastSeenAt, cutoff)
+	}
+	membershipsByFingerprint := make(map[string]cluster.CPANodeMembershipRecord, len(memberships))
+	for _, membership := range memberships {
+		membershipsByFingerprint[strings.TrimSpace(membership.CertificateFingerprint)] = membership
 	}
 
 	cpaItems := make([]gin.H, 0, len(cpaRecords))
+	logicalCPAs := make(map[string]struct{})
 	healthyCPACount := 0
 	staleCPACount := 0
 	unknownCPACount := 0
@@ -85,24 +101,38 @@ func (h *Handler) GetTopology(c *gin.Context) {
 	cpaAttentionCount := 0
 	for _, cpaRecord := range cpaRecords {
 		homeID := topologyHomeID(cpaRecord.HomeIP, cpaRecord.HomePort)
-		health := topologyCPAHealth(cpaRecord, homeHealth[homeID], cutoff)
-		healthy := health == topologyHealthHealthy
-		if healthy {
-			healthyCPACount++
-		} else if health == topologyHealthStale {
-			staleCPACount++
-		} else {
-			unknownCPACount++
+		homeKey := topologyHomeIncarnationKey(cpaRecord.HomeIP, cpaRecord.HomePort, cpaRecord.HomeStartedAt)
+		membership, hasMembership := membershipsByFingerprint[strings.TrimSpace(cpaRecord.CertificateFingerprint)]
+		state := topologyCPASnapshotState(cpaRecord, membership, hasMembership)
+		if state == "" {
+			continue
 		}
-		if stats := homeStats[homeID]; stats != nil {
-			stats.CPA++
-			switch health {
-			case topologyHealthHealthy:
-				stats.HealthyCPA++
-			case topologyHealthStale:
-				stats.StaleCPA++
-			default:
-				stats.UnknownCPA++
+		logicalKey := topologyLogicalCPAKey(cpaRecord)
+		if logicalKey != "" {
+			logicalCPAs[logicalKey] = struct{}{}
+		}
+		health := topologyCPASnapshotHealth(state, membership, homeHealth[homeKey], now)
+		healthy := health == topologyHealthHealthy
+		if stats := homeStats[homeKey]; stats != nil && state == topologyCPAActive {
+			stats.ActiveCPA++
+		}
+		if state == topologyCPAActive {
+			if healthy {
+				healthyCPACount++
+			} else if health == topologyHealthStale {
+				staleCPACount++
+			} else {
+				unknownCPACount++
+			}
+			if stats := homeStats[homeKey]; stats != nil {
+				switch health {
+				case topologyHealthHealthy:
+					stats.HealthyCPA++
+				case topologyHealthStale:
+					stats.StaleCPA++
+				default:
+					stats.UnknownCPA++
+				}
 			}
 		}
 
@@ -112,21 +142,21 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		}
 		pluginState := pluginReportState(statuses, requiredPluginIDs)
 		pluginNeedsAttention := topologyPluginNeedsAttention(pluginState)
-		if pluginNeedsAttention {
+		if state == topologyCPAActive && pluginNeedsAttention {
 			pluginAttentionCount++
 		}
-		if health != topologyHealthHealthy || pluginNeedsAttention {
+		if state == topologyCPAActive && (health != topologyHealthHealthy || pluginNeedsAttention) {
 			cpaAttentionCount++
 		}
-
 		cpaItems = append(cpaItems, gin.H{
 			"node_id":                cpaRecord.NodeID,
 			"ip":                     cpaRecord.ClientIP,
 			"connected_time":         cpaRecord.ConnectedAt,
 			"last_seen_at":           cpaRecord.LastSeenAt,
 			"client_count":           cpaRecord.ClientCount,
-			"healthy":                healthy,
+			"state":                  state,
 			"health":                 health,
+			"healthy":                healthy,
 			"home_id":                homeID,
 			"home_ip":                cpaRecord.HomeIP,
 			"home_port":              cpaRecord.HomePort,
@@ -143,7 +173,8 @@ func (h *Handler) GetTopology(c *gin.Context) {
 	var masterHome gin.H
 	for _, homeRecord := range homeRecords {
 		homeID := topologyHomeID(homeRecord.IP, homeRecord.Port)
-		health := homeHealth[homeID]
+		homeKey := topologyHomeIncarnationKey(homeRecord.IP, homeRecord.Port, homeRecord.StartedAt)
+		health := homeHealth[homeKey]
 		healthy := health == topologyHealthHealthy
 		if healthy {
 			healthyHomeCount++
@@ -160,7 +191,7 @@ func (h *Handler) GetTopology(c *gin.Context) {
 				role = topologyRoleFollower
 			}
 		}
-		stats := homeStats[homeID]
+		stats := homeStats[homeKey]
 		if stats == nil {
 			stats = &topologyHomeStats{}
 		}
@@ -176,7 +207,7 @@ func (h *Handler) GetTopology(c *gin.Context) {
 			"client_count":      homeRecord.ClientCount,
 			"started_at":        homeRecord.StartedAt,
 			"last_seen_at":      homeRecord.LastSeenAt,
-			"cpa_count":         stats.CPA,
+			"cpa_count":         stats.ActiveCPA,
 			"healthy_cpa_count": stats.HealthyCPA,
 			"stale_cpa_count":   stats.StaleCPA,
 			"unknown_cpa_count": stats.UnknownCPA,
@@ -199,7 +230,7 @@ func (h *Handler) GetTopology(c *gin.Context) {
 			"healthy_home_count":      healthyHomeCount,
 			"stale_home_count":        staleHomeCount,
 			"unknown_home_count":      unknownHomeCount,
-			"cpa_count":               len(cpaItems),
+			"cpa_count":               len(logicalCPAs),
 			"healthy_cpa_count":       healthyCPACount,
 			"stale_cpa_count":         staleCPACount,
 			"unknown_cpa_count":       unknownCPACount,
@@ -244,6 +275,17 @@ func topologyHomeID(ip string, port int) string {
 	return fmt.Sprintf("%s:%d", ip, port)
 }
 
+func topologyHomeIncarnationKey(ip string, port int, startedAt time.Time) string {
+	if startedAt.IsZero() {
+		return ""
+	}
+	homeID := topologyHomeID(ip, port)
+	if homeID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/%d", homeID, startedAt.UTC().UnixNano())
+}
+
 func topologyHealth(lastSeenAt time.Time, cutoff time.Time) string {
 	if lastSeenAt.IsZero() {
 		return topologyHealthUnknown
@@ -261,8 +303,21 @@ func topologySnapshotRetention(heartbeatTimeout time.Duration) time.Duration {
 	return heartbeatTimeout * topologyRetentionHeartbeatMultiplier
 }
 
-func topologyCPAHealth(record cluster.CPANodeRecord, homeHealth string, cutoff time.Time) string {
-	if strings.TrimSpace(record.HomeIP) == "" || record.HomePort <= 0 || homeHealth == "" {
+func topologyCPASnapshotState(record cluster.CPANodeRecord, membership cluster.CPANodeMembershipRecord, hasMembership bool) string {
+	if record.ClientCount <= 0 && record.OpenConnections <= 0 && record.ActiveHandlers <= 0 {
+		return ""
+	}
+	if record.ClientCount > 0 && hasMembership && strings.TrimSpace(record.CertificateFingerprint) != "" &&
+		strings.TrimSpace(record.CertificateFingerprint) == strings.TrimSpace(membership.CertificateFingerprint) &&
+		strings.TrimSpace(record.HomeIP) == strings.TrimSpace(membership.HomeIP) &&
+		record.HomePort == membership.HomePort && record.HomeStartedAt.Equal(membership.HomeStartedAt) {
+		return topologyCPAActive
+	}
+	return topologyCPADraining
+}
+
+func topologyCPASnapshotHealth(state string, membership cluster.CPANodeMembershipRecord, homeHealth string, now time.Time) string {
+	if homeHealth == "" {
 		return topologyHealthUnknown
 	}
 	if homeHealth == topologyHealthUnknown {
@@ -271,10 +326,26 @@ func topologyCPAHealth(record cluster.CPANodeRecord, homeHealth string, cutoff t
 	if homeHealth != topologyHealthHealthy {
 		return topologyHealthStale
 	}
-	if record.ClientCount <= 0 {
+	if state != topologyCPAActive {
 		return topologyHealthStale
 	}
-	return topologyHealth(record.LastSeenAt, cutoff)
+	if membership.CPAHeartbeatTimeout <= 0 || now.IsZero() {
+		return topologyHealthUnknown
+	}
+	return topologyHealth(membership.LastSeenAt, now.Add(-membership.CPAHeartbeatTimeout))
+}
+
+func topologyLogicalCPAKey(record cluster.CPANodeRecord) string {
+	if fingerprint := strings.TrimSpace(record.CertificateFingerprint); fingerprint != "" {
+		return "fingerprint:" + fingerprint
+	}
+	if nodeID := strings.TrimSpace(record.NodeID); nodeID != "" {
+		return "node:" + nodeID
+	}
+	if clientIP := strings.TrimSpace(record.ClientIP); clientIP != "" {
+		return "ip:" + clientIP
+	}
+	return ""
 }
 
 func topologyCurrentMasterHomeID(records []cluster.ClusterNodeRecord, cutoff time.Time) string {
