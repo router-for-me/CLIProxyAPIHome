@@ -1626,6 +1626,11 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 	resumeRefreshedModels(updated.ID, modelsToResume)
 }
 
+// ApplyRefreshSuccessState clears refresh errors and unauthorized execution state.
+func ApplyRefreshSuccessState(auth *Auth, now time.Time) []string {
+	return applyRefreshSuccessState(auth, now)
+}
+
 // applyRefreshSuccessState clears only refresh errors and unauthorized execution state.
 func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
 	if auth == nil {

@@ -267,61 +267,6 @@ func (r *Repository) GetAuth(ctx context.Context, uuid string) (*coreauth.Auth, 
 	return auth, record, nil
 }
 
-// WithAuthRefreshLock applies the auth refresh lock option.
-func (r *Repository) WithAuthRefreshLock(ctx context.Context, uuid string, fn func(tx *Repository, auth *coreauth.Auth) (*coreauth.Auth, error)) (*coreauth.Auth, error) {
-	// Resolve credential context before calling upstream OAuth services.
-	db, errDB := r.database()
-	if errDB != nil {
-		return nil, errDB
-	}
-	uuid = strings.TrimSpace(uuid)
-	if uuid == "" {
-		return nil, fmt.Errorf("cluster auth uuid is required")
-	}
-	if fn == nil {
-		return nil, fmt.Errorf("cluster auth refresh lock callback is nil")
-	}
-
-	var out *coreauth.Auth
-	ctx = contextOrBackground(ctx)
-	errTransaction := db.WithContext(ctx).Transaction(func(txDB *gorm.DB) error {
-		record := &AuthRecord{}
-		query := txDB.Where("uuid = ?", uuid)
-		if txDB.Dialector != nil && txDB.Dialector.Name() == "sqlite" {
-			// SQLite ignores SELECT FOR UPDATE. A no-op write acquires its
-			// database writer lock before the credential is read, preventing
-			// another Home process from rotating the same refresh token.
-			if errLock := txDB.Exec(`UPDATE "auth" SET "version" = "version" WHERE "uuid" = ?`, uuid).Error; errLock != nil {
-				return errLock
-			}
-		} else {
-			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
-		errFirst := query.First(record).Error
-		if errFirst != nil {
-			return errFirst
-		}
-
-		auth, errAuth := RecordToAuth(record)
-		if errAuth != nil {
-			return errAuth
-		}
-		auth.ID = uuid
-		auth.Index = uuid
-
-		refreshed, errRefresh := fn(&Repository{db: txDB}, auth)
-		if errRefresh != nil {
-			return errRefresh
-		}
-		out = refreshed
-		return nil
-	})
-	if errTransaction != nil {
-		return nil, errTransaction
-	}
-	return out, nil
-}
-
 // MutateAuth loads an auth row under a write lock, applies mutate to the
 // decoded auth, and persists the result in the same transaction when mutate
 // reports a change. Concurrent mutations from other Home nodes serialize on

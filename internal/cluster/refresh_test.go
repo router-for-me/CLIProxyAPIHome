@@ -344,6 +344,19 @@ func TestRefreshControllerMasterInvalidGrantPersistsDisabledAuth(t *testing.T) {
 	}
 }
 
+func TestMergeClusterRefreshOutcomePreservesIneffectiveBackoff(t *testing.T) {
+	now := time.Now().UTC()
+	base := newInvalidGrantRefreshAuth("ineffective-backoff")
+	current := base.Clone()
+	refreshed := base.Clone()
+	refreshed.NextRefreshAfter = now.Add(30 * time.Second)
+
+	merged := mergeClusterRefreshOutcome(current, base, refreshed, nil, now)
+	if merged == nil || !merged.NextRefreshAfter.Equal(refreshed.NextRefreshAfter) {
+		t.Fatalf("merged NextRefreshAfter = %v, want %v", merged.NextRefreshAfter, refreshed.NextRefreshAfter)
+	}
+}
+
 func TestRefreshControllerTransientFailureKeepsCredentialDispatchable(t *testing.T) {
 	const authID = "antigravity-transient"
 	ctx := context.Background()
@@ -385,65 +398,237 @@ func TestRefreshControllerTransientFailureKeepsCredentialDispatchable(t *testing
 	if persisted.NextRefreshAfter.IsZero() || !persisted.NextRetryAfter.IsZero() {
 		t.Fatalf("refresh/retry deadlines = %v/%v, want refresh-only backoff", persisted.NextRefreshAfter, persisted.NextRetryAfter)
 	}
+	if persisted.Attributes[refreshLeaseAttribute] != "" {
+		t.Fatalf("transient refresh retained lease: %#v", persisted.Attributes)
+	}
 }
 
-func TestWithAuthRefreshLockSerializesSeparateSQLiteConnections(t *testing.T) {
+func TestRefreshLeaseDoesNotBlockUnrelatedSQLiteWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth("sqlite-refresh-lease")
+	unrelated := newInvalidGrantRefreshAuth("sqlite-unrelated")
+	for _, candidate := range []*coreauth.Auth{auth, unrelated} {
+		if _, errUpsert := repo.UpsertAuth(ctx, candidate, "register"); errUpsert != nil {
+			t.Fatalf("UpsertAuth(%s) error = %v", candidate.ID, errUpsert)
+		}
+	}
+
+	transport := &blockingRefreshRoundTripper{
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		secondCall: make(chan struct{}, 1),
+	}
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	controller := NewRefreshController(nil, runtime, repo, nil)
+	result := make(chan error, 1)
+	go func() {
+		_, errRefresh := controller.refreshLocalWithLock(ctx, auth.ID, coreauth.AccessTokenSHA256(auth))
+		result <- errRefresh
+	}()
+	select {
+	case <-transport.started:
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not start: %v", ctx.Err())
+	}
+
+	writeCtx, cancelWrite := context.WithTimeout(ctx, 500*time.Millisecond)
+	unrelated.Metadata["access_token"] = "updated-unrelated-token"
+	_, errUnrelated := repo.UpsertAuth(writeCtx, unrelated, "update")
+	cancelWrite()
+	if errUnrelated != nil {
+		close(transport.release)
+		<-result
+		t.Fatalf("unrelated SQLite write was blocked by provider refresh: %v", errUnrelated)
+	}
+
+	close(transport.release)
+	select {
+	case errRefresh := <-result:
+		if errRefresh != nil {
+			t.Fatalf("refreshLocalWithLock() error = %v", errRefresh)
+		}
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not finish: %v", ctx.Err())
+	}
+}
+
+func TestRefreshLeasePreservesConcurrentCredentialUpdates(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth("sqlite-concurrent-update")
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := &blockingRefreshRoundTripper{
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		secondCall: make(chan struct{}, 1),
+	}
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	controller := NewRefreshController(nil, runtime, repo, nil)
+	result := make(chan error, 1)
+	go func() {
+		_, errRefresh := controller.refreshLocalWithLock(ctx, auth.ID, coreauth.AccessTokenSHA256(auth))
+		result <- errRefresh
+	}()
+	select {
+	case <-transport.started:
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not start: %v", ctx.Err())
+	}
+
+	_, _, _, errMutate := repo.MutateAuth(ctx, auth.ID, "concurrent-update", func(current *coreauth.Auth) bool {
+		current.Label = "updated-during-refresh"
+		current.Metadata["management_note"] = "preserve-me"
+		return true
+	})
+	if errMutate != nil {
+		close(transport.release)
+		<-result
+		t.Fatalf("concurrent credential update failed: %v", errMutate)
+	}
+	close(transport.release)
+	select {
+	case errRefresh := <-result:
+		if errRefresh != nil {
+			t.Fatalf("refreshLocalWithLock() error = %v", errRefresh)
+		}
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not finish: %v", ctx.Err())
+	}
+
+	persisted, _, errAuth := repo.GetAuth(ctx, auth.ID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.Label != "updated-during-refresh" || persisted.Metadata["management_note"] != "preserve-me" {
+		t.Fatalf("concurrent update was overwritten: label=%q metadata=%#v", persisted.Label, persisted.Metadata)
+	}
+	if persisted.Metadata["access_token"] != "new-access-token" {
+		t.Fatalf("refreshed access token = %v, want new-access-token", persisted.Metadata["access_token"])
+	}
+}
+
+func TestRefreshLeasePreservesDisableDuringProviderCall(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth("sqlite-disabled-during-refresh")
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := &blockingRefreshRoundTripper{
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		secondCall: make(chan struct{}, 1),
+	}
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	controller := NewRefreshController(nil, runtime, repo, nil)
+	result := make(chan error, 1)
+	go func() {
+		_, errRefresh := controller.refreshLocalWithLock(ctx, auth.ID, coreauth.AccessTokenSHA256(auth))
+		result <- errRefresh
+	}()
+	select {
+	case <-transport.started:
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not start: %v", ctx.Err())
+	}
+
+	_, _, _, errDisable := repo.MutateAuth(ctx, auth.ID, "disable", func(current *coreauth.Auth) bool {
+		current.Disabled = true
+		current.Unavailable = true
+		current.Status = coreauth.StatusDisabled
+		return true
+	})
+	if errDisable != nil {
+		close(transport.release)
+		<-result
+		t.Fatalf("disable during provider refresh failed: %v", errDisable)
+	}
+	close(transport.release)
+	select {
+	case errRefresh := <-result:
+		requireTerminalRefreshError(t, errRefresh)
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not finish: %v", ctx.Err())
+	}
+
+	persisted, _, errAuth := repo.GetAuth(ctx, auth.ID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if !persisted.Disabled || persisted.Status != coreauth.StatusDisabled {
+		t.Fatalf("disabled credential was overwritten by refresh: %#v", persisted)
+	}
+	if persisted.Attributes[refreshLeaseAttribute] != "" {
+		t.Fatalf("disabled credential retained refresh lease: %#v", persisted.Attributes)
+	}
+}
+
+func TestRefreshLeaseSerializesSeparateSQLiteConnections(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "shared.db")
 	repoA := openRefreshTestRepositoryAt(t, path, true)
 	repoB := openRefreshTestRepositoryAt(t, path, false)
-	var busyTimeout int
-	if errPragma := repoA.db.Raw("PRAGMA busy_timeout").Scan(&busyTimeout).Error; errPragma != nil || busyTimeout < 30000 {
-		t.Fatalf("SQLite busy_timeout = %d, %v; want at least 30000ms", busyTimeout, errPragma)
-	}
 	auth := newInvalidGrantRefreshAuth("sqlite-cross-connection")
 	if _, errUpsert := repoA.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
 		t.Fatalf("UpsertAuth() error = %v", errUpsert)
 	}
 
-	firstEntered := make(chan struct{})
-	secondEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	results := make(chan error, 2)
-	go func() {
-		_, errLock := repoA.WithAuthRefreshLock(ctx, auth.ID, func(_ *Repository, current *coreauth.Auth) (*coreauth.Auth, error) {
-			close(firstEntered)
-			<-releaseFirst
-			return current, nil
-		})
-		results <- errLock
-	}()
-	select {
-	case <-firstEntered:
-	case <-ctx.Done():
-		t.Fatalf("first SQLite refresh lock did not start: %v", ctx.Err())
+	transportA := &blockingRefreshRoundTripper{
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		secondCall: make(chan struct{}, 1),
 	}
-	go func() {
-		_, errLock := repoB.WithAuthRefreshLock(ctx, auth.ID, func(_ *Repository, current *coreauth.Auth) (*coreauth.Auth, error) {
-			close(secondEntered)
-			return current, nil
-		})
-		results <- errLock
-	}()
+	transportB := &refreshTestRoundTripper{
+		statusCode: http.StatusOK,
+		body:       `{"access_token":"unexpected-token","refresh_token":"unexpected-refresh","expires_in":3600}`,
+	}
+	runtimeA := newRefreshTestRuntime(t, repoA, auth, transportA)
+	runtimeB := newRefreshTestRuntime(t, repoB, auth, transportB)
+	controllerA := NewRefreshController(nil, runtimeA, repoA, nil)
+	controllerB := NewRefreshController(nil, runtimeB, repoB, nil)
+	observedHash := coreauth.AccessTokenSHA256(auth)
 
+	firstResult := make(chan error, 1)
+	go func() {
+		_, errRefresh := controllerA.refreshLocalWithLock(ctx, auth.ID, observedHash)
+		firstResult <- errRefresh
+	}()
 	select {
-	case <-secondEntered:
-		t.Fatal("second SQLite connection entered refresh while the first lock was held")
-	case errLock := <-results:
-		t.Fatalf("second SQLite refresh lock returned early: %v", errLock)
-	case <-time.After(100 * time.Millisecond):
+	case <-transportA.started:
+	case <-ctx.Done():
+		t.Fatalf("first provider refresh did not start: %v", ctx.Err())
 	}
-	close(releaseFirst)
-	for range 2 {
-		select {
-		case errLock := <-results:
-			if errLock != nil {
-				t.Fatalf("WithAuthRefreshLock() error = %v", errLock)
-			}
-		case <-ctx.Done():
-			t.Fatalf("SQLite refresh locks did not finish: %v", ctx.Err())
+
+	_, errConcurrent := controllerB.refreshLocalWithLock(ctx, auth.ID, observedHash)
+	var authErr *coreauth.Error
+	if !errors.As(errConcurrent, &authErr) || authErr.HTTPStatus != http.StatusServiceUnavailable {
+		close(transportA.release)
+		<-firstResult
+		t.Fatalf("concurrent refresh error = %#v, want transient 503", errConcurrent)
+	}
+	if transportB.calls != 0 {
+		close(transportA.release)
+		<-firstResult
+		t.Fatalf("second provider refresh calls = %d, want 0 while lease is active", transportB.calls)
+	}
+
+	close(transportA.release)
+	select {
+	case errRefresh := <-firstResult:
+		if errRefresh != nil {
+			t.Fatalf("first refresh error = %v", errRefresh)
 		}
+	case <-ctx.Done():
+		t.Fatalf("first refresh did not finish: %v", ctx.Err())
 	}
 }
 
@@ -575,6 +760,9 @@ func TestRefreshControllerHonorsCallerDeadline(t *testing.T) {
 	}
 	if persisted.Disabled || persisted.Unavailable || persisted.Status != coreauth.StatusActive {
 		t.Fatalf("timed-out refresh blocked credential: %#v", persisted)
+	}
+	if persisted.Attributes[refreshLeaseAttribute] != "" {
+		t.Fatalf("timed-out refresh retained lease: %#v", persisted.Attributes)
 	}
 }
 
