@@ -300,7 +300,8 @@ func TestRefreshControllerMasterInvalidGrantPersistsDisabledAuth(t *testing.T) {
 
 	_, errRefresh := controller.RefreshNow(ctx, authID)
 	requireTerminalRefreshError(t, errRefresh)
-	_, errRepeated := controller.RefreshNow(ctx, authID)
+	observedOldHash := coreauth.AccessTokenSHA256(&coreauth.Auth{Metadata: map[string]any{"access_token": "older-access-token"}})
+	_, errRepeated := controller.RefreshNowObserved(ctx, authID, observedOldHash)
 	requireTerminalRefreshError(t, errRepeated)
 	if transport.calls != 1 {
 		t.Fatalf("provider refresh calls = %d, want 1 after repeated terminal request", transport.calls)

@@ -240,11 +240,11 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 
 	var refreshErr error
 	updated, errLock := c.repo.WithAuthRefreshLock(refreshCtx, targetUUID, func(tx *Repository, auth *coreauth.Auth) (*coreauth.Auth, error) {
-		if coreauth.AuthIsNewerThanObserved(auth, observedAccessTokenSHA256) {
-			return auth, nil
-		}
 		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
 			refreshErr = &coreauth.Error{Code: "authentication_error", Message: "credential unauthorized", HTTPStatus: http.StatusUnauthorized}
+			return auth, nil
+		}
+		if coreauth.AuthIsNewerThanObserved(auth, observedAccessTokenSHA256) {
 			return auth, nil
 		}
 		if coreauth.RefreshRetryBackoffOpen(auth, time.Now().UTC()) {

@@ -1432,11 +1432,11 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
 	target = fullTarget
-	if AuthIsNewerThanObserved(target, observedAccessTokenSHA256) {
-		return target.Clone(), nil
-	}
 	if authRefreshDisabled(target) {
 		return nil, newUnauthorizedRefreshError()
+	}
+	if AuthIsNewerThanObserved(target, observedAccessTokenSHA256) {
+		return target.Clone(), nil
 	}
 	if RefreshRetryBackoffOpen(target, time.Now().UTC()) {
 		return nil, NewTransientRefreshError()
