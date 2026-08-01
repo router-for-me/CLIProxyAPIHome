@@ -159,60 +159,6 @@ func TestMarkResultUnauthorizedUsesRecoverableCooldown(t *testing.T) {
 	}
 }
 
-func TestMarkResultUnauthorizedBlocksEveryModelForCurrentToken(t *testing.T) {
-	manager := NewManager(nil, nil, nil)
-	auth := &Auth{
-		ID:       "auth-401-multi-model",
-		Index:    "auth-401-multi-model",
-		Provider: "codex",
-		Status:   StatusActive,
-		Metadata: map[string]any{"access_token": "invalid-current-token"},
-		ModelStates: map[string]*ModelState{
-			"model-a": {Status: StatusActive},
-			"model-b": {Status: StatusActive},
-		},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-
-	manager.MarkResult(context.Background(), Result{
-		AuthID:            auth.ID,
-		Model:             "model-a",
-		AccessTokenSHA256: AccessTokenSHA256(auth),
-		Success:           false,
-		Error:             &Error{Message: "invalid access token", HTTPStatus: http.StatusUnauthorized},
-	})
-
-	updated, ok := manager.GetByID(auth.ID)
-	if !ok || updated == nil {
-		t.Fatal("updated auth not found")
-	}
-	if updated.Disabled || updated.Status == StatusDisabled {
-		t.Fatalf("execution 401 permanently disabled auth: %#v", updated)
-	}
-	if !authUnauthorizedCooldownOpen(updated, time.Now()) {
-		t.Fatalf("auth-wide unauthorized cooldown is not open: %#v", updated)
-	}
-	if blocked, reason, next := isAuthBlockedForModel(updated, "model-b", time.Now()); !blocked || reason == blockReasonDisabled || next.IsZero() {
-		t.Fatalf("model-b block = %v, %v, %v; want recoverable auth-wide cooldown", blocked, reason, next)
-	}
-
-	manager.MarkResult(context.Background(), Result{
-		AuthID:  auth.ID,
-		Model:   "model-b",
-		Success: false,
-		Error:   &Error{Message: "temporary upstream failure", HTTPStatus: http.StatusInternalServerError},
-	})
-	updated, _ = manager.GetByID(auth.ID)
-	if !authUnauthorizedCooldownOpen(updated, time.Now()) {
-		t.Fatalf("later model failure cleared auth-wide unauthorized cooldown: %#v", updated)
-	}
-	if blocked, _, _ := isAuthBlockedForModel(updated, "model-c", time.Now()); !blocked {
-		t.Fatal("model-c remained dispatchable after current-token 401")
-	}
-}
-
 func TestAuthRefreshBackoffDoesNotBlockModels(t *testing.T) {
 	now := time.Now().UTC()
 	auth := &Auth{

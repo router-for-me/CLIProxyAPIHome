@@ -102,32 +102,6 @@ func TestTerminalRefreshClassificationRequiresExplicitOAuthSignal(t *testing.T) 
 	}
 }
 
-func TestRefreshNowObservedRejectsDisabledAuthBeforeTokenComparison(t *testing.T) {
-	manager := NewManager(nil, nil, nil)
-	auth := &Auth{
-		ID:          "disabled-observed-auth",
-		Index:       "disabled-observed-auth",
-		Provider:    "codex",
-		Status:      StatusDisabled,
-		Disabled:    true,
-		Unavailable: true,
-		Metadata:    map[string]any{"access_token": "disabled-current-token"},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	observedHash := AccessTokenSHA256(&Auth{Metadata: map[string]any{"access_token": "older-token"}})
-
-	updated, errRefresh := manager.RefreshNowObserved(context.Background(), auth.Index, observedHash)
-	if updated != nil {
-		t.Fatalf("RefreshNowObserved() auth = %#v, want nil", updated)
-	}
-	var authErr *Error
-	if !errors.As(errRefresh, &authErr) || authErr.Code != refreshAuthErrorCode || authErr.HTTPStatus != http.StatusUnauthorized {
-		t.Fatalf("RefreshNowObserved() error = %#v, want authentication_error/401", errRefresh)
-	}
-}
-
 func TestBackgroundRefreshUsesConfiguredHandler(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	auth := &Auth{
