@@ -12,10 +12,11 @@ import (
 // fakeMutatorStore is a Store with StateMutator support backed by one shared
 // auth, simulating the cluster database row shared by multiple Home nodes.
 type fakeMutatorStore struct {
-	mu        sync.Mutex
-	persisted *Auth
-	mutations int
-	saves     int
+	mu           sync.Mutex
+	persisted    *Auth
+	mutations    int
+	saves        int
+	beforeReturn func()
 }
 
 func (s *fakeMutatorStore) List(context.Context) ([]*Auth, error) { return nil, nil }
@@ -34,16 +35,26 @@ func (s *fakeMutatorStore) Delete(context.Context, string) error { return nil }
 
 func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.persisted == nil || s.persisted.ID != id {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("auth %s not found", id)
 	}
 	working := s.persisted.Clone()
 	if mutate(working) {
 		s.mutations++
+		if working.StateVersion > 0 {
+			working.StateVersion++
+		}
 		s.persisted = working
 	}
-	return s.persisted.Clone(), nil
+	result := s.persisted.Clone()
+	beforeReturn := s.beforeReturn
+	s.beforeReturn = nil
+	s.mu.Unlock()
+	if beforeReturn != nil {
+		beforeReturn()
+	}
+	return result, nil
 }
 
 func (s *fakeMutatorStore) persistedSnapshot() *Auth {
@@ -218,6 +229,198 @@ func TestMarkResultIgnoresUnauthorizedFromOlderAccessToken(t *testing.T) {
 	}
 	if store.mutationCount() != 0 {
 		t.Fatalf("late 401 persisted %d mutations, want 0", store.mutationCount())
+	}
+}
+
+func TestMarkResultIgnoresSuccessFromOlderAccessToken(t *testing.T) {
+	for _, model := range []string{"", "gpt-5"} {
+		name := "auth-scoped"
+		if model != "" {
+			name = "model-scoped"
+		}
+		t.Run(name, func(t *testing.T) {
+			const authID = "auth-cluster-stale-success"
+			current := &Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   StatusActive,
+				Metadata: map[string]any{"access_token": "new-access-token"},
+			}
+			if model != "" {
+				current.ModelStates = map[string]*ModelState{
+					model:     {Status: StatusActive},
+					"model-b": {Status: StatusActive},
+				}
+			}
+			store := &fakeMutatorStore{persisted: current}
+			node := newHomeNodeManager(t, store, authID)
+			currentHash := AccessTokenSHA256(current)
+
+			node.MarkResult(context.Background(), Result{
+				AuthID:            authID,
+				Provider:          "codex",
+				Model:             model,
+				AccessTokenSHA256: currentHash,
+				Success:           false,
+				Error:             &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+			})
+			if store.mutationCount() != 1 {
+				t.Fatalf("current-token 401 mutations = %d, want 1", store.mutationCount())
+			}
+			beforeSuccess := store.persistedSnapshot()
+			if !authUnauthorizedCooldownOpen(beforeSuccess, time.Now()) {
+				t.Fatalf("current-token 401 did not open auth cooldown: %#v", beforeSuccess)
+			}
+
+			oldHash := AccessTokenSHA256(&Auth{Metadata: map[string]any{"access_token": "old-access-token"}})
+			node.MarkResult(context.Background(), Result{
+				AuthID:            authID,
+				Provider:          "codex",
+				Model:             model,
+				AccessTokenSHA256: oldHash,
+				Success:           true,
+			})
+
+			afterSuccess := store.persistedSnapshot()
+			if !authUnauthorizedCooldownOpen(afterSuccess, time.Now()) {
+				t.Fatalf("older-token success cleared persisted cooldown: %#v", afterSuccess)
+			}
+			if store.mutationCount() != 1 {
+				t.Fatalf("older-token success persisted %d mutations, want 1 total", store.mutationCount())
+			}
+			local, ok := node.GetByID(authID)
+			if !ok || local == nil || !authUnauthorizedCooldownOpen(local, time.Now()) {
+				t.Fatalf("older-token success cleared local cooldown: %#v", local)
+			}
+			if blocked, _, _ := isAuthBlockedForModel(local, "model-b", time.Now()); !blocked {
+				t.Fatal("older-token success made current credential dispatchable")
+			}
+		})
+	}
+}
+
+func TestMarkResultDoesNotPersistTokenVersionedSuccessFromCleanStaleNode(t *testing.T) {
+	const authID = "auth-cluster-clean-stale-success"
+	now := time.Now()
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  "unauthorized",
+		Unavailable:    true,
+		LastError:      &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+		NextRetryAfter: now.Add(unauthorizedRetryBackoff),
+		Metadata:       map[string]any{"access_token": "new-access-token"},
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				StatusMessage:  "expired access token",
+				Unavailable:    true,
+				LastError:      &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+				NextRetryAfter: now.Add(unauthorizedRetryBackoff),
+			},
+		},
+	}}
+	manager := NewManager(store, nil, nil)
+	local := &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "old-access-token"},
+	}
+	if _, errRegister := manager.Register(context.Background(), local); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	savesBefore := store.saves
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:            authID,
+		Provider:          "codex",
+		Model:             "gpt-5",
+		AccessTokenSHA256: AccessTokenSHA256(local),
+		Success:           true,
+	})
+
+	persisted := store.persistedSnapshot()
+	if !authUnauthorizedCooldownOpen(persisted, time.Now()) {
+		t.Fatalf("clean stale node cleared authoritative cooldown: %#v", persisted)
+	}
+	if got := persisted.Metadata["access_token"]; got != "new-access-token" {
+		t.Fatalf("authoritative access token = %v, want new-access-token", got)
+	}
+	if store.mutationCount() != 0 || store.saves != savesBefore {
+		t.Fatalf("clean stale success persistence = mutations %d saves %d, want 0/%d", store.mutationCount(), store.saves, savesBefore)
+	}
+	localAfter, _ := manager.GetByID(authID)
+	if localAfter == nil || len(localAfter.ModelStates) != 0 {
+		t.Fatalf("clean stale success changed local availability state: %#v", localAfter)
+	}
+}
+
+func TestMarkResultDoesNotAdoptOlderMutationSnapshot(t *testing.T) {
+	const authID = "auth-cluster-out-of-order-adoption"
+	now := time.Now()
+	initial := &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		StateVersion:   1,
+		Metadata:       map[string]any{"access_token": "same-access-token"},
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				LastError:      &Error{Message: "temporary failure", HTTPStatus: http.StatusServiceUnavailable},
+			},
+		},
+	}
+	store := &fakeMutatorStore{persisted: initial.Clone()}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), initial.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	store.mu.Lock()
+	store.beforeReturn = func() {
+		newer := initial.Clone()
+		newer.StateVersion = 3
+		newer.Disabled = true
+		newer.Status = StatusDisabled
+		newer.StatusMessage = "disabled by operator"
+		store.mu.Lock()
+		store.persisted = newer.Clone()
+		store.mu.Unlock()
+		manager.mu.Lock()
+		manager.auths[authID] = newer
+		manager.indexAuth[authID] = newer
+		manager.mu.Unlock()
+	}
+	store.mu.Unlock()
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:            authID,
+		Provider:          "codex",
+		Model:             "gpt-5",
+		AccessTokenSHA256: AccessTokenSHA256(initial),
+		Success:           true,
+	})
+
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil {
+		t.Fatal("local auth not found")
+	}
+	if local.StateVersion != 3 || !local.Disabled || local.Status != StatusDisabled {
+		t.Fatalf("older mutation snapshot replaced newer local state: %#v", local)
+	}
+	if state := local.ModelStates["gpt-5"]; state == nil || !state.Unavailable {
+		t.Fatalf("older success cleared newer model state: %#v", state)
 	}
 }
 

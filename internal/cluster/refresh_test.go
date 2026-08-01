@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -510,6 +511,88 @@ func TestRefreshLeasePreservesConcurrentCredentialUpdates(t *testing.T) {
 	}
 	if persisted.Metadata["access_token"] != "new-access-token" {
 		t.Fatalf("refreshed access token = %v, want new-access-token", persisted.Metadata["access_token"])
+	}
+}
+
+func TestRefreshLeaseTransientFailurePreservesConcurrentUnauthorizedCooldown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth("sqlite-concurrent-unauthorized")
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	transport := refreshRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		startOnce.Do(func() { close(started) })
+		<-release
+		return nil, errors.New("temporary provider failure")
+	})
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	controller := NewRefreshController(nil, runtime, repo, nil)
+	result := make(chan error, 1)
+	go func() {
+		_, errRefresh := controller.refreshLocalWithLock(ctx, auth.ID, coreauth.AccessTokenSHA256(auth))
+		result <- errRefresh
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not start: %v", ctx.Err())
+	}
+
+	runtime.CoreManager().MarkResult(ctx, coreauth.Result{
+		AuthID:            auth.ID,
+		Provider:          auth.Provider,
+		Model:             "model-a",
+		AccessTokenSHA256: coreauth.AccessTokenSHA256(auth),
+		Success:           false,
+		Error:             &coreauth.Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+	})
+	beforeFinalize, _, errAuth := repo.GetAuth(ctx, auth.ID)
+	if errAuth != nil {
+		close(release)
+		<-result
+		t.Fatalf("GetAuth() before finalize error = %v", errAuth)
+	}
+	if !beforeFinalize.Unavailable || beforeFinalize.LastError == nil || beforeFinalize.LastError.StatusCode() != http.StatusUnauthorized {
+		close(release)
+		<-result
+		t.Fatalf("concurrent 401 cooldown was not persisted: %#v", beforeFinalize)
+	}
+
+	close(release)
+	select {
+	case errRefresh := <-result:
+		if errRefresh == nil {
+			t.Fatal("refreshLocalWithLock() error = nil, want transient failure")
+		}
+	case <-ctx.Done():
+		t.Fatalf("provider refresh did not finish: %v", ctx.Err())
+	}
+
+	persisted, _, errAuth := repo.GetAuth(ctx, auth.ID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.Disabled || persisted.Status == coreauth.StatusDisabled {
+		t.Fatalf("transient failure disabled credential: %#v", persisted)
+	}
+	if !persisted.Unavailable || persisted.Status != coreauth.StatusError || persisted.NextRetryAfter.Before(time.Now()) {
+		t.Fatalf("transient failure cleared auth-wide 401 cooldown: %#v", persisted)
+	}
+	if persisted.LastError == nil || persisted.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("transient failure replaced execution error: %#v", persisted.LastError)
+	}
+	state := persisted.ModelStates["model-a"]
+	if state == nil || !state.Unavailable || state.LastError == nil || state.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("transient failure cleared model 401 cooldown: %#v", state)
+	}
+	if persisted.NextRefreshAfter.Before(time.Now()) {
+		t.Fatalf("transient refresh backoff was not preserved: %v", persisted.NextRefreshAfter)
 	}
 }
 

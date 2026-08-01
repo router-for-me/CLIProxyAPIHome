@@ -138,6 +138,7 @@ func RecordToAuth(record *AuthRecord) (*coreauth.Auth, error) {
 		return nil, fmt.Errorf("auth json id %q must match uuid %q", auth.ID, record.UUID)
 	}
 	auth.Index = record.Index
+	auth.StateVersion = record.Version
 
 	return auth, nil
 }
@@ -320,6 +321,7 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 			return errRecord
 		}
 		record.Version = existing.Version + 1
+		auth.StateVersion = record.Version
 		record.CreatedAt = existing.CreatedAt
 		if errUpdate := txDB.Select("*").Where("uuid = ?", uuid).Updates(record).Error; errUpdate != nil {
 			return errUpdate
@@ -363,6 +365,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 		auth := auths[i]
 		out = append(out, AuthIndex{
 			UUID:           record.UUID,
+			Version:        record.Version,
 			ID:             record.ID,
 			Index:          record.Index,
 			Provider:       record.Provider,

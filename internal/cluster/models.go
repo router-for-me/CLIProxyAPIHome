@@ -591,6 +591,7 @@ func (CertificateRecord) TableName() string {
 
 type AuthIndex struct {
 	UUID           string
+	Version        int64
 	ID             string
 	Index          string
 	Provider       string

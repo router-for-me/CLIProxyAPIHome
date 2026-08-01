@@ -495,16 +495,44 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 		}
 		return merged
 	}
-	merged.Disabled = refreshed.Disabled
-	merged.Unavailable = refreshed.Unavailable
-	merged.Status = refreshed.Status
-	merged.StatusMessage = refreshed.StatusMessage
-	merged.LastError = refreshed.LastError
+	if refreshed.Disabled || refreshed.Status == coreauth.StatusDisabled {
+		merged.Disabled = refreshed.Disabled
+		merged.Unavailable = refreshed.Unavailable
+		merged.Status = refreshed.Status
+		merged.StatusMessage = refreshed.StatusMessage
+		merged.LastError = refreshed.LastError
+		merged.LastRefreshedAt = refreshed.LastRefreshedAt
+		merged.NextRefreshAfter = refreshed.NextRefreshAfter
+		merged.NextRetryAfter = refreshed.NextRetryAfter
+		merged.UpdatedAt = refreshed.UpdatedAt
+		return merged
+	}
+
+	// A transient acquisition failure only owns refresh scheduling fields. Keep
+	// execution availability that may have changed while OAuth ran outside the transaction.
 	merged.LastRefreshedAt = refreshed.LastRefreshedAt
 	merged.NextRefreshAfter = refreshed.NextRefreshAfter
-	merged.NextRetryAfter = refreshed.NextRetryAfter
-	merged.UpdatedAt = refreshed.UpdatedAt
+	if refreshExecutionStateEqual(current, base) {
+		merged.LastError = refreshed.LastError
+	}
+	if merged.UpdatedAt.Before(refreshed.UpdatedAt) {
+		merged.UpdatedAt = refreshed.UpdatedAt
+	}
 	return merged
+}
+
+func refreshExecutionStateEqual(left, right *coreauth.Auth) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Disabled == right.Disabled &&
+		left.Unavailable == right.Unavailable &&
+		left.Status == right.Status &&
+		left.StatusMessage == right.StatusMessage &&
+		left.NextRetryAfter.Equal(right.NextRetryAfter) &&
+		reflect.DeepEqual(left.Quota, right.Quota) &&
+		reflect.DeepEqual(left.LastError, right.LastError) &&
+		reflect.DeepEqual(left.ModelStates, right.ModelStates)
 }
 
 func mergeRefreshString(current, base, refreshed string) string {

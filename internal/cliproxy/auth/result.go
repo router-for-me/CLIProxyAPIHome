@@ -62,6 +62,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	auth := m.resultAuthLocked(result)
 	var mutator StateMutator
+	stateMutatorAvailable := false
 	if auth != nil {
 		resultAuthID = auth.ID
 		auth.recordRecentRequest(now, result.Success)
@@ -70,10 +71,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			auth.Failed++
 		}
-		if stateMutator, ok := m.store.(StateMutator); ok && m.resultNeedsGlobalTransition(auth, result, resultModel, now) {
-			mutator = stateMutator
+		if stateMutator, ok := m.store.(StateMutator); ok {
+			stateMutatorAvailable = true
+			if m.resultNeedsGlobalTransition(auth, result, resultModel, now) {
+				mutator = stateMutator
+			}
 		}
-		if mutator == nil {
+		// A locally clean token-versioned success has no state to clear. Drop its
+		// transition rather than enqueue a stale row or read the database per success;
+		// cluster events reconcile any newer authoritative state.
+		if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
 			transition = m.applyResultTransition(auth, result, resultModel, now)
 			authSnapshot = auth.Clone()
 		}
@@ -95,9 +102,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if errMutate != nil {
 				log.Warnf("auth manager: persisted result transition failed for %s: %v", resultAuthID, errMutate)
 			}
-			// A token-versioned 401 must be compared with the authoritative row.
-			// Failing open here is safer than cooling a newly refreshed local copy.
-			if isTokenVersionedUnauthorizedResult(result) {
+			// Token-versioned state transitions must be compared with the authoritative row.
+			// Failing open could cool a refreshed token or let an older success clear its cooldown.
+			if isTokenVersionFencedResult(result) {
 				return
 			}
 			m.mu.Lock()
@@ -108,7 +115,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			m.mu.Unlock()
 			m.enqueueResultPersist(ctx, authSnapshot)
 		} else {
-			authSnapshot = m.adoptPersistedResultState(result, resultModel, persisted, now)
+			var adopted bool
+			authSnapshot, adopted = m.adoptPersistedResultState(result, resultModel, persisted, now)
+			if !adopted {
+				transition = markResultTransition{}
+			}
 		}
 	} else {
 		m.enqueueResultPersist(ctx, authSnapshot)
@@ -142,7 +153,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if auth == nil {
 		return transition
 	}
-	if isTokenVersionedUnauthorizedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
+	if isTokenVersionFencedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
 		return transition
 	}
 
@@ -165,6 +176,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
+	preservedUnauthorized, preserveUnauthorized := snapshotAuthUnauthorizedCooldown(auth, now)
 	if resultModel != "" {
 		if isRequestScopedNotFoundResultError(result.Error) {
 			return transition
@@ -237,10 +249,18 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		auth.Status = StatusError
 		auth.UpdatedAt = now
 		updateAggregatedAvailability(auth, now)
+		if statusCode == http.StatusUnauthorized {
+			applyAuthUnauthorizedCooldown(auth, result.Error, now)
+		} else if preserveUnauthorized {
+			restoreAuthUnauthorizedCooldown(auth, preservedUnauthorized)
+		}
 		return transition
 	}
 
 	applyAuthFailureState(m, auth, result.Error, result.RetryAfter, now)
+	if statusCodeFromResult(result.Error) != http.StatusUnauthorized && preserveUnauthorized {
+		restoreAuthUnauthorizedCooldown(auth, preservedUnauthorized)
+	}
 	return transition
 }
 
@@ -397,21 +417,24 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 }
 
 // adoptPersistedResultState merges the authoritative persisted state produced
-// by a StateMutator back into the manager's in-memory auth and returns a
-// snapshot for scheduler updates.
-func (m *Manager) adoptPersistedResultState(result Result, resultModel string, persisted *Auth, now time.Time) *Auth {
+// by a StateMutator back into the manager's in-memory auth. The boolean reports
+// whether that snapshot remained current enough to apply its registry effects.
+func (m *Manager) adoptPersistedResultState(result Result, resultModel string, persisted *Auth, now time.Time) (*Auth, bool) {
 	if persisted == nil {
-		return nil
+		return nil, false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	local := m.resultAuthLocked(result)
 	if local == nil {
-		return persisted.Clone()
+		return persisted.Clone(), true
 	}
-	if isTokenVersionedUnauthorizedResult(result) {
+	if local.StateVersion > 0 && persisted.StateVersion > 0 && local.StateVersion > persisted.StateVersion {
+		return local.Clone(), false
+	}
+	if isTokenVersionFencedResult(result) {
 		if AuthIsNewerThanObserved(local, result.AccessTokenSHA256) {
-			return local.Clone()
+			return local.Clone(), false
 		}
 		if AuthIsNewerThanObserved(persisted, result.AccessTokenSHA256) {
 			replacement := persisted.Clone()
@@ -433,11 +456,12 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 			if nextIndex != "" {
 				m.indexAuth[nextIndex] = replacement
 			}
-			return replacement.Clone()
+			return replacement.Clone(), true
 		}
 	}
 	local.Disabled = persisted.Disabled
 	local.UpdatedAt = persisted.UpdatedAt
+	local.StateVersion = persisted.StateVersion
 	if resultModel != "" {
 		if state := persisted.ModelStates[resultModel]; state != nil {
 			if local.ModelStates == nil {
@@ -450,11 +474,15 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 		// Recompute the aggregate from the merged local view so cooldowns that
 		// only exist locally (non-persisted transitions) are preserved.
 		updateAggregatedAvailability(local, now)
+		persistedUnauthorized, hasPersistedUnauthorized := snapshotAuthUnauthorizedCooldown(persisted, now)
+		if hasPersistedUnauthorized {
+			restoreAuthUnauthorizedCooldown(local, persistedUnauthorized)
+		}
 		// The persisted copy can report a clean active state even though this
 		// node still tracks a model error that was never persisted (for
 		// example a transient 5xx). Mirror the hasModelError guard of the
 		// local success path and keep the local error view in that case.
-		if persisted.Status != StatusActive || !hasModelError(local, now) {
+		if hasPersistedUnauthorized || persisted.Status != StatusActive || !hasModelError(local, now) {
 			local.Status = persisted.Status
 			local.StatusMessage = persisted.StatusMessage
 			local.LastError = cloneError(persisted.LastError)
@@ -467,13 +495,78 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 		local.NextRetryAfter = persisted.NextRetryAfter
 		local.Quota = persisted.Quota
 	}
-	return local.Clone()
+	return local.Clone(), true
 }
 
 // resultAuthLocked handles a result auth locked.
-func isTokenVersionedUnauthorizedResult(result Result) bool {
+func isTokenVersionedSuccessResult(result Result) bool {
 	_, validHash := normalizeSHA256Hex(result.AccessTokenSHA256)
-	return validHash && statusCodeFromResult(result.Error) == http.StatusUnauthorized
+	return validHash && result.Success
+}
+
+func isTokenVersionFencedResult(result Result) bool {
+	_, validHash := normalizeSHA256Hex(result.AccessTokenSHA256)
+	return validHash && (result.Success || statusCodeFromResult(result.Error) == http.StatusUnauthorized)
+}
+
+type authUnauthorizedCooldownState struct {
+	status         Status
+	statusMessage  string
+	lastError      *Error
+	nextRetryAfter time.Time
+	updatedAt      time.Time
+}
+
+func authUnauthorizedCooldownOpen(auth *Auth, now time.Time) bool {
+	return auth != nil && auth.Unavailable && auth.NextRetryAfter.After(now) && isUnauthorizedAuthState(auth)
+}
+
+func snapshotAuthUnauthorizedCooldown(auth *Auth, now time.Time) (authUnauthorizedCooldownState, bool) {
+	if !authUnauthorizedCooldownOpen(auth, now) {
+		return authUnauthorizedCooldownState{}, false
+	}
+	return authUnauthorizedCooldownState{
+		status:         auth.Status,
+		statusMessage:  auth.StatusMessage,
+		lastError:      cloneError(auth.LastError),
+		nextRetryAfter: auth.NextRetryAfter,
+		updatedAt:      auth.UpdatedAt,
+	}, true
+}
+
+func restoreAuthUnauthorizedCooldown(auth *Auth, state authUnauthorizedCooldownState) {
+	if auth == nil || state.nextRetryAfter.IsZero() {
+		return
+	}
+	auth.Unavailable = true
+	auth.Status = state.status
+	if auth.Status == "" {
+		auth.Status = StatusError
+	}
+	auth.StatusMessage = state.statusMessage
+	if strings.TrimSpace(auth.StatusMessage) == "" {
+		auth.StatusMessage = "unauthorized"
+	}
+	auth.LastError = cloneError(state.lastError)
+	auth.NextRetryAfter = state.nextRetryAfter
+	if auth.UpdatedAt.Before(state.updatedAt) {
+		auth.UpdatedAt = state.updatedAt
+	}
+}
+
+func applyAuthUnauthorizedCooldown(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.StatusMessage = "unauthorized"
+	auth.LastError = cloneError(resultErr)
+	if auth.LastError == nil {
+		auth.LastError = &Error{Code: "unauthorized", Message: http.StatusText(http.StatusUnauthorized), HTTPStatus: http.StatusUnauthorized}
+	}
+	auth.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
+	auth.UpdatedAt = now
 }
 
 func (m *Manager) resultAuthLocked(result Result) *Auth {

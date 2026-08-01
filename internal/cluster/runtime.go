@@ -304,20 +304,9 @@ func (a *RuntimeAdapter) Save(ctx context.Context, auth *coreauth.Auth) (string,
 		return "", errRecord
 	}
 
-	item := authIndexFromRecord(record, auth)
-	a.mu.Lock()
-	if a.index == nil {
-		a.index = make(map[string]AuthIndex)
+	if !a.cacheAuthSnapshot(auth.ID, record, auth) {
+		a.InvalidateFullAuth(auth.ID)
 	}
-	item.Attributes = cloneStringMap(item.Attributes)
-	item.ModelMetadata = cloneModelMetadata(item.ModelMetadata)
-	item.ModelStates = cloneModelStateMap(item.ModelStates)
-	a.index[auth.ID] = item
-	if a.fullCache == nil {
-		a.fullCache = make(map[string]*coreauth.Auth)
-	}
-	a.fullCache[auth.ID] = auth.Clone()
-	a.mu.Unlock()
 	return auth.ID, nil
 }
 
@@ -337,23 +326,73 @@ func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate 
 	if errMutate != nil {
 		return nil, errMutate
 	}
-	if changed && auth != nil {
-		item := authIndexFromRecord(record, auth)
-		a.mu.Lock()
-		if a.index == nil {
-			a.index = make(map[string]AuthIndex)
+	if auth == nil {
+		return nil, nil
+	}
+	if !changed {
+		// A no-op still returns the authoritative row. Invalidate instead of
+		// caching that snapshot so a concurrent newer event cannot be overwritten.
+		newerKnown := a.invalidateFullAuthBeforeVersion(uuid, recordVersion(record))
+		if newerKnown {
+			return a.GetFullAuth(ctx, uuid)
 		}
-		item.Attributes = cloneStringMap(item.Attributes)
-		item.ModelMetadata = cloneModelMetadata(item.ModelMetadata)
-		item.ModelStates = cloneModelStateMap(item.ModelStates)
-		a.index[uuid] = item
-		if a.fullCache == nil {
-			a.fullCache = make(map[string]*coreauth.Auth)
-		}
-		a.fullCache[uuid] = auth.Clone()
-		a.mu.Unlock()
+		return auth, nil
+	}
+	if !a.cacheAuthSnapshot(uuid, record, auth) {
+		return a.GetFullAuth(ctx, uuid)
 	}
 	return auth, nil
+}
+
+// cacheAuthSnapshot installs a database snapshot only when it is not older
+// than the newest auth revision already observed by this runtime.
+func (a *RuntimeAdapter) cacheAuthSnapshot(uuid string, record *AuthRecord, auth *coreauth.Auth) bool {
+	if a == nil || auth == nil {
+		return false
+	}
+	item := authIndexFromRecord(record, auth)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if current, ok := a.index[uuid]; ok && item.Version > 0 && current.Version > item.Version {
+		return false
+	}
+	if a.index == nil {
+		a.index = make(map[string]AuthIndex)
+	}
+	item.Attributes = cloneStringMap(item.Attributes)
+	item.ModelMetadata = cloneModelMetadata(item.ModelMetadata)
+	item.ModelStates = cloneModelStateMap(item.ModelStates)
+	a.index[uuid] = item
+	if a.fullCache == nil {
+		a.fullCache = make(map[string]*coreauth.Auth)
+	}
+	cached := auth.Clone()
+	cached.StateVersion = item.Version
+	a.fullCache[uuid] = cached
+	return true
+}
+
+func (a *RuntimeAdapter) invalidateFullAuthBeforeVersion(uuid string, version int64) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	newerKnown := false
+	if current, ok := a.index[uuid]; ok && version > 0 {
+		newerKnown = current.Version > version
+	}
+	if a.fullCache != nil {
+		delete(a.fullCache, uuid)
+	}
+	return newerKnown
+}
+
+func recordVersion(record *AuthRecord) int64 {
+	if record == nil {
+		return 0
+	}
+	return record.Version
 }
 
 // Delete handles delete.
@@ -394,6 +433,10 @@ func (a *RuntimeAdapter) RefreshAuthIndex(ctx context.Context, uuid string) erro
 
 	item := authIndexFromRecord(record, auth)
 	a.mu.Lock()
+	if current, ok := a.index[uuid]; ok && item.Version > 0 && current.Version > item.Version {
+		a.mu.Unlock()
+		return nil
+	}
 	if a.index == nil {
 		a.index = make(map[string]AuthIndex)
 	}
@@ -468,34 +511,49 @@ func (a *RuntimeAdapter) GetFullAuth(ctx context.Context, uuid string) (*coreaut
 		return nil, fmt.Errorf("cluster auth uuid is required")
 	}
 
-	a.mu.RLock()
-	if cached := a.fullCache[uuid]; cached != nil {
+	for {
+		a.mu.RLock()
+		if cached := a.fullCache[uuid]; cached != nil {
+			a.mu.RUnlock()
+			return cached.Clone(), nil
+		}
 		a.mu.RUnlock()
+
+		auth, record, errAuth := a.repo.GetAuth(ctx, uuid)
+		if errAuth != nil {
+			if errors.Is(errAuth, gorm.ErrRecordNotFound) {
+				a.RemoveAuthIndex(uuid)
+				return nil, coreauth.ErrFullAuthNotFound
+			}
+			return nil, errAuth
+		}
+		if auth == nil {
+			return nil, nil
+		}
+		auth.ID = uuid
+		auth.Index = uuid
+
+		a.mu.Lock()
+		if current, ok := a.index[uuid]; ok && record != nil && record.Version > 0 && current.Version > record.Version {
+			a.mu.Unlock()
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
+			}
+			continue
+		}
+		if a.fullCache == nil {
+			a.fullCache = make(map[string]*coreauth.Auth)
+		}
+		cached := auth.Clone()
+		cached.StateVersion = recordVersion(record)
+		a.fullCache[uuid] = cached
+		a.mu.Unlock()
 		return cached.Clone(), nil
 	}
-	a.mu.RUnlock()
-
-	auth, _, errAuth := a.repo.GetAuth(ctx, uuid)
-	if errAuth != nil {
-		if errors.Is(errAuth, gorm.ErrRecordNotFound) {
-			a.RemoveAuthIndex(uuid)
-			return nil, coreauth.ErrFullAuthNotFound
-		}
-		return nil, errAuth
-	}
-	if auth == nil {
-		return nil, nil
-	}
-	auth.ID = uuid
-	auth.Index = uuid
-
-	a.mu.Lock()
-	if a.fullCache == nil {
-		a.fullCache = make(map[string]*coreauth.Auth)
-	}
-	a.fullCache[uuid] = auth.Clone()
-	a.mu.Unlock()
-	return auth.Clone(), nil
 }
 
 // InvalidateFullAuth invalidates a full auth.
@@ -540,6 +598,7 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 	item := AuthIndex{}
 	if record != nil {
 		item.UUID = strings.TrimSpace(record.UUID)
+		item.Version = record.Version
 		item.ID = item.UUID
 		item.Index = item.UUID
 		item.Provider = record.Provider
@@ -565,6 +624,9 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 		item.ModelStates = auth.ModelStates
 		item.Attributes = cloneStringMap(auth.Attributes)
 		item.ModelMetadata = modelMetadataFromAuth(auth)
+		if item.Version == 0 {
+			item.Version = auth.StateVersion
+		}
 	}
 	return item
 }
@@ -594,6 +656,7 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 	return &coreauth.Auth{
 		ID:             uuid,
 		Index:          uuid,
+		StateVersion:   item.Version,
 		Provider:       item.Provider,
 		Label:          item.Label,
 		Prefix:         item.Prefix,
