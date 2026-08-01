@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
 // fakeMutatorStore is a Store with StateMutator support backed by one shared
@@ -17,6 +19,7 @@ type fakeMutatorStore struct {
 	mutations    int
 	saves        int
 	beforeReturn func()
+	returnLatest bool
 }
 
 func (s *fakeMutatorStore) List(context.Context) ([]*Auth, error) { return nil, nil }
@@ -53,6 +56,11 @@ func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate 
 	s.mu.Unlock()
 	if beforeReturn != nil {
 		beforeReturn()
+	}
+	if s.returnLatest {
+		s.mu.Lock()
+		result = s.persisted.Clone()
+		s.mu.Unlock()
 	}
 	return result, nil
 }
@@ -421,6 +429,77 @@ func TestMarkResultDoesNotAdoptOlderMutationSnapshot(t *testing.T) {
 	}
 	if state := local.ModelStates["gpt-5"]; state == nil || !state.Unavailable {
 		t.Fatalf("older success cleared newer model state: %#v", state)
+	}
+}
+
+func TestMarkResultSuppressesEffectsFromSupersededMutation(t *testing.T) {
+	const (
+		authID  = "auth-cluster-superseded-effects"
+		modelID = "model-superseded-effects"
+	)
+	now := time.Now()
+	initial := &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		StateVersion:   1,
+		Metadata:       map[string]any{"access_token": "same-access-token"},
+		ModelStates: map[string]*ModelState{
+			modelID: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				LastError:      &Error{Message: "temporary failure", HTTPStatus: http.StatusServiceUnavailable},
+			},
+		},
+	}
+	store := &fakeMutatorStore{persisted: initial.Clone(), returnLatest: true}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), initial.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: modelID}})
+	modelRegistry.SuspendClientModel(authID, modelID, "temporary_failure")
+	t.Cleanup(func() { modelRegistry.RegisterClient(authID, "codex", nil) })
+
+	store.mu.Lock()
+	store.beforeReturn = func() {
+		newer := initial.Clone()
+		newer.StateVersion = 3
+		newer.LastError = &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized}
+		newer.StatusMessage = "expired access token"
+		newer.ModelStates[modelID].LastError = cloneError(newer.LastError)
+		newer.ModelStates[modelID].StatusMessage = newer.LastError.Message
+		store.mu.Lock()
+		store.persisted = newer
+		store.mu.Unlock()
+	}
+	store.mu.Unlock()
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:            authID,
+		Provider:          "codex",
+		Model:             modelID,
+		AccessTokenSHA256: AccessTokenSHA256(initial),
+		Success:           true,
+	})
+
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || local.StateVersion != 3 {
+		t.Fatalf("manager did not adopt newest snapshot: %#v", local)
+	}
+	if state := local.ModelStates[modelID]; state == nil || !state.Unavailable || state.LastError == nil || state.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("newest model cooldown was not retained: %#v", state)
+	}
+	for _, model := range modelRegistry.GetAvailableModelDefinitions() {
+		if model != nil && model.ID == modelID {
+			t.Fatal("superseded success resumed the model registry")
+		}
 	}
 }
 

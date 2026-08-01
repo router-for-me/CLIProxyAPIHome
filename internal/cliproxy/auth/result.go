@@ -54,6 +54,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	transition := markResultTransition{}
+	transitionVersion := int64(0)
 	var authSnapshot *Auth
 	resultModel := canonicalModelKey(result.Model)
 	resultAuthID := ""
@@ -95,8 +96,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		// results reported to other Home nodes cannot clobber the shared state.
 		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
 			before := availabilityFingerprint(persisted, resultModel)
+			baseVersion := persisted.StateVersion
 			transition = m.applyResultTransition(persisted, result, resultModel, now)
-			return availabilityFingerprint(persisted, resultModel) != before
+			changed := availabilityFingerprint(persisted, resultModel) != before
+			if baseVersion > 0 {
+				transitionVersion = baseVersion
+				if changed {
+					transitionVersion++
+				}
+			}
+			return changed
 		})
 		if errMutate != nil || persisted == nil {
 			if errMutate != nil {
@@ -115,6 +124,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			m.mu.Unlock()
 			m.enqueueResultPersist(ctx, authSnapshot)
 		} else {
+			if transitionVersion > 0 && persisted.StateVersion > transitionVersion {
+				transition = markResultTransition{}
+			}
 			var adopted bool
 			authSnapshot, adopted = m.adoptPersistedResultState(result, resultModel, persisted, now)
 			if !adopted {
