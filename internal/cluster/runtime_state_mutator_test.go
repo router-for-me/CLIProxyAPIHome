@@ -196,6 +196,56 @@ func TestRuntimeAdapterLoadIndexPreservesNewerEvent(t *testing.T) {
 	}
 }
 
+func TestRuntimeAdapterSaveStampsAndFencesCallerVersion(t *testing.T) {
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	authID := "runtime-state-save-version-auth"
+	authA := &coreauth.Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "token-a"},
+	}
+	adapter := NewRuntimeAdapter(repo, "")
+	if _, errSave := adapter.Save(ctx, authA); errSave != nil {
+		t.Fatalf("Save(token A) error = %v", errSave)
+	}
+	if authA.StateVersion <= 0 {
+		t.Fatalf("Save(token A) version = %d, want positive", authA.StateVersion)
+	}
+	versionA := authA.StateVersion
+
+	authB := authA.Clone()
+	authB.Metadata["access_token"] = "token-b"
+	authB.Disabled = true
+	authB.Status = coreauth.StatusDisabled
+	recordB, errUpsert := repo.UpsertAuth(ctx, authB, "update")
+	if errUpsert != nil {
+		t.Fatalf("UpsertAuth(token B) error = %v", errUpsert)
+	}
+	if errRefresh := adapter.RefreshAuthIndex(ctx, authID); errRefresh != nil {
+		t.Fatalf("RefreshAuthIndex(token B) error = %v", errRefresh)
+	}
+	if _, errSave := adapter.Save(ctx, authA); errSave != nil {
+		t.Fatalf("Save(stale token A) error = %v", errSave)
+	}
+	if authA.StateVersion != versionA {
+		t.Fatalf("stale save stamped caller version = %d, want unchanged %d", authA.StateVersion, versionA)
+	}
+
+	persisted, record, errGet := repo.GetAuth(ctx, authID)
+	if errGet != nil {
+		t.Fatalf("GetAuth() error = %v", errGet)
+	}
+	if record.Version != recordB.Version || !persisted.Disabled || persisted.Status != coreauth.StatusDisabled {
+		t.Fatalf("stale save replaced newer lifecycle state: version=%d auth=%#v", record.Version, persisted)
+	}
+	if got, want := coreauth.AccessTokenSHA256(persisted), coreauth.AccessTokenSHA256(authB); got != want {
+		t.Fatalf("persisted fingerprint = %q, want newer %q", got, want)
+	}
+}
+
 func TestRuntimeAdapterStaleSaveDoesNotRestoreDeletedAuth(t *testing.T) {
 	ctx := context.Background()
 	repo := newRefreshTestRepository(t)
@@ -211,17 +261,12 @@ func TestRuntimeAdapterStaleSaveDoesNotRestoreDeletedAuth(t *testing.T) {
 	if _, errSave := adapter.Save(ctx, auth); errSave != nil {
 		t.Fatalf("Save(create) error = %v", errSave)
 	}
-	if auth.StateVersion != 0 {
-		t.Fatalf("Save() mutated caller state version to %d", auth.StateVersion)
+	if auth.StateVersion <= 0 {
+		t.Fatalf("Save() caller state version = %d, want positive", auth.StateVersion)
 	}
+	staleVersioned := auth.Clone()
 	staleUnversioned := auth.Clone()
-	staleVersioned, _, errGet := repo.GetAuth(ctx, authID)
-	if errGet != nil {
-		t.Fatalf("GetAuth(before delete) error = %v", errGet)
-	}
-	if staleVersioned.StateVersion <= 0 {
-		t.Fatalf("persisted snapshot version = %d, want positive", staleVersioned.StateVersion)
-	}
+	staleUnversioned.StateVersion = 0
 	if errDelete := adapter.Delete(ctx, authID); errDelete != nil {
 		t.Fatalf("Delete() error = %v", errDelete)
 	}
@@ -231,7 +276,7 @@ func TestRuntimeAdapterStaleSaveDoesNotRestoreDeletedAuth(t *testing.T) {
 	if _, errSave := adapter.Save(ctx, staleVersioned); errSave != nil {
 		t.Fatalf("Save(stale versioned) error = %v", errSave)
 	}
-	if _, _, errGet = repo.GetAuth(ctx, authID); !errors.Is(errGet, gorm.ErrRecordNotFound) {
+	if _, _, errGet := repo.GetAuth(ctx, authID); !errors.Is(errGet, gorm.ErrRecordNotFound) {
 		t.Fatalf("GetAuth(after stale save) error = %v, want record not found", errGet)
 	}
 	adapter.mu.RLock()

@@ -20,6 +20,7 @@ type fakeMutatorStore struct {
 	saves        int
 	beforeReturn func()
 	returnLatest bool
+	saveVersion  int64
 }
 
 func (s *fakeMutatorStore) List(context.Context) ([]*Auth, error) { return nil, nil }
@@ -31,7 +32,21 @@ func (s *fakeMutatorStore) Save(_ context.Context, auth *Auth) (string, error) {
 	if auth == nil {
 		return "", nil
 	}
+	if s.saveVersion > 0 {
+		auth.StateVersion = s.saveVersion
+	}
 	return auth.ID, nil
+}
+
+func (s *fakeMutatorStore) SaveWithStateVersion(ctx context.Context, auth *Auth) (string, int64, error) {
+	id, errSave := s.Save(ctx, auth)
+	if errSave != nil {
+		return "", 0, errSave
+	}
+	s.mu.Lock()
+	stateVersion := s.saveVersion
+	s.mu.Unlock()
+	return id, stateVersion, nil
 }
 
 func (s *fakeMutatorStore) Delete(context.Context, string) error { return nil }
@@ -87,6 +102,31 @@ func newHomeNodeManager(t *testing.T, store *fakeMutatorStore, authID string) *M
 		t.Fatalf("Register returned error: %v", errRegister)
 	}
 	return manager
+}
+
+func TestManagerPersistAdoptsSavedStateVersion(t *testing.T) {
+	store := &fakeMutatorStore{saveVersion: 7}
+	manager := NewManager(store, nil, nil)
+	input := &Auth{
+		ID:       "auth-persisted-version",
+		Index:    "auth-persisted-version",
+		Provider: "codex",
+		Metadata: map[string]any{"access_token": "token-a"},
+	}
+	registered, errRegister := manager.Register(context.Background(), input)
+	if errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if input.StateVersion != 0 {
+		t.Fatalf("Register() mutated input version = %d", input.StateVersion)
+	}
+	if registered.StateVersion != 7 {
+		t.Fatalf("registered state version = %d, want 7", registered.StateVersion)
+	}
+	current, ok := manager.GetByID(input.ID)
+	if !ok || current == nil || current.StateVersion != 7 {
+		t.Fatalf("manager state version = %#v, want 7", current)
+	}
 }
 
 func TestMarkResultQuotaEscalationIsAtomicAcrossManagers(t *testing.T) {

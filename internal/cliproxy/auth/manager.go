@@ -369,6 +369,21 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if auth.Metadata == nil && auth.Storage == nil {
 		return nil
 	}
+	if versionedStore, ok := m.store.(StateVersionSaver); ok {
+		persisted := auth.Clone()
+		_, stateVersion, errSave := versionedStore.SaveWithStateVersion(ctx, persisted)
+		if errSave != nil {
+			return errSave
+		}
+		if stateVersion > 0 {
+			m.mu.Lock()
+			if current := m.auths[auth.ID]; current == auth {
+				current.StateVersion = stateVersion
+			}
+			m.mu.Unlock()
+		}
+		return nil
+	}
 	_, errSave := m.store.Save(ctx, auth)
 	return errSave
 }

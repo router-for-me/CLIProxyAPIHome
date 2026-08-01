@@ -314,43 +314,53 @@ func (a *RuntimeAdapter) List(ctx context.Context) ([]*coreauth.Auth, error) {
 
 // Save stores save.
 func (a *RuntimeAdapter) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	id, stateVersion, errSave := a.SaveWithStateVersion(ctx, auth)
+	if errSave == nil && auth != nil && stateVersion > 0 {
+		auth.StateVersion = stateVersion
+	}
+	return id, errSave
+}
+
+// SaveWithStateVersion stores auth and returns the accepted persisted revision.
+// A zero revision means the snapshot was stale and intentionally ignored.
+func (a *RuntimeAdapter) SaveWithStateVersion(ctx context.Context, auth *coreauth.Auth) (string, int64, error) {
 	// Prepare filesystem state before committing the write.
 	if !a.Enabled() {
-		return "", fmt.Errorf("cluster runtime adapter is disabled")
+		return "", 0, fmt.Errorf("cluster runtime adapter is disabled")
 	}
 	auth = normalizeAuthUUID(auth)
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
-		return "", fmt.Errorf("cluster auth uuid is required")
+		return "", 0, fmt.Errorf("cluster auth uuid is required")
 	}
 	saveAuth := auth.Clone()
 	knownVersion, active := a.authStateMarker(auth.ID)
 	if saveAuth.StateVersion <= 0 && knownVersion > 0 {
 		if !active {
-			return auth.ID, nil
+			return auth.ID, 0, nil
 		}
 		saveAuth.StateVersion = knownVersion
 	}
 	record, result, errRecord := a.repo.UpsertAuthWithResult(ctx, saveAuth, "update")
 	if errRecord != nil {
-		return "", errRecord
+		return "", 0, errRecord
 	}
 	if record == nil {
-		return "", fmt.Errorf("cluster auth save returned no record")
+		return "", 0, fmt.Errorf("cluster auth save returned no record")
 	}
 	if record.DeletedAt.Valid {
 		a.RemoveAuthIndexVersion(auth.ID, record.Version)
-		return auth.ID, nil
+		return auth.ID, 0, nil
 	}
 	if result == UpsertResultUnchanged && saveAuth.StateVersion > 0 && record.Version > saveAuth.StateVersion {
 		if errRefresh := a.RefreshAuthIndex(ctx, auth.ID); errRefresh != nil {
-			return "", errRefresh
+			return "", 0, errRefresh
 		}
-		return auth.ID, nil
+		return auth.ID, 0, nil
 	}
 
 	saveAuth.StateVersion = record.Version
 	a.cacheAuthSnapshot(auth.ID, record, saveAuth)
-	return auth.ID, nil
+	return auth.ID, record.Version, nil
 }
 
 // MutateAuthState implements coreauth.StateMutator. It applies mutate to the
