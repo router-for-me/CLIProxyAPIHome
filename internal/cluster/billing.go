@@ -600,6 +600,49 @@ func (r *Repository) ListBillingModelPrices(ctx context.Context, query BillingMo
 	return records, nil
 }
 
+// ListEnabledBillingModelPricesForModels returns the enabled price rules for an
+// exact set of model identifiers.
+//
+// ListBillingModelPrices matches models with LIKE because it backs an operator
+// search box; a caller pricing a catalog needs exact identity, or "gpt-4" would
+// drag in every model whose name contains it. The ordering mirrors how the rules
+// are applied at charge time, so a client can read a returned group top to
+// bottom as the ladder a request climbs.
+func (r *Repository) ListEnabledBillingModelPricesForModels(ctx context.Context, modelIDs []string) ([]BillingModelPriceRecord, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+
+	wanted := make([]string, 0, len(modelIDs))
+	seen := make(map[string]struct{}, len(modelIDs))
+	for _, modelID := range modelIDs {
+		trimmed := strings.TrimSpace(modelID)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		wanted = append(wanted, trimmed)
+	}
+	if len(wanted) == 0 {
+		return []BillingModelPriceRecord{}, nil
+	}
+
+	var records []BillingModelPriceRecord
+	if errFind := db.WithContext(contextOrBackground(ctx)).
+		Model(&BillingModelPriceRecord{}).
+		Where("enabled = ?", true).
+		Where("model IN ?", wanted).
+		Order("provider ASC, model ASC, service_tier ASC, min_input_tokens ASC, id ASC").
+		Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+	return records, nil
+}
+
 func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm.DB, usage *UsageRecord, payload string) error {
 	if tx == nil {
 		return fmt.Errorf("database transaction is nil")

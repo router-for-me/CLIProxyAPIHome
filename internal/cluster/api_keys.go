@@ -816,6 +816,70 @@ func (r *Repository) AllowedModelIDsForAPIKey(ctx context.Context, apiKey string
 	return allowedModelIDsForAPIKeyRecord(ctx, db, &record)
 }
 
+// UserModelAccess summarizes which models one user's API keys may call.
+type UserModelAccess struct {
+	// APIKeyCount is how many active keys the user holds. Zero means the user
+	// cannot call anything yet, which is a different situation from holding a
+	// key that happens to allow nothing.
+	APIKeyCount int
+	// Restricted reports whether every key is scoped to model groups. One
+	// unscoped key is enough to reach everything the cluster serves, so a false
+	// value here makes ModelIDs meaningless.
+	Restricted bool
+	// ModelIDs is the union of canonical model identifiers the scoped keys
+	// allow, sorted for stable output. It is only meaningful when Restricted.
+	ModelIDs []string
+}
+
+// UserModelAccess resolves what the user's own API keys are permitted to call.
+//
+// Access is the union across keys rather than the intersection: a buyer holding
+// a broad key and a narrow one can call everything the broad key reaches, and
+// reporting the intersection would hide models they can actually use today.
+func (r *Repository) UserModelAccess(ctx context.Context, userID uint) (UserModelAccess, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return UserModelAccess{}, errDB
+	}
+	if userID == 0 {
+		return UserModelAccess{}, fmt.Errorf("user id is required")
+	}
+
+	ctx = contextOrBackground(ctx)
+	var records []APIKeyRecord
+	if errFind := db.WithContext(ctx).Where("user_id = ?", userID).Order("id").Find(&records).Error; errFind != nil {
+		return UserModelAccess{}, errFind
+	}
+
+	access := UserModelAccess{APIKeyCount: len(records), Restricted: true}
+	if len(records) == 0 {
+		return access, nil
+	}
+
+	seen := make(map[string]struct{})
+	allowed := make([]string, 0)
+	for i := range records {
+		details, restricted, errDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, &records[i])
+		if errDetails != nil {
+			return UserModelAccess{}, errDetails
+		}
+		if !restricted {
+			return UserModelAccess{APIKeyCount: len(records), Restricted: false}, nil
+		}
+		for _, modelID := range allowedModelIDsFromDetails(details, restricted) {
+			key := strings.ToLower(modelID)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			allowed = append(allowed, modelID)
+		}
+	}
+	sort.Strings(allowed)
+	access.ModelIDs = allowed
+	return access, nil
+}
+
 func allowedAuthIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord) ([]string, error) {
 	if db == nil {
 		return nil, fmt.Errorf("database connection is nil")
