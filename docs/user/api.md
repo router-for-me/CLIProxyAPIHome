@@ -150,6 +150,8 @@ The table below is extracted from the User API route group registered by `intern
 | Method | Path |
 | --- | --- |
 | `GET` | `/capabilities` |
+| `GET` | `/models` |
+| `GET` | `/models/accessible` |
 | `POST` | `/register` |
 | `POST` | `/login` |
 | `POST` | `/login/passkey/begin` |
@@ -207,7 +209,8 @@ Example response:
   "capabilities": {
     "email_registration": true,
     "email_verification": true,
-    "password_recovery": true
+    "password_recovery": true,
+    "model_catalog": true
   },
   "server_info": {
     "home_version": "v1.2.3",
@@ -217,7 +220,9 @@ Example response:
 }
 ```
 
-All three flags are `false` when `user-email.enabled` is false or the mail configuration is incomplete or invalid. Older Home versions may return `404` because this route does not exist.
+The three email flags are `false` when `user-email.enabled` is false or the mail configuration is incomplete or invalid. Older Home versions may return `404` because this route does not exist.
+
+`model_catalog` is always `true` on a Home build that serves `/user/models`; it is absent on older builds. Clients should read it instead of calling the catalog route and treating a `404` as an outage.
 
 ### POST `/register`
 
@@ -646,6 +651,243 @@ Common errors:
 { "error": "bearer_token_required", "message": "bearer token is required" }
 { "error": "invalid_token", "message": "invalid token" }
 ```
+
+## Model Catalog
+
+Model catalog routes are under the `/user` base path, so the full paths are `/user/models` and `/user/models/accessible`. `/user/models` is unauthenticated; `/user/models/accessible` requires the bearer token returned by `/user/register` or `/user/login`. Neither route accepts or requires a Management Key.
+
+The two routes answer different questions. `/user/models` answers "what can this cluster serve", which a visitor may ask before holding an account. `/user/models/accessible` answers "what can I call, at what price, and how has it been behaving", which is specific to the caller's API keys and commercial terms.
+
+Neither response includes Management API data, credential identities, node identities, routing details, price rule identifiers, price rule sources, price rule notes, or any other user's data.
+
+### Three-state reporting
+
+Model metadata is reported as an explicit state rather than an empty value, because a model nobody described must not be presented as a model that lacks the capability:
+
+| State | Meaning |
+| --- | --- |
+| `known` / `supported` | The upstream provider or cluster configuration stated this. |
+| `unsupported` | The model published its parameter list and this capability was not in it. |
+| `unknown` | Nothing has described this model. Render it as "not published", not as absence of the capability. |
+
+The same rule governs price and availability:
+
+- A model with no enabled price rule is `unpublished`. It is not free, and it is not priced at zero.
+- A model with fewer observations than the window's minimum is `insufficient_data`. It is not 100% available.
+
+### GET `/models`
+
+Returns the public catalog: every model the cluster can currently serve.
+
+No headers are required.
+
+Example response:
+
+```json
+{
+  "models": [
+    {
+      "id": "gpt-4.1-mini",
+      "display_name": "GPT-4.1 mini",
+      "description": "Fast general purpose model.",
+      "type": "chat",
+      "providers": ["openai"],
+      "context_length": 128000,
+      "max_output_tokens": 16384,
+      "modalities": {
+        "status": "known",
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "reasoning": { "status": "supported", "levels": ["low", "medium", "high"] },
+        "tool_calling": { "status": "supported" },
+        "structured_output": { "status": "supported" },
+        "parameters": ["tools", "temperature", "reasoning_effort", "response_format"]
+      }
+    }
+  ],
+  "total": 1
+}
+```
+
+Model fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | string | The literal model identifier to send in an API request. Never translated or reformatted. |
+| `display_name` | string | Optional human-readable name. Absent when the upstream never supplied one. |
+| `description` | string | Optional short description supplied by the upstream. |
+| `version` | string | Optional upstream version string. |
+| `owned_by` | string | Optional upstream owner. |
+| `type` | string | Optional model type, for example `chat`. |
+| `providers[]` | array | Provider identifiers that can serve this model. These are the same identifiers used on usage records and price rules. |
+| `context_length` | number | Maximum input tokens. Omitted when unknown; `context_length` and `inputTokenLimit` upstream spellings are normalized into this one field. |
+| `max_output_tokens` | number | Maximum output tokens. Omitted when unknown; normalizes `max_completion_tokens` and `outputTokenLimit`. |
+| `modalities` | object | See below. |
+| `capabilities` | object | See below. |
+
+`modalities`:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `status` | string | `known` or `unknown`. |
+| `input[]` | array | Accepted modalities, for example `text`, `image`, `audio`. Present only when `status` is `known`. |
+| `output[]` | array | Produced modalities. Present only when `status` is `known`. |
+
+The published vocabulary is `text`, `image`, `audio` and `video`. Document formats are not modalities and are not reported here: several providers list PDF as an accepted input type and the rest do not describe their inputs that way, so publishing it would compare providers on a distinction only some of them make.
+
+Modalities come from the model catalog (`models.json`), which is curated by hand rather than probed from upstream. Values are taken from provider documentation, or from a first-party manifest where the provider publishes one — the Codex entries are filled from `codex_client_models.json`, which ships alongside the catalog and carries OpenAI's own `input_modalities`. A model the catalog does not describe reports `status: "unknown"` — never an empty `input` array, which a client would be entitled to read as "text only". Values are lower-cased and de-duplicated before they are returned.
+
+Leaving a model undescribed is a normal outcome, not a gap to be filled in later with a guess. A handful of models whose vendor documents context length and speed but never input types are expected to report `unknown` indefinitely; that is the catalog working as intended, not a backlog item.
+
+`capabilities`:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `reasoning.status` | string | `supported`, `unsupported`, or `unknown`. |
+| `reasoning.levels[]` | array | Optional reasoning effort levels the model accepts. |
+| `reasoning.budget` | object | Optional thinking budget with `min`, `max`, `can_disable`, `dynamic`. Individual keys are omitted when the model did not state them. |
+| `tool_calling.status` | string | `supported`, `unsupported`, or `unknown`. |
+| `structured_output.status` | string | `supported`, `unsupported`, or `unknown`. Whether the model can be constrained to a caller-supplied schema. Resolved server-side from the parameter list; clients must not re-derive it. |
+| `parameters[]` | array | Optional request parameters the model accepts. |
+| `generation_methods[]` | array | Optional upstream generation methods. |
+
+This route never includes `pricing` or `availability`. Their absence is the contract, not a missing value: an anonymous visitor is not entitled to the operator's commercial terms.
+
+### GET `/models/accessible`
+
+Returns the subset of the catalog the authenticated user's own API keys are allowed to call, with price and observed availability attached.
+
+Headers:
+
+```http
+Authorization: Bearer user.jwt.token
+```
+
+Example response:
+
+```json
+{
+  "models": [
+    {
+      "id": "gpt-4.1-mini",
+      "display_name": "GPT-4.1 mini",
+      "providers": ["openai"],
+      "context_length": 128000,
+      "max_output_tokens": 16384,
+      "modalities": { "status": "known", "input": ["text", "image"], "output": ["text"] },
+      "capabilities": { "reasoning": { "status": "supported" }, "tool_calling": { "status": "supported" } },
+      "pricing": {
+        "status": "published",
+        "providers": [
+          {
+            "provider": "openai",
+            "tiers": [
+              {
+                "service_tier": "*",
+                "is_default": true,
+                "rungs": [
+                  {
+                    "min_input_tokens": 0,
+                    "input_price_per_million": 0.4,
+                    "output_price_per_million": 1.6,
+                    "cache_read_price_per_million": 0.1,
+                    "cache_write_price_per_million": 0.5,
+                    "request_price": 0
+                  },
+                  {
+                    "min_input_tokens": 128000,
+                    "input_price_per_million": 0.8,
+                    "output_price_per_million": 3.2,
+                    "cache_read_price_per_million": 0.2,
+                    "cache_write_price_per_million": 1,
+                    "request_price": 0
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "availability": {
+        "status": "observed",
+        "window": {
+          "from": "2026-07-25T00:00:00Z",
+          "to": "2026-08-01T00:00:00Z",
+          "hours": 168,
+          "min_samples": 10
+        },
+        "sample_count": 240,
+        "success_count": 236,
+        "failed_count": 4,
+        "availability_rate": 0.9833,
+        "avg_latency_ms": 2140.5,
+        "avg_ttft_ms": 318.2,
+        "output_tokens_per_second": 42.17,
+        "first_observed_at": "2026-07-25T04:11:02Z",
+        "last_observed_at": "2026-08-01T09:52:44Z"
+      }
+    }
+  ],
+  "total": 1,
+  "access": {
+    "restricted": false,
+    "api_key_count": 2,
+    "reason": "unrestricted"
+  }
+}
+```
+
+`access`:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `restricted` | boolean | `true` when every one of the user's API keys is scoped to model groups. |
+| `api_key_count` | number | How many API keys the user holds. |
+| `reason` | string | `unrestricted`, `model_groups`, or `no_api_keys`. Lets a client explain an empty list instead of showing a bare zero state. |
+
+Access is a union across the user's keys, not an intersection: holding one unscoped key makes the whole catalog accessible. Holding no key makes nothing accessible, because an account without a credential cannot call the cluster.
+
+`pricing` is a ladder, not a scalar, because a charge resolves by service tier and then by input size:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `status` | string | `published` or `unpublished`. |
+| `providers[]` | array | One entry per provider that can both serve the model and has an enabled price rule for it. Rules naming a provider that cannot serve the model are excluded, because they are not offers. |
+| `providers[].provider` | string | Provider identifier. |
+| `providers[].tiers[]` | array | One entry per service tier. |
+| `providers[].tiers[].service_tier` | string | Tier name, or `*` for the wildcard tier. |
+| `providers[].tiers[].is_default` | boolean | Present and `true` on the `*` tier, which prices requests that name no tier or a tier nobody priced. |
+| `providers[].tiers[].rungs[]` | array | Ascending by `min_input_tokens`. A request is priced by the last rung whose threshold it clears. |
+| `rungs[].min_input_tokens` | number | Input token count at which this rung takes effect. |
+| `rungs[].input_price_per_million` | number | Price per million input tokens. |
+| `rungs[].output_price_per_million` | number | Price per million output tokens. |
+| `rungs[].cache_read_price_per_million` | number | Price per million cache-read tokens. |
+| `rungs[].cache_write_price_per_million` | number | Price per million cache-write tokens. |
+| `rungs[].request_price` | number | Flat per-request price. |
+
+A zero price component is emitted rather than omitted: a provider that does not bill for cache reads has stated that, and dropping the field would make it indistinguishable from a component nobody priced. A whole model with no enabled rule reports `"status": "unpublished"` and no `providers`.
+
+Discount metadata is not returned in this version. Clients must not derive, infer, or display a discount from these fields.
+
+`availability` summarizes observed behaviour over a rolling window:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `status` | string | `observed` or `insufficient_data`. |
+| `window.from` / `window.to` | string | RFC3339 bounds of the observation window, half-open `[from,to)`. |
+| `window.hours` | number | Window length in hours. Currently `168`. |
+| `window.min_samples` | number | Observations required before a rate is published. Currently `10`. |
+| `sample_count` | number | Observations found in the window. Always present, including when it is `0`. |
+| `success_count` / `failed_count` | number | Present only when `status` is `observed`. |
+| `availability_rate` | number | Successes over samples, rounded to four decimals. **Present only when `status` is `observed`.** |
+| `avg_latency_ms` | number | Mean end-to-end latency of measured successful requests. Absent when nothing was measurable. |
+| `avg_ttft_ms` | number | Mean time to first token. Only streamed responses report it, so it can be absent while `avg_latency_ms` is present. |
+| `output_tokens_per_second` | number | Total output tokens over total generation time, which weights long generations the way a caller experiences them. |
+| `first_observed_at` / `last_observed_at` | string | RFC3339 bounds of the observations actually found, which can be much narrower than the window. `last_observed_at` may also appear on an `insufficient_data` model. |
+
+When `status` is `insufficient_data`, no rate, latency, or throughput is published. Clients must render this as "not enough data", never as full availability. The summary is cluster-wide model health and is cached briefly in-process; it contains no per-user request data.
 
 ## Billing
 

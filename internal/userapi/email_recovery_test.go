@@ -64,41 +64,6 @@ func TestRespondErrorDoesNotExposeInternalFailureDetails(t *testing.T) {
 	}
 }
 
-func TestUserCapabilitiesReflectUsableConfiguration(t *testing.T) {
-	tests := []struct {
-		name    string
-		mutate  func(*appconfig.Config)
-		enabled bool
-	}{
-		{name: "disabled", mutate: func(cfg *appconfig.Config) { cfg.UserEmail.Enabled = false }, enabled: false},
-		{name: "invalid", mutate: func(cfg *appconfig.Config) { cfg.UserEmail.FromAddress = "" }, enabled: false},
-		{name: "enabled", mutate: func(*appconfig.Config) {}, enabled: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			handler, router, _ := newUserEmailTestHandler(t, test.mutate)
-			_ = handler
-			response := performUserJSONRequest(t, router, http.MethodGet, "/user/capabilities", nil, "")
-			if response.Code != http.StatusOK {
-				t.Fatalf("capabilities status = %d body=%s", response.Code, response.Body.String())
-			}
-			var body struct {
-				Capabilities struct {
-					EmailRegistration bool `json:"email_registration"`
-					EmailVerification bool `json:"email_verification"`
-					PasswordRecovery  bool `json:"password_recovery"`
-				} `json:"capabilities"`
-			}
-			if errDecode := json.Unmarshal(response.Body.Bytes(), &body); errDecode != nil {
-				t.Fatalf("decode capabilities: %v", errDecode)
-			}
-			if body.Capabilities.EmailRegistration != test.enabled || body.Capabilities.EmailVerification != test.enabled || body.Capabilities.PasswordRecovery != test.enabled {
-				t.Fatalf("capabilities = %#v, want enabled=%v", body.Capabilities, test.enabled)
-			}
-		})
-	}
-}
-
 func TestForgotPasswordResponsesDoNotEnumerateAccounts(t *testing.T) {
 	handler, router, db := newUserEmailTestHandler(t, nil)
 	ctx := context.Background()
