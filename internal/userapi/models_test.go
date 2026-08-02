@@ -479,31 +479,6 @@ func TestModelAvailabilityCollapsesConcurrentRecomputations(t *testing.T) {
 	}
 }
 
-func TestModelCatalogCapabilityIsAdvertised(t *testing.T) {
-	handler, closeRepo := newUserModelTestHandler(t)
-	defer closeRepo()
-
-	resp := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(resp)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/capabilities", nil)
-	handler.GetCapabilities(ctx)
-
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s, want 200", resp.Code, resp.Body.String())
-	}
-	var payload struct {
-		Capabilities struct {
-			ModelCatalog bool `json:"model_catalog"`
-		} `json:"capabilities"`
-	}
-	if errDecode := json.Unmarshal(resp.Body.Bytes(), &payload); errDecode != nil {
-		t.Fatalf("decode capabilities: %v", errDecode)
-	}
-	if !payload.Capabilities.ModelCatalog {
-		t.Errorf("model_catalog = false, want true")
-	}
-}
-
 // --- decoding helpers -------------------------------------------------------
 
 type userModelModalitiesPayload struct {

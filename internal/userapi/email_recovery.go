@@ -12,7 +12,6 @@ import (
 	"unicode"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPIHome/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/usermail"
 	log "github.com/sirupsen/logrus"
@@ -69,27 +68,6 @@ type passwordResetRequest struct {
 	Token           string `json:"token"`
 	NewPassword     string `json:"new_password"`
 	NewPasswordDash string `json:"new-password"`
-}
-
-// GetCapabilities reports optional User API features without exposing mail configuration.
-func (h *Handler) GetCapabilities(c *gin.Context) {
-	enabled := h.userEmailEnabled()
-	c.JSON(http.StatusOK, gin.H{
-		"capabilities": gin.H{
-			"email_registration": enabled,
-			"email_verification": enabled,
-			"password_recovery":  enabled,
-			// Advertised so a client can hide the catalog on an older Home
-			// instead of discovering the route is missing by calling it and
-			// handling a 404 as if it were an outage.
-			"model_catalog": true,
-		},
-		"server_info": gin.H{
-			"home_version":    buildinfo.Version,
-			"home_commit":     buildinfo.Commit,
-			"home_build_date": buildinfo.BuildDate,
-		},
-	})
 }
 
 // UpdateEmail adds or replaces the authenticated user's optional email.
