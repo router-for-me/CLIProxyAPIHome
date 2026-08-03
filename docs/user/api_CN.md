@@ -56,6 +56,7 @@ user-email:
 | Method | Path | 说明 |
 | --- | --- | --- |
 | `GET` | `/capabilities` | 返回可选 User API capability。 |
+| `GET` | `/models` | 返回公开模型目录。 |
 | `POST` | `/register` | 创建用户并返回 bearer token。 |
 | `POST` | `/login` | 用户未启用 passkey 和 TOTP 时的密码登录。 |
 | `POST` | `/login/totp` | 用户启用 TOTP 时的密码 + TOTP 登录。 |
@@ -150,6 +151,8 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 | Method | Path |
 | --- | --- |
 | `GET` | `/capabilities` |
+| `GET` | `/models` |
+| `GET` | `/models/accessible` |
 | `POST` | `/register` |
 | `POST` | `/login` |
 | `POST` | `/login/passkey/begin` |
@@ -207,7 +210,8 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
   "capabilities": {
     "email_registration": true,
     "email_verification": true,
-    "password_recovery": true
+    "password_recovery": true,
+    "model_catalog": true
   },
   "server_info": {
     "home_version": "v1.2.3",
@@ -217,7 +221,9 @@ User API handler 通常同时返回机器可读 `error` 和可读 `message`：
 }
 ```
 
-当 `user-email.enabled` 为 false，或邮件配置不完整/无效时，三个 flag 都为 `false`。旧版 Home 可能因没有该 route 而返回 `404`。
+当 `user-email.enabled` 为 false，或邮件配置不完整/无效时，三个邮箱相关 flag 都为 `false`。旧版 Home 可能因没有该 route 而返回 `404`。
+
+在提供 `/user/models` 的 Home 版本上，`model_catalog` 恒为 `true`；旧版本不会返回该字段。客户端应读取该 flag 来决定是否展示模型目录，而不是直接调用目录 route 并把 `404` 当作故障处理。
 
 ### POST `/register`
 
@@ -646,6 +652,243 @@ Authorization: Bearer user.jwt.token
 { "error": "bearer_token_required", "message": "bearer token is required" }
 { "error": "invalid_token", "message": "invalid token" }
 ```
+
+## 模型目录
+
+模型目录路由位于 `/user` 基础路径下，因此完整路径是 `/user/models` 和 `/user/models/accessible`。`/user/models` 无需认证；`/user/models/accessible` 需要 `/user/register` 或 `/user/login` 返回的 Bearer token。两个路由都不接受也不需要 Management Key。
+
+两个路由回答的是不同的问题。`/user/models` 回答"这个集群能提供什么模型"，访客在拥有账号之前就可以查询。`/user/models/accessible` 回答"我能调用什么、价格是多少、最近表现如何"，答案取决于调用方自己的 API keys 与商务条款。
+
+两个响应都不包含 Management API 数据、凭据身份、节点身份、路由细节、价格规则 ID、价格规则来源、价格规则备注，以及任何其他用户的数据。
+
+### 三态语义
+
+模型元数据以显式状态而非空值返回，因为"没有人描述过这个模型"绝不能被呈现成"这个模型不具备该能力"：
+
+| 状态 | 含义 |
+| --- | --- |
+| `known` / `supported` | 上游 provider 或集群配置明确声明了该能力。 |
+| `unsupported` | 模型公布了参数列表，而该能力不在其中。 |
+| `unknown` | 没有任何来源描述过该模型。应渲染为"未公布"，而不是"不支持"。 |
+
+价格与可用性遵循同一规则：
+
+- 没有启用价格规则的模型是 `unpublished`。它不是免费的，也不是价格为 0。
+- 观测样本少于窗口最小值的模型是 `insufficient_data`。它不是 100% 可用。
+
+### GET `/models`
+
+返回公开目录：集群当前能够提供的全部模型。
+
+无需任何 header。
+
+响应示例：
+
+```json
+{
+  "models": [
+    {
+      "id": "gpt-4.1-mini",
+      "display_name": "GPT-4.1 mini",
+      "description": "Fast general purpose model.",
+      "type": "chat",
+      "providers": ["openai"],
+      "context_length": 128000,
+      "max_output_tokens": 16384,
+      "modalities": {
+        "status": "known",
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "reasoning": { "status": "supported", "levels": ["low", "medium", "high"] },
+        "tool_calling": { "status": "supported" },
+        "structured_output": { "status": "supported" },
+        "parameters": ["tools", "temperature", "reasoning_effort", "response_format"]
+      }
+    }
+  ],
+  "total": 1
+}
+```
+
+模型字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 发起 API 请求时使用的字面量模型标识符。不得翻译或改写。 |
+| `display_name` | string | 可选的可读名称。上游未提供时不返回。 |
+| `description` | string | 可选的上游简介。 |
+| `version` | string | 可选的上游版本号。 |
+| `owned_by` | string | 可选的上游归属方。 |
+| `type` | string | 可选的模型类型，例如 `chat`。 |
+| `providers[]` | array | 能够提供该模型的 provider 标识符，与用量记录和价格规则中使用的标识符一致。 |
+| `context_length` | number | 最大输入 token 数。未知时不返回；上游的 `context_length` 与 `inputTokenLimit` 两种写法在此归一为同一字段。 |
+| `max_output_tokens` | number | 最大输出 token 数。未知时不返回；归一 `max_completion_tokens` 与 `outputTokenLimit`。 |
+| `modalities` | object | 见下。 |
+| `capabilities` | object | 见下。 |
+
+`modalities`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `known` 或 `unknown`。 |
+| `input[]` | array | 支持的输入模态，例如 `text`、`image`、`audio`。仅在 `status` 为 `known` 时出现。 |
+| `output[]` | array | 支持的输出模态。仅在 `status` 为 `known` 时出现。 |
+
+对外发布的取值范围是 `text`、`image`、`audio`、`video`。文档格式不属于模态，因此不在此返回：部分厂商会把 PDF 列为输入类型，其余厂商并不这样描述输入，若一并发布，就会拿只有部分厂商作出的区分去横向比较所有厂商。
+
+模态数据来自人工维护的模型目录（`models.json`），由人整理而非从上游探测。取值来自厂商文档；厂商自己发布清单的，则以清单为准——Codex 系列取自与目录同仓的 `codex_client_models.json`，其中带有 OpenAI 自己声明的 `input_modalities`。目录未描述的模型返回 `status: "unknown"`，绝不返回空的 `input` 数组——客户端有理由把空数组理解为“仅支持文本”。返回前会做小写化与去重。
+
+某个模型没有被描述是正常结果，不是待补的缺口，更不该事后用推测填上。少数只公开了上下文与速度、从未说明输入类型的模型预计将长期返回 `unknown`；这是目录按设计工作，不是待办事项。
+
+`capabilities`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `reasoning.status` | string | `supported`、`unsupported` 或 `unknown`。 |
+| `reasoning.levels[]` | array | 可选的推理强度级别。 |
+| `reasoning.budget` | object | 可选的思考预算，含 `min`、`max`、`can_disable`、`dynamic`。模型未声明的键不会出现。 |
+| `tool_calling.status` | string | `supported`、`unsupported` 或 `unknown`。 |
+| `structured_output.status` | string | `supported`、`unsupported` 或 `unknown`。表示模型能否被约束为调用方给定的 schema。该判定在服务端根据参数列表完成，客户端不得自行推导。 |
+| `parameters[]` | array | 可选的请求参数列表。 |
+| `generation_methods[]` | array | 可选的上游生成方法。 |
+
+该 route 永远不返回 `pricing` 与 `availability`。它们的缺失本身就是契约，而不是数据缺失：匿名访客无权获取运营方的商务条款。
+
+### GET `/models/accessible`
+
+返回当前认证用户的 API keys 实际可以调用的模型子集，并附带价格与观测到的可用性。
+
+Headers：
+
+```http
+Authorization: Bearer user.jwt.token
+```
+
+响应示例：
+
+```json
+{
+  "models": [
+    {
+      "id": "gpt-4.1-mini",
+      "display_name": "GPT-4.1 mini",
+      "providers": ["openai"],
+      "context_length": 128000,
+      "max_output_tokens": 16384,
+      "modalities": { "status": "known", "input": ["text", "image"], "output": ["text"] },
+      "capabilities": { "reasoning": { "status": "supported" }, "tool_calling": { "status": "supported" } },
+      "pricing": {
+        "status": "published",
+        "providers": [
+          {
+            "provider": "openai",
+            "tiers": [
+              {
+                "service_tier": "*",
+                "is_default": true,
+                "rungs": [
+                  {
+                    "min_input_tokens": 0,
+                    "input_price_per_million": 0.4,
+                    "output_price_per_million": 1.6,
+                    "cache_read_price_per_million": 0.1,
+                    "cache_write_price_per_million": 0.5,
+                    "request_price": 0
+                  },
+                  {
+                    "min_input_tokens": 128000,
+                    "input_price_per_million": 0.8,
+                    "output_price_per_million": 3.2,
+                    "cache_read_price_per_million": 0.2,
+                    "cache_write_price_per_million": 1,
+                    "request_price": 0
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "availability": {
+        "status": "observed",
+        "window": {
+          "from": "2026-07-25T00:00:00Z",
+          "to": "2026-08-01T00:00:00Z",
+          "hours": 168,
+          "min_samples": 10
+        },
+        "sample_count": 240,
+        "success_count": 236,
+        "failed_count": 4,
+        "availability_rate": 0.9833,
+        "avg_latency_ms": 2140.5,
+        "avg_ttft_ms": 318.2,
+        "output_tokens_per_second": 42.17,
+        "first_observed_at": "2026-07-25T04:11:02Z",
+        "last_observed_at": "2026-08-01T09:52:44Z"
+      }
+    }
+  ],
+  "total": 1,
+  "access": {
+    "restricted": false,
+    "api_key_count": 2,
+    "reason": "unrestricted"
+  }
+}
+```
+
+`access`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `restricted` | boolean | 当用户的每一个 API key 都被限定在 model groups 内时为 `true`。 |
+| `api_key_count` | number | 用户持有的 API key 数量。 |
+| `reason` | string | `unrestricted`、`model_groups` 或 `no_api_keys`。用于向用户解释列表为什么是空的，而不是只显示一个空态。 |
+
+访问范围是用户各个 key 的并集而非交集：只要持有一个未限定范围的 key，整个目录都可访问。一个 key 都没有则任何模型都不可访问，因为没有凭据的账号无法调用集群。
+
+`pricing` 是价格阶梯而不是标量，因为计费先按 service tier 再按输入规模解析：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `published` 或 `unpublished`。 |
+| `providers[]` | array | 每个既能提供该模型、又存在启用价格规则的 provider 一项。指向无法提供该模型的 provider 的规则会被排除，因为它们不构成报价。 |
+| `providers[].provider` | string | Provider 标识符。 |
+| `providers[].tiers[]` | array | 每个 service tier 一项。 |
+| `providers[].tiers[].service_tier` | string | Tier 名称，通配 tier 为 `*`。 |
+| `providers[].tiers[].is_default` | boolean | 仅在 `*` tier 上出现且为 `true`。请求未指定 tier、或指定了没有定价的 tier 时按该 tier 计费。 |
+| `providers[].tiers[].rungs[]` | array | 按 `min_input_tokens` 升序。请求按其满足的最后一个阶梯计价。 |
+| `rungs[].min_input_tokens` | number | 该阶梯生效的输入 token 阈值。 |
+| `rungs[].input_price_per_million` | number | 每百万输入 token 价格。 |
+| `rungs[].output_price_per_million` | number | 每百万输出 token 价格。 |
+| `rungs[].cache_read_price_per_million` | number | 每百万 cache read token 价格。 |
+| `rungs[].cache_write_price_per_million` | number | 每百万 cache write token 价格。 |
+| `rungs[].request_price` | number | 每次请求的固定价格。 |
+
+价格分量为 0 时会显式返回而不是省略：provider 不对 cache read 计费本身就是一种声明，省略字段会让它与"没有人为该分量定价"无法区分。整个模型没有启用规则时返回 `"status": "unpublished"` 且不带 `providers`。
+
+本版本不返回折扣元数据。客户端不得从上述字段推导、推断或展示折扣。
+
+`availability` 汇总滚动窗口内观测到的实际表现：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `observed` 或 `insufficient_data`。 |
+| `window.from` / `window.to` | string | 观测窗口的 RFC3339 边界，半开区间 `[from,to)`。 |
+| `window.hours` | number | 窗口长度（小时）。当前为 `168`。 |
+| `window.min_samples` | number | 发布可用率所需的最小观测数。当前为 `10`。 |
+| `sample_count` | number | 窗口内的观测数。始终返回，包括为 `0` 时。 |
+| `success_count` / `failed_count` | number | 仅在 `status` 为 `observed` 时出现。 |
+| `availability_rate` | number | 成功数除以观测数，保留四位小数。**仅在 `status` 为 `observed` 时出现。** |
+| `avg_latency_ms` | number | 可测量的成功请求的端到端平均延迟。无可测量样本时不返回。 |
+| `avg_ttft_ms` | number | 平均首 token 时间。仅流式响应上报，因此可能在 `avg_latency_ms` 存在时缺失。 |
+| `output_tokens_per_second` | number | 总输出 token 除以总生成耗时，长生成的权重更高，与调用方的实际体感一致。 |
+| `first_observed_at` / `last_observed_at` | string | 实际观测的 RFC3339 时间边界，可能远窄于窗口。`insufficient_data` 的模型也可能带有 `last_observed_at`。 |
+
+`status` 为 `insufficient_data` 时不返回可用率、延迟与吞吐。客户端必须渲染为"数据不足"，绝不能渲染为完全可用。该汇总是集群级的模型健康度，在进程内做短时缓存，不包含任何单个用户的请求数据。
 
 ## Billing
 

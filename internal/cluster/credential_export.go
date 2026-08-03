@@ -192,6 +192,7 @@ func credentialCodexKey(auth *coreauth.Auth) appconfig.CodexKey {
 		Prefix:         strings.TrimSpace(auth.Prefix),
 		BaseURL:        authAttribute(auth, "base_url"),
 		Websockets:     strings.EqualFold(authAttribute(auth, "websockets"), "true"),
+		AlphaSearch:    strings.EqualFold(authAttribute(auth, coreauth.AttributeCodexAlphaSearch), "true"),
 		ProxyURL:       strings.TrimSpace(auth.ProxyURL),
 		Models:         credentialCodexModels(auth),
 		Headers:        credentialHeaders(auth),

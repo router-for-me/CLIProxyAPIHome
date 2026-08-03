@@ -107,6 +107,9 @@ func Register(group *gin.RouterGroup, handler *Handler) {
 	group.POST("/login/totp", handler.LoginTOTP)
 	group.POST("/login/passkey", handler.LoginPasskey)
 
+	group.GET("/models", handler.ListModels)
+	group.GET("/models/accessible", handler.ListAccessibleModels)
+
 	group.GET("/me", handler.CurrentUser)
 	group.GET("/billing/overview", handler.CurrentUserBillingOverview)
 	group.GET("/billing/charges", handler.ListCurrentUserBillingCharges)

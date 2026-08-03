@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
@@ -217,6 +219,11 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		return nil, "", &reply
 	}
 	count := dispatchCount(jsonArg)
+	credentialPolicy, errPolicy := dispatchCredentialPolicy(jsonArg)
+	if errPolicy != nil {
+		reply := dispatch.BulkString([]byte(buildErrorJSON(errPolicy.Error())))
+		return nil, "", &reply
+	}
 
 	headers := parseHeaders(jsonArg)
 	sessionID := strings.TrimSpace(gjson.Get(jsonArg, "session_id").String())
@@ -240,7 +247,7 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	}
 
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
-	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, home.DispatchConcurrencyContext{
+	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, home.DispatchConcurrencyContext{
 		Fingerprint:     env.ConnectionLifetime.Fingerprint,
 		ConnectedAt:     env.ConnectionLifetime.ConnectedAt,
 		Controlled:      env.ConnectionLifetime.Controlled,
@@ -273,6 +280,15 @@ func dispatchCount(jsonArg string) int {
 		return 1
 	}
 	return count
+}
+
+func dispatchCredentialPolicy(jsonArg string) (string, error) {
+	policy := strings.TrimSpace(gjson.Get(jsonArg, "credential_policy").String())
+	normalized, okPolicy := coreauth.NormalizeCredentialPolicy(policy)
+	if !okPolicy {
+		return "", fmt.Errorf("unsupported_credential_policy: unsupported credential policy %q", policy)
+	}
+	return normalized, nil
 }
 
 // dispatchRetryExceeded handles a dispatch retry exceeded.

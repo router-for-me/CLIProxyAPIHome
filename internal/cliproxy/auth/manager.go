@@ -575,7 +575,7 @@ type dispatchCandidate struct {
 	originalAlias string
 }
 
-func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel string, now time.Time) (dispatchCandidate, bool, blockReason, time.Time) {
+func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel, credentialPolicy string, now time.Time) (dispatchCandidate, bool, blockReason, time.Time) {
 	authForResolution := auth
 	if auth != nil && strings.TrimSpace(auth.Provider) == "" {
 		normalizedProvider := strings.ToLower(strings.TrimSpace(providerKey))
@@ -584,6 +584,9 @@ func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel str
 			authCopy.Provider = normalizedProvider
 			authForResolution = &authCopy
 		}
+	}
+	if !credentialPolicyAllows(credentialPolicy, authForResolution) {
+		return dispatchCandidate{}, false, blockReasonOther, time.Time{}
 	}
 	resolved := m.resolveDispatchModel(authForResolution, routeModel)
 	if strings.TrimSpace(resolved.Model) == "" {
@@ -650,6 +653,12 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 
 	routeModel := strings.TrimSpace(requestedModel)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	credentialPolicy := credentialPolicyFromOptions(opts)
+	if normalizedPolicy, okPolicy := NormalizeCredentialPolicy(credentialPolicy); !okPolicy {
+		return nil, &Error{Code: "unsupported_credential_policy", Message: "unsupported credential policy " + strconv.Quote(credentialPolicy)}
+	} else {
+		credentialPolicy = normalizedPolicy
+	}
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	allowedModelIDs := allowedModelIDsFromOptions(opts)
 	routeKey := canonicalModelKey(routeModel)
@@ -681,7 +690,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if fullProviderKey == "" {
 				fullProviderKey = providerKey
 			}
-			fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, fullProviderKey, routeModel, time.Now())
+			fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, fullProviderKey, routeModel, credentialPolicy, time.Now())
 			if !okCandidate || concurrencyCandidateExcluded(opts, fullAuth.ID, fullCandidate.upstreamKey) {
 				continue
 			}
@@ -742,7 +751,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				continue
 			}
 			totalCandidates++
-			dispatchCandidate, okCandidate, reason, next := m.buildDispatchCandidate(candidate, providerKey, routeModel, now)
+			dispatchCandidate, okCandidate, reason, next := m.buildDispatchCandidate(candidate, providerKey, routeModel, credentialPolicy, now)
 			if !okCandidate {
 				if reason == blockReasonCooldown {
 					cooldownCount++
@@ -825,7 +834,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		if providerKey == "" {
 			providerKey = providerForSelector
 		}
-		fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, providerKey, routeModel, time.Now())
+		fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, providerKey, routeModel, credentialPolicy, time.Now())
 		if !okCandidate || concurrencyCandidateExcluded(opts, fullAuth.ID, fullCandidate.upstreamKey) {
 			continue
 		}

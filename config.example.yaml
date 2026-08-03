@@ -250,6 +250,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
+#     alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
 #     disable-cooling: false # optional: disable cooldown scheduling for this credential when true
 #     headers:
 #       X-Custom-Header: "custom-value"

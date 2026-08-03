@@ -2007,6 +2007,7 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `cloak` | Claude | 可选请求 cloaking 配置。 |
 | `experimental-cch-signing` | Claude | 为 cloaked Claude 请求启用实验性 CCH signing。 |
 | `websockets` | Codex、xAI | 启用 Responses API websocket transport。 |
+| `alpha-search` | Codex | 允许该 API key 通过 `base-url` 加 `/alpha/search` 提供 `/v1/alpha/search`，默认值为 `false`。 |
 | `api-key` | Vertex | 作为 `x-goog-api-key` 发送。 |
 
 `OpenAICompatibility`：

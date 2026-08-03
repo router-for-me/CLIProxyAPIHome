@@ -621,6 +621,9 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 	if (key == "codex-api-key" || key == "xai-api-key") && strings.EqualFold(attrs["websockets"], "true") {
 		item["websockets"] = true
 	}
+	if key == "codex-api-key" && strings.EqualFold(attrs[coreauth.AttributeCodexAlphaSearch], "true") {
+		item["alpha-search"] = true
+	}
 	if excluded := apiKeyExcludedModels(auth); len(excluded) > 0 {
 		item["excluded-models"] = excluded
 	}

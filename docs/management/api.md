@@ -2007,6 +2007,7 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `cloak` | Claude | Optional request cloaking config. |
 | `experimental-cch-signing` | Claude | Enables experimental CCH signing for cloaked Claude requests. |
 | `websockets` | Codex, xAI | Enables Responses API websocket transport. |
+| `alpha-search` | Codex | Allows this API key to serve `/v1/alpha/search` through `base-url` plus `/alpha/search`. Defaults to `false`. |
 | `api-key` | Vertex | Sent as `x-goog-api-key`. |
 
 `OpenAICompatibility`:
