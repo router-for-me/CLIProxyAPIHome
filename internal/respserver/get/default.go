@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	"github.com/tidwall/gjson"
@@ -81,14 +82,41 @@ func handleDefaultRefresh(ctx context.Context, env dispatch.Env, jsonArg string)
 		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageMissingAuthIndex)))
 	}
 
-	payload, errRefresh := env.Runtime.RefreshNow(ctx, authIndex)
+	observedAccessTokenSHA256 := strings.TrimSpace(gjson.Get(jsonArg, "access_token_sha256").String())
+	payload, errRefresh := env.Runtime.RefreshNowObserved(ctx, authIndex, observedAccessTokenSHA256)
 	if errRefresh != nil {
-		return dispatch.BulkString([]byte(buildErrorJSON(errRefresh.Error())))
+		return dispatch.BulkString([]byte(buildRefreshErrorJSON(errRefresh)))
 	}
 	if len(payload) == 0 {
 		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageAuthNotFound)))
 	}
 	return dispatch.BulkString(payload)
+}
+
+func buildRefreshErrorJSON(errRefresh error) string {
+	var authErr *coreauth.Error
+	if errors.As(errRefresh, &authErr) && authErr != nil {
+		errorType := strings.TrimSpace(authErr.Code)
+		if errorType == "" {
+			errorType = "error"
+		}
+		message := strings.TrimSpace(authErr.Message)
+		if message == "" {
+			message = "credential refresh failed"
+		}
+		return buildTypedErrorJSON(errorType, message)
+	}
+	if errRefresh != nil && strings.Contains(strings.ToLower(errRefresh.Error()), "auth not found") {
+		return buildTypedErrorJSON("auth_not_found", "credential not found")
+	}
+	return buildTypedErrorJSON("refresh_temporarily_unavailable", "credential refresh temporarily unavailable")
+}
+
+func buildTypedErrorJSON(errorType, message string) string {
+	out := "{}"
+	out, _ = sjson.Set(out, "error.type", errorType)
+	out, _ = sjson.Set(out, "error.message", message)
+	return out
 }
 
 func looksLikeJSONObject(value string) bool {

@@ -12,6 +12,12 @@ type Store interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// StateVersionSaver is an optional Store capability that returns the revision
+// accepted for a save. A zero revision means the snapshot was ignored as stale.
+type StateVersionSaver interface {
+	SaveWithStateVersion(ctx context.Context, auth *Auth) (id string, stateVersion int64, err error)
+}
+
 // StateMutator is an optional Store capability. Implementations load the
 // authoritative persisted copy of the auth (typically under a database row
 // lock), apply mutate to it, and persist the result atomically when mutate

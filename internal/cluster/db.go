@@ -80,7 +80,7 @@ func OpenSQLite(ctx context.Context, path string) (*gorm.DB, error) {
 		}
 		return nil, errPragma
 	}
-	if errPragma := db.Exec("PRAGMA busy_timeout=5000").Error; errPragma != nil {
+	if errPragma := db.Exec("PRAGMA busy_timeout=30000").Error; errPragma != nil {
 		if errClose := sqlDB.Close(); errClose != nil {
 			return nil, fmt.Errorf("configure sqlite busy timeout: %w; close sql db: %v", errPragma, errClose)
 		}

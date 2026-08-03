@@ -3,6 +3,8 @@
 package claude
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,7 +25,7 @@ type utlsRoundTripper struct {
 	// connections caches HTTP/2 client connections per host
 	connections map[string]*http2.ClientConn
 	// pending tracks hosts that are currently being connected to (prevents race condition)
-	pending map[string]*sync.Cond
+	pending map[string]chan struct{}
 	// dialer is used to create network connections, supporting proxies
 	dialer proxy.Dialer
 }
@@ -42,7 +44,7 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 
 	return &utlsRoundTripper{
 		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
+		pending:     make(map[string]chan struct{}),
 		dialer:      dialer,
 	}
 }
@@ -50,57 +52,55 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 // getOrCreateConnection gets an existing connection or creates a new one.
 // It uses a per-host locking mechanism to prevent multiple goroutines from
 // creating connections to the same host simultaneously.
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
-	t.mu.Lock()
-
-	// Check if connection exists and is usable
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	// Check if another goroutine is already creating a connection
-	if cond, ok := t.pending[host]; ok {
-		// Wait for the other goroutine to finish
-		cond.Wait()
-		// Check if connection is now available
+	for {
+		t.mu.Lock()
 		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
 			t.mu.Unlock()
 			return h2Conn, nil
 		}
-		// Connection still not available, we'll create one
+		if pending, ok := t.pending[host]; ok {
+			t.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-pending:
+				continue
+			}
+		}
+
+		completed := make(chan struct{})
+		t.pending[host] = completed
+		t.mu.Unlock()
+
+		h2Conn, errConnection := t.createConnection(ctx, host, addr)
+		t.mu.Lock()
+		delete(t.pending, host)
+		if errConnection == nil {
+			t.connections[host] = h2Conn
+		}
+		close(completed)
+		t.mu.Unlock()
+		return h2Conn, errConnection
 	}
-
-	// Mark this host as pending
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	// Create connection outside the lock
-	h2Conn, err := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Remove pending marker and wake up waiting goroutines
-	delete(t.pending, host)
-	cond.Broadcast()
-
-	if err != nil {
-		return nil, err
-	}
-
-	// Store the new connection
-	t.connections[host] = h2Conn
-	return h2Conn, nil
 }
 
 // createConnection creates a new HTTP/2 connection with Chrome TLS fingerprint.
 // Chrome's TLS fingerprint is closer to Node.js/OpenSSL (which real Claude Code uses)
 // than Firefox, reducing the mismatch between TLS layer and HTTP headers.
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
 	// Keep validation before state changes so failures leave existing data intact.
-	conn, err := t.dialer.Dial("tcp", addr)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	contextDialer, ok := t.dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("claude proxy dialer does not support context cancellation")
+	}
+	conn, err := contextDialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +108,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
 
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -134,7 +134,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	// Get hostname without port for TLS ServerName
 	hostname := req.URL.Hostname()
 
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
+	h2Conn, err := t.getOrCreateConnection(req.Context(), hostname, addr)
 	if err != nil {
 		return nil, err
 	}

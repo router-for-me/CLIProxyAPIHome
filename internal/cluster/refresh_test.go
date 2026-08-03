@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,16 +59,52 @@ func TestForwardRefreshToMasterRequiresTLSConfig(t *testing.T) {
 }
 
 type refreshTestRoundTripper struct {
-	body  string
-	calls int
+	body       string
+	statusCode int
+	calls      int
 }
 
 func (rt *refreshTestRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	rt.calls++
+	statusCode := rt.statusCode
+	if statusCode == 0 {
+		statusCode = http.StatusBadRequest
+	}
 	return &http.Response{
-		StatusCode: http.StatusBadRequest,
+		StatusCode: statusCode,
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(rt.body)),
+	}, nil
+}
+
+type refreshRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn refreshRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+type blockingRefreshRoundTripper struct {
+	calls      atomic.Int32
+	started    chan struct{}
+	release    chan struct{}
+	secondCall chan struct{}
+}
+
+func (rt *blockingRefreshRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	call := rt.calls.Add(1)
+	if call == 1 {
+		close(rt.started)
+		<-rt.release
+	} else {
+		select {
+		case rt.secondCall <- struct{}{}:
+		default:
+		}
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"access_token":"new-access-token","refresh_token":"new-refresh-token","expires_in":3600}`)),
 	}, nil
 }
 
@@ -89,8 +126,13 @@ func (a *refreshTestFailingIndexAdapter) RefreshAuthIndex(context.Context, strin
 
 func newRefreshTestRepository(t *testing.T) *Repository {
 	t.Helper()
+	return openRefreshTestRepositoryAt(t, filepath.Join(t.TempDir(), "home.db"), true)
+}
+
+func openRefreshTestRepositoryAt(t *testing.T, path string, migrate bool) *Repository {
+	t.Helper()
 	ctx := context.Background()
-	db, errOpen := OpenSQLite(ctx, filepath.Join(t.TempDir(), "home.db"))
+	db, errOpen := OpenSQLite(ctx, path)
 	if errOpen != nil {
 		t.Fatalf("OpenSQLite() error = %v", errOpen)
 	}
@@ -103,8 +145,10 @@ func newRefreshTestRepository(t *testing.T) *Repository {
 			t.Errorf("close sqlite db: %v", errClose)
 		}
 	})
-	if errMigrate := AutoMigrate(db); errMigrate != nil {
-		t.Fatalf("AutoMigrate() error = %v", errMigrate)
+	if migrate {
+		if errMigrate := AutoMigrate(db); errMigrate != nil {
+			t.Fatalf("AutoMigrate() error = %v", errMigrate)
+		}
 	}
 	return NewRepository(db)
 }
@@ -256,8 +300,10 @@ func TestRefreshControllerMasterInvalidGrantPersistsDisabledAuth(t *testing.T) {
 
 	_, errRefresh := controller.RefreshNow(ctx, authID)
 	requireTerminalRefreshError(t, errRefresh)
+	_, errRepeated := controller.RefreshNow(ctx, authID)
+	requireTerminalRefreshError(t, errRepeated)
 	if transport.calls != 1 {
-		t.Fatalf("provider refresh calls = %d, want 1", transport.calls)
+		t.Fatalf("provider refresh calls = %d, want 1 after repeated terminal request", transport.calls)
 	}
 
 	persisted, _, errAuth := repo.GetAuth(ctx, authID)
@@ -297,6 +343,278 @@ func TestRefreshControllerMasterInvalidGrantPersistsDisabledAuth(t *testing.T) {
 	}
 }
 
+func TestRefreshControllerTransientFailureKeepsCredentialDispatchable(t *testing.T) {
+	const authID = "antigravity-transient"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	providerCalls := 0
+	transport := refreshRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		providerCalls++
+		return nil, errors.New("proxy unavailable")
+	})
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9302, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	_, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	var authErr *coreauth.Error
+	if !errors.As(errRefresh, &authErr) || authErr.Code != "refresh_temporarily_unavailable" || authErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("RefreshNowObserved() error = %#v, want transient 503", errRefresh)
+	}
+	if _, errRepeated := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth)); errRepeated == nil {
+		t.Fatal("repeated refresh during backoff returned nil error")
+	}
+	if providerCalls != 1 {
+		t.Fatalf("provider refresh calls = %d, want 1 during refresh backoff", providerCalls)
+	}
+
+	persisted, _, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.Disabled || persisted.Unavailable || persisted.Status != coreauth.StatusActive {
+		t.Fatalf("transient refresh blocked credential dispatch: %#v", persisted)
+	}
+	if persisted.NextRefreshAfter.IsZero() || !persisted.NextRetryAfter.IsZero() {
+		t.Fatalf("refresh/retry deadlines = %v/%v, want refresh-only backoff", persisted.NextRefreshAfter, persisted.NextRetryAfter)
+	}
+}
+
+func TestWithAuthRefreshLockSerializesSeparateSQLiteConnections(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "shared.db")
+	repoA := openRefreshTestRepositoryAt(t, path, true)
+	repoB := openRefreshTestRepositoryAt(t, path, false)
+	var busyTimeout int
+	if errPragma := repoA.db.Raw("PRAGMA busy_timeout").Scan(&busyTimeout).Error; errPragma != nil || busyTimeout < 30000 {
+		t.Fatalf("SQLite busy_timeout = %d, %v; want at least 30000ms", busyTimeout, errPragma)
+	}
+	auth := newInvalidGrantRefreshAuth("sqlite-cross-connection")
+	if _, errUpsert := repoA.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		_, errLock := repoA.WithAuthRefreshLock(ctx, auth.ID, func(_ *Repository, current *coreauth.Auth) (*coreauth.Auth, error) {
+			close(firstEntered)
+			<-releaseFirst
+			return current, nil
+		})
+		results <- errLock
+	}()
+	select {
+	case <-firstEntered:
+	case <-ctx.Done():
+		t.Fatalf("first SQLite refresh lock did not start: %v", ctx.Err())
+	}
+	go func() {
+		_, errLock := repoB.WithAuthRefreshLock(ctx, auth.ID, func(_ *Repository, current *coreauth.Auth) (*coreauth.Auth, error) {
+			close(secondEntered)
+			return current, nil
+		})
+		results <- errLock
+	}()
+
+	select {
+	case <-secondEntered:
+		t.Fatal("second SQLite connection entered refresh while the first lock was held")
+	case errLock := <-results:
+		t.Fatalf("second SQLite refresh lock returned early: %v", errLock)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		select {
+		case errLock := <-results:
+			if errLock != nil {
+				t.Fatalf("WithAuthRefreshLock() error = %v", errLock)
+			}
+		case <-ctx.Done():
+			t.Fatalf("SQLite refresh locks did not finish: %v", ctx.Err())
+		}
+	}
+}
+
+func TestRefreshControllerSerializesConcurrentSQLiteRotations(t *testing.T) {
+	const authID = "antigravity-concurrent"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := &blockingRefreshRoundTripper{
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		secondCall: make(chan struct{}, 1),
+	}
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9305, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+	observedHash := coreauth.AccessTokenSHA256(auth)
+
+	results := make(chan error, 2)
+	go func() {
+		_, errRefresh := controller.RefreshNowObserved(ctx, authID, observedHash)
+		results <- errRefresh
+	}()
+	select {
+	case <-transport.started:
+	case <-ctx.Done():
+		t.Fatalf("first provider refresh did not start: %v", ctx.Err())
+	}
+	go func() {
+		_, errRefresh := controller.RefreshNowObserved(ctx, authID, observedHash)
+		results <- errRefresh
+	}()
+
+	select {
+	case <-transport.secondCall:
+		t.Fatal("concurrent SQLite refresh reached the provider before the first rotation committed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(transport.release)
+	for range 2 {
+		select {
+		case errRefresh := <-results:
+			if errRefresh != nil {
+				t.Fatalf("RefreshNowObserved() error = %v", errRefresh)
+			}
+		case <-ctx.Done():
+			t.Fatalf("concurrent refresh did not finish: %v", ctx.Err())
+		}
+	}
+	if got := transport.calls.Load(); got != 1 {
+		t.Fatalf("provider refresh calls = %d, want 1", got)
+	}
+}
+
+func TestRefreshControllerSkipsRotationAfterObservedTokenChanges(t *testing.T) {
+	const authID = "antigravity-observed-token"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := &refreshTestRoundTripper{
+		statusCode: http.StatusOK,
+		body:       `{"access_token":"new-access-token","refresh_token":"new-refresh-token","expires_in":3600,"token_type":"Bearer"}`,
+	}
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9303, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+	observedHash := coreauth.AccessTokenSHA256(auth)
+
+	if _, errRefresh := controller.RefreshNowObserved(ctx, authID, observedHash); errRefresh != nil {
+		t.Fatalf("first RefreshNowObserved() error = %v", errRefresh)
+	}
+	if _, errRefresh := controller.RefreshNowObserved(ctx, authID, observedHash); errRefresh != nil {
+		t.Fatalf("second RefreshNowObserved() error = %v", errRefresh)
+	}
+	if transport.calls != 1 {
+		t.Fatalf("provider refresh calls = %d, want 1", transport.calls)
+	}
+	persisted, _, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if got := persisted.Metadata["access_token"]; got != "new-access-token" {
+		t.Fatalf("persisted access token = %v, want new-access-token", got)
+	}
+}
+
+func TestRefreshControllerHonorsCallerDeadline(t *testing.T) {
+	const authID = "antigravity-deadline"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := refreshRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9304, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	deadlineCtx, cancelDeadline := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancelDeadline()
+	startedAt := time.Now()
+	_, errRefresh := controller.RefreshNowObserved(deadlineCtx, authID, coreauth.AccessTokenSHA256(auth))
+	if !errors.Is(errRefresh, context.DeadlineExceeded) {
+		t.Fatalf("RefreshNowObserved() error = %v, want context deadline exceeded", errRefresh)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("refresh cancellation took %v, want under 1s", elapsed)
+	}
+	persisted, _, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.Disabled || persisted.Unavailable || persisted.Status != coreauth.StatusActive {
+		t.Fatalf("timed-out refresh blocked credential: %#v", persisted)
+	}
+}
+
+func TestRefreshControllerStandbySyncsSuccessfulMasterRefresh(t *testing.T) {
+	const authID = "antigravity-forwarded-success"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	masterTransport := &refreshTestRoundTripper{
+		statusCode: http.StatusOK,
+		body:       `{"access_token":"new-access-token","refresh_token":"new-refresh-token","expires_in":3600}`,
+	}
+	masterRuntime := newRefreshTestRuntime(t, repo, auth, masterTransport)
+	standbyRuntime := newRefreshTestRuntime(t, repo, auth, &refreshTestRoundTripper{})
+	masterCoordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9403, Secret: "master-secret", StartedAt: time.Now().UTC().Add(-time.Minute)}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, masterCoordinator)
+	masterController := NewRefreshController(masterCoordinator, masterRuntime, repo, nil)
+
+	standbyCoordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.2", Port: 9404, Secret: "standby-secret"}, CoordinatorOptions{})
+	standbyCoordinator.setMaster(false)
+	standbyController := NewRefreshController(standbyCoordinator, standbyRuntime, repo, nil)
+	standbyController.forwardRefresh = func(ctx context.Context, _ *ClusterNodeRecord, forwardedAuthID, _ string, observedAccessTokenSHA256 string, _ *tls.Config) ([]byte, error) {
+		return masterController.RefreshNowObserved(ctx, forwardedAuthID, observedAccessTokenSHA256)
+	}
+
+	if _, errRefresh := standbyController.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth)); errRefresh != nil {
+		t.Fatalf("standby RefreshNowObserved() error = %v", errRefresh)
+	}
+	standbyAuth, ok := standbyRuntime.CoreManager().GetByID(authID)
+	if !ok || standbyAuth == nil || standbyAuth.Metadata["access_token"] != "new-access-token" {
+		t.Fatalf("standby auth cache = %#v, want refreshed token", standbyAuth)
+	}
+	if masterTransport.calls != 1 {
+		t.Fatalf("master provider refresh calls = %d, want 1", masterTransport.calls)
+	}
+}
+
 func TestRefreshControllerStandbyPreservesTerminalMasterError(t *testing.T) {
 	const authID = "antigravity-forwarded"
 	ctx := context.Background()
@@ -320,9 +638,9 @@ func TestRefreshControllerStandbyPreservesTerminalMasterError(t *testing.T) {
 	standbyCoordinator.setMaster(false)
 	standbyController := NewRefreshController(standbyCoordinator, standbyRuntime, repo, nil)
 	forwardCalls := 0
-	standbyController.forwardRefresh = func(ctx context.Context, _ *ClusterNodeRecord, forwardedAuthID, _ string, _ *tls.Config) ([]byte, error) {
+	standbyController.forwardRefresh = func(ctx context.Context, _ *ClusterNodeRecord, forwardedAuthID, _ string, observedAccessTokenSHA256 string, _ *tls.Config) ([]byte, error) {
 		forwardCalls++
-		payload, errMasterRefresh := masterController.RefreshNow(ctx, forwardedAuthID)
+		payload, errMasterRefresh := masterController.RefreshNowObserved(ctx, forwardedAuthID, observedAccessTokenSHA256)
 		if errMasterRefresh == nil {
 			return payload, nil
 		}

@@ -201,7 +201,7 @@ func (r *Repository) RetireProviderAuth(ctx context.Context, credentialID string
 
 func retireProviderAuthTx(ctx context.Context, tx *gorm.DB, credentialID string) error {
 	record := AuthRecord{}
-	if errFirst := tx.Where("uuid = ?", credentialID).First(&record).Error; errFirst != nil {
+	if errFirst := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ?", credentialID).First(&record).Error; errFirst != nil {
 		return errFirst
 	}
 	record.Version++

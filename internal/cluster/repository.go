@@ -138,6 +138,7 @@ func RecordToAuth(record *AuthRecord) (*coreauth.Auth, error) {
 		return nil, fmt.Errorf("auth json id %q must match uuid %q", auth.ID, record.UUID)
 	}
 	auth.Index = record.Index
+	auth.StateVersion = record.Version
 
 	return auth, nil
 }
@@ -179,7 +180,7 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		existing := AuthRecord{}
 		query := tx.Unscoped().Where("uuid = ?", record.UUID)
-		if preserveDisabled && tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+		if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
 		errFirst := query.First(&existing).Error
@@ -194,6 +195,16 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 		case errFirst != nil:
 			return errFirst
 		default:
+			if auth.StateVersion > 0 {
+				switch {
+				case existing.DeletedAt.Valid, existing.Version > auth.StateVersion:
+					result = UpsertResultUnchanged
+					out = &existing
+					return nil
+				case existing.Version < auth.StateVersion:
+					return fmt.Errorf("auth state version %d is ahead of persisted version %d", auth.StateVersion, existing.Version)
+				}
+			}
 			if preserveDisabled {
 				current, errCurrent := RecordToAuth(&existing)
 				if errCurrent != nil {
@@ -267,9 +278,9 @@ func (r *Repository) GetAuth(ctx context.Context, uuid string) (*coreauth.Auth, 
 	return auth, record, nil
 }
 
-// WithAuthRefreshLock applies the auth refresh lock option.
+// WithAuthRefreshLock runs a short credential mutation under the database row lock.
+// Deprecated: OAuth refresh network calls must use the lease flow instead.
 func (r *Repository) WithAuthRefreshLock(ctx context.Context, uuid string, fn func(tx *Repository, auth *coreauth.Auth) (*coreauth.Auth, error)) (*coreauth.Auth, error) {
-	// Resolve credential context before calling upstream OAuth services.
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
@@ -283,21 +294,25 @@ func (r *Repository) WithAuthRefreshLock(ctx context.Context, uuid string, fn fu
 	}
 
 	var out *coreauth.Auth
-	ctx = contextOrBackground(ctx)
-	errTransaction := db.WithContext(ctx).Transaction(func(txDB *gorm.DB) error {
+	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(txDB *gorm.DB) error {
 		record := &AuthRecord{}
-		errFirst := txDB.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ?", uuid).First(record).Error
-		if errFirst != nil {
+		query := txDB.Where("uuid = ?", uuid)
+		if txDB.Dialector != nil && txDB.Dialector.Name() == "sqlite" {
+			if errLock := txDB.Exec(`UPDATE "auth" SET "version" = "version" WHERE "uuid" = ?`, uuid).Error; errLock != nil {
+				return errLock
+			}
+		} else {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if errFirst := query.First(record).Error; errFirst != nil {
 			return errFirst
 		}
-
 		auth, errAuth := RecordToAuth(record)
 		if errAuth != nil {
 			return errAuth
 		}
 		auth.ID = uuid
 		auth.Index = uuid
-
 		refreshed, errRefresh := fn(&Repository{db: txDB}, auth)
 		if errRefresh != nil {
 			return errRefresh
@@ -364,6 +379,7 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 			return errRecord
 		}
 		record.Version = existing.Version + 1
+		auth.StateVersion = record.Version
 		record.CreatedAt = existing.CreatedAt
 		if errUpdate := txDB.Select("*").Where("uuid = ?", uuid).Updates(record).Error; errUpdate != nil {
 			return errUpdate
@@ -407,6 +423,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 		auth := auths[i]
 		out = append(out, AuthIndex{
 			UUID:           record.UUID,
+			Version:        record.Version,
 			ID:             record.ID,
 			Index:          record.Index,
 			Provider:       record.Provider,
@@ -705,16 +722,27 @@ func (r *Repository) ListAuths(ctx context.Context) ([]*coreauth.Auth, error) {
 
 // SoftDeleteAuth handles a soft delete auth.
 func (r *Repository) SoftDeleteAuth(ctx context.Context, uuid string) error {
+	_, errDelete := r.SoftDeleteAuthWithVersion(ctx, uuid)
+	return errDelete
+}
+
+// SoftDeleteAuthWithVersion soft-deletes an auth and returns its tombstone revision.
+func (r *Repository) SoftDeleteAuthWithVersion(ctx context.Context, uuid string) (int64, error) {
 	// Validate request inputs before mutating persisted state.
 	db, errDB := r.database()
 	if errDB != nil {
-		return errDB
+		return 0, errDB
 	}
 
 	ctx = contextOrBackground(ctx)
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	deletedVersion := int64(0)
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		record := AuthRecord{}
-		if errFirst := tx.Where("uuid = ?", uuid).First(&record).Error; errFirst != nil {
+		query := tx.Where("uuid = ?", uuid)
+		if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if errFirst := query.First(&record).Error; errFirst != nil {
 			return errFirst
 		}
 		newVersion := record.Version + 1
@@ -731,8 +759,16 @@ func (r *Repository) SoftDeleteAuth(ctx context.Context, uuid string) error {
 		if errDeleteSnapshot := tx.Where("credential_id = ?", uuid).Delete(&QuotaSnapshotRecord{}).Error; errDeleteSnapshot != nil {
 			return errDeleteSnapshot
 		}
-		return appendEvent(tx, "auth", "delete", record.UUID, record.Version)
+		if errEvent := appendEvent(tx, "auth", "delete", record.UUID, record.Version); errEvent != nil {
+			return errEvent
+		}
+		deletedVersion = record.Version
+		return nil
 	})
+	if errTransaction != nil {
+		return 0, errTransaction
+	}
+	return deletedVersion, nil
 }
 
 const configAPIKeysRootKey = "api-keys"

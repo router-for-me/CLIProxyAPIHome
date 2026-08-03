@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,12 +21,17 @@ import (
 )
 
 const (
-	refreshCheckInterval  = 5 * time.Second
-	refreshMaxConcurrency = 16
-	refreshPendingBackoff = time.Minute
-	refreshFailureBackoff = 5 * time.Minute
-	refreshAuthErrorCode  = "authentication_error"
-	refreshAuthErrorMsg   = "credential unauthorized"
+	refreshCheckInterval       = 5 * time.Second
+	refreshMaxConcurrency      = 16
+	refreshPendingBackoff      = time.Minute
+	refreshFailureBackoff      = 5 * time.Minute
+	refreshAuthErrorCode       = "authentication_error"
+	refreshAuthErrorMsg        = "credential unauthorized"
+	refreshTransientErrorCode  = "refresh_temporarily_unavailable"
+	refreshTransientErrorMsg   = "credential refresh temporarily unavailable"
+	refreshUnsupportedCode     = "refresh_unsupported"
+	refreshUnsupportedMsg      = "credential does not support refresh"
+	refreshProviderCallTimeout = 25 * time.Second
 	// refreshIneffectiveBackoff throttles refresh attempts when the refresh completes
 	// successfully but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
@@ -41,7 +48,14 @@ type FullAuthResolver interface {
 	GetFullAuth(ctx context.Context, uuid string) (*Auth, error)
 }
 
-var ErrFullAuthNotFound = errors.New("full auth not found")
+var (
+	ErrFullAuthNotFound   = errors.New("full auth not found")
+	ErrRefreshUnsupported = &Error{
+		Code:       refreshUnsupportedCode,
+		Message:    refreshUnsupportedMsg,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+)
 
 // Manager orchestrates auth lifecycle, selection, and persistence for CLIProxyAPIHome.
 //
@@ -59,10 +73,11 @@ type Manager struct {
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
 
-	rtProvider      RoundTripperProvider
-	fullResolver    FullAuthResolver
-	pluginRefresher PluginAuthRefresher
-	pluginScheduler PluginScheduler
+	rtProvider         RoundTripperProvider
+	fullResolver       FullAuthResolver
+	pluginRefresher    PluginAuthRefresher
+	pluginScheduler    PluginScheduler
+	autoRefreshHandler func(context.Context, *Auth) error
 
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
@@ -93,6 +108,16 @@ func NewManager(store Store, selector Selector, _ any) *Manager {
 		return mgr.resolveDispatchModel(auth, routeModel).Model
 	})
 	return mgr
+}
+
+// SetAutoRefreshHandler routes background refresh through the cluster lock owner.
+func (m *Manager) SetAutoRefreshHandler(handler func(context.Context, *Auth) error) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.autoRefreshHandler = handler
+	m.mu.Unlock()
 }
 
 // SetRoundTripperProvider sets a round tripper provider.
@@ -342,6 +367,21 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 		// Keep disabled auth entries persisted to disk too, consistent with CPA.
 	}
 	if auth.Metadata == nil && auth.Storage == nil {
+		return nil
+	}
+	if versionedStore, ok := m.store.(StateVersionSaver); ok {
+		persisted := auth.Clone()
+		_, stateVersion, errSave := versionedStore.SaveWithStateVersion(ctx, persisted)
+		if errSave != nil {
+			return errSave
+		}
+		if stateVersion > 0 {
+			m.mu.Lock()
+			if current := m.auths[auth.ID]; current == auth {
+				current.StateVersion = stateVersion
+			}
+			m.mu.Unlock()
+		}
 		return nil
 	}
 	_, errSave := m.store.Save(ctx, auth)
@@ -959,8 +999,9 @@ func authRefreshDisabled(auth *Auth) bool {
 	return auth == nil || auth.Disabled || auth.Status == StatusDisabled
 }
 
-// applyRefreshFailureState records refresh failures and permanently disables
-// credentials whose refresh token can no longer authenticate.
+// applyRefreshFailureState backs off only credential acquisition after a
+// transient refresh failure. It must not make a still-valid access token
+// unavailable for request dispatch.
 func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 	if auth == nil || errRefresh == nil {
 		return
@@ -970,7 +1011,37 @@ func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 		return
 	}
 	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
-	auth.LastError = &Error{Message: errRefresh.Error()}
+	auth.LastError = newTransientRefreshError()
+	auth.UpdatedAt = now
+}
+
+func applyUnsupportedRefreshBackoff(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
+	auth.LastError = cloneError(ErrRefreshUnsupported)
+	auth.UpdatedAt = now
+}
+
+// RefreshRetryBackoffOpen reports whether provider refresh calls are currently
+// backed off. This state is intentionally ignored by request selection.
+func RefreshRetryBackoffOpen(auth *Auth, now time.Time) bool {
+	return auth != nil && auth.NextRefreshAfter.After(now)
+}
+
+func newTransientRefreshError() *Error {
+	return &Error{
+		Code:       refreshTransientErrorCode,
+		Message:    refreshTransientErrorMsg,
+		Retryable:  true,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
+// NewTransientRefreshError returns a redacted refresh acquisition error.
+func NewTransientRefreshError() error {
+	return newTransientRefreshError()
 }
 
 // newUnauthorizedRefreshError returns the fixed wire error for failed forced refresh.
@@ -983,26 +1054,112 @@ func newUnauthorizedRefreshError() *Error {
 }
 
 // isTerminalRefreshAuthError reports whether retrying the same refresh token
-// cannot restore the credential.
+// cannot restore the credential. Generic HTTP 401 responses are not enough:
+// proxies and provider edges can return them for transient failures.
 func isTerminalRefreshAuthError(errRefresh error) bool {
-	if errRefresh == nil {
+	if errRefresh == nil || errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
 		return false
 	}
 	var authErr *Error
 	if errors.As(errRefresh, &authErr) && authErr != nil {
-		code := strings.ToLower(strings.TrimSpace(authErr.Code))
-		if authErr.HTTPStatus == http.StatusUnauthorized || code == refreshAuthErrorCode || code == "unauthorized" {
+		switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
+		case refreshAuthErrorCode:
+			return strings.EqualFold(strings.TrimSpace(authErr.Message), refreshAuthErrorMsg)
+		case "invalid_grant", "refresh_token_expired", "refresh_token_revoked", "refresh_token_reused":
 			return true
 		}
 	}
 	raw := strings.ToLower(errRefresh.Error())
-	return strings.Contains(raw, "status 401") ||
-		strings.Contains(raw, "status: 401") ||
-		strings.Contains(raw, "status code 401") ||
-		strings.Contains(raw, "http 401") ||
-		strings.Contains(raw, "401 unauthorized") ||
-		strings.Contains(raw, "invalid_grant") ||
+	return strings.Contains(raw, "invalid_grant") ||
+		strings.Contains(raw, "refresh_token_expired") ||
+		strings.Contains(raw, "refresh_token_revoked") ||
+		strings.Contains(raw, "refresh_token_reused") ||
 		isTerminalOAuthRefreshDescription(raw)
+}
+
+func authSupportsBuiltInRefresh(auth *Auth) bool {
+	if auth == nil || metaStringValue(auth.Metadata, "refresh_token") == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "codex", "claude", "kimi", "antigravity", "xai":
+		return true
+	default:
+		return false
+	}
+}
+
+func withRefreshProviderTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, refreshProviderCallTimeout)
+}
+
+// AuthIsNewerThanObserved reports whether Home stores a different access token
+// from the one used by the failed downstream attempt.
+func AuthIsNewerThanObserved(auth *Auth, observedAccessTokenSHA256 string) bool {
+	observedHash, okObserved := normalizeSHA256Hex(observedAccessTokenSHA256)
+	currentHash, okCurrent := normalizeSHA256Hex(AccessTokenSHA256(auth))
+	return okObserved && okCurrent && currentHash != observedHash
+}
+
+func normalizeSHA256Hex(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if len(value) != sha256.Size*2 {
+		return "", false
+	}
+	if _, errDecode := hex.DecodeString(value); errDecode != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// AccessTokenSHA256 fingerprints an OAuth token without exposing it.
+func AccessTokenSHA256(auth *Auth) string {
+	accessToken := accessTokenForFingerprint(auth)
+	if accessToken == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(accessToken))
+	return hex.EncodeToString(digest[:])
+}
+
+func accessTokenForFingerprint(auth *Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"access_token", "accessToken"} {
+		if value, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	for _, key := range []string{"token", "Token"} {
+		switch token := auth.Metadata[key].(type) {
+		case map[string]any:
+			for _, tokenKey := range []string{"access_token", "accessToken"} {
+				if value, ok := token[tokenKey].(string); ok && strings.TrimSpace(value) != "" {
+					return strings.TrimSpace(value)
+				}
+			}
+		case map[string]string:
+			for _, tokenKey := range []string{"access_token", "accessToken"} {
+				if value := strings.TrimSpace(token[tokenKey]); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// ApplyRefreshPendingState opens refresh-only backoff without changing request availability.
+func ApplyRefreshPendingState(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
+	auth.UpdatedAt = now
 }
 
 // markRefreshPending handles a mark refresh pending.
@@ -1017,7 +1174,7 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 		m.mu.Unlock()
 		return false
 	}
-	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
+	ApplyRefreshPendingState(auth, now)
 	m.auths[id] = auth
 	m.mu.Unlock()
 
@@ -1265,7 +1422,12 @@ func (m *Manager) stopAutoRefresh(stopSelector bool) {
 // RefreshNow forces a best-effort credential refresh for the given auth.
 // It updates the in-memory record and persists it when enabled.
 func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, error) {
-	// Resolve credential context before calling upstream OAuth services.
+	return m.RefreshNowObserved(ctx, authIndex, "")
+}
+
+// RefreshNowObserved refreshes unless Home already replaced the access token
+// observed by the downstream attempt that received a 401.
+func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAccessTokenSHA256 string) (*Auth, error) {
 	if m == nil {
 		return nil, fmt.Errorf("auth manager: nil manager")
 	}
@@ -1283,11 +1445,7 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 	target := m.indexAuth[targetIndex]
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	m.mu.RUnlock()
-
-	if requested == nil {
-		return nil, fmt.Errorf("auth manager: auth not found")
-	}
-	if target == nil {
+	if requested == nil || target == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
 	fullTarget, okFull, errFull := m.resolveFullRefreshAuth(ctx, target)
@@ -1298,15 +1456,27 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
 	target = fullTarget
+	if authRefreshDisabled(target) {
+		return nil, newUnauthorizedRefreshError()
+	}
+	if AuthIsNewerThanObserved(target, observedAccessTokenSHA256) {
+		return target.Clone(), nil
+	}
+	if RefreshRetryBackoffOpen(target, time.Now().UTC()) {
+		return nil, NewTransientRefreshError()
+	}
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
 
-	rt := m.roundTripperFor(target)
-	updated, handledPluginRefresh, errRefresh := m.refreshViaPlugin(ctx, target)
+	refreshCtx, cancelRefresh := withRefreshProviderTimeout(ctx)
+	updated, handledPluginRefresh, errRefresh := m.refreshViaPlugin(refreshCtx, target)
+	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
-		updated, errRefresh = refreshCredential(ctx, cfg, target.Clone(), rt)
+		refreshAttempted = authSupportsBuiltInRefresh(target)
+		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
 	}
+	cancelRefresh()
 	now := time.Now().UTC()
 	if errRefresh != nil {
 		snapshot := target.Clone()
@@ -1318,7 +1488,18 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 		if terminalAuthFailure {
 			return nil, newUnauthorizedRefreshError()
 		}
-		return nil, errRefresh
+		if errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+			return nil, errRefresh
+		}
+		return nil, NewTransientRefreshError()
+	}
+	if !refreshAttempted {
+		snapshot := target.Clone()
+		applyUnsupportedRefreshBackoff(snapshot, now)
+		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
+			return nil, errUpdate
+		}
+		return nil, ErrRefreshUnsupported
 	}
 	if updated == nil {
 		updated = target.Clone()
@@ -1326,9 +1507,7 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 	if updated.Runtime == nil {
 		updated.Runtime = target.Runtime
 	}
-	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
+	modelsToResume := applyRefreshSuccessState(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
@@ -1336,6 +1515,7 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 	if errUpdate != nil {
 		return nil, errUpdate
 	}
+	resumeRefreshedModels(updated.ID, modelsToResume)
 	if targetIndex != authIndex {
 		refreshed, ok := m.GetByIndex(authIndex)
 		if !ok || refreshed == nil {
@@ -1348,7 +1528,6 @@ func (m *Manager) RefreshNow(ctx context.Context, authIndex string) (*Auth, erro
 
 // RefreshAuthCredential refreshes a full auth value without updating memory or persistence.
 func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Auth, error) {
-	// Resolve credential context before calling upstream OAuth services.
 	if m == nil {
 		return nil, fmt.Errorf("auth manager: nil manager")
 	}
@@ -1366,11 +1545,14 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 		cfg = &internalconfig.Config{}
 	}
 
-	rt := m.roundTripperFor(target)
-	updated, handledPluginRefresh, errRefresh := m.refreshViaPlugin(ctx, target)
+	refreshCtx, cancelRefresh := withRefreshProviderTimeout(ctx)
+	updated, handledPluginRefresh, errRefresh := m.refreshViaPlugin(refreshCtx, target)
+	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
-		updated, errRefresh = refreshCredential(ctx, cfg, target.Clone(), rt)
+		refreshAttempted = authSupportsBuiltInRefresh(target)
+		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
 	}
+	cancelRefresh()
 	now := time.Now().UTC()
 	if errRefresh != nil {
 		snapshot := target.Clone()
@@ -1379,7 +1561,15 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 		if terminalAuthFailure {
 			return snapshot, newUnauthorizedRefreshError()
 		}
-		return snapshot, errRefresh
+		if errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+			return snapshot, errRefresh
+		}
+		return snapshot, NewTransientRefreshError()
+	}
+	if !refreshAttempted {
+		snapshot := target.Clone()
+		applyUnsupportedRefreshBackoff(snapshot, now)
+		return snapshot, ErrRefreshUnsupported
 	}
 	if updated == nil {
 		updated = target.Clone()
@@ -1387,9 +1577,7 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	if updated.Runtime == nil {
 		updated.Runtime = target.Runtime
 	}
-	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
+	applyRefreshSuccessState(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
@@ -1398,7 +1586,6 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 
 // refreshAuth refreshes an auth.
 func (m *Manager) refreshAuth(ctx context.Context, authID string) {
-	// Resolve credential context before calling upstream OAuth services.
 	if m == nil {
 		return
 	}
@@ -1412,7 +1599,7 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 
 	m.mu.RLock()
 	current := m.auths[authID]
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	autoRefreshHandler := m.autoRefreshHandler
 	m.mu.RUnlock()
 	if current == nil {
 		return
@@ -1426,50 +1613,183 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 		return
 	}
 	current = fullCurrent
-	if cfg == nil {
-		cfg = &internalconfig.Config{}
-	}
-
-	now := time.Now()
+	now := time.Now().UTC()
 	if !m.shouldRefresh(current, now) {
 		return
 	}
 
-	updated, handledPluginRefresh, errRefresh := m.refreshViaPlugin(ctx, current)
-	if !handledPluginRefresh {
-		updated, errRefresh = refreshCredential(ctx, cfg, current.Clone(), m.roundTripperFor(current))
-	}
-	if errRefresh != nil && errors.Is(errRefresh, context.Canceled) {
-		log.Debugf("auth refresh canceled | auth=%s provider=%s", authID, current.Provider)
+	if autoRefreshHandler != nil {
+		if errRefresh := autoRefreshHandler(ctx, current.Clone()); errRefresh != nil {
+			switch {
+			case errors.Is(errRefresh, context.Canceled), errors.Is(errRefresh, context.DeadlineExceeded):
+				log.Debugf("auth refresh canceled | auth=%s provider=%s", authID, current.Provider)
+			case errors.Is(errRefresh, ErrRefreshUnsupported):
+				log.Debugf("auth refresh unsupported | auth=%s provider=%s", authID, current.Provider)
+			default:
+				logEntryWithRequestID(ctx).Warnf("auth refresh failed | auth=%s provider=%s err=%s", authID, current.Provider, refreshTransientErrorMsg)
+			}
+		}
 		return
 	}
+
+	beforeRefresh := current.Clone()
+	updated, errRefresh := m.RefreshAuthCredential(ctx, current)
 	if errRefresh != nil {
-		if isTerminalRefreshAuthError(errRefresh) {
-			logEntryWithRequestID(ctx).Warnf("auth refresh disabled terminal credential | auth=%s provider=%s", authID, current.Provider)
-		} else {
-			logEntryWithRequestID(ctx).Warnf("auth refresh failed | auth=%s provider=%s err=%v", authID, current.Provider, errRefresh)
-		}
-		snapshot := current.Clone()
-		applyRefreshFailureState(snapshot, errRefresh, now)
-		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
-			logEntryWithRequestID(ctx).Warnf("auth refresh failure state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
+		if updated != nil {
+			if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
+				logEntryWithRequestID(ctx).Warnf("auth refresh failure state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
+			}
 		}
 		return
 	}
-	if updated == nil {
-		updated = current.Clone()
+	modelsToResume := refreshedUnauthorizedModels(beforeRefresh, updated)
+	if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
+		logEntryWithRequestID(ctx).Warnf("auth refresh state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
+		return
 	}
-	if updated.Runtime == nil {
-		updated.Runtime = current.Runtime
+	resumeRefreshedModels(updated.ID, modelsToResume)
+}
+
+// ApplyRefreshSuccessState clears refresh errors and unauthorized execution state.
+func ApplyRefreshSuccessState(auth *Auth, now time.Time) []string {
+	return applyRefreshSuccessState(auth, now)
+}
+
+// applyRefreshSuccessState clears only refresh errors and unauthorized execution state.
+func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
+	if auth == nil {
+		return nil
 	}
-	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
-	updated.UpdatedAt = now
-	if m.shouldRefresh(updated, now) {
-		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
+	authQuota := auth.Quota
+	preserveAuthQuota := authQuota.Exceeded && authQuota.NextRecoverAt.After(now) && !quotaAggregatedFromModel(authQuota, auth.ModelStates)
+	clearUnauthorizedAuth := isUnauthorizedAuthState(auth)
+	clearRefreshAcquisition := isRefreshAcquisitionState(auth)
+
+	auth.LastRefreshedAt = now
+	auth.NextRefreshAfter = time.Time{}
+	auth.UpdatedAt = now
+	if clearRefreshAcquisition {
+		auth.LastError = nil
 	}
-	_, _ = m.Update(ctx, updated)
+	if clearUnauthorizedAuth {
+		auth.NextRetryAfter = time.Time{}
+		auth.Unavailable = false
+		auth.LastError = nil
+		auth.StatusMessage = ""
+	}
+
+	resumed := make([]string, 0)
+	for model, state := range auth.ModelStates {
+		if !isUnauthorizedModelState(state) {
+			continue
+		}
+		if resetUnauthorizedModelStateAfterRefresh(state, now) {
+			resumed = append(resumed, model)
+		}
+	}
+	if clearUnauthorizedAuth || len(resumed) > 0 {
+		updateAggregatedAvailability(auth, now)
+	}
+	if preserveAuthQuota {
+		auth.Quota = authQuota
+		auth.Unavailable = true
+		if auth.NextRetryAfter.Before(authQuota.NextRecoverAt) {
+			auth.NextRetryAfter = authQuota.NextRecoverAt
+		}
+	}
+	if wasDisabled {
+		auth.Status = StatusDisabled
+		auth.Unavailable = true
+	} else if preserveAuthQuota || hasModelError(auth, now) {
+		auth.Status = StatusError
+	} else if clearUnauthorizedAuth || len(resumed) > 0 {
+		auth.Status = StatusActive
+	}
+	return resumed
+}
+
+func resetUnauthorizedModelStateAfterRefresh(state *ModelState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	quota := state.Quota
+	resetModelState(state, now)
+	if quota.Exceeded && quota.NextRecoverAt.After(now) {
+		state.Status = StatusError
+		state.StatusMessage = strings.TrimSpace(quota.Reason)
+		state.Unavailable = true
+		state.NextRetryAfter = quota.NextRecoverAt
+		state.Quota = quota
+		return false
+	}
+	return true
+}
+
+func quotaAggregatedFromModel(quota QuotaState, states map[string]*ModelState) bool {
+	for _, state := range states {
+		if state == nil || !state.Quota.Exceeded {
+			continue
+		}
+		if state.Quota.NextRecoverAt.Equal(quota.NextRecoverAt) && state.Quota.BackoffLevel == quota.BackoffLevel && strings.TrimSpace(state.Quota.Reason) == strings.TrimSpace(quota.Reason) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRefreshAcquisitionState(auth *Auth) bool {
+	if auth == nil || auth.LastError == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.LastError.Code)) {
+	case refreshTransientErrorCode, refreshUnsupportedCode:
+		return true
+	default:
+		return false
+	}
+}
+
+func isUnauthorizedAuthState(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "unauthorized") {
+		return true
+	}
+	return auth.LastError != nil && (auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(strings.TrimSpace(auth.LastError.Code), "unauthorized"))
+}
+
+func isUnauthorizedModelState(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(state.StatusMessage), "unauthorized") {
+		return true
+	}
+	return state.LastError != nil && (state.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(strings.TrimSpace(state.LastError.Code), "unauthorized"))
+}
+
+func refreshedUnauthorizedModels(before, after *Auth) []string {
+	if before == nil || after == nil {
+		return nil
+	}
+	models := make([]string, 0)
+	for model, state := range before.ModelStates {
+		if !isUnauthorizedModelState(state) {
+			continue
+		}
+		if next := after.ModelStates[model]; next == nil || !isUnauthorizedModelState(next) {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+func resumeRefreshedModels(authID string, models []string) {
+	for _, model := range models {
+		registry.GetGlobalRegistry().ResumeClientModel(authID, model)
+	}
 }
 
 // logEntryWithRequestID returns a logrus entry with request_id field if available in context.

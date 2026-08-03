@@ -68,6 +68,8 @@ type Auth struct {
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
+	// StateVersion is the storage revision of this runtime snapshot when available.
+	StateVersion int64 `json:"-"`
 
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`

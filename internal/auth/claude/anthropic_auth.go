@@ -168,7 +168,7 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 	}
 
 	result, err, _ := claudeRefreshGroup.Do(refreshToken, func() (interface{}, error) {
-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+		return o.refreshTokensSingleFlight(ctx, refreshToken)
 	})
 	if err != nil {
 		return nil, err
@@ -274,7 +274,7 @@ func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken st
 		}
 
 		lastErr = err
-		log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
+		log.Warnf("Token refresh attempt %d failed with a provider response", attempt+1)
 		if !isClaudeRefreshRetryable(err) {
 			break
 		}
