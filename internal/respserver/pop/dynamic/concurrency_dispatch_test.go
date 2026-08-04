@@ -154,6 +154,39 @@ func TestConcurrencyDispatchFixture(t *testing.T) {
 	}
 }
 
+func TestPrepareDispatchResponseIncludesForceMapping(t *testing.T) {
+	result := &home.DispatchResult{
+		Model:         "gemini-3-flash-agent",
+		Provider:      "antigravity",
+		ForceMapping:  true,
+		OriginalAlias: "gemini-3.5-flash",
+		Auth: &coreauth.Auth{
+			ID:       "antigravity-auth",
+			Index:    "antigravity-auth",
+			Provider: "antigravity",
+			Status:   coreauth.StatusActive,
+		},
+		Concurrency: home.ConcurrencyAdmissionResult{
+			Accounted:    true,
+			CredentialID: "antigravity-auth",
+			Model:        "gemini-3-flash-agent",
+		},
+	}
+
+	unaccounted, accounted, errPrepare := prepareDispatchResponse(result, "user-key")
+	if errPrepare != nil {
+		t.Fatalf("prepareDispatchResponse() error = %v", errPrepare)
+	}
+	for name, payload := range map[string][]byte{"unaccounted": unaccounted, "accounted": accounted} {
+		if !gjson.GetBytes(payload, "force_mapping").Bool() {
+			t.Fatalf("%s response = %s, want force_mapping true", name, payload)
+		}
+		if got := gjson.GetBytes(payload, "original_alias").String(); got != "gemini-3.5-flash" {
+			t.Fatalf("%s original_alias = %q, want gemini-3.5-flash", name, got)
+		}
+	}
+}
+
 func TestHandleAuthSkipsSaturatedAffinityCandidate(t *testing.T) {
 	runtime, admitter := newConcurrencyDispatchRuntime(t, []string{"cred-a", "cred-b"})
 	admitter.SetResult("cred-a", concurrencyError("credential_concurrency_exceeded"))

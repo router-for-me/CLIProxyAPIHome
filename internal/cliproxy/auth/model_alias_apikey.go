@@ -84,7 +84,10 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 // resolveDispatchModel resolves the auth-specific upstream model used for execution and runtime state.
 func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchModelResolution {
 	requestedModel := rewriteModelForAuth(routeModel, auth)
-	requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
+	oauthAlias := m.resolveOAuthModelAlias(auth, requestedModel)
+	if strings.TrimSpace(oauthAlias.upstreamModel) != "" {
+		requestedModel = oauthAlias.upstreamModel
+	}
 	resolved := m.applyAPIKeyModelAlias(auth, requestedModel)
 	if strings.TrimSpace(resolved) == "" {
 		resolved = requestedModel
@@ -96,7 +99,10 @@ func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchMo
 	if resolved == "" {
 		return dispatchModelResolution{}
 	}
-	forceMapping, originalAlias := forceMappingFromAuthConfigModels(auth, requestedModel)
+	forceMapping, originalAlias := oauthAlias.forceMapping, oauthAlias.originalAlias
+	if !forceMapping {
+		forceMapping, originalAlias = forceMappingFromAuthConfigModels(auth, requestedModel)
+	}
 	return dispatchModelResolution{
 		Model:         resolved,
 		Key:           canonicalModelKey(resolved),
