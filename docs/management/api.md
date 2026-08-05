@@ -182,6 +182,7 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/credentials/concurrency` |
 | `GET` | `/credentials/:credential_id/concurrency-policy` |
 | `PATCH` | `/credentials/:credential_id/concurrency-policy` |
+| `DELETE` | `/credentials/:credential_id/cooldown` |
 | `GET` | `/config.yaml` |
 | `PUT` | `/config.yaml` |
 | `GET` | `/debug` |
@@ -2615,6 +2616,36 @@ Example response:
 }
 ```
 
+### DELETE `/credentials/:credential_id/cooldown`
+
+Clears Home-owned execution quota cooldown state for one credential. Without a query parameter, the operation clears quota cooldowns for every model. With `?model=<model>`, request-option suffixes such as `(high)` are removed and credential-specific public aliases or prefixes are resolved to the canonical upstream model before lookup. The compatibility route-model key is also cleared when it differs from the upstream key.
+
+Execution cooldowns are always scoped to a credential and canonical model pair; Home never creates a credential-wide execution cooldown. CPA execution results without a canonical model are ignored by the cooldown state machine. HTTP 429 results use the capped model-level exponential backoff and do not use `Retry-After` or provider `retryDelay` hints for scheduling.
+
+This operation is idempotent. It only clears cooldown state created by quota-exceeded/HTTP 429 results: quota flags, retry deadline, and backoff level. It does not enable a manually disabled credential, clear model-level 401/403/404/5xx state, change refresh scheduling, modify provider quota snapshots, or consume provider reset credits.
+
+Examples:
+
+```http
+DELETE /credentials/credential-db-id/cooldown
+DELETE /credentials/credential-db-id/cooldown?model=gpt-5
+```
+
+Example model-scoped response:
+
+```json
+{
+  "status": "ok",
+  "credential_id": "credential-db-id",
+  "scope": "model",
+  "model": "gpt-5",
+  "cleared": true,
+  "cleared_models": ["gpt-5"]
+}
+```
+
+For an all-model request, `scope` is `all` and `model` is omitted. `cleared` is `false` when the credential exists but the requested scope has no quota cooldown. An unknown credential returns HTTP `404` with `error: "credential_not_found"`; an explicitly empty `model` returns HTTP `400` with `error: "model_required"`; an unavailable atomic state backend returns HTTP `503` with `error: "cooldown_reset_unavailable"`.
+
 ### Credential in-flight observation
 
 `GET /credentials/in-flight` returns bounded request details derived only from the latest complete CPA snapshots. It accepts optional `credential_id` and `model` exact-match filters plus `limit` and `offset`. `limit` defaults to 100 and is bounded to 1 through 1000; `offset` defaults to 0. Each item contains `request_id`, `credential_id`, normalized upstream `model`, `request_kind`, and `started_at`. `request_id` is a display and correlation field, not a row-uniqueness guarantee; clients must preserve distinct returned rows even when request IDs repeat. A credential with a policy also includes its authoritative `limiter` state. It never exposes CPA identity, tokens, or request payloads. Every response also returns `total`, nullable `next_offset`, nullable `snapshot_cursor`, nullable `snapshot_cursor_read_at`, and nullable `snapshot_expires_at`. When `offset + returned item count < total`, `next_offset` equals that sum; otherwise `next_offset` is `null`.
@@ -2704,6 +2735,7 @@ Response fields:
 | `capabilities.credential_in_flight_snapshots` | boolean | Whether the independent CPA in-flight observation snapshot APIs are available. |
 | `capabilities.credential_in_flight_snapshot_cursor` | boolean | Whether `GET /credentials/in-flight` supports database-backed stable snapshot cursors for multi-page reads. |
 | `capabilities.credential_concurrency_limits_v2` | boolean | Whether concurrency policy and authoritative admitted-counter APIs are available. |
+| `capabilities.credential_cooldown_reset` | boolean | Whether `DELETE /credentials/:credential_id/cooldown` supports all-model and model-scoped quota cooldown resets. |
 | `server_info.home_version` | string | Home build version. |
 | `server_info.home_commit` | string | Home build commit. |
 | `server_info.home_build_date` | string | Home build time. |
@@ -3970,7 +4002,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `plugins.configs` | object | Per-plugin config keyed by plugin ID. Store installs write a pinned `store` manifest under each plugin entry. Home-mode CPA nodes download store entries from that manifest; Home downloads and loads them only when `load-in-home: true` is explicitly set. |
 | `usage-statistics-enabled` | boolean | Enables in-memory usage aggregation. Home forces this to `true` for downstream CPA nodes and rejects disabling it through Management API updates. |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue retention window. Default `60`, max `3600`. |
-| `disable-cooling` | boolean | Globally disables quota cooldown scheduling. Home forces this to `true` for downstream CPA nodes. |
+| `disable-cooling` | boolean | Compatibility field. Home is the sole credential scheduler and always normalizes this to `false` so central quota cooldown remains enabled. Config sent to downstream CPA nodes is independently forced to `true`, disabling only CPA-local cooldown. |
 | `auth-auto-refresh-workers` | integer | Overrides auth auto-refresh worker count. |
 | `request-retry` | integer | Failed request retry count. |
 | `max-retry-credentials` | integer | Max credentials to try per failed request; `<=0` means all available. |

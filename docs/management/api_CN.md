@@ -182,6 +182,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/credentials/concurrency` |
 | `GET` | `/credentials/:credential_id/concurrency-policy` |
 | `PATCH` | `/credentials/:credential_id/concurrency-policy` |
+| `DELETE` | `/credentials/:credential_id/cooldown` |
 | `GET` | `/config.yaml` |
 | `PUT` | `/config.yaml` |
 | `GET` | `/debug` |
@@ -2614,6 +2615,36 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 }
 ```
 
+### DELETE `/credentials/:credential_id/cooldown`
+
+清除一个凭证中由 Home 管理的执行 quota cooldown。不带 query 参数时，会清除全部模型的 quota cooldown；带 `?model=<model>` 时，会先移除请求选项后缀（例如 `(high)`），再按目标凭证把公开 alias 或 prefix 解析为 canonical upstream model 后查找。若兼容用的 route-model key 与 upstream key 不同，也会一并清除。
+
+执行 cooldown 始终限定到 credential 与 canonical model 的组合；Home 不会创建凭证级执行 cooldown。缺少 canonical model 的 CPA 执行结果不会进入 cooldown 状态机。HTTP 429 始终使用有上限的模型级指数退避，不使用 `Retry-After` 或 provider `retryDelay` 提示进行调度。
+
+该操作是幂等的，只清除 quota-exceeded/HTTP 429 产生的 cooldown 状态，包括 quota 标记、retry deadline 和 backoff level。它不会启用人工 disabled 的凭证，不会清除模型级 401/403/404/5xx 状态，不会改变 refresh 调度、修改 provider quota snapshot，也不会消费 provider reset credit。
+
+示例：
+
+```http
+DELETE /credentials/credential-db-id/cooldown
+DELETE /credentials/credential-db-id/cooldown?model=gpt-5
+```
+
+指定 model 的响应示例：
+
+```json
+{
+  "status": "ok",
+  "credential_id": "credential-db-id",
+  "scope": "model",
+  "model": "gpt-5",
+  "cleared": true,
+  "cleared_models": ["gpt-5"]
+}
+```
+
+全模型请求的 `scope` 为 `all`，且不返回 `model`。凭证存在但目标范围当前没有 quota cooldown 时，`cleared` 为 `false`。未知凭证返回 HTTP `404` 和 `error: "credential_not_found"`；显式提供空 `model` 返回 HTTP `400` 和 `error: "model_required"`；原子状态后端不可用时返回 HTTP `503` 和 `error: "cooldown_reset_unavailable"`。
+
 ### Credential in-flight observation
 
 `GET /credentials/in-flight` 只返回从最新完整 CPA snapshot 派生的有界请求详情。它支持可选的精确匹配 `credential_id`、`model` 过滤，以及 `limit` 和 `offset`。`limit` 默认 100，范围为 1 到 1000；`offset` 默认 0。每项包含 `request_id`、`credential_id`、规范化上游 `model`、`request_kind` 和 `started_at`。`request_id` 只是展示和关联字段，不保证每行唯一；即使 request ID 重复，客户端也必须保留后端返回的不同记录。带有策略的凭证还会包含权威 `limiter` 状态。接口绝不暴露 CPA 身份、token 或请求 payload。每个响应还会返回 `total`、可空的 `next_offset`、可空的 `snapshot_cursor`、可空的 `snapshot_cursor_read_at` 和可空的 `snapshot_expires_at`。当 `offset + 本页返回条数 < total` 时，`next_offset` 必须等于该和值；否则 `next_offset` 为 `null`。
@@ -2703,6 +2734,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-
 | `capabilities.credential_in_flight_snapshots` | boolean | 是否支持独立的 CPA in-flight observation snapshot 接口。 |
 | `capabilities.credential_in_flight_snapshot_cursor` | boolean | `GET /credentials/in-flight` 是否支持数据库支持的稳定 snapshot cursor 多页读取。 |
 | `capabilities.credential_concurrency_limits_v2` | boolean | 是否支持 concurrency policy 和权威已准入计数接口。 |
+| `capabilities.credential_cooldown_reset` | boolean | 是否支持通过 `DELETE /credentials/:credential_id/cooldown` 清除全部模型或指定模型的 quota cooldown。 |
 | `server_info.home_version` | string | Home 构建版本。 |
 | `server_info.home_commit` | string | Home 构建 commit。 |
 | `server_info.home_build_date` | string | Home 构建时间。 |
@@ -3939,7 +3971,7 @@ DELETE query：
 | `plugins.configs` | object | 以插件 ID 为 key 的单插件配置。插件商店安装会在插件条目下写入固定 `store` manifest；Home-mode CPA 节点根据该 manifest 下载产物，Home 仅在显式设置 `load-in-home: true` 时下载并加载。 |
 | `usage-statistics-enabled` | boolean | 启用内存 usage aggregation。Home 会向下游 CPA 强制为 `true`，并拒绝通过 Management API 关闭。 |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue 保留窗口；默认 `60`，最大 `3600`。 |
-| `disable-cooling` | boolean | 全局禁用 quota cooldown scheduling。Home 会向下游 CPA 强制为 `true`。 |
+| `disable-cooling` | boolean | 兼容字段。Home 是唯一的凭证调度器，会始终将该值规范为 `false`，确保中央 quota cooldown 启用；发送给下游 CPA 的配置会独立强制为 `true`，仅禁用 CPA 本地 cooldown。 |
 | `auth-auto-refresh-workers` | integer | 覆盖 auth auto-refresh worker 数量。 |
 | `request-retry` | integer | 失败请求重试次数。 |
 | `max-retry-credentials` | integer | 一个失败请求最多尝试的凭证数量；`<=0` 表示所有可用凭证。 |

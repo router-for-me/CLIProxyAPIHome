@@ -178,7 +178,8 @@ max-retry-credentials: 0
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
 max-retry-interval: 30
 
-# When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
+# Home always owns auth/model cooldown scheduling and normalizes this to false.
+# Home-mode CPA nodes always receive true and defer credential management to Home.
 disable-cooling: false
 
 # disable-image-generation supports: false (default), true, or "chat".

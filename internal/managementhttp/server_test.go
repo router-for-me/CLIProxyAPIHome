@@ -168,6 +168,7 @@ func TestClusterManagementInFlightRoutesRegistered(t *testing.T) {
 		{Method: http.MethodGet, Path: "/credentials/concurrency"},
 		{Method: http.MethodGet, Path: "/credentials/:credential_id/concurrency-policy"},
 		{Method: http.MethodPatch, Path: "/credentials/:credential_id/concurrency-policy"},
+		{Method: http.MethodDelete, Path: "/credentials/:credential_id/cooldown"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)

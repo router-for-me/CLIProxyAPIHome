@@ -177,7 +177,7 @@ func TestApplyRefreshFailureStateKeepsTransientFailuresRetryable(t *testing.T) {
 	}
 }
 
-func TestApplyRefreshSuccessStateClearsUnauthorizedCooldown(t *testing.T) {
+func TestApplyRefreshSuccessStateClearsUnauthorizedModelCooldown(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().UTC()

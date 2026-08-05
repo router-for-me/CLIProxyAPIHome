@@ -12,6 +12,7 @@ func TestSanitizeConfigYAMLForDownstream_RemovesSensitiveKeys(t *testing.T) {
 # head comment
 host: ""
 port: 8327
+disable-cooling: false
 tls:
   enable: false
 remote-management:

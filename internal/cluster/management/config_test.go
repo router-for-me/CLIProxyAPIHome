@@ -529,7 +529,7 @@ func stringSliceContains(values []string, target string) bool {
 	return false
 }
 
-func TestPutConfigYAMLForcesHomeModeScalarsAndPreservesRemoteManagement(t *testing.T) {
+func TestPutConfigYAMLEnablesCentralCoolingAndHomeInvariants(t *testing.T) {
 	db, cleanup := openManagementLogTestDB(t)
 	defer cleanup()
 
@@ -542,7 +542,7 @@ func TestPutConfigYAMLForcesHomeModeScalarsAndPreservesRemoteManagement(t *testi
 
 	payload := `port: 8327
 usage-statistics-enabled: false
-disable-cooling: false
+disable-cooling: true
 ws-auth: true
 remote-management:
   allow-remote: true
@@ -587,8 +587,8 @@ plugins:
 	if cfg["usage-statistics-enabled"] != true {
 		t.Fatalf("usage-statistics-enabled = %v, want true", cfg["usage-statistics-enabled"])
 	}
-	if cfg["disable-cooling"] != true {
-		t.Fatalf("disable-cooling = %v, want true", cfg["disable-cooling"])
+	if cfg["disable-cooling"] != false {
+		t.Fatalf("disable-cooling = %v, want Home central cooling enabled", cfg["disable-cooling"])
 	}
 	if cfg["ws-auth"] != false {
 		t.Fatalf("ws-auth = %v, want false", cfg["ws-auth"])
@@ -627,6 +627,15 @@ plugins:
 	engine.ServeHTTP(yamlResp, yamlReq)
 	if yamlResp.Code != http.StatusOK {
 		t.Fatalf("yaml status = %d, body = %s", yamlResp.Code, yamlResp.Body.String())
+	}
+	if !strings.Contains(yamlResp.Body.String(), "usage-statistics-enabled: true") {
+		t.Fatalf("config yaml = %s, want Home usage statistics forced true", yamlResp.Body.String())
+	}
+	if !strings.Contains(yamlResp.Body.String(), "disable-cooling: false") {
+		t.Fatalf("config yaml = %s, want Home central cooling enabled", yamlResp.Body.String())
+	}
+	if !strings.Contains(yamlResp.Body.String(), "ws-auth: false") {
+		t.Fatalf("config yaml = %s, want Home ws-auth forced false", yamlResp.Body.String())
 	}
 	if !strings.Contains(yamlResp.Body.String(), "allow-remote: true") {
 		t.Fatalf("config yaml = %s, want allow-remote preserved true", yamlResp.Body.String())

@@ -1,17 +1,21 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
-func TestForceDownstreamHomeModeConfigPreservesRemoteManagement(t *testing.T) {
+func TestForceHomeRuntimeConfigEnablesCentralCooling(t *testing.T) {
 	cfg := &Config{}
 	cfg.APIKeys = []string{"local-key"}
 	cfg.UsageStatisticsEnabled = false
-	cfg.DisableCooling = false
+	cfg.DisableCooling = true
 	cfg.WebsocketAuth = true
 	cfg.RemoteManagement.AllowRemote = true
 	cfg.RemoteManagement.DisableControlPanel = false
 
-	ForceDownstreamHomeModeConfig(cfg)
+	ForceHomeRuntimeConfig(cfg)
 
 	if len(cfg.APIKeys) != 0 {
 		t.Fatalf("APIKeys = %#v, want nil/empty", cfg.APIKeys)
@@ -19,8 +23,8 @@ func TestForceDownstreamHomeModeConfigPreservesRemoteManagement(t *testing.T) {
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("UsageStatisticsEnabled = false, want true")
 	}
-	if !cfg.DisableCooling {
-		t.Fatal("DisableCooling = false, want true")
+	if cfg.DisableCooling {
+		t.Fatal("DisableCooling = true, want Home central cooling enabled")
 	}
 	if cfg.WebsocketAuth {
 		t.Fatal("WebsocketAuth = true, want false")
@@ -30,6 +34,55 @@ func TestForceDownstreamHomeModeConfigPreservesRemoteManagement(t *testing.T) {
 	}
 	if cfg.RemoteManagement.DisableControlPanel {
 		t.Fatal("RemoteManagement.DisableControlPanel = true, want preserved false")
+	}
+}
+
+func TestLoadConfigOptionalEnablesCentralCooling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(path, []byte(`api-keys:
+  - local-key
+usage-statistics-enabled: false
+disable-cooling: true
+ws-auth: true
+`), 0o600); errWrite != nil {
+		t.Fatalf("write config: %v", errWrite)
+	}
+
+	cfg, errLoad := LoadConfigOptional(path, false)
+	if errLoad != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", errLoad)
+	}
+	if len(cfg.APIKeys) != 0 {
+		t.Fatalf("APIKeys = %#v, want nil/empty", cfg.APIKeys)
+	}
+	if !cfg.UsageStatisticsEnabled {
+		t.Fatal("UsageStatisticsEnabled = false, want true")
+	}
+	if cfg.DisableCooling {
+		t.Fatal("DisableCooling = true, want Home central cooling enabled")
+	}
+	if cfg.WebsocketAuth {
+		t.Fatal("WebsocketAuth = true, want false")
+	}
+}
+
+func TestApplyHomeRuntimeScalarsEnablesCentralCooling(t *testing.T) {
+	root := map[string]any{
+		"usage-statistics-enabled": false,
+		"disable-cooling":          true,
+		"ws-auth":                  true,
+	}
+
+	ApplyHomeRuntimeScalars(root)
+
+	if root["usage-statistics-enabled"] != true {
+		t.Fatalf("usage-statistics-enabled = %v, want true", root["usage-statistics-enabled"])
+	}
+	if root["disable-cooling"] != false {
+		t.Fatalf("disable-cooling = %v, want Home central cooling enabled", root["disable-cooling"])
+	}
+	if root["ws-auth"] != false {
+		t.Fatalf("ws-auth = %v, want false", root["ws-auth"])
 	}
 }
 
