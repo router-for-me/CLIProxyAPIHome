@@ -206,6 +206,44 @@ func TestClearQuotaCooldownOverridesNewerLocalQuotaTimestamp(t *testing.T) {
 	}
 }
 
+func TestClearQuotaCooldownResolvesConfiguredAlias(t *testing.T) {
+	const authID = "auth-reset-alias"
+	const routeModel = "team/alias-b"
+	const upstreamModel = "upstream-shared"
+	now := time.Now().UTC()
+	quotaState := quotaCooldownModelState(now, 10*time.Minute)
+	quotaState.Quota.Scope = quotaScopeModel
+	auth := geminiAPIKeyAuth(authID, "high-key", "1")
+	auth.Prefix = "team"
+	auth.Status = StatusError
+	auth.Quota = quotaState.Quota
+	auth.ModelStates = map[string]*ModelState{
+		routeModel:    quotaState.Clone(),
+		upstreamModel: quotaState,
+	}
+	store := &fakeMutatorStore{persisted: auth.Clone()}
+	manager := NewManager(store, nil, nil)
+	setGeminiAliasConfig(manager)
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	result, errClear := manager.ClearQuotaCooldown(context.Background(), authID, routeModel+"(high)")
+	if errClear != nil {
+		t.Fatalf("ClearQuotaCooldown() error = %v", errClear)
+	}
+	if !result.Cleared || result.Model != upstreamModel || !reflect.DeepEqual(result.ClearedModels, []string{routeModel, upstreamModel}) {
+		t.Fatalf("ClearQuotaCooldown() result = %#v", result)
+	}
+	persisted := store.persistedSnapshot()
+	for _, model := range []string{routeModel, upstreamModel} {
+		state := persisted.ModelStates[model]
+		if state == nil || state.Quota.Exceeded || state.Unavailable || state.QuotaResetAt.IsZero() {
+			t.Fatalf("persisted %s state after alias reset = %#v", model, state)
+		}
+	}
+}
+
 func TestMergePersistedModelStatePreservesActiveQuotaWithNewerNonQuotaError(t *testing.T) {
 	now := time.Now().UTC()
 	quotaRecover := now.Add(10 * time.Minute)
@@ -656,6 +694,29 @@ func TestReconcileRegistryModelStatesKeepsTransientErrorsVisible(t *testing.T) {
 				t.Fatalf("registry hid model for transient HTTP %d", tc.status)
 			}
 		})
+	}
+}
+
+func TestReconcileRegistryModelStatesMapsUpstreamStateToRegisteredAlias(t *testing.T) {
+	const authID = "auth-registry-alias"
+	const routeModel = "team/alias-b"
+	const upstreamModel = "upstream-shared"
+	manager := NewManager(nil, nil, nil)
+	setGeminiAliasConfig(manager)
+	auth := geminiAPIKeyAuth(authID, "high-key", "1")
+	auth.Prefix = "team"
+	registerDispatchTestAuth(t, manager, auth, routeModel)
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "gemini",
+		Model:    upstreamModel,
+		Error:    &Error{Message: "forbidden", HTTPStatus: http.StatusForbidden},
+	})
+	manager.ReconcileRegistryModelStates(context.Background(), authID)
+
+	if registryHasAvailableModel(registry.GetGlobalRegistry(), routeModel) {
+		t.Fatal("registry kept alias visible despite blocked upstream model")
 	}
 }
 

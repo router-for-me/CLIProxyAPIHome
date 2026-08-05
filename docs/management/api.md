@@ -2618,7 +2618,7 @@ Example response:
 
 ### DELETE `/credentials/:credential_id/cooldown`
 
-Clears Home-owned execution quota cooldown state for one credential. Without a query parameter, the operation clears quota cooldowns for every model. With `?model=<model>`, it clears only the canonicalized model key; request-option suffixes such as `(high)` are removed before lookup.
+Clears Home-owned execution quota cooldown state for one credential. Without a query parameter, the operation clears quota cooldowns for every model. With `?model=<model>`, request-option suffixes such as `(high)` are removed and credential-specific public aliases or prefixes are resolved to the canonical upstream model before lookup. The compatibility route-model key is also cleared when it differs from the upstream key.
 
 Execution cooldowns are always scoped to a credential and canonical model pair; Home never creates a credential-wide execution cooldown. CPA execution results without a canonical model are ignored by the cooldown state machine. HTTP 429 results use the capped model-level exponential backoff and do not use `Retry-After` or provider `retryDelay` hints for scheduling.
 

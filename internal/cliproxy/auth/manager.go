@@ -538,31 +538,49 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 	}
 
 	modelRegistry := registry.GetGlobalRegistry()
-	models := make(map[string]struct{}, len(auth.ModelStates))
+	// Registry IDs are client-visible route models, while execution state is
+	// keyed by the credential-specific upstream model. Keep both so aliases and
+	// credential prefixes reconcile against the same state used by Dispatch.
+	models := make(map[string]string, len(auth.ModelStates))
 	for model := range auth.ModelStates {
 		if model = canonicalModelKey(model); model != "" {
-			models[model] = struct{}{}
+			models[model] = model
 		}
 	}
 	for _, model := range modelRegistry.GetModelsForClient(auth.ID) {
-		if model != nil {
-			if modelID := canonicalModelKey(model.ID); modelID != "" {
-				models[modelID] = struct{}{}
-			}
+		if model == nil {
+			continue
 		}
+		registryModel := strings.TrimSpace(model.ID)
+		if registryModel == "" {
+			continue
+		}
+		stateModel := canonicalModelKey(registryModel)
+		if resolved := m.resolveDispatchModel(auth, registryModel); resolved.Key != "" {
+			stateModel = resolved.Key
+		}
+		models[registryModel] = stateModel
 	}
 
 	now := time.Now()
-	for model := range models {
-		blocked, reason, _ := isAuthBlockedForModel(auth, model, now)
+	for registryModel, stateModel := range models {
+		blocked, reason, _ := isAuthBlockedForModel(auth, stateModel, now)
+		legacyModel := canonicalModelKey(registryModel)
+		if !blocked && stateModel != legacyModel {
+			if legacyBlocked, legacyReason, _ := isAuthBlockedForModel(auth, legacyModel, now); legacyBlocked {
+				blocked = true
+				reason = legacyReason
+				stateModel = legacyModel
+			}
+		}
 		if blocked && reason == blockReasonCooldown {
-			modelRegistry.SetModelQuotaExceeded(auth.ID, model)
+			modelRegistry.SetModelQuotaExceeded(auth.ID, registryModel)
 		} else {
-			modelRegistry.ClearModelQuotaExceeded(auth.ID, model)
+			modelRegistry.ClearModelQuotaExceeded(auth.ID, registryModel)
 		}
 
-		if !blocked || !shouldSuspendRegistryModel(auth, model, reason) {
-			modelRegistry.ResumeClientModel(auth.ID, model)
+		if !blocked || !shouldSuspendRegistryModel(auth, stateModel, reason) {
+			modelRegistry.ResumeClientModel(auth.ID, registryModel)
 			continue
 		}
 		suspendReason := "unavailable"
@@ -572,14 +590,14 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 		case blockReasonDisabled:
 			suspendReason = "disabled"
 		default:
-			if state := auth.ModelStates[model]; state != nil && strings.TrimSpace(state.StatusMessage) != "" {
+			if state := auth.ModelStates[stateModel]; state != nil && strings.TrimSpace(state.StatusMessage) != "" {
 				suspendReason = strings.TrimSpace(state.StatusMessage)
 			}
 		}
 		// Recreate the suspension so a transition from quota to another error
 		// also updates the registry reason.
-		modelRegistry.ResumeClientModel(auth.ID, model)
-		modelRegistry.SuspendClientModel(auth.ID, model, suspendReason)
+		modelRegistry.ResumeClientModel(auth.ID, registryModel)
+		modelRegistry.SuspendClientModel(auth.ID, registryModel, suspendReason)
 	}
 }
 

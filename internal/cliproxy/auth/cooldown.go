@@ -42,9 +42,9 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 	if credentialID == "" {
 		return result, errors.New("auth manager: missing auth id")
 	}
-	model = canonicalModelKey(model)
+	requestedModel := canonicalModelKey(model)
 	result.CredentialID = credentialID
-	result.Model = model
+	result.Model = requestedModel
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -60,7 +60,21 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 	now := time.Now().UTC()
 	transition := cooldownClearTransition{}
 	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) bool {
-		transition = clearQuotaCooldownState(auth, model, now)
+		modelKeys := []string(nil)
+		if requestedModel != "" {
+			resolvedModel := requestedModel
+			if resolved := m.resolveDispatchModel(auth, requestedModel); resolved.Key != "" {
+				resolvedModel = resolved.Key
+			}
+			result.Model = resolvedModel
+			modelKeys = append(modelKeys, resolvedModel)
+			if requestedModel != resolvedModel {
+				// Clear the pre-upstream-key route state too so rolling upgrades do
+				// not leave the scheduler blocked by its compatibility fallback.
+				modelKeys = append(modelKeys, requestedModel)
+			}
+		}
+		transition = clearQuotaCooldownState(auth, modelKeys, now)
 		return transition.changed()
 	})
 	if errMutate != nil {
@@ -83,7 +97,7 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 	return result, nil
 }
 
-func clearQuotaCooldownState(auth *Auth, model string, now time.Time) cooldownClearTransition {
+func clearQuotaCooldownState(auth *Auth, models []string, now time.Time) cooldownClearTransition {
 	transition := cooldownClearTransition{}
 	if auth == nil {
 		return transition
@@ -105,17 +119,29 @@ func clearQuotaCooldownState(auth *Auth, model string, now time.Time) cooldownCl
 	preservedAuthRetryAfter := auth.NextRetryAfter
 	preserveNonQuotaAuthError := auth.LastError != nil && statusCodeFromResult(auth.LastError) != http.StatusTooManyRequests && !authErrorMirroredByModel(auth)
 
-	if model != "" {
-		if state := auth.ModelStates[model]; clearModelQuotaCooldown(state, now) {
-			transition.clearedModels = append(transition.clearedModels, model)
-		}
-	} else {
-		models := make([]string, 0, len(auth.ModelStates))
-		for modelID := range auth.ModelStates {
-			models = append(models, modelID)
-		}
-		sort.Strings(models)
+	if len(models) > 0 {
+		seen := make(map[string]struct{}, len(models))
 		for _, modelID := range models {
+			modelID = canonicalModelKey(modelID)
+			if modelID == "" {
+				continue
+			}
+			if _, exists := seen[modelID]; exists {
+				continue
+			}
+			seen[modelID] = struct{}{}
+			if state := auth.ModelStates[modelID]; clearModelQuotaCooldown(state, now) {
+				transition.clearedModels = append(transition.clearedModels, modelID)
+			}
+		}
+		sort.Strings(transition.clearedModels)
+	} else {
+		allModels := make([]string, 0, len(auth.ModelStates))
+		for modelID := range auth.ModelStates {
+			allModels = append(allModels, modelID)
+		}
+		sort.Strings(allModels)
+		for _, modelID := range allModels {
 			state := auth.ModelStates[modelID]
 			if !clearModelQuotaCooldown(state, now) {
 				continue
