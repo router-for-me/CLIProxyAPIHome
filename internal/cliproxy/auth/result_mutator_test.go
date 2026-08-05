@@ -14,6 +14,7 @@ import (
 type fakeMutatorStore struct {
 	mu        sync.Mutex
 	persisted *Auth
+	mutateErr error
 	mutations int
 	saves     int
 }
@@ -35,6 +36,9 @@ func (s *fakeMutatorStore) Delete(context.Context, string) error { return nil }
 func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.mutateErr != nil {
+		return nil, s.mutateErr
+	}
 	if s.persisted == nil || s.persisted.ID != id {
 		return nil, fmt.Errorf("auth %s not found", id)
 	}
@@ -141,6 +145,38 @@ func TestMarkResultQuotaEscalationIsAtomicAcrossManagers(t *testing.T) {
 
 	if store.saves != 0 {
 		t.Fatalf("expected no Save calls on the mutator path, got %d", store.saves)
+	}
+}
+
+func TestMarkResultMutationFailureDoesNotApplyLocalPenalty(t *testing.T) {
+	for _, statusCode := range []int{http.StatusUnauthorized, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			const authID = "auth-mutation-failure"
+			store := &fakeMutatorStore{
+				persisted: &Auth{ID: authID, Index: authID, Provider: "codex", Status: StatusActive},
+				mutateErr: fmt.Errorf("database temporarily unavailable"),
+			}
+			manager := newHomeNodeManager(t, store, authID)
+
+			manager.MarkResult(context.Background(), Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    "gpt-5",
+				Error:    &Error{Message: http.StatusText(statusCode), HTTPStatus: statusCode},
+			})
+
+			persisted := store.persistedSnapshot()
+			if persisted.ModelStates["gpt-5"] != nil || store.mutationCount() != 0 {
+				t.Fatalf("persisted state/mutations = %#v/%d, want unchanged", persisted.ModelStates["gpt-5"], store.mutationCount())
+			}
+			local, ok := manager.GetByID(authID)
+			if !ok || local == nil {
+				t.Fatal("GetByID() missing auth")
+			}
+			if state := local.ModelStates["gpt-5"]; state != nil && (state.Quota.Exceeded || state.Unavailable) {
+				t.Fatalf("local state = %#v, database failure must not apply cooldown", state)
+			}
+		})
 	}
 }
 

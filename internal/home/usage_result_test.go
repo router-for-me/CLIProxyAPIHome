@@ -54,7 +54,7 @@ func TestRecordUsagePayloadUsesModelAsUpstreamKey(t *testing.T) {
 	}
 }
 
-func TestRecordUsagePayloadUsesRetryDelayFromFailBody(t *testing.T) {
+func TestRecordUsagePayloadUsesExponentialBackoffDespiteRetryDelay(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-retry-delay-auth",
 		Index:    "usage-retry-delay-index",
@@ -84,14 +84,14 @@ func TestRecordUsagePayloadUsesRetryDelayFromFailBody(t *testing.T) {
 		t.Fatalf("ModelStates[gemini-3-pro-preview] missing after usage payload: %#v", got.ModelStates)
 	}
 	delay := state.NextRetryAfter.Sub(before)
-	if delay < 45*time.Minute || delay > 46*time.Minute {
-		t.Fatalf("ModelStates[gemini-3-pro-preview].NextRetryAfter delay = %v, want about 45m7s", delay)
+	if delay < 500*time.Millisecond || delay > 2*time.Second {
+		t.Fatalf("ModelStates[gemini-3-pro-preview].NextRetryAfter delay = %v, want first exponential backoff", delay)
 	}
 	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
 		t.Fatalf("Quota.NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
 	}
-	if state.Quota.BackoffLevel != 0 {
-		t.Fatalf("Quota.BackoffLevel = %d, want 0 when explicit retry delay is used", state.Quota.BackoffLevel)
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
 	}
 }
 
@@ -124,7 +124,32 @@ func TestRecordUsagePayloadIgnoresUnauthorizedFromOlderToken(t *testing.T) {
 	}
 }
 
-func TestRecordUsagePayloadFallsBackToAliasWhenModelEmpty(t *testing.T) {
+func TestRecordUsagePayloadIgnoresMissingModel(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-missing-model-auth",
+		Index:    "usage-missing-model-index",
+		Provider: "gemini",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	rt.RecordUsagePayload(context.Background(), `{
+		"auth_index": "usage-missing-model-index",
+		"provider": "gemini",
+		"failed": true,
+		"fail": {"status_code": 429, "body": "quota exhausted"}
+	}`)
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth", auth.ID)
+	}
+	if len(got.ModelStates) != 0 || got.Status != coreauth.StatusActive || got.Unavailable || got.Quota.Exceeded {
+		t.Fatalf("auth changed for model-less result: %#v", got)
+	}
+}
+
+func TestRecordUsagePayloadIgnoresAliasWithoutModel(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-alias-auth",
 		Index:    "usage-alias-index",
@@ -149,11 +174,7 @@ func TestRecordUsagePayloadFallsBackToAliasWhenModelEmpty(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
 	}
-	state := got.ModelStates["alias-model"]
-	if state == nil {
-		t.Fatalf("ModelStates[alias-model] missing after usage payload: %#v", got.ModelStates)
-	}
-	if !state.Unavailable || !state.Quota.Exceeded || state.NextRetryAfter.IsZero() {
-		t.Fatalf("ModelStates[alias-model] = %#v, want 429 cooldown state", state)
+	if len(got.ModelStates) != 0 || got.Status != coreauth.StatusActive || got.Unavailable || got.Quota.Exceeded {
+		t.Fatalf("alias-only result changed auth: %#v", got)
 	}
 }

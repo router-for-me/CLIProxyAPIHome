@@ -1661,8 +1661,6 @@ func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
 		return nil
 	}
 	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
-	authQuota := auth.Quota
-	preserveAuthQuota := authQuota.Exceeded && authQuota.NextRecoverAt.After(now) && !quotaAggregatedFromModel(authQuota, auth.ModelStates)
 	clearUnauthorizedAuth := isUnauthorizedAuthState(auth)
 	clearRefreshAcquisition := isRefreshAcquisitionState(auth)
 
@@ -1691,17 +1689,10 @@ func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
 	if clearUnauthorizedAuth || len(resumed) > 0 {
 		updateAggregatedAvailability(auth, now)
 	}
-	if preserveAuthQuota {
-		auth.Quota = authQuota
-		auth.Unavailable = true
-		if auth.NextRetryAfter.Before(authQuota.NextRecoverAt) {
-			auth.NextRetryAfter = authQuota.NextRecoverAt
-		}
-	}
 	if wasDisabled {
 		auth.Status = StatusDisabled
 		auth.Unavailable = true
-	} else if preserveAuthQuota || hasModelError(auth, now) {
+	} else if hasModelError(auth, now) {
 		auth.Status = StatusError
 	} else if clearUnauthorizedAuth || len(resumed) > 0 {
 		auth.Status = StatusActive
@@ -1724,18 +1715,6 @@ func resetUnauthorizedModelStateAfterRefresh(state *ModelState, now time.Time) b
 		return false
 	}
 	return true
-}
-
-func quotaAggregatedFromModel(quota QuotaState, states map[string]*ModelState) bool {
-	for _, state := range states {
-		if state == nil || !state.Quota.Exceeded {
-			continue
-		}
-		if state.Quota.NextRecoverAt.Equal(quota.NextRecoverAt) && state.Quota.BackoffLevel == quota.BackoffLevel && strings.TrimSpace(state.Quota.Reason) == strings.TrimSpace(quota.Reason) {
-			return true
-		}
-	}
-	return false
 }
 
 func isRefreshAcquisitionState(auth *Auth) bool {

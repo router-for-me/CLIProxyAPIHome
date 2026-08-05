@@ -157,6 +157,33 @@ func TestMarkResultUnauthorizedUsesRecoverableCooldown(t *testing.T) {
 	if blocked, reason, _ := isAuthBlockedForModel(updated, "gpt-5", time.Now()); !blocked || reason == blockReasonDisabled {
 		t.Fatalf("isAuthBlockedForModel() = blocked %v reason %v, want non-disabled cooldown", blocked, reason)
 	}
+	if blocked, reason, next := isAuthBlockedForModel(updated, "gpt-5-mini", time.Now()); blocked || reason != blockReasonNone || !next.IsZero() {
+		t.Fatalf("unrelated model blocked/reason/next = %v/%v/%v", blocked, reason, next)
+	}
+}
+
+func TestMarkResultIgnoresMissingCanonicalModel(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-missing-model", Index: "auth-missing-model", Provider: "codex", Status: StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   " ",
+		Success: false,
+		Error:   &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Success: true})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("updated auth not found")
+	}
+	if updated.Success != 0 || updated.Failed != 0 || updated.Status != StatusActive || updated.Unavailable || updated.Quota.Exceeded || len(updated.ModelStates) != 0 {
+		t.Fatalf("model-less result changed auth: %#v", updated)
+	}
 }
 
 func TestAuthRefreshBackoffDoesNotBlockModels(t *testing.T) {

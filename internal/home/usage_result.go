@@ -26,8 +26,8 @@ func (r *Runtime) RecordUsagePayload(ctx context.Context, payload string) {
 
 	provider := strings.TrimSpace(gjson.Get(payload, "provider").String())
 	model := strings.TrimSpace(gjson.Get(payload, "model").String())
-	if model == "" {
-		model = strings.TrimSpace(gjson.Get(payload, "alias").String())
+	if coreauth.CanonicalModelID(model) == "" {
+		return
 	}
 
 	statusCode := int(gjson.Get(payload, "fail.status_code").Int())

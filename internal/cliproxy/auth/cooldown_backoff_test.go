@@ -95,50 +95,6 @@ func TestMarkResultQuotaBackoffEscalatesAfterWindowExpiry(t *testing.T) {
 	}
 }
 
-func TestApplyAuthFailureStateQuotaBackoffOncePerWindow(t *testing.T) {
-	manager := NewManager(nil, nil, nil)
-	now := time.Now()
-	quotaErr := &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests}
-	auth := &Auth{ID: "auth-level-quota"}
-
-	applyAuthFailureState(manager, auth, quotaErr, nil, now)
-	if auth.Quota.BackoffLevel != 1 {
-		t.Fatalf("expected BackoffLevel 1 after first failure, got %d", auth.Quota.BackoffLevel)
-	}
-	firstRecover := auth.Quota.NextRecoverAt
-	if !firstRecover.Equal(now.Add(time.Second)) {
-		t.Fatalf("expected first window to close at %v, got %v", now.Add(time.Second), firstRecover)
-	}
-
-	// In-window failure keeps the current window and level.
-	applyAuthFailureState(manager, auth, quotaErr, nil, now.Add(100*time.Millisecond))
-	if auth.Quota.BackoffLevel != 1 {
-		t.Fatalf("expected BackoffLevel to stay 1 for in-window failure, got %d", auth.Quota.BackoffLevel)
-	}
-	if !auth.Quota.NextRecoverAt.Equal(firstRecover) {
-		t.Fatalf("expected NextRecoverAt to stay %v for in-window failure, got %v", firstRecover, auth.Quota.NextRecoverAt)
-	}
-
-	// A failure after the window expired escalates to the next level.
-	applyAuthFailureState(manager, auth, quotaErr, nil, now.Add(2*time.Second))
-	if auth.Quota.BackoffLevel != 2 {
-		t.Fatalf("expected BackoffLevel 2 after post-window failure, got %d", auth.Quota.BackoffLevel)
-	}
-	if !auth.Quota.NextRecoverAt.Equal(now.Add(4 * time.Second)) {
-		t.Fatalf("expected second window to close at %v, got %v", now.Add(4*time.Second), auth.Quota.NextRecoverAt)
-	}
-
-	// A provider supplied retry hint always takes effect, even in-window.
-	retryAfter := 10 * time.Second
-	applyAuthFailureState(manager, auth, quotaErr, &retryAfter, now.Add(3*time.Second))
-	if auth.Quota.BackoffLevel != 2 {
-		t.Fatalf("expected BackoffLevel to stay 2 with retry hint, got %d", auth.Quota.BackoffLevel)
-	}
-	if !auth.Quota.NextRecoverAt.Equal(now.Add(13 * time.Second)) {
-		t.Fatalf("expected retry hint window to close at %v, got %v", now.Add(13*time.Second), auth.Quota.NextRecoverAt)
-	}
-}
-
 func TestNextQuotaCooldownLadder(t *testing.T) {
 	cases := []struct {
 		prevLevel    int

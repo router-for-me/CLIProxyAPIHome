@@ -103,6 +103,8 @@ type RecentRequestBucket struct {
 type QuotaState struct {
 	// Exceeded indicates the credential recently hit a quota error.
 	Exceeded bool `json:"exceeded"`
+	// Scope records that this quota is model-scoped or aggregated from models.
+	Scope string `json:"scope,omitempty"`
 	// Reason provides an optional provider specific human readable description.
 	Reason string `json:"reason,omitempty"`
 	// NextRecoverAt is when the credential may become available again.
@@ -127,6 +129,9 @@ type ModelState struct {
 	Quota QuotaState `json:"quota"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
+	// QuotaResetAt marks an operator reset so peers can merge it without
+	// discarding unrelated local execution errors.
+	QuotaResetAt time.Time `json:"quota_reset_at,omitzero"`
 }
 
 // recentRequestBucketID handles a recent request bucket id.
