@@ -50,11 +50,8 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	r.coreManager.RefreshSchedulerEntry(auth.ID)
 }
 
-// mergeModelStates merges the locally accumulated model states into the
-// incoming cluster view, keeping whichever per-model state is fresher. Local
-// states cover transitions that are not persisted to the cluster row (for
-// example transient 5xx cooldowns), while incoming states carry cooldowns
-// recorded by other Home nodes.
+// mergeModelStates merges locally accumulated execution state into the
+// incoming cluster view while keeping persisted quota state authoritative.
 func mergeModelStates(incoming, local map[string]*coreauth.ModelState) map[string]*coreauth.ModelState {
 	if len(local) == 0 {
 		return incoming
@@ -66,10 +63,7 @@ func mergeModelStates(incoming, local map[string]*coreauth.ModelState) map[strin
 		if state == nil {
 			continue
 		}
-		current, ok := incoming[model]
-		if !ok || current == nil || state.UpdatedAt.After(current.UpdatedAt) {
-			incoming[model] = state
-		}
+		incoming[model] = coreauth.MergePersistedModelState(incoming[model], state)
 	}
 	return incoming
 }

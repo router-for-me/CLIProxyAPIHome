@@ -206,3 +206,37 @@ func TestReconcileRegistryModelStatesResumesPeerAfterStateReset(t *testing.T) {
 		t.Fatal("registry remained suspended after peer reconciliation")
 	}
 }
+func TestMergePersistedModelStatePreservesActiveQuotaWithNewerNonQuotaError(t *testing.T) {
+	now := time.Now().UTC()
+	quotaRecover := now.Add(10 * time.Minute)
+	persisted := quotaCooldownModelState(now, 10*time.Minute)
+	persisted.Quota.Scope = quotaScopeModel
+	localRetry := now.Add(time.Minute)
+	localUpdated := now.Add(2 * time.Minute)
+	local := &ModelState{
+		Status:         StatusError,
+		StatusMessage:  "transient upstream error",
+		Unavailable:    true,
+		NextRetryAfter: localRetry,
+		LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+		UpdatedAt:      localUpdated,
+	}
+
+	merged := MergePersistedModelState(persisted, local)
+	if merged == nil || merged.LastError == nil || merged.LastError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("merged state = %#v, want newer local 5xx", merged)
+	}
+	if !merged.Quota.Exceeded || merged.Quota.Scope != quotaScopeModel || !merged.Quota.NextRecoverAt.Equal(quotaRecover) {
+		t.Fatalf("merged quota = %#v, want persisted quota", merged.Quota)
+	}
+	if !merged.Unavailable || !merged.NextRetryAfter.Equal(quotaRecover) {
+		t.Fatalf("merged availability = %v/%v, want quota deadline %v", merged.Unavailable, merged.NextRetryAfter, quotaRecover)
+	}
+	if !merged.UpdatedAt.Equal(localUpdated) {
+		t.Fatalf("merged UpdatedAt = %v, want local timestamp %v", merged.UpdatedAt, localUpdated)
+	}
+	auth := &Auth{ModelStates: map[string]*ModelState{"gpt-a": merged}}
+	if blocked, reason, next := isAuthBlockedForModel(auth, "gpt-a", now.Add(2*time.Minute)); !blocked || reason != blockReasonCooldown || !next.Equal(quotaRecover) {
+		t.Fatalf("blocked/reason/next after local retry = %v/%v/%v, want shared quota until %v", blocked, reason, next, quotaRecover)
+	}
+}
