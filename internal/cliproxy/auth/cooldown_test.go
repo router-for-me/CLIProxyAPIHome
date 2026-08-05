@@ -1,9 +1,12 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
 func quotaCooldownModelState(now time.Time, delay time.Duration) *ModelState {
@@ -103,5 +106,103 @@ func TestLegacyCredentialWideStateDoesNotBlockDispatch(t *testing.T) {
 		if blocked, reason, retryAt := isAuthBlockedForModel(auth, model, now); blocked || reason != blockReasonNone || !retryAt.IsZero() {
 			t.Fatalf("model %q blocked/reason/next = %v/%v/%v, want available", model, blocked, reason, retryAt)
 		}
+	}
+}
+func registryHasAvailableModel(modelRegistry *registry.ModelRegistry, model string) bool {
+	for _, item := range modelRegistry.GetAvailableModelDefinitions() {
+		if item != nil && item.ID == model {
+			return true
+		}
+	}
+	return false
+}
+
+func TestReconcileRegistryModelStatesKeepsTransientErrorsVisible(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{name: "unauthorized", status: http.StatusUnauthorized},
+		{name: "request-timeout", status: http.StatusRequestTimeout},
+		{name: "internal-server-error", status: http.StatusInternalServerError},
+		{name: "bad-gateway", status: http.StatusBadGateway},
+		{name: "service-unavailable", status: http.StatusServiceUnavailable},
+		{name: "gateway-timeout", status: http.StatusGatewayTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authID := "auth-registry-transient-" + tc.name
+			model := "registry-transient-" + tc.name
+			modelRegistry := registry.GetGlobalRegistry()
+			modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model, Object: "model", Type: "openai"}})
+			t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+			manager := NewManager(nil, nil, nil)
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Index: authID, Provider: "codex", Status: StatusActive}); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+			manager.MarkResult(context.Background(), Result{
+				AuthID: authID, Provider: "codex", Model: model,
+				Error: &Error{Message: http.StatusText(tc.status), HTTPStatus: tc.status},
+			})
+			manager.ReconcileRegistryModelStates(context.Background(), authID)
+			if !registryHasAvailableModel(modelRegistry, model) {
+				t.Fatalf("registry hid model for transient HTTP %d", tc.status)
+			}
+		})
+	}
+}
+
+func TestShouldSuspendRegistryModelMatchesResultTransitions(t *testing.T) {
+	const model = "registry-transition-model"
+	modelUnsupported := &Error{Message: "requested model is not supported", HTTPStatus: http.StatusBadRequest}
+	cases := []struct {
+		name   string
+		reason blockReason
+		err    *Error
+		want   bool
+	}{
+		{name: "quota", reason: blockReasonCooldown, want: true},
+		{name: "disabled", reason: blockReasonDisabled, want: true},
+		{name: "payment-required", reason: blockReasonOther, err: &Error{HTTPStatus: http.StatusPaymentRequired}, want: true},
+		{name: "forbidden", reason: blockReasonOther, err: &Error{HTTPStatus: http.StatusForbidden}, want: true},
+		{name: "not-found", reason: blockReasonOther, err: &Error{HTTPStatus: http.StatusNotFound}, want: true},
+		{name: "model-not-supported", reason: blockReasonOther, err: modelUnsupported, want: true},
+		{name: "unauthorized", reason: blockReasonOther, err: &Error{HTTPStatus: http.StatusUnauthorized}},
+		{name: "request-timeout", reason: blockReasonOther, err: &Error{HTTPStatus: http.StatusRequestTimeout}},
+		{name: "service-unavailable", reason: blockReasonOther, err: &Error{HTTPStatus: http.StatusServiceUnavailable}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &Auth{ModelStates: map[string]*ModelState{model: {LastError: tc.err}}}
+			if got := shouldSuspendRegistryModel(auth, model, tc.reason); got != tc.want {
+				t.Fatalf("shouldSuspendRegistryModel() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReconcileRegistryModelStatesResumesPeerAfterStateReset(t *testing.T) {
+	const authID = "auth-registry-peer"
+	const model = "registry-peer-model"
+	now := time.Now().UTC()
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model, Object: "model", Type: "openai"}})
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+	modelRegistry.SuspendClientModel(authID, model, "forbidden")
+	if registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("test setup did not suspend model")
+	}
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID: authID, Index: authID, Provider: "codex", Status: StatusActive,
+		ModelStates: map[string]*ModelState{model: {Status: StatusActive, UpdatedAt: now, QuotaResetAt: now}},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	manager.ReconcileRegistryModelStates(context.Background(), authID)
+	if !registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("registry remained suspended after peer reconciliation")
 	}
 }

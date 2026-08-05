@@ -526,10 +526,84 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	m.scheduler.upsertAuth(auth)
 }
 
-// ReconcileRegistryModelStates reconciles a registry model states.
-func (m *Manager) ReconcileRegistryModelStates(_ context.Context, _ string) {
-	// CLIProxyAPIHome does not execute upstream requests, so it does not maintain
-	// per-model runtime state beyond the shared model registry.
+// ReconcileRegistryModelStates aligns the derived model registry with the
+// authoritative scheduler state held by this Home instance.
+func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string) {
+	if m == nil {
+		return
+	}
+	auth, ok := m.GetByID(authID)
+	if !ok || auth == nil {
+		return
+	}
+
+	modelRegistry := registry.GetGlobalRegistry()
+	models := make(map[string]struct{}, len(auth.ModelStates))
+	for model := range auth.ModelStates {
+		if model = canonicalModelKey(model); model != "" {
+			models[model] = struct{}{}
+		}
+	}
+	for _, model := range modelRegistry.GetModelsForClient(auth.ID) {
+		if model != nil {
+			if modelID := canonicalModelKey(model.ID); modelID != "" {
+				models[modelID] = struct{}{}
+			}
+		}
+	}
+
+	now := time.Now()
+	for model := range models {
+		blocked, reason, _ := isAuthBlockedForModel(auth, model, now)
+		if blocked && reason == blockReasonCooldown {
+			modelRegistry.SetModelQuotaExceeded(auth.ID, model)
+		} else {
+			modelRegistry.ClearModelQuotaExceeded(auth.ID, model)
+		}
+
+		if !blocked || !shouldSuspendRegistryModel(auth, model, reason) {
+			modelRegistry.ResumeClientModel(auth.ID, model)
+			continue
+		}
+		suspendReason := "unavailable"
+		switch reason {
+		case blockReasonCooldown:
+			suspendReason = "quota"
+		case blockReasonDisabled:
+			suspendReason = "disabled"
+		default:
+			if state := auth.ModelStates[model]; state != nil && strings.TrimSpace(state.StatusMessage) != "" {
+				suspendReason = strings.TrimSpace(state.StatusMessage)
+			}
+		}
+		// Recreate the suspension so a transition from quota to another error
+		// also updates the registry reason.
+		modelRegistry.ResumeClientModel(auth.ID, model)
+		modelRegistry.SuspendClientModel(auth.ID, model, suspendReason)
+	}
+}
+
+func shouldSuspendRegistryModel(auth *Auth, model string, reason blockReason) bool {
+	switch reason {
+	case blockReasonCooldown, blockReasonDisabled:
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	state := auth.ModelStates[canonicalModelKey(model)]
+	if state == nil {
+		return false
+	}
+	if isModelSupportResultError(state.LastError) {
+		return true
+	}
+	switch statusCodeFromResult(state.LastError) {
+	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound:
+		return true
+	default:
+		return false
+	}
 }
 
 // ensureRequestedModelMetadata ensures a requested model metadata.
