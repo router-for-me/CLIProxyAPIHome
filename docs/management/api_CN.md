@@ -3939,7 +3939,7 @@ DELETE query：
 | `plugins.configs` | object | 以插件 ID 为 key 的单插件配置。插件商店安装会在插件条目下写入固定 `store` manifest；Home-mode CPA 节点根据该 manifest 下载产物，Home 仅在显式设置 `load-in-home: true` 时下载并加载。 |
 | `usage-statistics-enabled` | boolean | 启用内存 usage aggregation。Home 会向下游 CPA 强制为 `true`，并拒绝通过 Management API 关闭。 |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue 保留窗口；默认 `60`，最大 `3600`。 |
-| `disable-cooling` | boolean | 全局禁用 quota cooldown scheduling。Home 会向下游 CPA 强制为 `true`。 |
+| `disable-cooling` | boolean | 兼容字段。Home 是唯一的凭证调度器，会始终将该值规范为 `false`，确保中央 quota cooldown 启用；发送给下游 CPA 的配置会独立强制为 `true`，仅禁用 CPA 本地 cooldown。 |
 | `auth-auto-refresh-workers` | integer | 覆盖 auth auto-refresh worker 数量。 |
 | `request-retry` | integer | 失败请求重试次数。 |
 | `max-retry-credentials` | integer | 一个失败请求最多尝试的凭证数量；`<=0` 表示所有可用凭证。 |

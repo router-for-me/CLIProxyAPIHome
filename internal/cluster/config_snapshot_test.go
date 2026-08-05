@@ -2,10 +2,14 @@ package cluster
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,11 +52,11 @@ func TestRuntimeConfigFromRootPreservesConcurrencyLimiterConfig(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigFromRootAppliesHomeModeScalarsAndPreservesRemoteManagement(t *testing.T) {
+func TestRuntimeConfigFromRootEnablesCentralCoolingAndHomeInvariants(t *testing.T) {
 	root := map[string]any{
 		"api-keys":                 []any{"local-key"},
 		"usage-statistics-enabled": false,
-		"disable-cooling":          false,
+		"disable-cooling":          true,
 		"ws-auth":                  true,
 		"remote-management": map[string]any{
 			"allow-remote":          true,
@@ -70,8 +74,8 @@ func TestRuntimeConfigFromRootAppliesHomeModeScalarsAndPreservesRemoteManagement
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("UsageStatisticsEnabled = false, want true")
 	}
-	if !cfg.DisableCooling {
-		t.Fatal("DisableCooling = false, want true")
+	if cfg.DisableCooling {
+		t.Fatal("DisableCooling = true, want Home central cooling enabled")
 	}
 	if cfg.WebsocketAuth {
 		t.Fatal("WebsocketAuth = true, want false")
@@ -81,6 +85,40 @@ func TestRuntimeConfigFromRootAppliesHomeModeScalarsAndPreservesRemoteManagement
 	}
 	if cfg.RemoteManagement.DisableControlPanel {
 		t.Fatal("RemoteManagement.DisableControlPanel = true, want preserved false")
+	}
+}
+
+func TestRuntimeConfigFromRootEnablesCentralQuotaCooldown(t *testing.T) {
+	cfg, _, errConfig := RuntimeConfigFromRoot(map[string]any{"disable-cooling": true})
+	if errConfig != nil {
+		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	auth := &coreauth.Auth{ID: "central-cooling-auth", Index: "central-cooling-auth", Provider: "codex", Status: coreauth.StatusActive}
+	t.Cleanup(func() { registry.GetGlobalRegistry().ClearModelQuotaExceeded(auth.ID, "gpt-5") })
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5",
+		Success:  false,
+		Error: &coreauth.Error{
+			Message:    "quota exhausted",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	got, ok := manager.GetByID(auth.ID)
+	if !ok || got == nil || got.ModelStates["gpt-5"] == nil {
+		t.Fatalf("GetByID() missing quota state: %#v", got)
+	}
+	state := got.ModelStates["gpt-5"]
+	if !state.Unavailable || !state.Quota.Exceeded || !state.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("quota state = %#v, want active central cooldown", state)
 	}
 }
 
