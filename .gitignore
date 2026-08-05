@@ -16,14 +16,16 @@ config.yaml
 cluster.yaml
 home.db
 home.db-*
-.DS_Store
 .env
+docker-compose.override.yml
+.DS_Store
 AGENTS.md
 plugins
 
 # Local agent / IDE tooling (project-specific; skills, settings, worktrees)
 .agents
 .agents/*
+.pi
 .agent
 .agent/*
 .claude
