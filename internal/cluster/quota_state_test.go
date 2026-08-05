@@ -171,6 +171,89 @@ func TestClusterQuotaBackoffEscalatesOncePerWindowAcrossNodes(t *testing.T) {
 	}
 }
 
+func TestClusterClearQuotaCooldownPersistsAndPublishesAuthEvent(t *testing.T) {
+	const authID = "auth-cluster-clear"
+	const clearedModel = "gpt-a"
+	const preservedModel = "gpt-b"
+	repo := newQuotaTestRepository(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	clearedAt := now.Add(10 * time.Minute)
+	preservedAt := now.Add(20 * time.Minute)
+	seed := &coreauth.Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         coreauth.StatusError,
+		Unavailable:    true,
+		NextRetryAfter: clearedAt,
+		Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: clearedAt, BackoffLevel: 2},
+		Metadata:       map[string]any{"type": "codex"},
+		ModelStates: map[string]*coreauth.ModelState{
+			clearedModel: {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				NextRetryAfter: clearedAt,
+				LastError:      &coreauth.Error{Message: "quota exhausted", HTTPStatus: http.StatusTooManyRequests},
+				Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: clearedAt, BackoffLevel: 2},
+			},
+			preservedModel: {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				NextRetryAfter: preservedAt,
+				LastError:      &coreauth.Error{Message: "quota exhausted", HTTPStatus: http.StatusTooManyRequests},
+				Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: preservedAt, BackoffLevel: 4},
+			},
+		},
+	}
+	seedRecord, errUpsert := repo.UpsertAuth(ctx, seed, "register")
+	if errUpsert != nil {
+		t.Fatalf("UpsertAuth returned error: %v", errUpsert)
+	}
+	manager := newQuotaTestNode(t, repo, authID)
+
+	result, errClear := manager.ClearQuotaCooldown(ctx, authID, clearedModel)
+	if errClear != nil {
+		t.Fatalf("ClearQuotaCooldown returned error: %v", errClear)
+	}
+	if !result.Cleared || len(result.ClearedModels) != 1 || result.ClearedModels[0] != clearedModel {
+		t.Fatalf("ClearQuotaCooldown result = %#v", result)
+	}
+
+	persisted, record, errGet := repo.GetAuth(ctx, authID)
+	if errGet != nil {
+		t.Fatalf("GetAuth returned error: %v", errGet)
+	}
+	if record.Version != seedRecord.Version+1 {
+		t.Fatalf("auth version = %d, want %d", record.Version, seedRecord.Version+1)
+	}
+	if state := persisted.ModelStates[clearedModel]; state == nil || state.Quota.Exceeded || state.Unavailable || !state.NextRetryAfter.IsZero() || state.QuotaResetAt.IsZero() {
+		t.Fatalf("cleared model state = %#v", state)
+	}
+	if state := persisted.ModelStates[preservedModel]; state == nil || !state.Quota.Exceeded || !state.Unavailable {
+		t.Fatalf("preserved model state = %#v", state)
+	}
+
+	var event ClusterEventRecord
+	if errEvent := repo.db.Where("scope = ? AND entity_uuid = ? AND version = ?", "auth", authID, record.Version).Order("id DESC").First(&event).Error; errEvent != nil {
+		t.Fatalf("load auth event: %v", errEvent)
+	}
+	if event.Op != "update" {
+		t.Fatalf("event op = %q, want update", event.Op)
+	}
+
+	peerAdapter := NewRuntimeAdapter(repo, "127.0.0.2")
+	if errApply := peerAdapter.ApplyEvent(ctx, event); errApply != nil {
+		t.Fatalf("ApplyEvent returned error: %v", errApply)
+	}
+	peerAuths := peerAdapter.ListMinimalAuths()
+	if len(peerAuths) != 1 || peerAuths[0].ModelStates[clearedModel] == nil || peerAuths[0].ModelStates[clearedModel].Quota.Exceeded || peerAuths[0].ModelStates[clearedModel].QuotaResetAt.IsZero() {
+		t.Fatalf("peer auth index = %#v, want cleared model state", peerAuths)
+	}
+}
+
 func TestClusterAuthIndexCarriesCooldownState(t *testing.T) {
 	const authID = "auth-cluster-index"
 	const model = "gpt-5"
