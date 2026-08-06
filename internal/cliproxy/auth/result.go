@@ -20,6 +20,9 @@ const (
 	unauthorizedRetryBackoff = time.Minute
 	transientErrorCooldown   = time.Minute
 	quotaScopeModel          = "model"
+
+	cloudflareChallengeReason      = "cloudflare challenge"
+	cloudflareChallengeMinCooldown = 10 * time.Second
 )
 
 var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
@@ -200,6 +203,28 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		state.NextRetryAfter = next
 		transition.suspendReason = "model_not_supported"
 		transition.shouldSuspendModel = true
+	} else if isCloudflareChallengeResultError(result.Error) {
+		next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
+		state.NextRetryAfter = next
+		state.StatusMessage = cloudflareChallengeReason
+		if auth.LastError != nil {
+			auth.StatusMessage = cloudflareChallengeReason
+		}
+		state.Quota = QuotaState{
+			Exceeded:      true,
+			Scope:         quotaScopeModel,
+			Reason:        cloudflareChallengeReason,
+			NextRecoverAt: next,
+			BackoffLevel:  backoffLevel,
+		}
+	} else if isInvalidGrantResultError(result.Error) {
+		if disableCooling {
+			state.NextRetryAfter = time.Time{}
+		} else {
+			state.NextRetryAfter = now.Add(30 * time.Minute)
+			transition.suspendReason = "invalid_grant"
+			transition.shouldSuspendModel = true
+		}
 	} else {
 		switch statusCode {
 		case http.StatusUnauthorized:
@@ -759,6 +784,59 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 		return quotaBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
+}
+
+// isInvalidGrantErrorMessage reports whether a message identifies a revoked,
+// expired, or reused refresh token.
+func isInvalidGrantErrorMessage(message string) bool {
+	return strings.Contains(strings.ToLower(message), "invalid_grant")
+}
+
+// isInvalidGrantResultError reports whether an execution result failed because the
+// credential's grant is no longer valid. Retrying the same token cannot fix it, so
+// only 400 and 401 responses qualify: other statuses stay on the transient path.
+func isInvalidGrantResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
+		return false
+	}
+	return isInvalidGrantErrorMessage(err.Code) || isInvalidGrantErrorMessage(err.Message)
+}
+
+// isCloudflareChallengeResultError reports whether the upstream returned a
+// Cloudflare interstitial instead of a provider response.
+func isCloudflareChallengeResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "cf-mitigated") ||
+		strings.Contains(lower, cloudflareChallengeReason) ||
+		(strings.Contains(lower, "cloudflare") && strings.Contains(lower, "<html"))
+}
+
+// nextCloudflareCooldown reuses the quota backoff ladder with a floor so a challenge
+// page cannot be retried in a tight loop.
+func nextCloudflareCooldown(backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
+	var next time.Time
+	if !disableCooling {
+		cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+		if cooldown < cloudflareChallengeMinCooldown {
+			cooldown = cloudflareChallengeMinCooldown
+		}
+		if cooldown > 0 {
+			next = now.Add(cooldown)
+		}
+		backoffLevel = nextLevel
+	}
+	return next, backoffLevel
 }
 
 // recoverableFailureRetryAfter returns the cooldown deadline for a recoverable
