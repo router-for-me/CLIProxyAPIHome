@@ -18,6 +18,7 @@ const (
 	quotaBackoffBase         = time.Second
 	quotaBackoffMax          = 30 * time.Minute
 	unauthorizedRetryBackoff = time.Minute
+	transientErrorCooldown   = time.Minute
 	quotaScopeModel          = "model"
 )
 
@@ -238,14 +239,23 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.setModelQuota = true
 			}
 		case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			if disableCooling {
-				state.NextRetryAfter = time.Time{}
-			} else {
-				state.NextRetryAfter = now.Add(time.Minute)
-			}
+			state.NextRetryAfter = recoverableFailureRetryAfter(now, disableCooling)
+			state.Unavailable = !state.NextRetryAfter.IsZero()
 		default:
-			state.NextRetryAfter = time.Time{}
+			// An unmapped upstream failure is recoverable: park the model for a short
+			// window so dispatch moves to another credential, then let it return on
+			// its own. Leaving a zero deadline here would block the model forever.
+			state.NextRetryAfter = recoverableFailureRetryAfter(now, disableCooling)
+			state.Unavailable = !state.NextRetryAfter.IsZero()
 		}
+	}
+
+	// disable_cooling means "keep retrying", not "park the credential forever".
+	// Without any recovery deadline the unavailable and quota flags would be
+	// unbounded, so clear them instead of leaving a state nothing can expire.
+	if disableCooling && state.NextRetryAfter.IsZero() && state.Quota.NextRecoverAt.IsZero() {
+		state.Unavailable = false
+		state.Quota.Exceeded = false
 	}
 
 	auth.Status = StatusError
@@ -749,6 +759,16 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 		return quotaBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
+}
+
+// recoverableFailureRetryAfter returns the cooldown deadline for a recoverable
+// upstream failure. Disabled cooling yields a zero deadline so the credential is
+// retried immediately rather than parked.
+func recoverableFailureRetryAfter(now time.Time, disableCooling bool) time.Time {
+	if disableCooling {
+		return time.Time{}
+	}
+	return now.Add(transientErrorCooldown)
 }
 
 func nextQuotaRecoverAt(now time.Time, _ *time.Duration, quota QuotaState, disableCooling bool) (time.Time, int) {
