@@ -206,9 +206,10 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		transition.suspendReason = "model_not_supported"
 		transition.shouldSuspendModel = true
 	} else if isCloudflareChallengeResultError(result.Error) {
-		next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
+		next, backoffLevel := nextCloudflareCooldown(state.Quota, disableCooling, now)
 		state.NextRetryAfter = next
 		state.StatusMessage = cloudflareChallengeReason
+		state.QuotaResetAt = time.Time{}
 		if auth.LastError != nil {
 			auth.StatusMessage = cloudflareChallengeReason
 		}
@@ -310,13 +311,22 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 		return authHasClearableAvailabilityState(auth, resultModel, now)
 	}
 	statusCode := statusCodeFromResult(result.Error)
+	if isModelSupportResultError(result.Error) {
+		return false
+	}
+	// A Cloudflare challenge writes quota state, so it needs the same shared row the
+	// 429 path uses: without it every Home node would advance its own backoff ladder
+	// for one incident and the last writer would win.
+	if isCloudflareChallengeResultError(result.Error) {
+		if m.quotaCooldownDisabledForAuth(auth) {
+			return false
+		}
+		return !authQuotaWindowOpen(auth, resultModel, now)
+	}
 	if statusCode == http.StatusUnauthorized {
 		return true
 	}
 	if statusCode != http.StatusTooManyRequests {
-		return false
-	}
-	if isModelSupportResultError(result.Error) {
 		return false
 	}
 	if m.quotaCooldownDisabledForAuth(auth) {
@@ -836,19 +846,23 @@ func isCloudflareChallengeResultError(err *Error) bool {
 
 // nextCloudflareCooldown reuses the quota backoff ladder with a floor so a challenge
 // page cannot be retried in a tight loop.
-func nextCloudflareCooldown(backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
-	var next time.Time
-	if !disableCooling {
-		cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-		if cooldown < cloudflareChallengeMinCooldown {
-			cooldown = cloudflareChallengeMinCooldown
-		}
-		if cooldown > 0 {
-			next = now.Add(cooldown)
-		}
-		backoffLevel = nextLevel
+//
+// Home aggregates results from every CPA node, so a single challenge is reported many
+// times over. Failures landing inside an open window reuse that window instead of
+// escalating, exactly like the quota path, so one incident advances the ladder at most
+// once no matter how many nodes observe it.
+func nextCloudflareCooldown(quota QuotaState, disableCooling bool, now time.Time) (time.Time, int) {
+	if disableCooling {
+		return time.Time{}, quota.BackoffLevel
 	}
-	return next, backoffLevel
+	if quota.NextRecoverAt.After(now) {
+		return quota.NextRecoverAt, quota.BackoffLevel
+	}
+	cooldown, nextLevel := nextQuotaCooldown(quota.BackoffLevel, false)
+	if cooldown < cloudflareChallengeMinCooldown {
+		cooldown = cloudflareChallengeMinCooldown
+	}
+	return now.Add(cooldown), nextLevel
 }
 
 // recoverableFailureRetryAfter returns the cooldown deadline for a recoverable

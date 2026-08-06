@@ -117,25 +117,47 @@ func TestCloudflareChallengeUsesQuotaBackoffWithFloor(t *testing.T) {
 	}
 }
 
-// TestCloudflareChallengeEscalatesBackoffLevel keeps repeated challenges backing off.
-func TestCloudflareChallengeEscalatesBackoffLevel(t *testing.T) {
+// TestCloudflareChallengeReusesOpenWindow keeps one incident from being punished once
+// per reporting node. Home aggregates results from every CPA node, so the same
+// challenge arrives repeatedly and must not walk the backoff ladder each time.
+func TestCloudflareChallengeReusesOpenWindow(t *testing.T) {
+	now := time.Now().UTC()
+	auth := failingAuth("auth-cloudflare-window", false)
+
+	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now)
+	first := auth.ModelStates["gpt-5"].Quota
+	if first.BackoffLevel == 0 {
+		t.Fatalf("first BackoffLevel = %d, want the ladder to advance once", first.BackoffLevel)
+	}
+
+	// A second node reporting the same challenge inside the open window changes nothing.
+	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now.Add(time.Second))
+	second := auth.ModelStates["gpt-5"].Quota
+	if second.BackoffLevel != first.BackoffLevel {
+		t.Fatalf("BackoffLevel advanced inside the open window: %d -> %d", first.BackoffLevel, second.BackoffLevel)
+	}
+	if !second.NextRecoverAt.Equal(first.NextRecoverAt) {
+		t.Fatalf("NextRecoverAt moved inside the open window: %v -> %v", first.NextRecoverAt, second.NextRecoverAt)
+	}
+}
+
+// TestCloudflareChallengeEscalatesAfterWindowExpires keeps a persistent challenge
+// backing off once the previous window actually elapsed.
+func TestCloudflareChallengeEscalatesAfterWindowExpires(t *testing.T) {
 	now := time.Now().UTC()
 	auth := failingAuth("auth-cloudflare-escalate", false)
 
 	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now)
 	first := auth.ModelStates["gpt-5"].Quota
-	if first.BackoffLevel == 0 {
-		t.Fatalf("first BackoffLevel = %d, want the ladder to advance", first.BackoffLevel)
-	}
 
-	// The open window must be reused rather than restarted while it is still live.
-	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now.Add(time.Second))
+	afterWindow := first.NextRecoverAt.Add(time.Second)
+	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", afterWindow)
 	second := auth.ModelStates["gpt-5"].Quota
-	if second.BackoffLevel < first.BackoffLevel {
-		t.Fatalf("BackoffLevel regressed: %d -> %d", first.BackoffLevel, second.BackoffLevel)
+	if second.BackoffLevel <= first.BackoffLevel {
+		t.Fatalf("BackoffLevel = %d, want it to advance past %d once the window elapsed", second.BackoffLevel, first.BackoffLevel)
 	}
-	if second.NextRecoverAt.Before(first.NextRecoverAt) {
-		t.Fatalf("NextRecoverAt moved earlier: %v -> %v", first.NextRecoverAt, second.NextRecoverAt)
+	if !second.NextRecoverAt.After(afterWindow) {
+		t.Fatalf("NextRecoverAt = %v, want a fresh window after %v", second.NextRecoverAt, afterWindow)
 	}
 }
 
