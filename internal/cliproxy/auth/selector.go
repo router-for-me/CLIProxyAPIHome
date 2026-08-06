@@ -401,10 +401,15 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 
 // availabilityBlock reports whether an availability snapshot blocks dispatch.
 //
-// A snapshot marked unavailable or quota-exceeded without any recovery deadline is
-// treated as blocked. Such a state is unbounded, so failing closed is the only way to
-// stop the scheduler from handing the same broken credential out forever. Deadlines
-// that already elapsed restore availability so a recovered credential returns on its own.
+// Availability defaults to healthy: a snapshot flagged unavailable or quota exceeded
+// blocks only while a recovery deadline is still in the future. A snapshot carrying no
+// deadline at all counts as recovered rather than parked, so a legacy row, a cluster
+// merge artifact, or a credential configured with disable_cooling can never strand
+// itself in a state nothing is able to expire. Every failure transition writes a
+// bounded deadline, so a real cooldown always carries one.
+//
+// The reported deadline is the later of the retry and quota windows so Retry-After
+// cannot invite a premature retry.
 func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
 	if !unavailable && !quotaExceeded {
 		return false, blockReasonNone, time.Time{}
@@ -418,16 +423,13 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 			next = candidate
 		}
 	}
-	if !next.IsZero() {
-		if quotaExceeded {
-			return true, blockReasonCooldown, next
-		}
-		return true, blockReasonOther, next
-	}
-	if !nextRetryAfter.IsZero() || !nextRecoverAt.IsZero() {
+	if next.IsZero() {
 		return false, blockReasonNone, time.Time{}
 	}
-	return true, blockReasonOther, time.Time{}
+	if quotaExceeded {
+		return true, blockReasonCooldown, next
+	}
+	return true, blockReasonOther, next
 }
 
 // sessionPattern matches Claude Code user_id format:

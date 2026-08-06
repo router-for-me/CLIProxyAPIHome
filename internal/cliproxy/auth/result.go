@@ -575,15 +575,19 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		stateUnavailable := false
 		if state.Status == StatusDisabled {
 			stateUnavailable = true
-		} else if state.Unavailable {
-			if state.NextRetryAfter.IsZero() {
-				stateUnavailable = false
-			} else if state.NextRetryAfter.After(now) {
+		} else {
+			// Reuse the dispatch decision so the aggregate an operator sees can never
+			// disagree with the scheduler.
+			blocked, _, next := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+			if blocked {
 				stateUnavailable = true
-				if earliestRetry.IsZero() || state.NextRetryAfter.Before(earliestRetry) {
-					earliestRetry = state.NextRetryAfter
+				if earliestRetry.IsZero() || next.Before(earliestRetry) {
+					earliestRetry = next
 				}
-			} else {
+			} else if state.Unavailable {
+				// The deadline elapsed, or a legacy snapshot never carried one. Normalize
+				// the stored flags so nothing keeps reporting a cooldown that dispatch
+				// already ignores.
 				state.Unavailable = false
 				state.NextRetryAfter = time.Time{}
 			}

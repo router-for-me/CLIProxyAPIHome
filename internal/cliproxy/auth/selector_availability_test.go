@@ -19,10 +19,11 @@ func modelStateAuth(id string, priority string, model string, state *ModelState)
 	return auth
 }
 
-// TestZeroDeadlineUnavailableModelBlocksDispatch locks the regression behind the
-// production 503: a model marked unavailable without any recovery deadline is an
-// unbounded bad state and must fail closed instead of being dispatched.
-func TestZeroDeadlineUnavailableModelBlocksDispatch(t *testing.T) {
+// TestZeroDeadlineUnavailableModelStaysDispatchable pins the fail-open rule: a state
+// with no recovery deadline is something nothing can expire, so it must read as
+// recovered rather than park the credential. Legacy rows and cluster merge artifacts
+// reach dispatch in exactly this shape.
+func TestZeroDeadlineUnavailableModelStaysDispatchable(t *testing.T) {
 	now := time.Now().UTC()
 	auth := modelStateAuth("auth-zero-deadline", "", "gemini-3-flash-agent", &ModelState{
 		Status:      StatusError,
@@ -31,35 +32,48 @@ func TestZeroDeadlineUnavailableModelBlocksDispatch(t *testing.T) {
 	})
 
 	blocked, reason, next := isAuthBlockedForModel(auth, "gemini-3-flash-agent", now)
-	if !blocked {
-		t.Fatal("unavailable model without a recovery deadline was reported dispatchable")
+	if blocked {
+		t.Fatal("a state with no recovery deadline parked the credential")
 	}
-	if reason != blockReasonOther {
-		t.Fatalf("reason = %v, want blockReasonOther for an unbounded bad state", reason)
-	}
-	if !next.IsZero() {
-		t.Fatalf("next = %v, want zero: there is no deadline to report", next)
+	if reason != blockReasonNone || !next.IsZero() {
+		t.Fatalf("reason/next = %v/%v, want an unblocked verdict", reason, next)
 	}
 }
 
-// TestQuotaExceededWithoutUnavailableBlocksDispatch covers state written by cluster
-// merges or the Management API where only the quota flag is set.
-func TestQuotaExceededWithoutUnavailableBlocksDispatch(t *testing.T) {
+// TestQuotaExceededWithOpenWindowBlocksDispatch covers state written by cluster merges
+// or the Management API where the quota flag carries the window and the unavailable
+// flag was never set.
+func TestQuotaExceededWithOpenWindowBlocksDispatch(t *testing.T) {
 	now := time.Now().UTC()
+	recoverAt := now.Add(10 * time.Minute)
 	auth := modelStateAuth("auth-quota-only", "", "gpt-5", &ModelState{
 		Status: StatusError,
-		Quota:  QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota"},
+		Quota:  QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota", NextRecoverAt: recoverAt},
 	})
 
 	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
 	if !blocked {
-		t.Fatal("quota-exceeded model was reported dispatchable")
+		t.Fatal("quota-exceeded model with an open window was reported dispatchable")
 	}
-	if reason != blockReasonOther {
-		t.Fatalf("reason = %v, want blockReasonOther without a recovery deadline", reason)
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want blockReasonCooldown", reason)
 	}
-	if !next.IsZero() {
-		t.Fatalf("next = %v, want zero", next)
+	if !next.Equal(recoverAt) {
+		t.Fatalf("next = %v, want %v", next, recoverAt)
+	}
+}
+
+// TestQuotaExceededWithoutDeadlineStaysDispatchable keeps a quota flag that lost its
+// window from becoming a state nothing can expire.
+func TestQuotaExceededWithoutDeadlineStaysDispatchable(t *testing.T) {
+	now := time.Now().UTC()
+	auth := modelStateAuth("auth-quota-no-window", "", "gpt-5", &ModelState{
+		Status: StatusError,
+		Quota:  QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota"},
+	})
+
+	if blocked, _, _ := isAuthBlockedForModel(auth, "gpt-5", now); blocked {
+		t.Fatal("quota flag without a recovery window parked the credential")
 	}
 }
 
@@ -109,6 +123,47 @@ func TestBlockedNextUsesLatestRecoveryDeadline(t *testing.T) {
 	}
 }
 
+// TestBlockAlwaysReportsDeadline pins the invariant the scheduler depends on: a block
+// verdict always carries a future deadline, so promoteExpiredLocked can always bring the
+// entry back on its own and no snapshot can strand a credential.
+func TestBlockAlwaysReportsDeadline(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(time.Minute)
+	past := now.Add(-time.Minute)
+
+	snapshots := []struct {
+		name          string
+		unavailable   bool
+		quotaExceeded bool
+		retryAfter    time.Time
+		recoverAt     time.Time
+	}{
+		{name: "no flags"},
+		{name: "unavailable without deadline", unavailable: true},
+		{name: "quota without deadline", quotaExceeded: true},
+		{name: "both without deadline", unavailable: true, quotaExceeded: true},
+		{name: "elapsed deadlines", unavailable: true, quotaExceeded: true, retryAfter: past, recoverAt: past},
+		{name: "open retry window", unavailable: true, retryAfter: future},
+		{name: "open quota window", quotaExceeded: true, recoverAt: future},
+		{name: "mixed windows", unavailable: true, quotaExceeded: true, retryAfter: past, recoverAt: future},
+	}
+
+	for _, tc := range snapshots {
+		t.Run(tc.name, func(t *testing.T) {
+			blocked, _, next := availabilityBlock(tc.unavailable, tc.quotaExceeded, tc.retryAfter, tc.recoverAt, now)
+			if !blocked {
+				if !next.IsZero() {
+					t.Fatalf("next = %v, want zero for an unblocked verdict", next)
+				}
+				return
+			}
+			if next.IsZero() || !next.After(now) {
+				t.Fatalf("next = %v, want a future deadline for a blocked verdict", next)
+			}
+		})
+	}
+}
+
 // TestExpiredDeadlinesRestoreAvailability keeps recovery automatic: once every
 // deadline elapsed the credential returns without operator action.
 func TestExpiredDeadlinesRestoreAvailability(t *testing.T) {
@@ -126,20 +181,22 @@ func TestExpiredDeadlinesRestoreAvailability(t *testing.T) {
 	}
 }
 
-// TestHighPriorityBadCredentialFallsBackToHealthy is the scheduling-level
-// regression test for the production 503: a priority=4 credential stuck in an
-// unbounded bad state must not starve a healthy priority=0 credential.
-func TestHighPriorityBadCredentialFallsBackToHealthy(t *testing.T) {
+// TestHighPriorityCoolingCredentialFallsBackToHealthy is the scheduling-level
+// regression test for the production 503: a priority=4 credential inside its cooldown
+// must not starve a healthy priority=0 credential.
+func TestHighPriorityCoolingCredentialFallsBackToHealthy(t *testing.T) {
 	now := time.Now().UTC()
 	model := "gemini-3-flash-agent"
-	broken := modelStateAuth("auth-broken-high-priority", "4", model, &ModelState{
-		Status:      StatusError,
-		Unavailable: true,
-		Quota:       QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota"},
+	recoverAt := now.Add(5 * time.Minute)
+	cooling := modelStateAuth("auth-cooling-high-priority", "4", model, &ModelState{
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: recoverAt,
+		Quota:          QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota", NextRecoverAt: recoverAt},
 	})
 	healthy := modelStateAuth("auth-healthy-low-priority", "0", model, &ModelState{Status: StatusActive})
 
-	available, err := getAvailableAuths([]*Auth{broken, healthy}, "antigravity", model, now)
+	available, err := getAvailableAuths([]*Auth{cooling, healthy}, "antigravity", model, now)
 	if err != nil {
 		t.Fatalf("getAvailableAuths() error = %v, want the healthy credential", err)
 	}
@@ -149,6 +206,37 @@ func TestHighPriorityBadCredentialFallsBackToHealthy(t *testing.T) {
 			ids = append(ids, auth.ID)
 		}
 		t.Fatalf("available = %v, want only %s", ids, healthy.ID)
+	}
+}
+
+// TestLegacyUnboundedStateKeepsCredentialSchedulable is the upgrade guard: a snapshot
+// written by an older Home version carries an unavailable flag with no deadline, and it
+// must never survive as a credential nothing can revive.
+func TestLegacyUnboundedStateKeepsCredentialSchedulable(t *testing.T) {
+	now := time.Now().UTC()
+	model := "gemini-3-flash-agent"
+	legacy := modelStateAuth("auth-legacy-unbounded", "4", model, &ModelState{
+		Status:      StatusError,
+		Unavailable: true,
+		LastError:   &Error{Message: "conflict", HTTPStatus: 409},
+	})
+
+	available, err := getAvailableAuths([]*Auth{legacy}, "antigravity", model, now)
+	if err != nil {
+		t.Fatalf("getAvailableAuths() error = %v, want the legacy credential to stay schedulable", err)
+	}
+	if len(available) != 1 || available[0].ID != legacy.ID {
+		t.Fatalf("available = %v, want the legacy credential", available)
+	}
+
+	// The next aggregate pass normalizes the stored snapshot so nothing keeps
+	// reporting a cooldown dispatch already ignores.
+	updateAggregatedAvailability(legacy, now)
+	if state := legacy.ModelStates[model]; state == nil || state.Unavailable {
+		t.Fatalf("state = %#v, want the unbounded flag cleared", state)
+	}
+	if legacy.Unavailable {
+		t.Fatal("credential aggregate still reports unavailable")
 	}
 }
 
