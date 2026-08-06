@@ -211,8 +211,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 }
 
 // getAvailableAuthsAcrossPriorities returns every available candidate regardless of
-// priority. Use it for membership checks such as validating an established session
-// binding, never as a priority-ordered selection order.
+// priority, sorted by ID. Use it for membership checks such as validating an established
+// session binding, or feed it to highestPriorityAuths; the order carries no priority
+// meaning and must never be treated as a selection order.
 func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, true)
 }
@@ -244,8 +245,8 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 
 // availableAuthsFromPriorityBuckets flattens availability buckets into a stable,
 // ID-sorted slice. With allPriorities false only the highest available tier is
-// returned; with allPriorities true every tier is merged and the result therefore
-// carries no priority ordering.
+// returned; with allPriorities true every tier is merged, so the ID order of the
+// result says nothing about credential priority.
 func availableAuthsFromPriorityBuckets(availableByPriority map[int][]*Auth, allPriorities bool) []*Auth {
 	var candidates []*Auth
 	if allPriorities {
@@ -486,13 +487,19 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
-		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
-	}
-
 	now := time.Now()
 	auths = filterConcurrencyExcludedAuths(auths, model, opts)
+	if primaryID == "" {
+		// Keep both paths on one availability evaluation so a sessionless request cannot
+		// see a different candidate set than a session-bound one.
+		sessionlessAuths, errAvailable := getAvailableAuths(auths, provider, model, now)
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		return s.fallback.Pick(ctx, provider, model, opts, sessionlessAuths)
+	}
+
 	// A single availability pass serves both lookups: the bound credential is validated
 	// against every priority tier, while the fallback selector keeps seeing only the
 	// highest tier.
