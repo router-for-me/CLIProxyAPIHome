@@ -325,30 +325,46 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				if state.Status == StatusDisabled {
 					return true, blockReasonDisabled, time.Time{}
 				}
-				if state.Unavailable {
-					if state.NextRetryAfter.IsZero() {
-						return false, blockReasonNone, time.Time{}
-					}
-					if state.NextRetryAfter.After(now) {
-						next := state.NextRetryAfter
-						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
-							next = state.Quota.NextRecoverAt
-						}
-						if next.Before(now) {
-							next = now
-						}
-						if state.Quota.Exceeded {
-							return true, blockReasonCooldown, next
-						}
-						return true, blockReasonOther, next
-					}
-				}
-				return false, blockReasonNone, time.Time{}
+				return availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
 			}
 		}
+		// Credential-wide aggregates are advisory only: legacy Home versions recorded
+		// quota state with a "credential" scope, and honouring it here would block every
+		// model instead of the one that actually failed.
 		return false, blockReasonNone, time.Time{}
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+// availabilityBlock reports whether an availability snapshot blocks dispatch.
+//
+// A snapshot marked unavailable or quota-exceeded without any recovery deadline is
+// treated as blocked. Such a state is unbounded, so failing closed is the only way to
+// stop the scheduler from handing the same broken credential out forever. Deadlines
+// that already elapsed restore availability so a recovered credential returns on its own.
+func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
+	if !unavailable && !quotaExceeded {
+		return false, blockReasonNone, time.Time{}
+	}
+	next := time.Time{}
+	for _, candidate := range []time.Time{nextRetryAfter, nextRecoverAt} {
+		if candidate.IsZero() || !candidate.After(now) {
+			continue
+		}
+		if next.IsZero() || candidate.After(next) {
+			next = candidate
+		}
+	}
+	if !next.IsZero() {
+		if quotaExceeded {
+			return true, blockReasonCooldown, next
+		}
+		return true, blockReasonOther, next
+	}
+	if !nextRetryAfter.IsZero() || !nextRecoverAt.IsZero() {
+		return false, blockReasonNone, time.Time{}
+	}
+	return true, blockReasonOther, time.Time{}
 }
 
 // sessionPattern matches Claude Code user_id format:
