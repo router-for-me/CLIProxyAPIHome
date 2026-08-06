@@ -21,6 +21,10 @@ const (
 	transientErrorCooldown   = time.Minute
 	quotaScopeModel          = "model"
 
+	// statusClientClosedRequest is the non-standard status proxies use when the caller
+	// disconnects before the upstream answered.
+	statusClientClosedRequest = 499
+
 	cloudflareChallengeReason      = "cloudflare challenge"
 	cloudflareChallengeMinCooldown = 10 * time.Second
 )
@@ -52,6 +56,11 @@ type markResultTransition struct {
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	// Keep validation before state changes so failures leave existing data intact.
 	if m == nil || (strings.TrimSpace(result.AuthID) == "" && strings.TrimSpace(result.AuthIndex) == "") {
+		return
+	}
+	// A client that walked away says nothing about the credential. Drop the result
+	// entirely so the attempt is neither counted as a failure nor cooled down.
+	if isClientCanceledResult(result) {
 		return
 	}
 	if ctx == nil {
@@ -182,7 +191,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
-	if isRequestScopedNotFoundResultError(result.Error) {
+	if isRequestScopedNotFoundResultError(result.Error) || isClientCanceledResult(result) {
 		return transition
 	}
 	disableCooling := m.quotaCooldownDisabledForAuth(auth)
@@ -309,6 +318,9 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	}
 	if result.Success {
 		return authHasClearableAvailabilityState(auth, resultModel, now)
+	}
+	if isClientCanceledResult(result) {
+		return false
 	}
 	statusCode := statusCodeFromResult(result.Error)
 	if isModelSupportResultError(result.Error) {
@@ -754,6 +766,52 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 		return false
 	}
 	return isRequestScopedNotFoundMessage(err.Message)
+}
+
+// isClientCanceledResult reports whether a failed attempt was aborted by the caller
+// rather than rejected by the provider. Such a result carries no information about the
+// credential, so Home must not cool it down or count the attempt against it.
+func isClientCanceledResult(result Result) bool {
+	if result.Success {
+		return false
+	}
+	return isClientCanceledResultError(result.Error)
+}
+
+// isClientCanceledResultError reports whether an execution error describes a caller
+// that went away.
+func isClientCanceledResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromResult(err) == statusClientClosedRequest {
+		return true
+	}
+	return isClientCanceledMessage(err.Code) || isClientCanceledMessage(err.Message)
+}
+
+// isClientCanceledMessage matches the cancellation vocabulary produced by Go, net/http,
+// and the CPA executors when a caller disconnects mid-flight.
+//
+// Timeouts are deliberately excluded. A deadline says the upstream stopped responding,
+// which is exactly the signal the transient cooldown exists for, and "Client.Timeout
+// exceeded" phrases the same thing with the word canceled.
+func isClientCanceledMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") {
+		return false
+	}
+	return strings.Contains(lower, "context canceled") ||
+		strings.Contains(lower, "context cancelled") ||
+		strings.Contains(lower, "request canceled") ||
+		strings.Contains(lower, "request cancelled") ||
+		strings.Contains(lower, "client disconnected") ||
+		strings.Contains(lower, "client closed request") ||
+		strings.Contains(lower, "operation was canceled") ||
+		strings.Contains(lower, "operation was cancelled")
 }
 
 // disableAuthAfterUnauthorized permanently disables a credential after a terminal refresh failure.
