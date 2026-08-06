@@ -199,6 +199,8 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 
 	statusCode := statusCodeFromResult(result.Error)
 	if isModelSupportResultError(result.Error) {
+		// A model the credential cannot serve is a capability verdict, not a cooldown,
+		// so disable_cooling does not shorten it.
 		next := now.Add(12 * time.Hour)
 		state.NextRetryAfter = next
 		transition.suspendReason = "model_not_supported"
@@ -228,7 +230,13 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	} else {
 		switch statusCode {
 		case http.StatusUnauthorized:
-			state.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
+			// Home refreshes tokens centrally, so a 401 only parks the model long enough
+			// for the refresh to land. disable_cooling opts out of that wait as well.
+			if disableCooling {
+				state.NextRetryAfter = time.Time{}
+			} else {
+				state.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
+			}
 		case http.StatusPaymentRequired, http.StatusForbidden:
 			if disableCooling {
 				state.NextRetryAfter = time.Time{}
