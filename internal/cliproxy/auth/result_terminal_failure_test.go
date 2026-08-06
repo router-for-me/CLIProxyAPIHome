@@ -161,6 +161,24 @@ func TestCloudflareChallengeEscalatesAfterWindowExpires(t *testing.T) {
 	}
 }
 
+// TestInvalidGrantKeepsRegistryModelSuspended keeps the published model list in step
+// with dispatch: a revoked grant blocks dispatch for 30 minutes, so a registry
+// reconcile must not resume the model in the meantime.
+func TestInvalidGrantKeepsRegistryModelSuspended(t *testing.T) {
+	now := time.Now().UTC()
+	auth := failingAuth("auth-invalid-grant-registry", false)
+
+	applyFailureWithCode(auth, "gpt-5", http.StatusBadRequest, "invalid_grant", "token has been revoked", now)
+
+	blocked, reason, _ := isAuthBlockedForModel(auth, "gpt-5", now)
+	if !blocked {
+		t.Fatal("invalid_grant left the model dispatchable")
+	}
+	if !shouldSuspendRegistryModel(auth, "gpt-5", reason) {
+		t.Fatal("registry would resume a model dispatch still refuses")
+	}
+}
+
 // TestCloudflareChallengeWithDisableCoolingStaysAvailable keeps disable_cooling from
 // leaving a quota flag nothing can expire.
 func TestCloudflareChallengeWithDisableCoolingStaysAvailable(t *testing.T) {
