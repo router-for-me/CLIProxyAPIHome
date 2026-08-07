@@ -492,12 +492,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if primaryID == "" {
 		// Keep both paths on one availability evaluation so a sessionless request cannot
 		// see a different candidate set than a session-bound one.
-		sessionlessAuths, errAvailable := getAvailableAuths(auths, provider, model, now)
+		sessionlessAuths, errAvailable := getAvailableAuthsAcrossPriorities(auths, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, sessionlessAuths)
+		return s.fallback.Pick(ctx, provider, model, opts, coldStartCandidates(sessionlessAuths, provider, opts))
 	}
 
 	cacheKey := provider + "::" + primaryID + "::" + model
@@ -527,13 +527,39 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, highestPriorityAuths(available))
+	auth, err := s.fallback.Pick(ctx, provider, model, opts, coldStartCandidates(available, provider, opts))
 	if err != nil {
 		return nil, err
 	}
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: no usable binding, selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// coldStartCandidates narrows an availability view down to what a new binding may pick.
+//
+// Credential priority governs a cold start, except for a downstream websocket: keeping
+// the transport intact outranks the tier, so a websocket-capable credential wins across
+// priorities. This mirrors the scheduler's own preference, which never runs while
+// session affinity is enabled because that path is served by the fallback selector.
+func coldStartCandidates(available []*Auth, provider string, opts Options) []*Auth {
+	if downstreamWebsocketFromOptions(opts) && providerPrefersWebsocketTransport(provider) {
+		if websocketAuths := websocketCapableAuths(available); len(websocketAuths) > 0 {
+			return highestPriorityAuths(websocketAuths)
+		}
+	}
+	return highestPriorityAuths(available)
+}
+
+// websocketCapableAuths keeps only credentials whose upstream can carry a websocket.
+func websocketCapableAuths(auths []*Auth) []*Auth {
+	capable := make([]*Auth, 0, len(auths))
+	for _, candidate := range auths {
+		if authWebsocketsEnabled(candidate) {
+			capable = append(capable, candidate)
+		}
+	}
+	return capable
 }
 
 // availableAuthByID resolves one credential by ID and reports it only when it is still

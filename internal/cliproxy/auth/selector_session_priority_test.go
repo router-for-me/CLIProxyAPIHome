@@ -247,3 +247,85 @@ func TestAvailableAuthByIDIgnoresBlockedAndUnknownIDs(t *testing.T) {
 		t.Fatalf("empty lookup = %s, want nil", got.ID)
 	}
 }
+
+// wsSessionAuth builds a codex credential at the given priority with an explicit
+// websocket capability flag, for the shared session-affinity model.
+func wsSessionAuth(id, priority string, websockets bool) *Auth {
+	auth := modelStateAuth(id, priority, sessionPriorityModel, &ModelState{Status: StatusActive})
+	auth.Provider = "codex"
+	auth.Attributes["websockets"] = "false"
+	if websockets {
+		auth.Attributes["websockets"] = "true"
+	}
+	return auth
+}
+
+// TestWebsocketColdStartOutranksPriorityUnderSessionAffinity closes the gap that made
+// the scheduler's websocket preference unreachable in practice. A websocket session
+// binds on its first request and stays bound, so if that first pick ignores websocket
+// capability the whole session runs on a credential that cannot hold the transport.
+// Session affinity replaces the scheduler fast path entirely, so the preference has to
+// exist here too.
+func TestWebsocketColdStartOutranksPriorityUnderSessionAffinity(t *testing.T) {
+	httpOnly := wsSessionAuth("auth-http-high", "9", false)
+	websocketCapable := wsSessionAuth("auth-ws-low", "1", true)
+	selector := newSessionSelector()
+	auths := []*Auth{httpOnly, websocketCapable}
+
+	opts := sessionOptions("session-websocket")
+	opts.Metadata = map[string]any{DownstreamWebsocketMetadataKey: true}
+
+	picked, err := selector.Pick(context.Background(), "codex", sessionPriorityModel, opts, auths)
+	if err != nil {
+		t.Fatalf("cold start failed: %v", err)
+	}
+	if picked.ID != websocketCapable.ID {
+		t.Fatalf("cold start picked %s, want the websocket credential %s", picked.ID, websocketCapable.ID)
+	}
+
+	// The binding must then hold for the rest of the session.
+	again, err := selector.Pick(context.Background(), "codex", sessionPriorityModel, opts, auths)
+	if err != nil {
+		t.Fatalf("bound pick failed: %v", err)
+	}
+	if again.ID != websocketCapable.ID {
+		t.Fatalf("bound pick returned %s, want %s", again.ID, websocketCapable.ID)
+	}
+}
+
+// TestNonWebsocketColdStartStillFollowsPriority keeps the preference scoped: an
+// ordinary request must still bind to the highest priority credential.
+func TestNonWebsocketColdStartStillFollowsPriority(t *testing.T) {
+	httpOnly := wsSessionAuth("auth-http-high", "9", false)
+	websocketCapable := wsSessionAuth("auth-ws-low", "1", true)
+	selector := newSessionSelector()
+	auths := []*Auth{httpOnly, websocketCapable}
+
+	picked, err := selector.Pick(context.Background(), "codex", sessionPriorityModel, sessionOptions("session-plain"), auths)
+	if err != nil {
+		t.Fatalf("cold start failed: %v", err)
+	}
+	if picked.ID != httpOnly.ID {
+		t.Fatalf("cold start picked %s, want the highest priority credential %s", picked.ID, httpOnly.ID)
+	}
+}
+
+// TestWebsocketColdStartFallsBackWhenNoCapableCredential keeps a websocket request
+// dispatchable when nothing in the pool can hold a websocket upstream.
+func TestWebsocketColdStartFallsBackWhenNoCapableCredential(t *testing.T) {
+	high := wsSessionAuth("auth-http-high", "9", false)
+	low := wsSessionAuth("auth-http-low", "1", false)
+	selector := newSessionSelector()
+	auths := []*Auth{high, low}
+
+	opts := sessionOptions("session-websocket-nofit")
+	opts.Metadata = map[string]any{DownstreamWebsocketMetadataKey: true}
+
+	picked, err := selector.Pick(context.Background(), "codex", sessionPriorityModel, opts, auths)
+	if err != nil {
+		t.Fatalf("cold start failed: %v", err)
+	}
+	if picked.ID != high.ID {
+		t.Fatalf("cold start picked %s, want the highest priority credential %s", picked.ID, high.ID)
+	}
+}
