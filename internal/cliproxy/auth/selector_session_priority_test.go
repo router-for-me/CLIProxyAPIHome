@@ -181,3 +181,69 @@ func TestAcrossPrioritiesReturnsEveryTier(t *testing.T) {
 		t.Fatalf("available = [%s %s], want ID-sorted [%s %s]", available[0].ID, available[1].ID, high.ID, low.ID)
 	}
 }
+
+// TestBoundSessionResolvesWithoutPoolWideEvaluation pins the cheap path: reusing an
+// established binding must depend only on the bound credential. The bound credential
+// here sits at the lowest priority while every other candidate is blocked, so a
+// pool-wide evaluation is neither needed nor allowed to change the answer.
+func TestBoundSessionResolvesWithoutPoolWideEvaluation(t *testing.T) {
+	now := time.Now().UTC()
+	bound := sessionPriorityAuth("auth-bound", "1")
+	high := sessionPriorityAuth("auth-high", "9")
+	other := sessionPriorityAuth("auth-other", "5")
+	selector := newSessionSelector()
+	opts := sessionOptions("session-cheap-path")
+	auths := []*Auth{high, other, bound}
+
+	// Cold start binds to the highest priority credential.
+	first, err := selector.Pick(context.Background(), "gemini", sessionPriorityModel, opts, auths)
+	if err != nil {
+		t.Fatalf("cold start failed: %v", err)
+	}
+	if first.ID != high.ID {
+		t.Fatalf("cold start picked %s, want %s", first.ID, high.ID)
+	}
+
+	// Rebind onto the lowest priority credential by blocking everything else.
+	blockModel(high, now)
+	blockModel(other, now)
+	second, err := selector.Pick(context.Background(), "gemini", sessionPriorityModel, opts, auths)
+	if err != nil {
+		t.Fatalf("rebinding failed: %v", err)
+	}
+	if second.ID != bound.ID {
+		t.Fatalf("rebinding picked %s, want %s", second.ID, bound.ID)
+	}
+
+	// The binding now resolves on its own even though the rest of the pool is blocked.
+	third, err := selector.Pick(context.Background(), "gemini", sessionPriorityModel, opts, auths)
+	if err != nil {
+		t.Fatalf("bound pick failed: %v", err)
+	}
+	if third.ID != bound.ID {
+		t.Fatalf("bound pick returned %s, want %s", third.ID, bound.ID)
+	}
+}
+
+// TestAvailableAuthByIDIgnoresBlockedAndUnknownIDs covers the single-credential lookup
+// behind the bound-session path.
+func TestAvailableAuthByIDIgnoresBlockedAndUnknownIDs(t *testing.T) {
+	now := time.Now().UTC()
+	healthy := sessionPriorityAuth("auth-healthy", "1")
+	blocked := sessionPriorityAuth("auth-blocked", "1")
+	blockModel(blocked, now)
+	auths := []*Auth{healthy, blocked}
+
+	if got := availableAuthByID(auths, healthy.ID, sessionPriorityModel, now); got == nil || got.ID != healthy.ID {
+		t.Fatalf("healthy lookup = %v, want %s", got, healthy.ID)
+	}
+	if got := availableAuthByID(auths, blocked.ID, sessionPriorityModel, now); got != nil {
+		t.Fatalf("blocked lookup = %s, want nil", got.ID)
+	}
+	if got := availableAuthByID(auths, "auth-missing", sessionPriorityModel, now); got != nil {
+		t.Fatalf("unknown lookup = %s, want nil", got.ID)
+	}
+	if got := availableAuthByID(auths, "", sessionPriorityModel, now); got != nil {
+		t.Fatalf("empty lookup = %s, want nil", got.ID)
+	}
+}

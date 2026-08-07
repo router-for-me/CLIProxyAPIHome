@@ -500,54 +500,59 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return s.fallback.Pick(ctx, provider, model, opts, sessionlessAuths)
 	}
 
-	// A single availability pass serves both lookups: the bound credential is validated
-	// against every priority tier, while the fallback selector keeps seeing only the
-	// highest tier.
+	cacheKey := provider + "::" + primaryID + "::" + model
+
+	// Reusing an established binding is the common case and only needs an answer about
+	// one credential, so it is settled before any pool-wide work. Evaluating every
+	// candidate first would make the cheapest outcome the most expensive one.
+	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		if bound := availableAuthByID(auths, cachedAuthID, model, now); bound != nil {
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+			return bound, nil
+		}
+	} else if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey := provider + "::" + fallbackID + "::" + model
+		if cachedAuthID, okFallback := s.cache.Get(fallbackKey); okFallback {
+			if bound := availableAuthByID(auths, cachedAuthID, model, now); bound != nil {
+				s.cache.Set(cacheKey, bound.ID)
+				entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), bound.ID, provider, model)
+				return bound, nil
+			}
+		}
+	}
+
+	// No usable binding: evaluate the pool and let the fallback selector choose from the
+	// highest available tier, which is what governs a cold start.
 	available, err := getAvailableAuthsAcrossPriorities(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
-
-	cacheKey := provider + "::" + primaryID + "::" + model
-
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
-			}
-		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
-		if err != nil {
-			return nil, err
-		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
-	}
-
-	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
-				}
-			}
-		}
-	}
-
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.fallback.Pick(ctx, provider, model, opts, highestPriorityAuths(available))
 	if err != nil {
 		return nil, err
 	}
 	s.cache.Set(cacheKey, auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	entry.Infof("session-affinity: no usable binding, selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// availableAuthByID resolves one credential by ID and reports it only when it is still
+// dispatchable for the model. A bound session needs exactly this answer, and asking it
+// directly avoids evaluating every other candidate to reach a foregone conclusion.
+func availableAuthByID(auths []*Auth, authID, model string, now time.Time) *Auth {
+	if authID == "" {
+		return nil
+	}
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID != authID {
+			continue
+		}
+		if blocked, _, _ := isAuthBlockedForModel(candidate, model, now); blocked {
+			return nil
+		}
+		return candidate
+	}
+	return nil
 }
 
 // selectorLogEntry handles a selector log entry.
