@@ -64,7 +64,7 @@ func TestUnmappedStatusParksModelBriefly(t *testing.T) {
 	now := time.Now().UTC()
 	auth := failingAuth("auth-unmapped", false)
 
-	applyFailure(auth, "gpt-5", http.StatusConflict, "conflict", now)
+	applyFailure(auth, "gpt-5", http.StatusNotImplemented, "not implemented", now)
 
 	state := auth.ModelStates["gpt-5"]
 	if state == nil {
@@ -91,7 +91,7 @@ func TestUnmappedStatusWithDisableCoolingStaysAvailable(t *testing.T) {
 	now := time.Now().UTC()
 	auth := failingAuth("auth-unmapped-nocool", true)
 
-	applyFailure(auth, "gpt-5", http.StatusBadRequest, "bad request", now)
+	applyFailure(auth, "gpt-5", http.StatusNotImplemented, "not implemented", now)
 
 	state := auth.ModelStates["gpt-5"]
 	if state == nil {

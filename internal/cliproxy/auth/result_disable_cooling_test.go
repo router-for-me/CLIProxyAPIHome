@@ -31,7 +31,7 @@ func TestDisableCoolingKeepsEveryFailureDispatchable(t *testing.T) {
 		{name: "not found", status: http.StatusNotFound, body: "model not found"},
 		{name: "quota", status: http.StatusTooManyRequests, body: "quota exceeded"},
 		{name: "transient", status: http.StatusBadGateway, body: "bad gateway"},
-		{name: "unmapped", status: http.StatusConflict, body: "conflict"},
+		{name: "unmapped", status: http.StatusNotImplemented, body: "not implemented"},
 		{name: "invalid grant", status: http.StatusBadRequest, body: "invalid_grant"},
 		{name: "cloudflare challenge", status: http.StatusForbidden, body: "cf-mitigated"},
 	}

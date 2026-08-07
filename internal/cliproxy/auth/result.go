@@ -31,6 +31,28 @@ const (
 
 var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
 
+// requestFaultCodes and requestFaultTypes mirror CPA's internal/clienterror so both
+// sides agree on which upstream rejections belong to the request rather than the
+// credential.
+var requestFaultCodes = map[string]struct{}{
+	"cyber_policy":                {},
+	"context_length_exceeded":     {},
+	"message_too_big":             {},
+	"string_above_max_length":     {},
+	"invalid_prompt":              {},
+	"invalid_value":               {},
+	"unsupported_value":           {},
+	"invalid_request_error":       {},
+	"previous_response_not_found": {},
+}
+
+var requestFaultTypes = map[string]struct{}{
+	"invalid_request":       {},
+	"invalid_request_error": {},
+	"bad_request_error":     {},
+	"invalid_prompt":        {},
+}
+
 // Result captures an upstream execution result reported by a downstream CPA node.
 type Result struct {
 	AuthID            string
@@ -191,7 +213,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
-	if isRequestScopedNotFoundResultError(result.Error) || isClientCanceledResult(result) {
+	if resultSkipsCredentialCooldown(result) {
 		return transition
 	}
 	disableCooling := m.quotaCooldownDisabledForAuth(auth)
@@ -319,7 +341,7 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	if result.Success {
 		return authHasClearableAvailabilityState(auth, resultModel, now)
 	}
-	if isClientCanceledResult(result) {
+	if resultSkipsCredentialCooldown(result) {
 		return false
 	}
 	statusCode := statusCodeFromResult(result.Error)
@@ -766,6 +788,72 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 		return false
 	}
 	return isRequestScopedNotFoundMessage(err.Message)
+}
+
+// resultSkipsCredentialCooldown reports failures that say nothing about the credential
+// and therefore must not cool the credential/model pair down.
+//
+// Order matters. Several provider verdicts arrive on the very status codes a request
+// fault uses (invalid_grant on 400/401, an unsupported model on 400/422), so each of
+// them is settled before the generic request-fault test runs. Getting this backwards
+// would let a revoked grant masquerade as a bad request and never cool down.
+func resultSkipsCredentialCooldown(result Result) bool {
+	if result.Success {
+		return false
+	}
+	if isClientCanceledResult(result) {
+		return true
+	}
+	err := result.Error
+	if isRequestScopedNotFoundResultError(err) {
+		return true
+	}
+	if isCloudflareChallengeResultError(err) || isInvalidGrantResultError(err) || isModelSupportResultError(err) {
+		return false
+	}
+	return isRequestFaultResultError(err)
+}
+
+// isRequestFaultResultError reports whether an upstream rejection was caused by the
+// request itself. Every credential would produce the same answer for the same input,
+// so cooling one down only shrinks the pool while the caller keeps replaying a request
+// that cannot succeed until it is rebuilt.
+func isRequestFaultResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if hasRequestFaultBody(err.Message) {
+		return true
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusBadRequest,
+		http.StatusConflict,
+		http.StatusRequestEntityTooLarge,
+		http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+// hasRequestFaultBody matches the structured identifiers providers use to say the
+// request was malformed, oversized, or rejected by policy.
+func hasRequestFaultBody(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" || !gjson.Valid(body) {
+		return false
+	}
+	for _, path := range []string{"error.code", "code", "response.error.code", "body.error.code"} {
+		if _, ok := requestFaultCodes[strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))]; ok {
+			return true
+		}
+	}
+	for _, path := range []string{"error.type", "type", "response.error.type", "body.error.type"} {
+		if _, ok := requestFaultTypes[strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // isClientCanceledResult reports whether a failed attempt was aborted by the caller
