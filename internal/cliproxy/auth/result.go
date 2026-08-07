@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -28,8 +27,6 @@ const (
 	cloudflareChallengeReason      = "cloudflare challenge"
 	cloudflareChallengeMinCooldown = 10 * time.Second
 )
-
-var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
 
 // requestFaultCodes and requestFaultTypes mirror CPA's internal/clienterror so both
 // sides agree on which upstream rejections belong to the request rather than the
@@ -61,7 +58,6 @@ type Result struct {
 	Model             string
 	Success           bool
 	Error             *Error
-	RetryAfter        *time.Duration
 	AccessTokenSHA256 string
 }
 
@@ -82,6 +78,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	// A client that walked away says nothing about the credential. Drop the result
 	// entirely so the attempt is neither counted as a failure nor cooled down.
+	//
+	// This deliberately skips the recent-request counters too. A cancellation is
+	// neither a success nor a failure, and folding it into either would distort the
+	// health rate that operators read to judge a credential.
 	if isClientCanceledResult(result) {
 		return
 	}
@@ -276,6 +276,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.shouldSuspendModel = true
 			}
 		case http.StatusNotFound:
+			// Unlike an explicit model-not-supported verdict, a bare 404 can also mean a
+			// misrouted or briefly missing endpoint, so it stays a cooldown that
+			// disable_cooling is allowed to waive.
 			if disableCooling {
 				state.NextRetryAfter = time.Time{}
 			} else {
@@ -285,7 +288,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.shouldSuspendModel = true
 			}
 		case http.StatusTooManyRequests:
-			next, backoffLevel := nextQuotaRecoverAt(now, result.RetryAfter, state.Quota, disableCooling)
+			next, backoffLevel := nextQuotaRecoverAt(now, state.Quota, disableCooling)
 			state.NextRetryAfter = next
 			state.QuotaResetAt = time.Time{}
 			state.Quota = QuotaState{
@@ -709,13 +712,14 @@ func hasModelError(auth *Auth, now time.Time) bool {
 		if state == nil {
 			continue
 		}
-		if state.LastError != nil {
+		if state.Status == StatusDisabled {
 			return true
 		}
-		if state.Status == StatusError {
-			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {
-				return true
-			}
+		// Only a model that is still blocked counts. A recorded LastError outlives the
+		// cooldown it came from, so treating it as current kept a credential marked
+		// unhealthy long after every one of its models had recovered.
+		if blocked, _, _ := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now); blocked {
+			return true
 		}
 	}
 	return false
@@ -1031,7 +1035,7 @@ func recoverableFailureRetryAfter(now time.Time, disableCooling bool) time.Time 
 	return now.Add(transientErrorCooldown)
 }
 
-func nextQuotaRecoverAt(now time.Time, _ *time.Duration, quota QuotaState, disableCooling bool) (time.Time, int) {
+func nextQuotaRecoverAt(now time.Time, quota QuotaState, disableCooling bool) (time.Time, int) {
 	if disableCooling {
 		return time.Time{}, quota.BackoffLevel
 	}
@@ -1079,81 +1083,13 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 		message = fmt.Sprintf("request failed with status %d", statusCode)
 	}
 	return Result{
-		AuthIndex:  authIndex,
-		Provider:   provider,
-		Model:      model,
-		Success:    false,
-		RetryAfter: parseUsageRetryAfter(body, statusCode),
+		AuthIndex: authIndex,
+		Provider:  provider,
+		Model:     model,
+		Success:   false,
 		Error: &Error{
 			Message:    message,
 			HTTPStatus: statusCode,
 		},
 	}
-}
-
-func parseUsageRetryAfter(body string, statusCode int) *time.Duration {
-	if statusCode != http.StatusTooManyRequests {
-		return nil
-	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return nil
-	}
-	if gjson.Valid(body) {
-		if retryAfter := parseGoogleRetryDelay(body); retryAfter != nil {
-			return retryAfter
-		}
-		if retryAfter := parseRetryDelayFromMessage(gjson.Get(body, "error.message").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return parseRetryDelayFromMessage(body)
-}
-
-func parseGoogleRetryDelay(body string) *time.Duration {
-	details := gjson.Get(body, "error.details")
-	if !details.Exists() || !details.IsArray() {
-		return nil
-	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.RetryInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("retryDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("metadata.quotaResetDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return nil
-}
-
-func parseRetryDelayFromMessage(message string) *time.Duration {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return nil
-	}
-	matches := usageRetryDelayPattern.FindStringSubmatch(message)
-	if len(matches) < 2 {
-		return nil
-	}
-	return parseDurationPointer(matches[1])
-}
-
-func parseDurationPointer(value string) *time.Duration {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-	duration, errParse := time.ParseDuration(value)
-	if errParse != nil || duration <= 0 {
-		return nil
-	}
-	return &duration
 }

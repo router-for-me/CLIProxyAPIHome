@@ -189,3 +189,37 @@ func TestModelNotSupportedKeepsLongCooldown(t *testing.T) {
 		t.Fatal("unsupported model stayed available")
 	}
 }
+
+// TestRecoveredModelStopsMarkingTheCredentialUnhealthy keeps a stale error record from
+// outliving the cooldown it came from. A recorded LastError used to count as a current
+// fault forever, so one transient failure left the credential reported as unhealthy
+// even after every model had recovered and dispatch was using it normally.
+func TestRecoveredModelStopsMarkingTheCredentialUnhealthy(t *testing.T) {
+	now := time.Now().UTC()
+	auth := failingAuth("auth-recovered", false)
+
+	applyFailure(auth, "gpt-5", http.StatusServiceUnavailable, "service unavailable", now)
+	if !hasModelError(auth, now) {
+		t.Fatal("an active cooldown was not reported as a model error")
+	}
+
+	afterWindow := now.Add(transientErrorCooldown + time.Second)
+	if hasModelError(auth, afterWindow) {
+		t.Fatal("an expired cooldown still reported the credential as unhealthy")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, "gpt-5", afterWindow); blocked {
+		t.Fatal("dispatch and health disagree after the cooldown expired")
+	}
+}
+
+// TestDisabledModelKeepsCredentialUnhealthy keeps an operator disable visible, since it
+// carries no deadline and must not be mistaken for a recovered model.
+func TestDisabledModelKeepsCredentialUnhealthy(t *testing.T) {
+	now := time.Now().UTC()
+	auth := failingAuth("auth-disabled-model", false)
+	auth.ModelStates = map[string]*ModelState{"gpt-5": {Status: StatusDisabled}}
+
+	if !hasModelError(auth, now.Add(24*time.Hour)) {
+		t.Fatal("a disabled model stopped counting as a fault")
+	}
+}
