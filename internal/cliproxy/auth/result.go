@@ -237,19 +237,16 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		transition.suspendReason = "model_not_supported"
 		transition.shouldSuspendModel = true
 	} else if isCloudflareChallengeResultError(result.Error) {
-		next, backoffLevel := nextCloudflareCooldown(state.Quota, disableCooling, now)
+		// A challenge is an edge-level temporary restriction on this credential/model
+		// pair, not a provider quota. Recording it as quota made dispatch answer with a
+		// quota cooldown error and pointed every investigation at the wrong subsystem.
+		next, backoffLevel := nextCloudflareCooldown(state.NextRetryAfter, state.RetryBackoffLevel, disableCooling, now)
 		state.NextRetryAfter = next
+		state.RetryBackoffLevel = backoffLevel
+		state.Unavailable = !next.IsZero()
 		state.StatusMessage = cloudflareChallengeReason
-		state.QuotaResetAt = time.Time{}
 		if auth.LastError != nil {
 			auth.StatusMessage = cloudflareChallengeReason
-		}
-		state.Quota = QuotaState{
-			Exceeded:      true,
-			Scope:         quotaScopeModel,
-			Reason:        cloudflareChallengeReason,
-			NextRecoverAt: next,
-			BackoffLevel:  backoffLevel,
 		}
 	} else if isInvalidGrantResultError(result.Error) {
 		if disableCooling {
@@ -348,14 +345,14 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	if isModelSupportResultError(result.Error) {
 		return false
 	}
-	// A Cloudflare challenge writes quota state, so it needs the same shared row the
-	// 429 path uses: without it every Home node would advance its own backoff ladder
-	// for one incident and the last writer would win.
+	// A Cloudflare challenge advances a backoff ladder, so it needs the same shared row
+	// the 429 path uses: without it every Home node would advance its own ladder for one
+	// incident and the last writer would win.
 	if isCloudflareChallengeResultError(result.Error) {
 		if m.quotaCooldownDisabledForAuth(auth) {
 			return false
 		}
-		return !authQuotaWindowOpen(auth, resultModel, now)
+		return !authRetryWindowOpen(auth, resultModel, now)
 	}
 	if statusCode == http.StatusUnauthorized {
 		return true
@@ -382,6 +379,16 @@ func authQuotaWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
 	}
 	state := auth.ModelStates[resultModel]
 	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now)
+}
+
+// authRetryWindowOpen reports whether a non-quota cooldown window is still live for
+// this model, which means the shared row already carries the restriction.
+func authRetryWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
+	if auth == nil || resultModel == "" {
+		return false
+	}
+	state := auth.ModelStates[resultModel]
+	return state != nil && state.NextRetryAfter.After(now)
 }
 
 // authHasClearableAvailabilityState reports whether a success outcome would
@@ -423,6 +430,7 @@ type availabilityFingerprintValue struct {
 	modelUnavail   bool
 	modelRetryUnix int64
 	modelResetUnix int64
+	modelRetryLvl  int
 	modelQuota     quotaFingerprint
 }
 
@@ -463,6 +471,7 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 			fp.modelUnavail = state.Unavailable
 			fp.modelRetryUnix = fingerprintUnix(state.NextRetryAfter)
 			fp.modelResetUnix = fingerprintUnix(state.QuotaResetAt)
+			fp.modelRetryLvl = state.RetryBackoffLevel
 			fp.modelQuota = fingerprintQuota(state.Quota)
 		}
 	}
@@ -601,6 +610,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.Quota = QuotaState{}
 	state.UpdatedAt = now
 	state.QuotaResetAt = time.Time{}
+	state.RetryBackoffLevel = 0
 }
 
 // updateAggregatedAvailability updates an aggregated availability.
@@ -997,14 +1007,14 @@ func isCloudflareChallengeResultError(err *Error) bool {
 // times over. Failures landing inside an open window reuse that window instead of
 // escalating, exactly like the quota path, so one incident advances the ladder at most
 // once no matter how many nodes observe it.
-func nextCloudflareCooldown(quota QuotaState, disableCooling bool, now time.Time) (time.Time, int) {
+func nextCloudflareCooldown(nextRetryAfter time.Time, backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
 	if disableCooling {
-		return time.Time{}, quota.BackoffLevel
+		return time.Time{}, backoffLevel
 	}
-	if quota.NextRecoverAt.After(now) {
-		return quota.NextRecoverAt, quota.BackoffLevel
+	if nextRetryAfter.After(now) {
+		return nextRetryAfter, backoffLevel
 	}
-	cooldown, nextLevel := nextQuotaCooldown(quota.BackoffLevel, false)
+	cooldown, nextLevel := nextQuotaCooldown(backoffLevel, false)
 	if cooldown < cloudflareChallengeMinCooldown {
 		cooldown = cloudflareChallengeMinCooldown
 	}

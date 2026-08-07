@@ -87,9 +87,11 @@ func TestInvalidGrantWithDisableCoolingStaysAvailable(t *testing.T) {
 	}
 }
 
-// TestCloudflareChallengeUsesQuotaBackoffWithFloor keeps a challenge page from being
-// retried in a tight loop.
-func TestCloudflareChallengeUsesQuotaBackoffWithFloor(t *testing.T) {
+// TestCloudflareChallengeIsATemporaryRestrictionNotQuota keeps a challenge page from
+// being retried in a tight loop while making sure it is never reported as a provider
+// quota. Recording it as quota made dispatch answer with a quota cooldown error and
+// pointed every investigation at the wrong subsystem.
+func TestCloudflareChallengeIsATemporaryRestrictionNotQuota(t *testing.T) {
 	now := time.Now().UTC()
 	auth := failingAuth("auth-cloudflare", false)
 
@@ -99,21 +101,28 @@ func TestCloudflareChallengeUsesQuotaBackoffWithFloor(t *testing.T) {
 	if state == nil {
 		t.Fatal("model state was not recorded")
 	}
-	if !state.Quota.Exceeded || state.Quota.Reason != cloudflareChallengeReason {
-		t.Fatalf("quota = %#v, want a cloudflare challenge cooldown", state.Quota)
+	if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("quota = %#v, want a challenge to leave quota state untouched", state.Quota)
 	}
 	if state.StatusMessage != cloudflareChallengeReason {
 		t.Fatalf("StatusMessage = %q, want %q", state.StatusMessage, cloudflareChallengeReason)
+	}
+	if !state.Unavailable {
+		t.Fatal("a challenge left the model dispatchable")
 	}
 	minDeadline := now.Add(cloudflareChallengeMinCooldown)
 	if state.NextRetryAfter.Before(minDeadline) {
 		t.Fatalf("NextRetryAfter = %v, want at least %v", state.NextRetryAfter, minDeadline)
 	}
-	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
-		t.Fatalf("NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
+	if !blocked || reason != blockReasonOther {
+		t.Fatalf("blocked/reason = %v/%v, want a non-quota block", blocked, reason)
 	}
-	if blocked, reason, _ := isAuthBlockedForModel(auth, "gpt-5", now); !blocked || reason != blockReasonCooldown {
-		t.Fatalf("blocked/reason = %v/%v, want blockReasonCooldown", blocked, reason)
+	if !next.After(now) {
+		t.Fatalf("deadline = %v, want a bounded window after %v", next, now)
+	}
+	if blockedAfter, _, _ := isAuthBlockedForModel(auth, "gpt-5", next.Add(time.Second)); blockedAfter {
+		t.Fatal("a challenge cooldown did not expire on its own")
 	}
 }
 
@@ -125,19 +134,19 @@ func TestCloudflareChallengeReusesOpenWindow(t *testing.T) {
 	auth := failingAuth("auth-cloudflare-window", false)
 
 	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now)
-	first := auth.ModelStates["gpt-5"].Quota
-	if first.BackoffLevel == 0 {
-		t.Fatalf("first BackoffLevel = %d, want the ladder to advance once", first.BackoffLevel)
+	first := *auth.ModelStates["gpt-5"]
+	if first.RetryBackoffLevel == 0 {
+		t.Fatalf("first RetryBackoffLevel = %d, want the ladder to advance once", first.RetryBackoffLevel)
 	}
 
 	// A second node reporting the same challenge inside the open window changes nothing.
 	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now.Add(time.Second))
-	second := auth.ModelStates["gpt-5"].Quota
-	if second.BackoffLevel != first.BackoffLevel {
-		t.Fatalf("BackoffLevel advanced inside the open window: %d -> %d", first.BackoffLevel, second.BackoffLevel)
+	second := *auth.ModelStates["gpt-5"]
+	if second.RetryBackoffLevel != first.RetryBackoffLevel {
+		t.Fatalf("RetryBackoffLevel advanced inside the open window: %d -> %d", first.RetryBackoffLevel, second.RetryBackoffLevel)
 	}
-	if !second.NextRecoverAt.Equal(first.NextRecoverAt) {
-		t.Fatalf("NextRecoverAt moved inside the open window: %v -> %v", first.NextRecoverAt, second.NextRecoverAt)
+	if !second.NextRetryAfter.Equal(first.NextRetryAfter) {
+		t.Fatalf("NextRetryAfter moved inside the open window: %v -> %v", first.NextRetryAfter, second.NextRetryAfter)
 	}
 }
 
@@ -148,16 +157,19 @@ func TestCloudflareChallengeEscalatesAfterWindowExpires(t *testing.T) {
 	auth := failingAuth("auth-cloudflare-escalate", false)
 
 	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", now)
-	first := auth.ModelStates["gpt-5"].Quota
+	first := *auth.ModelStates["gpt-5"]
 
-	afterWindow := first.NextRecoverAt.Add(time.Second)
+	afterWindow := first.NextRetryAfter.Add(time.Second)
 	applyFailure(auth, "gpt-5", http.StatusForbidden, "cloudflare challenge", afterWindow)
-	second := auth.ModelStates["gpt-5"].Quota
-	if second.BackoffLevel <= first.BackoffLevel {
-		t.Fatalf("BackoffLevel = %d, want it to advance past %d once the window elapsed", second.BackoffLevel, first.BackoffLevel)
+	second := *auth.ModelStates["gpt-5"]
+	if second.RetryBackoffLevel <= first.RetryBackoffLevel {
+		t.Fatalf("RetryBackoffLevel = %d, want it to advance past %d once the window elapsed", second.RetryBackoffLevel, first.RetryBackoffLevel)
 	}
-	if !second.NextRecoverAt.After(afterWindow) {
-		t.Fatalf("NextRecoverAt = %v, want a fresh window after %v", second.NextRecoverAt, afterWindow)
+	if !second.NextRetryAfter.After(afterWindow) {
+		t.Fatalf("NextRetryAfter = %v, want a fresh window after %v", second.NextRetryAfter, afterWindow)
+	}
+	if second.NextRetryAfter.Sub(afterWindow) > quotaBackoffMax {
+		t.Fatalf("window = %v, want it capped at %v", second.NextRetryAfter.Sub(afterWindow), quotaBackoffMax)
 	}
 }
 

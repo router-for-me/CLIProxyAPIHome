@@ -132,6 +132,10 @@ type ModelState struct {
 	// QuotaResetAt marks an operator reset so peers can merge it without
 	// discarding unrelated local execution errors.
 	QuotaResetAt time.Time `json:"quota_reset_at,omitzero"`
+	// RetryBackoffLevel stores the progressive cooldown exponent for temporary
+	// restrictions that are not quota, such as a Cloudflare challenge. Quota keeps
+	// its own level in QuotaState so the two ladders cannot interfere.
+	RetryBackoffLevel int `json:"retry_backoff_level,omitempty"`
 }
 
 // recentRequestBucketID handles a recent request bucket id.
