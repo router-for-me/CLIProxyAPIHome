@@ -434,8 +434,43 @@ func serveManagementAssetFile(c *gin.Context, file fs.File, cacheControl string)
 	}
 
 	c.Header("Cache-Control", cacheControl)
+
+	// Both the identity and the gzip representation are cacheable, so shared
+	// caches have to key on the negotiated encoding even when this particular
+	// response goes out uncompressed.
+	c.Header("Vary", "Accept-Encoding")
+
+	assetName := fileInfo.Name()
+	contentType := mime.TypeByExtension(path.Ext(assetName))
+
+	if shouldCompressAsset(c.Request, assetName, fileInfo) {
+		compressed, raw, compressedOK := gzipAsset(assetName, fileInfo, file)
+		if compressedOK {
+			c.Header("Content-Encoding", "gzip")
+			// ServeContent would otherwise sniff the gzip bytes; the extension
+			// already tells us the real type.
+			if contentType != "" {
+				c.Header("Content-Type", contentType)
+			}
+			http.ServeContent(c.Writer, c.Request, assetName, fileInfo.ModTime(), compressedAssetReader(compressed))
+			return
+		}
+		// Compression was attempted, so the reader is spent. Serve the bytes it
+		// consumed instead of re-reading an exhausted file.
+		if raw == nil {
+			log.Error("failed to read management control panel asset for compression")
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+		if contentType == "" {
+			contentType = http.DetectContentType(raw)
+		}
+		c.Data(http.StatusOK, contentType, raw)
+		return
+	}
+
 	if readSeeker, ok := file.(io.ReadSeeker); ok {
-		http.ServeContent(c.Writer, c.Request, fileInfo.Name(), fileInfo.ModTime(), readSeeker)
+		http.ServeContent(c.Writer, c.Request, assetName, fileInfo.ModTime(), readSeeker)
 		return
 	}
 
@@ -446,7 +481,6 @@ func serveManagementAssetFile(c *gin.Context, file fs.File, cacheControl string)
 		return
 	}
 
-	contentType := mime.TypeByExtension(path.Ext(fileInfo.Name()))
 	if contentType == "" {
 		contentType = http.DetectContentType(data)
 	}
