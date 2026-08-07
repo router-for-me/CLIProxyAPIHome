@@ -247,7 +247,8 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	}
 
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
-	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, home.DispatchConcurrencyContext{
+	downstreamWebsocket := gjson.Get(jsonArg, "downstream_websocket").Bool()
+	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, downstreamWebsocket, home.DispatchConcurrencyContext{
 		Fingerprint:     env.ConnectionLifetime.Fingerprint,
 		ConnectedAt:     env.ConnectionLifetime.ConnectedAt,
 		Controlled:      env.ConnectionLifetime.Controlled,

@@ -797,15 +797,25 @@ type DispatchResult struct {
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
 func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string) (*DispatchResult, error) {
-	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, "", DispatchConcurrencyContext{})
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, "", false, DispatchConcurrencyContext{})
 }
 
 // DispatchForAPIKeyWithConcurrency performs dispatch and atomic admission for a RESP request.
-func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
-	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, credentialPolicy, concurrencyCtx)
+func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, downstreamWebsocket bool, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, credentialPolicy, downstreamWebsocket, concurrencyCtx)
 }
 
-func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+// headersIndicateWebsocketUpgrade reports a downstream websocket from the forwarded
+// request headers. Nodes that predate the explicit dispatch field still forward the
+// upgrade header, so this keeps the preference working without a protocol bump.
+func headersIndicateWebsocketUpgrade(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(headers.Get("Upgrade")), "websocket")
+}
+
+func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, downstreamWebsocket bool, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
 	opts := coreauth.Options{}
 	if headers != nil {
 		opts.Headers = headers.Clone()
@@ -823,6 +833,9 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	if credentialPolicy = strings.TrimSpace(credentialPolicy); credentialPolicy != "" {
 		metadata[coreauth.CredentialPolicyMetadataKey] = credentialPolicy
+	}
+	if downstreamWebsocket || headersIndicateWebsocketUpgrade(headers) {
+		metadata[coreauth.DownstreamWebsocketMetadataKey] = true
 	}
 	if len(metadata) > 0 {
 		opts.Metadata = metadata

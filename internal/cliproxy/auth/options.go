@@ -19,6 +19,21 @@ const AllowedModelIDsMetadataKey = "allowed_model_ids"
 // concurrency admission during this dispatch attempt.
 const ExcludedConcurrencyCandidatesMetadataKey = "excluded_concurrency_candidates"
 
+// DownstreamWebsocketMetadataKey records that the CPA node is serving this request over
+// a downstream websocket. CPA knows this from its own request context, so it can only
+// reach Home by travelling with the dispatch request.
+const DownstreamWebsocketMetadataKey = "downstream_websocket"
+
+// downstreamWebsocketFromOptions reports whether the requesting node is serving a
+// downstream websocket connection.
+func downstreamWebsocketFromOptions(opts Options) bool {
+	if opts.Metadata == nil {
+		return false
+	}
+	enabled, _ := opts.Metadata[DownstreamWebsocketMetadataKey].(bool)
+	return enabled
+}
+
 // ExcludedConcurrencyCandidate identifies a credential-wide or model-scoped exclusion.
 type ExcludedConcurrencyCandidate struct {
 	CredentialID string
