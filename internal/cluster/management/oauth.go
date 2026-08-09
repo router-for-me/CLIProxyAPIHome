@@ -578,6 +578,12 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 		entry["updated_at"] = auth.UpdatedAt
 		entry["modtime"] = auth.UpdatedAt
 	}
+	// Surface the cooling override so the management UI can read back a
+	// persisted disable-cooling state (mirrors apiKeyAuthToMap). True-only:
+	// emit the field only when the override is explicitly set to true.
+	if disabledCooling, okDisableCooling := auth.DisableCoolingOverride(); okDisableCooling && disabledCooling {
+		entry["disable-cooling"] = true
+	}
 	return entry
 }
 
