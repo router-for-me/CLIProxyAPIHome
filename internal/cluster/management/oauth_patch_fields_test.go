@@ -208,6 +208,86 @@ func TestAuthFileEntryIncludesExplicitEmptyMetadataProjection(t *testing.T) {
 	}
 }
 
+func TestAuthFileEntryEmitsDisableCoolingOverride(t *testing.T) {
+	t.Run("emits when override is true", func(t *testing.T) {
+		entry := authFileEntry(&coreauth.Auth{
+			ID:       "codex-auth",
+			Provider: "codex",
+			Metadata: map[string]any{"type": "codex", "disable_cooling": true},
+		})
+		if got, ok := entry["disable-cooling"]; !ok || got != true {
+			t.Fatalf("disable-cooling = %#v (present=%t), want true", entry["disable-cooling"], ok)
+		}
+	})
+	t.Run("omits when override is unset", func(t *testing.T) {
+		entry := authFileEntry(&coreauth.Auth{
+			ID:       "codex-auth",
+			Provider: "codex",
+			Metadata: map[string]any{"type": "codex"},
+		})
+		if _, ok := entry["disable-cooling"]; ok {
+			t.Fatalf("disable-cooling present = %#v, want absent", entry["disable-cooling"])
+		}
+	})
+	t.Run("omits when override is explicitly false", func(t *testing.T) {
+		entry := authFileEntry(&coreauth.Auth{
+			ID:       "codex-auth",
+			Provider: "codex",
+			Metadata: map[string]any{"type": "codex", "disable_cooling": false},
+		})
+		if _, ok := entry["disable-cooling"]; ok {
+			t.Fatalf("disable-cooling present = %#v, want absent (override is true-only)", entry["disable-cooling"])
+		}
+	})
+}
+
+func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {
+	handler, engine, _, closeRepo := newConcurrencyManagementTestServer(t)
+	defer closeRepo()
+	seedOAuthAuth(t, handler.repo, "oauth-cooling")
+	engine.GET("/auth-files", handler.ListAuthFiles)
+
+	patchResponse := httptest.NewRecorder()
+	patchRequest := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{
+		"id":"oauth-cooling",
+		"disable_cooling":true
+	}`))
+	patchRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(patchResponse, patchRequest)
+	if patchResponse.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", patchResponse.Code, patchResponse.Body.String())
+	}
+
+	listResponse := httptest.NewRecorder()
+	engine.ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/auth-files", nil))
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", listResponse.Code, listResponse.Body.String())
+	}
+	var payload struct {
+		Files []struct {
+			ID             string `json:"id"`
+			DisableCooling bool   `json:"disable-cooling"`
+		} `json:"files"`
+	}
+	if errDecode := json.Unmarshal(listResponse.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode GET response: %v", errDecode)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files = %#v, want one item", payload.Files)
+	}
+	if file := payload.Files[0]; file.ID != "oauth-cooling" || !file.DisableCooling {
+		t.Fatalf("file = %#v, want disable-cooling round-tripped to true", file)
+	}
+
+	persisted, _, errAuth := handler.repo.GetAuth(t.Context(), "oauth-cooling")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if disabled, ok := persisted.DisableCoolingOverride(); !ok || !disabled {
+		t.Fatalf("persisted override = (%t, %t), want (true, true)", disabled, ok)
+	}
+}
+
 func mustRawFields(t *testing.T, payload string) map[string]json.RawMessage {
 	t.Helper()
 	var fields map[string]json.RawMessage
