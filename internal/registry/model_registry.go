@@ -551,9 +551,18 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 //   - clientID: The client that exceeded quota
 //   - modelID: The model that exceeded quota
 func (r *ModelRegistry) SetModelQuotaExceeded(clientID, modelID string) {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return
+	}
+
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	if !r.clientSupportsModelLocked(clientID, modelID) {
+		return
+	}
 	if registration, exists := r.models[modelID]; exists {
 		now := time.Now()
 		registration.QuotaExceededClients[clientID] = &now
@@ -582,12 +591,17 @@ func (r *ModelRegistry) ClearModelQuotaExceeded(clientID, modelID string) {
 //   - reason: Optional description for observability
 func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
 	// Normalize source data before building the derived payload.
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
 	if clientID == "" || modelID == "" {
 		return
 	}
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	if !r.clientSupportsModelLocked(clientID, modelID) {
+		return
+	}
 	registration, exists := r.models[modelID]
 	if !exists || registration == nil {
 		return
@@ -641,7 +655,10 @@ func (r *ModelRegistry) ClientSupportsModel(clientID, modelID string) bool {
 
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
+	return r.clientSupportsModelLocked(clientID, modelID)
+}
 
+func (r *ModelRegistry) clientSupportsModelLocked(clientID, modelID string) bool {
 	models, exists := r.clientModels[clientID]
 	if !exists || len(models) == 0 {
 		return false

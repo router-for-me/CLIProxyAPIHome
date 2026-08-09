@@ -538,6 +538,13 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 	}
 
 	modelRegistry := registry.GetGlobalRegistry()
+	if auth.Disabled || auth.Status == StatusDisabled {
+		// Disabled credentials have no registry binding. Reconciling their sparse
+		// model states would attach ghost availability state to another client.
+		modelRegistry.UnregisterClient(auth.ID)
+		return
+	}
+
 	// Registry IDs are client-visible route models, while execution state is
 	// keyed by the credential-specific upstream model. Keep both so aliases and
 	// credential prefixes reconcile against the same state used by Dispatch.
