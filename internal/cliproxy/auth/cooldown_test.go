@@ -774,6 +774,59 @@ func TestReconcileRegistryModelStatesResumesPeerAfterStateReset(t *testing.T) {
 	}
 }
 
+func TestReconcileRegistryModelStatesIgnoresDisabledUnregisteredCredential(t *testing.T) {
+	const disabledAuthID = "auth-registry-disabled"
+	const activePeerID = "auth-registry-disabled-peer"
+	modelIDs := []string{
+		"registry-disabled-model-1",
+		"registry-disabled-model-2",
+		"registry-disabled-model-3",
+		"registry-disabled-model-4",
+		"registry-disabled-model-5",
+		"registry-disabled-model-6",
+		"registry-disabled-model-7",
+		"registry-disabled-model-8",
+		"registry-disabled-model-9",
+	}
+	models := make([]*registry.ModelInfo, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		models = append(models, &registry.ModelInfo{ID: modelID, Object: "model", Type: "gemini"})
+	}
+
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(activePeerID, "gemini", models)
+	modelRegistry.RegisterClient(disabledAuthID, "gemini", models)
+	modelRegistry.UnregisterClient(disabledAuthID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(disabledAuthID)
+		modelRegistry.UnregisterClient(activePeerID)
+	})
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       disabledAuthID,
+		Index:    disabledAuthID,
+		Provider: "gemini",
+		Status:   StatusDisabled,
+		Disabled: true,
+		ModelStates: map[string]*ModelState{
+			modelIDs[0]: {Status: StatusActive},
+			modelIDs[1]: {Status: StatusActive},
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.ReconcileRegistryModelStates(context.Background(), disabledAuthID)
+	manager.ReconcileRegistryModelStates(context.Background(), disabledAuthID)
+
+	for _, modelID := range modelIDs {
+		if !registryHasAvailableModel(modelRegistry, modelID) {
+			t.Fatalf("registry hid active peer model %q because a disabled credential retained sparse model state", modelID)
+		}
+	}
+}
+
 func TestClearQuotaCooldownRequiresAtomicStore(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	_, errClear := manager.ClearQuotaCooldown(context.Background(), "auth-no-store", "")
