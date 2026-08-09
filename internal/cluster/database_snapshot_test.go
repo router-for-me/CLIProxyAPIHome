@@ -77,6 +77,7 @@ func TestDatabaseSnapshotModelRegistryMatchesMigrationModels(t *testing.T) {
 		&ConcurrencyObservationBarrierRecord{},
 		&HomeProcessIncarnationRecord{},
 		&CPANodeMembershipRecord{},
+		&CPANodeMetadataRecord{},
 		&CPANodeParticipationRecord{},
 		&CPANodeQuiescenceRecord{},
 		&CPAInFlightSnapshotRecord{},
@@ -102,13 +103,13 @@ func TestDatabaseSnapshotV2RegistryExcludesMigrationOnlyModels(t *testing.T) {
 	if !okModels {
 		t.Fatal("databaseSnapshotModels(2) is unsupported")
 	}
-	if len(models) != len(homeDatabaseModels) {
-		t.Fatalf("v2 model count = %d, frozen registry count = %d", len(models), len(homeDatabaseModels))
+	if len(models) != len(databaseSnapshotV2Models) {
+		t.Fatalf("v2 model count = %d, frozen registry count = %d", len(models), len(databaseSnapshotV2Models))
 	}
 	snapshotNames := make(map[string]struct{}, len(models))
 	for index, model := range models {
-		if model.name != homeDatabaseModels[index].name {
-			t.Fatalf("v2 model %d = %q, frozen registry = %q", index, model.name, homeDatabaseModels[index].name)
+		if model.name != databaseSnapshotV2Models[index].name {
+			t.Fatalf("v2 model %d = %q, frozen registry = %q", index, model.name, databaseSnapshotV2Models[index].name)
 		}
 		snapshotNames[model.name] = struct{}{}
 	}
@@ -126,12 +127,12 @@ func TestDatabaseSnapshotV1RegistryRemainsCompatible(t *testing.T) {
 	if !okModels {
 		t.Fatal("databaseSnapshotModels(1) is unsupported")
 	}
-	if len(models) >= len(homeDatabaseModels) {
-		t.Fatalf("v1 model count = %d, current model count = %d", len(models), len(homeDatabaseModels))
+	if len(models) >= len(databaseSnapshotV2Models) {
+		t.Fatalf("v1 model count = %d, v2 model count = %d", len(models), len(databaseSnapshotV2Models))
 	}
 	for index, model := range models {
-		if model.name != homeDatabaseModels[index].name {
-			t.Fatalf("v1 model %d = %q, current prefix = %q", index, model.name, homeDatabaseModels[index].name)
+		if model.name != databaseSnapshotV2Models[index].name {
+			t.Fatalf("v1 model %d = %q, v2 prefix = %q", index, model.name, databaseSnapshotV2Models[index].name)
 		}
 		if model.name != "cpa_node" {
 			continue
@@ -142,7 +143,7 @@ func TestDatabaseSnapshotV1RegistryRemainsCompatible(t *testing.T) {
 		if gotOrder := strings.Join(model.orderBy, ","); gotOrder != "home_ip,home_port,node_key" {
 			t.Fatalf("v1 cpa_node order = %q", gotOrder)
 		}
-		if gotOrder := strings.Join(homeDatabaseModels[index].orderBy, ","); gotOrder != "home_ip,home_port,home_started_at,node_key" {
+		if gotOrder := strings.Join(databaseSnapshotV2Models[index].orderBy, ","); gotOrder != "home_ip,home_port,home_started_at,node_key" {
 			t.Fatalf("current cpa_node order = %q", gotOrder)
 		}
 	}

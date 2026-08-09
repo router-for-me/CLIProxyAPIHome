@@ -72,6 +72,15 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "cpa_nodes_load_failed", errCPAs)
 		return
 	}
+	nodeIDs := make([]string, 0, len(cpaRecords))
+	for _, cpaRecord := range cpaRecords {
+		nodeIDs = append(nodeIDs, cpaRecord.NodeID)
+	}
+	nodeNames, errNodeNames := h.repo.ListCPANodeNames(ctx, nodeIDs)
+	if errNodeNames != nil {
+		respondError(c, http.StatusInternalServerError, "cpa_node_names_load_failed", errNodeNames)
+		return
+	}
 	memberships, errMemberships := h.repo.ListActiveCPAMemberships(ctx)
 	if errMemberships != nil {
 		respondError(c, http.StatusInternalServerError, "cpa_memberships_load_failed", errMemberships)
@@ -150,6 +159,7 @@ func (h *Handler) GetTopology(c *gin.Context) {
 		}
 		cpaItems = append(cpaItems, gin.H{
 			"node_id":                cpaRecord.NodeID,
+			"node_name":              emptyStringAsNil(nodeNames[strings.TrimSpace(cpaRecord.NodeID)]),
 			"ip":                     cpaRecord.ClientIP,
 			"connected_time":         cpaRecord.ConnectedAt,
 			"last_seen_at":           cpaRecord.LastSeenAt,

@@ -533,6 +533,18 @@ func (CPANodeRecord) TableName() string {
 	return "cpa_node"
 }
 
+// CPANodeMetadataRecord stores operator-managed metadata for a CPA node.
+type CPANodeMetadataRecord struct {
+	NodeID    string    `gorm:"column:node_id;primaryKey;size:128"`
+	NodeName  string    `gorm:"column:node_name;not null;size:128"`
+	CreatedAt time.Time `gorm:"column:created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at"`
+}
+
+func (CPANodeMetadataRecord) TableName() string {
+	return "cpa_node_metadata"
+}
+
 type ClusterEventRecord struct {
 	ID         uint      `gorm:"column:id;primaryKey;autoIncrement;index:idx_cluster_events_scope_id,priority:2"`
 	Scope      string    `gorm:"column:scope;index:idx_cluster_events_scope_id,priority:1"`

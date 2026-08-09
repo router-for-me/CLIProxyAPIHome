@@ -227,6 +227,7 @@ The table below is extracted from the final Home route registry built by `intern
 | `PUT` | `/model-groups/:id` |
 | `GET` | `/models` |
 | `GET` | `/nodes` |
+| `PATCH` | `/nodes/:node_id` |
 | `POST` | `/oauth-callback` |
 | `DELETE` | `/oauth-excluded-models` |
 | `GET` | `/oauth-excluded-models` |
@@ -573,6 +574,7 @@ Example response:
     {
       "ip": "10.0.0.12",
       "node_id": "node-1",
+      "node_name": "primary-cpa",
       "connected_time": "2026-05-27T10:30:00Z",
       "last_seen_at": "2026-05-27T10:30:02Z",
       "client_count": 1,
@@ -600,6 +602,7 @@ Example response:
 | `plugin_report_required` | boolean | Whether the current Home config expects CPA plugin reports because at least one enabled plugin has a pinned store manifest. |
 | `plugin_report_statuses` | array | Latest plugin reports stored in the shared database, grouped by reporting node and report metadata. Delete reports for one plugin can coexist with preserved status rows for other plugins. These are retained until the node reports again or is explicitly cleaned up; they do not expire by TTL and are self-reported observations, not authoritative install proof. |
 | `nodes[].node_id` | string | CPA node ID derived from the Home client certificate when available. |
+| `nodes[].node_name` | string/null | Optional Home-managed CPA node name. `null` means the node has not been named. |
 | `nodes[].ip` | string | Node IP address. |
 | `nodes[].connected_time` | string | First connection time for the active node entry. |
 | `nodes[].last_seen_at` | string | Time when the serving Home last refreshed the derived `cpa_node` snapshot. |
@@ -686,6 +689,7 @@ Example response:
   "cpas": [
     {
       "node_id": "node-1",
+      "node_name": "primary-cpa",
       "ip": "192.0.2.10",
       "connected_time": "2026-05-27T10:05:00Z",
       "last_seen_at": "2026-05-27T10:30:02Z",
@@ -740,6 +744,7 @@ Example response:
 | `homes[].unknown_cpa_count` | integer | Unknown-health active CPAs owned by this Home incarnation. |
 | `cpas[]` | array | Active and draining CPA diagnostic snapshots. Revision-only snapshots are omitted. |
 | `cpas[].node_id` | string | CPA node ID derived from the client certificate when available. |
+| `cpas[].node_name` | string/null | Optional Home-managed CPA node name. `null` means the node has not been named. |
 | `cpas[].ip` | string | CPA node IP address observed by its serving Home. |
 | `cpas[].connected_time` | string | First observed active connection time for this CPA snapshot on its serving Home. |
 | `cpas[].last_seen_at` | string | Last time the serving Home refreshed this derived snapshot. |
@@ -1019,14 +1024,19 @@ Responses include `id`, `name`, `match`, `apply_to`, `auth_type`, optional `head
 
 Creates a pending client certificate enrollment record and returns a Home JWT that a node can use to finish client-certificate enrollment.
 
-Input: none.
+Input: optional JSON object. Requests with no body, `{}`, or top-level `null` preserve the legacy unnamed behavior. The body is limited to 4 KiB; when an object is supplied, it must be the only JSON value and may contain only `node_name`. Malformed input, unknown fields, and trailing JSON return `400 invalid_request`; oversized bodies return `413 invalid_request`.
+
+```json
+{ "node_name": "primary-cpa" }
+```
 
 Example response:
 
 ```json
 {
   "id": "cert-uuid",
-  "home_jwt": "eyJhbGciOi..."
+  "home_jwt": "eyJhbGciOi...",
+  "node_name": "primary-cpa"
 }
 ```
 
@@ -1034,14 +1044,50 @@ Example response:
 | --- | --- | --- |
 | `id` | string | Pending client certificate ID. |
 | `home_jwt` | string | Enrollment JWT containing Home target information and enrollment secret. |
+| `node_name` | string/null | Optional Home-managed CPA node name. `null` when not supplied or normalized to empty. |
 
 Common errors:
 
 ```json
+{ "error": "invalid_request", "message": "detail" }
 { "error": "cluster_unavailable", "message": "cluster_unavailable" }
 { "error": "certificate_jwt_target_invalid", "message": "certificate_jwt_target_invalid" }
 { "error": "certificate_create_failed", "message": "detail" }
 { "error": "certificate_jwt_failed", "message": "detail" }
+{ "error": "cpa_node_name_invalid", "message": "detail" }
+```
+
+### PATCH `/nodes/:node_id`
+
+Sets or clears the Home-managed name for a CPA node. The `node_id` is the client certificate ID. The request must contain `node_name`; a string sets the name, while `null` or an empty string clears it. Names are trimmed, may be duplicated, and are limited to 128 Unicode characters without control characters. The body is limited to 4 KiB and must contain exactly one JSON object with only `node_name`; malformed input, a missing or unknown field, and trailing JSON return `400 invalid_request`, while oversized bodies return `413 invalid_request`.
+
+Input:
+
+```json
+{ "node_name": "primary-cpa" }
+```
+
+Clear the name:
+
+```json
+{ "node_name": null }
+```
+
+Example response:
+
+```json
+{
+  "node_id": "cert-uuid",
+  "node_name": "primary-cpa"
+}
+```
+
+Common errors:
+
+```json
+{ "error": "invalid_request", "message": "detail" }
+{ "error": "cpa_node_name_invalid", "message": "detail" }
+{ "error": "cpa_node_not_found", "message": "detail" }
 ```
 
 ## Users

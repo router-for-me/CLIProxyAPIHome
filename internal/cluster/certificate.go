@@ -74,10 +74,19 @@ func (r *Repository) EnsureClusterCertificates(ctx context.Context, ip string) (
 }
 
 // CreatePendingClientCertificate creates an empty client certificate slot.
-func (r *Repository) CreatePendingClientCertificate(ctx context.Context) (string, string, error) {
+// The optional name preserves the legacy no-name call form.
+func (r *Repository) CreatePendingClientCertificate(ctx context.Context, nodeNames ...string) (string, string, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return "", "", errDB
+	}
+	nodeName := ""
+	if len(nodeNames) > 0 {
+		nodeName = nodeNames[0]
+	}
+	normalizedNodeName, errNodeName := NormalizeCPANodeName(nodeName)
+	if errNodeName != nil {
+		return "", "", errNodeName
 	}
 	ctx = contextOrBackground(ctx)
 	ca, errCA := r.ensureCARecord(ctx, db)
@@ -102,7 +111,16 @@ func (r *Repository) CreatePendingClientCertificate(ctx context.Context) (string
 		CAFingerprint:        caFingerprint,
 		EnrollmentSecretHash: hashEnrollmentSecret(secret),
 	}
-	if errCreate := db.WithContext(ctx).Create(record).Error; errCreate != nil {
+	errCreate := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errCreateRecord := tx.Create(record).Error; errCreateRecord != nil {
+			return errCreateRecord
+		}
+		if normalizedNodeName == "" {
+			return nil
+		}
+		return tx.Create(&CPANodeMetadataRecord{NodeID: id, NodeName: normalizedNodeName}).Error
+	})
+	if errCreate != nil {
 		return "", "", errCreate
 	}
 	return id, secret, nil
