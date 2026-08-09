@@ -29,7 +29,7 @@ import (
 
 const (
 	databaseSnapshotFormat        = "cliproxyapihome-database-snapshot"
-	databaseSnapshotFormatVersion = 2
+	databaseSnapshotFormatVersion = 3
 	databaseSnapshotManifestName  = "manifest.json"
 	databaseSnapshotBatchSize     = 500
 	databaseSnapshotManifestLimit = 4 << 20
@@ -642,6 +642,14 @@ func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, mo
 	case *QuotaSnapshotRecord:
 		if strings.TrimSpace(typed.CredentialID) == "" {
 			return databaseSnapshotFieldError(model.name, primaryLabel, "credential_id", "must not be blank")
+		}
+	case *CPANodeMetadataRecord:
+		normalizedNodeName, errNodeName := NormalizeCPANodeName(typed.NodeName)
+		if errNodeName != nil {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "node_name", errNodeName.Error())
+		}
+		if normalizedNodeName != typed.NodeName {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "node_name", "must be normalized")
 		}
 	}
 	return nil
@@ -1283,6 +1291,7 @@ func validateImportedDatabaseSnapshotRelationships(tx *gorm.DB) error {
 		{name: "billing_charge.api_key_id", query: `SELECT COUNT(*) FROM "billing_charge" AS child WHERE child."api_key_id" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "api_key" AS parent WHERE parent."id" = child."api_key_id")`},
 		{name: "credential_concurrency_policies.credential_id", query: `SELECT COUNT(*) FROM "credential_concurrency_policies" AS child WHERE NOT EXISTS (SELECT 1 FROM "auth" AS parent WHERE parent."uuid" = child."credential_id")`},
 		{name: "credential_concurrency_model_policies.credential_id", query: `SELECT COUNT(*) FROM "credential_concurrency_model_policies" AS child WHERE NOT EXISTS (SELECT 1 FROM "credential_concurrency_policies" AS parent WHERE parent."credential_id" = child."credential_id")`},
+		{name: "cpa_node_metadata.node_id", query: `SELECT COUNT(*) FROM "cpa_node_metadata" AS child WHERE NOT EXISTS (SELECT 1 FROM "certificate" AS parent WHERE parent."id" = child."node_id" AND parent."is_ca" = FALSE AND parent."is_server" = FALSE AND (parent."is_client" = TRUE OR parent."enrollment_secret_hash" <> ''))`},
 	}
 	for _, check := range checks {
 		var count int64

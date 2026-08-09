@@ -154,6 +154,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	}
 
 	r.Set(http.MethodGet, "/nodes", handler.ListNodes)
+	r.Set(http.MethodPatch, "/nodes/:node_id", handler.UpdateCPANodeName)
 	r.Set(http.MethodGet, "/topology", handler.GetTopology)
 	r.Set(http.MethodGet, "/latest-version", handler.GetLatestVersion)
 	r.Set(http.MethodPost, "/certificates/clients", handler.CreateClientCertificate)

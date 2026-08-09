@@ -74,10 +74,13 @@ var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[CertificateRecord]("certificate", []string{"id"}, false, true),
 }
 
-// homeDatabaseModels is the frozen database snapshot format v2 registry.
-// Runtime-only tables added after v2 must use databaseMigrationOnlyModels so
-// existing v2 archives remain importable.
-var homeDatabaseModels = currentDatabaseModels()
+// databaseSnapshotV2Models is the frozen database snapshot format v2 registry.
+var databaseSnapshotV2Models = currentDatabaseModels()
+
+// homeDatabaseModels is the current database snapshot registry.
+var homeDatabaseModels = append(append([]databaseModel(nil), databaseSnapshotV2Models...),
+	newDatabaseModel[CPANodeMetadataRecord]("cpa_node_metadata", []string{"node_id"}, false, true),
+)
 
 var databaseMigrationOnlyModels = []databaseModel{
 	newDatabaseModel[ClusterMasterGateRecord]("cluster_master_gate", []string{"id"}, false, false),
@@ -117,6 +120,8 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 	switch formatVersion {
 	case 1:
 		return databaseSnapshotV1Models, true
+	case 2:
+		return databaseSnapshotV2Models, true
 	case databaseSnapshotFormatVersion:
 		return homeDatabaseModels, true
 	default:

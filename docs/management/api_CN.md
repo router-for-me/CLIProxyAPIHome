@@ -227,6 +227,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `PUT` | `/model-groups/:id` |
 | `GET` | `/models` |
 | `GET` | `/nodes` |
+| `PATCH` | `/nodes/:node_id` |
 | `POST` | `/oauth-callback` |
 | `DELETE` | `/oauth-excluded-models` |
 | `GET` | `/oauth-excluded-models` |
@@ -573,6 +574,7 @@ openai-compatibility
     {
       "ip": "10.0.0.12",
       "node_id": "node-1",
+      "node_name": "primary-cpa",
       "connected_time": "2026-05-27T10:30:00Z",
       "last_seen_at": "2026-05-27T10:30:02Z",
       "client_count": 1,
@@ -600,6 +602,7 @@ openai-compatibility
 | `plugin_report_required` | boolean | 当前 Home 配置是否期望 CPA 上报插件状态；至少一个已启用插件带有固定的 store manifest 时为 `true`。 |
 | `plugin_report_statuses` | array | 共享数据库中保存的最新插件上报，按上报节点和上报元数据分组；单插件删除上报可以和其他插件保留的状态行同时存在。它们会一直保留到节点再次上报或被显式清理，不按 TTL 自动过期。这是 CPA 自报告的观测信息，不是强可信安装事实。 |
 | `nodes[].node_id` | string | 从 Home 客户端证书得到的 CPA node ID。 |
+| `nodes[].node_name` | string/null | Home 管理的可选 CPA 节点名称；未命名时为 `null`。 |
 | `nodes[].ip` | string | 节点 IP 地址。 |
 | `nodes[].connected_time` | string | 当前活跃节点条目的首次连接时间。 |
 | `nodes[].last_seen_at` | string | 服务 Home 最近一次刷新派生 `cpa_node` 快照的时间。 |
@@ -686,6 +689,7 @@ openai-compatibility
   "cpas": [
     {
       "node_id": "node-1",
+      "node_name": "primary-cpa",
       "ip": "192.0.2.10",
       "connected_time": "2026-05-27T10:05:00Z",
       "last_seen_at": "2026-05-27T10:30:02Z",
@@ -740,6 +744,7 @@ openai-compatibility
 | `homes[].unknown_cpa_count` | integer | 此 Home incarnation 拥有的未知健康活动 CPA 数。 |
 | `cpas[]` | array | active 与 draining CPA 诊断快照；revision-only 快照不会返回。 |
 | `cpas[].node_id` | string | 从客户端证书得到的 CPA node ID。 |
+| `cpas[].node_name` | string/null | Home 管理的可选 CPA 节点名称；未命名时为 `null`。 |
 | `cpas[].ip` | string | 服务它的 Home 观测到的 CPA 节点 IP。 |
 | `cpas[].connected_time` | string | 此 CPA 快照在服务它的 Home 上首次观测到活跃连接的时间。 |
 | `cpas[].last_seen_at` | string | 服务 Home 最近一次刷新此派生快照的时间。 |
@@ -1019,14 +1024,19 @@ Home 将插件商店凭证加密保存在共享数据库中。Secret 为只写�
 
 创建 pending client certificate enrollment record，并返回节点完成证书注册所需的 Home JWT。
 
-输入：无。
+输入：可选 JSON 对象。无请求体、`{}` 或顶层 `null` 都保留旧版未命名行为。请求体上限为 4 KiB；提供对象时，它必须是唯一的 JSON 值且只能包含 `node_name`。格式错误、未知字段和尾随 JSON 返回 `400 invalid_request`；超出上限返回 `413 invalid_request`。
+
+```json
+{ "node_name": "primary-cpa" }
+```
 
 输出示例：
 
 ```json
 {
   "id": "cert-uuid",
-  "home_jwt": "eyJhbGciOi..."
+  "home_jwt": "eyJhbGciOi...",
+  "node_name": "primary-cpa"
 }
 ```
 
@@ -1034,14 +1044,50 @@ Home 将插件商店凭证加密保存在共享数据库中。Secret 为只写�
 | --- | --- | --- |
 | `id` | string | Pending client certificate ID。 |
 | `home_jwt` | string | 包含 Home target 信息和 enrollment secret 的注册 JWT。 |
+| `node_name` | string/null | Home 管理的可选 CPA 节点名称；未提供或规范化为空时为 `null`。 |
 
 常见错误：
 
 ```json
+{ "error": "invalid_request", "message": "detail" }
 { "error": "cluster_unavailable", "message": "cluster_unavailable" }
 { "error": "certificate_jwt_target_invalid", "message": "certificate_jwt_target_invalid" }
 { "error": "certificate_create_failed", "message": "detail" }
 { "error": "certificate_jwt_failed", "message": "detail" }
+{ "error": "cpa_node_name_invalid", "message": "detail" }
+```
+
+### PATCH `/nodes/:node_id`
+
+设置或清除 Home 管理的 CPA 节点名称。`node_id` 是客户端证书 ID。请求必须包含 `node_name`；字符串用于设置名称，`null` 或空字符串用于清除名称。名称会去除首尾空格，可以重复，最多 128 个 Unicode 字符且不能包含控制字符。请求体上限为 4 KiB，且必须只包含一个仅含 `node_name` 的 JSON 对象；格式错误、缺失或未知字段以及尾随 JSON 返回 `400 invalid_request`，超出上限返回 `413 invalid_request`。
+
+输入：
+
+```json
+{ "node_name": "primary-cpa" }
+```
+
+清除名称：
+
+```json
+{ "node_name": null }
+```
+
+输出示例：
+
+```json
+{
+  "node_id": "cert-uuid",
+  "node_name": "primary-cpa"
+}
+```
+
+常见错误：
+
+```json
+{ "error": "invalid_request", "message": "detail" }
+{ "error": "cpa_node_name_invalid", "message": "detail" }
+{ "error": "cpa_node_not_found", "message": "detail" }
 ```
 
 ## Users

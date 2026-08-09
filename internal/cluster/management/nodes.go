@@ -22,6 +22,7 @@ const (
 
 type activeCPANode struct {
 	NodeID      string
+	NodeName    string
 	IP          string
 	Connected   time.Time
 	ClientCount int
@@ -60,6 +61,7 @@ func (h *Handler) ListNodes(c *gin.Context) {
 		homeID := topologyHomeID(activeNode.HomeIP, activeNode.HomePort)
 		nodes = append(nodes, gin.H{
 			"node_id":                activeNode.NodeID,
+			"node_name":              emptyStringAsNil(activeNode.NodeName),
 			"ip":                     activeNode.IP,
 			"connected_time":         activeNode.Connected,
 			"last_seen_at":           activeNode.LastSeenAt,
@@ -94,6 +96,14 @@ func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 		if errRecords != nil {
 			return nil, errRecords
 		}
+		nodeIDs := make([]string, 0, len(records))
+		for _, record := range records {
+			nodeIDs = append(nodeIDs, record.NodeID)
+		}
+		nodeNames, errNodeNames := h.repo.ListCPANodeNames(ctx, nodeIDs)
+		if errNodeNames != nil {
+			return nil, errNodeNames
+		}
 		memberships, errMemberships := h.repo.ListActiveCPAMemberships(ctx)
 		if errMemberships != nil {
 			return nil, errMemberships
@@ -125,6 +135,7 @@ func (h *Handler) activeCPANodes(ctx context.Context) ([]activeCPANode, error) {
 			}
 			nodesByKey[key] = activeCPANode{
 				NodeID:      strings.TrimSpace(record.NodeID),
+				NodeName:    strings.TrimSpace(nodeNames[strings.TrimSpace(record.NodeID)]),
 				IP:          strings.TrimSpace(record.ClientIP),
 				Connected:   record.ConnectedAt,
 				ClientCount: record.ClientCount,
