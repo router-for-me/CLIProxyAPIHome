@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -18,10 +17,38 @@ const (
 	quotaBackoffBase         = time.Second
 	quotaBackoffMax          = 30 * time.Minute
 	unauthorizedRetryBackoff = time.Minute
+	transientErrorCooldown   = time.Minute
 	quotaScopeModel          = "model"
+
+	// statusClientClosedRequest is the non-standard status proxies use when the caller
+	// disconnects before the upstream answered.
+	statusClientClosedRequest = 499
+
+	cloudflareChallengeReason      = "cloudflare challenge"
+	cloudflareChallengeMinCooldown = 10 * time.Second
 )
 
-var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
+// requestFaultCodes and requestFaultTypes mirror CPA's internal/clienterror so both
+// sides agree on which upstream rejections belong to the request rather than the
+// credential.
+var requestFaultCodes = map[string]struct{}{
+	"cyber_policy":                {},
+	"context_length_exceeded":     {},
+	"message_too_big":             {},
+	"string_above_max_length":     {},
+	"invalid_prompt":              {},
+	"invalid_value":               {},
+	"unsupported_value":           {},
+	"invalid_request_error":       {},
+	"previous_response_not_found": {},
+}
+
+var requestFaultTypes = map[string]struct{}{
+	"invalid_request":       {},
+	"invalid_request_error": {},
+	"bad_request_error":     {},
+	"invalid_prompt":        {},
+}
 
 // Result captures an upstream execution result reported by a downstream CPA node.
 type Result struct {
@@ -31,7 +58,6 @@ type Result struct {
 	Model             string
 	Success           bool
 	Error             *Error
-	RetryAfter        *time.Duration
 	AccessTokenSHA256 string
 }
 
@@ -48,6 +74,15 @@ type markResultTransition struct {
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	// Keep validation before state changes so failures leave existing data intact.
 	if m == nil || (strings.TrimSpace(result.AuthID) == "" && strings.TrimSpace(result.AuthIndex) == "") {
+		return
+	}
+	// A client that walked away says nothing about the credential. Drop the result
+	// entirely so the attempt is neither counted as a failure nor cooled down.
+	//
+	// This deliberately skips the recent-request counters too. A cancellation is
+	// neither a success nor a failure, and folding it into either would distort the
+	// health rate that operators read to judge a credential.
+	if isClientCanceledResult(result) {
 		return
 	}
 	if ctx == nil {
@@ -178,7 +213,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
-	if isRequestScopedNotFoundResultError(result.Error) {
+	if resultSkipsCredentialCooldown(result) {
 		return transition
 	}
 	disableCooling := m.quotaCooldownDisabledForAuth(auth)
@@ -195,14 +230,42 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 
 	statusCode := statusCodeFromResult(result.Error)
 	if isModelSupportResultError(result.Error) {
+		// A model the credential cannot serve is a capability verdict, not a cooldown,
+		// so disable_cooling does not shorten it.
 		next := now.Add(12 * time.Hour)
 		state.NextRetryAfter = next
 		transition.suspendReason = "model_not_supported"
 		transition.shouldSuspendModel = true
+	} else if isCloudflareChallengeResultError(result.Error) {
+		// A challenge is an edge-level temporary restriction on this credential/model
+		// pair, not a provider quota. Recording it as quota made dispatch answer with a
+		// quota cooldown error and pointed every investigation at the wrong subsystem.
+		next, backoffLevel := nextCloudflareCooldown(state.NextRetryAfter, state.RetryBackoffLevel, disableCooling, now)
+		state.NextRetryAfter = next
+		state.RetryBackoffLevel = backoffLevel
+		state.Unavailable = !next.IsZero()
+		state.StatusMessage = cloudflareChallengeReason
+		if auth.LastError != nil {
+			auth.StatusMessage = cloudflareChallengeReason
+		}
+	} else if isInvalidGrantResultError(result.Error) {
+		if disableCooling {
+			state.NextRetryAfter = time.Time{}
+		} else {
+			state.NextRetryAfter = now.Add(30 * time.Minute)
+			transition.suspendReason = "invalid_grant"
+			transition.shouldSuspendModel = true
+		}
 	} else {
 		switch statusCode {
 		case http.StatusUnauthorized:
-			state.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
+			// Home refreshes tokens centrally, so a 401 only parks the model long enough
+			// for the refresh to land. disable_cooling opts out of that wait as well.
+			if disableCooling {
+				state.NextRetryAfter = time.Time{}
+			} else {
+				state.NextRetryAfter = now.Add(unauthorizedRetryBackoff)
+			}
 		case http.StatusPaymentRequired, http.StatusForbidden:
 			if disableCooling {
 				state.NextRetryAfter = time.Time{}
@@ -213,6 +276,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.shouldSuspendModel = true
 			}
 		case http.StatusNotFound:
+			// Unlike an explicit model-not-supported verdict, a bare 404 can also mean a
+			// misrouted or briefly missing endpoint, so it stays a cooldown that
+			// disable_cooling is allowed to waive.
 			if disableCooling {
 				state.NextRetryAfter = time.Time{}
 			} else {
@@ -222,7 +288,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.shouldSuspendModel = true
 			}
 		case http.StatusTooManyRequests:
-			next, backoffLevel := nextQuotaRecoverAt(now, result.RetryAfter, state.Quota, disableCooling)
+			next, backoffLevel := nextQuotaRecoverAt(now, state.Quota, disableCooling)
 			state.NextRetryAfter = next
 			state.QuotaResetAt = time.Time{}
 			state.Quota = QuotaState{
@@ -238,14 +304,23 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.setModelQuota = true
 			}
 		case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			if disableCooling {
-				state.NextRetryAfter = time.Time{}
-			} else {
-				state.NextRetryAfter = now.Add(time.Minute)
-			}
+			state.NextRetryAfter = recoverableFailureRetryAfter(now, disableCooling)
+			state.Unavailable = !state.NextRetryAfter.IsZero()
 		default:
-			state.NextRetryAfter = time.Time{}
+			// An unmapped upstream failure is recoverable: park the model for a short
+			// window so dispatch moves to another credential, then let it return on
+			// its own. Leaving a zero deadline here would block the model forever.
+			state.NextRetryAfter = recoverableFailureRetryAfter(now, disableCooling)
+			state.Unavailable = !state.NextRetryAfter.IsZero()
 		}
+	}
+
+	// disable_cooling means "keep retrying", not "park the credential forever".
+	// Without any recovery deadline the unavailable and quota flags would be
+	// unbounded, so clear them instead of leaving a state nothing can expire.
+	if disableCooling && state.NextRetryAfter.IsZero() && state.Quota.NextRecoverAt.IsZero() {
+		state.Unavailable = false
+		state.Quota.Exceeded = false
 	}
 
 	auth.Status = StatusError
@@ -266,14 +341,26 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	if result.Success {
 		return authHasClearableAvailabilityState(auth, resultModel, now)
 	}
+	if resultSkipsCredentialCooldown(result) {
+		return false
+	}
 	statusCode := statusCodeFromResult(result.Error)
+	if isModelSupportResultError(result.Error) {
+		return false
+	}
+	// A Cloudflare challenge advances a backoff ladder, so it needs the same shared row
+	// the 429 path uses: without it every Home node would advance its own ladder for one
+	// incident and the last writer would win.
+	if isCloudflareChallengeResultError(result.Error) {
+		if m.quotaCooldownDisabledForAuth(auth) {
+			return false
+		}
+		return !authRetryWindowOpen(auth, resultModel, now)
+	}
 	if statusCode == http.StatusUnauthorized {
 		return true
 	}
 	if statusCode != http.StatusTooManyRequests {
-		return false
-	}
-	if isModelSupportResultError(result.Error) {
 		return false
 	}
 	if m.quotaCooldownDisabledForAuth(auth) {
@@ -295,6 +382,16 @@ func authQuotaWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
 	}
 	state := auth.ModelStates[resultModel]
 	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now)
+}
+
+// authRetryWindowOpen reports whether a non-quota cooldown window is still live for
+// this model, which means the shared row already carries the restriction.
+func authRetryWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
+	if auth == nil || resultModel == "" {
+		return false
+	}
+	state := auth.ModelStates[resultModel]
+	return state != nil && state.NextRetryAfter.After(now)
 }
 
 // authHasClearableAvailabilityState reports whether a success outcome would
@@ -336,6 +433,7 @@ type availabilityFingerprintValue struct {
 	modelUnavail   bool
 	modelRetryUnix int64
 	modelResetUnix int64
+	modelRetryLvl  int
 	modelQuota     quotaFingerprint
 }
 
@@ -376,6 +474,7 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 			fp.modelUnavail = state.Unavailable
 			fp.modelRetryUnix = fingerprintUnix(state.NextRetryAfter)
 			fp.modelResetUnix = fingerprintUnix(state.QuotaResetAt)
+			fp.modelRetryLvl = state.RetryBackoffLevel
 			fp.modelQuota = fingerprintQuota(state.Quota)
 		}
 	}
@@ -514,6 +613,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.Quota = QuotaState{}
 	state.UpdatedAt = now
 	state.QuotaResetAt = time.Time{}
+	state.RetryBackoffLevel = 0
 }
 
 // updateAggregatedAvailability updates an aggregated availability.
@@ -540,15 +640,19 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		stateUnavailable := false
 		if state.Status == StatusDisabled {
 			stateUnavailable = true
-		} else if state.Unavailable {
-			if state.NextRetryAfter.IsZero() {
-				stateUnavailable = false
-			} else if state.NextRetryAfter.After(now) {
+		} else {
+			// Reuse the dispatch decision so the aggregate an operator sees can never
+			// disagree with the scheduler.
+			blocked, _, next := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+			if blocked {
 				stateUnavailable = true
-				if earliestRetry.IsZero() || state.NextRetryAfter.Before(earliestRetry) {
-					earliestRetry = state.NextRetryAfter
+				if earliestRetry.IsZero() || next.Before(earliestRetry) {
+					earliestRetry = next
 				}
-			} else {
+			} else if state.Unavailable {
+				// The deadline elapsed, or a legacy snapshot never carried one. Normalize
+				// the stored flags so nothing keeps reporting a cooldown that dispatch
+				// already ignores.
 				state.Unavailable = false
 				state.NextRetryAfter = time.Time{}
 			}
@@ -608,13 +712,14 @@ func hasModelError(auth *Auth, now time.Time) bool {
 		if state == nil {
 			continue
 		}
-		if state.LastError != nil {
+		if state.Status == StatusDisabled {
 			return true
 		}
-		if state.Status == StatusError {
-			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {
-				return true
-			}
+		// Only a model that is still blocked counts. A recorded LastError outlives the
+		// cooldown it came from, so treating it as current kept a credential marked
+		// unhealthy long after every one of its models had recovered.
+		if blocked, _, _ := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now); blocked {
+			return true
 		}
 	}
 	return false
@@ -699,6 +804,118 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 	return isRequestScopedNotFoundMessage(err.Message)
 }
 
+// resultSkipsCredentialCooldown reports failures that say nothing about the credential
+// and therefore must not cool the credential/model pair down.
+//
+// Order matters. Several provider verdicts arrive on the very status codes a request
+// fault uses (invalid_grant on 400/401, an unsupported model on 400/422), so each of
+// them is settled before the generic request-fault test runs. Getting this backwards
+// would let a revoked grant masquerade as a bad request and never cool down.
+func resultSkipsCredentialCooldown(result Result) bool {
+	if result.Success {
+		return false
+	}
+	if isClientCanceledResult(result) {
+		return true
+	}
+	err := result.Error
+	if isRequestScopedNotFoundResultError(err) {
+		return true
+	}
+	if isCloudflareChallengeResultError(err) || isInvalidGrantResultError(err) || isModelSupportResultError(err) {
+		return false
+	}
+	return isRequestFaultResultError(err)
+}
+
+// isRequestFaultResultError reports whether an upstream rejection was caused by the
+// request itself. Every credential would produce the same answer for the same input,
+// so cooling one down only shrinks the pool while the caller keeps replaying a request
+// that cannot succeed until it is rebuilt.
+func isRequestFaultResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if hasRequestFaultBody(err.Message) {
+		return true
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusBadRequest,
+		http.StatusConflict,
+		http.StatusRequestEntityTooLarge,
+		http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+// hasRequestFaultBody matches the structured identifiers providers use to say the
+// request was malformed, oversized, or rejected by policy.
+func hasRequestFaultBody(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" || !gjson.Valid(body) {
+		return false
+	}
+	for _, path := range []string{"error.code", "code", "response.error.code", "body.error.code"} {
+		if _, ok := requestFaultCodes[strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))]; ok {
+			return true
+		}
+	}
+	for _, path := range []string{"error.type", "type", "response.error.type", "body.error.type"} {
+		if _, ok := requestFaultTypes[strings.ToLower(strings.TrimSpace(gjson.Get(body, path).String()))]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isClientCanceledResult reports whether a failed attempt was aborted by the caller
+// rather than rejected by the provider. Such a result carries no information about the
+// credential, so Home must not cool it down or count the attempt against it.
+func isClientCanceledResult(result Result) bool {
+	if result.Success {
+		return false
+	}
+	return isClientCanceledResultError(result.Error)
+}
+
+// isClientCanceledResultError reports whether an execution error describes a caller
+// that went away.
+func isClientCanceledResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromResult(err) == statusClientClosedRequest {
+		return true
+	}
+	return isClientCanceledMessage(err.Code) || isClientCanceledMessage(err.Message)
+}
+
+// isClientCanceledMessage matches the cancellation vocabulary produced by Go, net/http,
+// and the CPA executors when a caller disconnects mid-flight.
+//
+// Timeouts are deliberately excluded. A deadline says the upstream stopped responding,
+// which is exactly the signal the transient cooldown exists for, and "Client.Timeout
+// exceeded" phrases the same thing with the word canceled.
+func isClientCanceledMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") {
+		return false
+	}
+	return strings.Contains(lower, "context canceled") ||
+		strings.Contains(lower, "context cancelled") ||
+		strings.Contains(lower, "request canceled") ||
+		strings.Contains(lower, "request cancelled") ||
+		strings.Contains(lower, "client disconnected") ||
+		strings.Contains(lower, "client closed request") ||
+		strings.Contains(lower, "operation was canceled") ||
+		strings.Contains(lower, "operation was cancelled")
+}
+
 // disableAuthAfterUnauthorized permanently disables a credential after a terminal refresh failure.
 func disableAuthAfterUnauthorized(auth *Auth, state *ModelState, resultErr *Error, now time.Time) {
 	if auth == nil {
@@ -751,7 +968,74 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 	return cooldown, prevLevel + 1
 }
 
-func nextQuotaRecoverAt(now time.Time, _ *time.Duration, quota QuotaState, disableCooling bool) (time.Time, int) {
+// isInvalidGrantErrorMessage reports whether a message identifies a revoked,
+// expired, or reused refresh token.
+func isInvalidGrantErrorMessage(message string) bool {
+	return strings.Contains(strings.ToLower(message), "invalid_grant")
+}
+
+// isInvalidGrantResultError reports whether an execution result failed because the
+// credential's grant is no longer valid. Retrying the same token cannot fix it, so
+// only 400 and 401 responses qualify: other statuses stay on the transient path.
+func isInvalidGrantResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
+		return false
+	}
+	return isInvalidGrantErrorMessage(err.Code) || isInvalidGrantErrorMessage(err.Message)
+}
+
+// isCloudflareChallengeResultError reports whether the upstream returned a
+// Cloudflare interstitial instead of a provider response.
+func isCloudflareChallengeResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "cf-mitigated") ||
+		strings.Contains(lower, cloudflareChallengeReason) ||
+		(strings.Contains(lower, "cloudflare") && strings.Contains(lower, "<html"))
+}
+
+// nextCloudflareCooldown reuses the quota backoff ladder with a floor so a challenge
+// page cannot be retried in a tight loop.
+//
+// Home aggregates results from every CPA node, so a single challenge is reported many
+// times over. Failures landing inside an open window reuse that window instead of
+// escalating, exactly like the quota path, so one incident advances the ladder at most
+// once no matter how many nodes observe it.
+func nextCloudflareCooldown(nextRetryAfter time.Time, backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
+	if disableCooling {
+		return time.Time{}, backoffLevel
+	}
+	if nextRetryAfter.After(now) {
+		return nextRetryAfter, backoffLevel
+	}
+	cooldown, nextLevel := nextQuotaCooldown(backoffLevel, false)
+	if cooldown < cloudflareChallengeMinCooldown {
+		cooldown = cloudflareChallengeMinCooldown
+	}
+	return now.Add(cooldown), nextLevel
+}
+
+// recoverableFailureRetryAfter returns the cooldown deadline for a recoverable
+// upstream failure. Disabled cooling yields a zero deadline so the credential is
+// retried immediately rather than parked.
+func recoverableFailureRetryAfter(now time.Time, disableCooling bool) time.Time {
+	if disableCooling {
+		return time.Time{}
+	}
+	return now.Add(transientErrorCooldown)
+}
+
+func nextQuotaRecoverAt(now time.Time, quota QuotaState, disableCooling bool) (time.Time, int) {
 	if disableCooling {
 		return time.Time{}, quota.BackoffLevel
 	}
@@ -799,81 +1083,13 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 		message = fmt.Sprintf("request failed with status %d", statusCode)
 	}
 	return Result{
-		AuthIndex:  authIndex,
-		Provider:   provider,
-		Model:      model,
-		Success:    false,
-		RetryAfter: parseUsageRetryAfter(body, statusCode),
+		AuthIndex: authIndex,
+		Provider:  provider,
+		Model:     model,
+		Success:   false,
 		Error: &Error{
 			Message:    message,
 			HTTPStatus: statusCode,
 		},
 	}
-}
-
-func parseUsageRetryAfter(body string, statusCode int) *time.Duration {
-	if statusCode != http.StatusTooManyRequests {
-		return nil
-	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return nil
-	}
-	if gjson.Valid(body) {
-		if retryAfter := parseGoogleRetryDelay(body); retryAfter != nil {
-			return retryAfter
-		}
-		if retryAfter := parseRetryDelayFromMessage(gjson.Get(body, "error.message").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return parseRetryDelayFromMessage(body)
-}
-
-func parseGoogleRetryDelay(body string) *time.Duration {
-	details := gjson.Get(body, "error.details")
-	if !details.Exists() || !details.IsArray() {
-		return nil
-	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.RetryInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("retryDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("metadata.quotaResetDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return nil
-}
-
-func parseRetryDelayFromMessage(message string) *time.Duration {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return nil
-	}
-	matches := usageRetryDelayPattern.FindStringSubmatch(message)
-	if len(matches) < 2 {
-		return nil
-	}
-	return parseDurationPointer(matches[1])
-}
-
-func parseDurationPointer(value string) *time.Duration {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-	duration, errParse := time.ParseDuration(value)
-	if errParse != nil || duration <= 0 {
-		return nil
-	}
-	return &duration
 }

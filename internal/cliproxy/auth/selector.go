@@ -205,8 +205,20 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	return available, cooldownCount, earliest
 }
 
-// getAvailableAuths returns an available auths.
+// getAvailableAuths returns the highest available priority tier.
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, false)
+}
+
+// getAvailableAuthsAcrossPriorities returns every available candidate regardless of
+// priority, sorted by ID. Use it for membership checks such as validating an established
+// session binding, or feed it to highestPriorityAuths; the order carries no priority
+// meaning and must never be treated as a selection order.
+func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, true)
+}
+
+func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, now time.Time, allPriorities bool) ([]*Auth, error) {
 	// Build the candidate view before applying availability rules.
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
@@ -228,20 +240,72 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
+	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+}
+
+// availableAuthsFromPriorityBuckets flattens availability buckets into a stable,
+// ID-sorted slice. With allPriorities false only the highest available tier is
+// returned; with allPriorities true every tier is merged, so the ID order of the
+// result says nothing about credential priority.
+func availableAuthsFromPriorityBuckets(availableByPriority map[int][]*Auth, allPriorities bool) []*Auth {
+	var candidates []*Auth
+	if allPriorities {
+		total := 0
+		for _, bucket := range availableByPriority {
+			total += len(bucket)
+		}
+		candidates = make([]*Auth, 0, total)
+		for _, bucket := range availableByPriority {
+			candidates = append(candidates, bucket...)
+		}
+	} else {
+		bestPriority := 0
+		found := false
+		for priority := range availableByPriority {
+			if !found || priority > bestPriority {
+				bestPriority = priority
+				found = true
+			}
+		}
+		bucket := availableByPriority[bestPriority]
+		candidates = make([]*Auth, 0, len(bucket))
+		candidates = append(candidates, bucket...)
+	}
+	if len(candidates) > 1 {
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	}
+	return candidates
+}
+
+// highestPriorityAuths narrows an availability slice to its highest priority tier
+// while preserving the input order. The input slice is returned unchanged when every
+// candidate already shares the highest priority.
+func highestPriorityAuths(auths []*Auth) []*Auth {
+	if len(auths) <= 1 {
+		return auths
+	}
 	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
+	bestCount := 0
+	for _, auth := range auths {
+		priority := authPriority(auth)
+		switch {
+		case bestCount == 0 || priority > bestPriority:
 			bestPriority = priority
-			found = true
+			bestCount = 1
+		case priority == bestPriority:
+			bestCount++
 		}
 	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	if bestCount == len(auths) {
+		return auths
 	}
-	return available, nil
+	highest := make([]*Auth, 0, bestCount)
+	for _, auth := range auths {
+		if authPriority(auth) == bestPriority {
+			highest = append(highest, auth)
+		}
+	}
+	return highest
 }
 
 func filterConcurrencyExcludedAuths(auths []*Auth, model string, opts Options) []*Auth {
@@ -325,30 +389,48 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				if state.Status == StatusDisabled {
 					return true, blockReasonDisabled, time.Time{}
 				}
-				if state.Unavailable {
-					if state.NextRetryAfter.IsZero() {
-						return false, blockReasonNone, time.Time{}
-					}
-					if state.NextRetryAfter.After(now) {
-						next := state.NextRetryAfter
-						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
-							next = state.Quota.NextRecoverAt
-						}
-						if next.Before(now) {
-							next = now
-						}
-						if state.Quota.Exceeded {
-							return true, blockReasonCooldown, next
-						}
-						return true, blockReasonOther, next
-					}
-				}
-				return false, blockReasonNone, time.Time{}
+				return availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
 			}
 		}
+		// Credential-wide aggregates are advisory only: legacy Home versions recorded
+		// quota state with a "credential" scope, and honouring it here would block every
+		// model instead of the one that actually failed.
 		return false, blockReasonNone, time.Time{}
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+// availabilityBlock reports whether an availability snapshot blocks dispatch.
+//
+// Availability defaults to healthy: a snapshot flagged unavailable or quota exceeded
+// blocks only while a recovery deadline is still in the future. A snapshot carrying no
+// deadline at all counts as recovered rather than parked, so a legacy row, a cluster
+// merge artifact, or a credential configured with disable_cooling can never strand
+// itself in a state nothing is able to expire. Every failure transition writes a
+// bounded deadline, so a real cooldown always carries one.
+//
+// The reported deadline is the later of the retry and quota windows so Retry-After
+// cannot invite a premature retry.
+func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
+	if !unavailable && !quotaExceeded {
+		return false, blockReasonNone, time.Time{}
+	}
+	next := time.Time{}
+	for _, candidate := range []time.Time{nextRetryAfter, nextRecoverAt} {
+		if candidate.IsZero() || !candidate.After(now) {
+			continue
+		}
+		if next.IsZero() || candidate.After(next) {
+			next = candidate
+		}
+	}
+	if next.IsZero() {
+		return false, blockReasonNone, time.Time{}
+	}
+	if quotaExceeded {
+		return true, blockReasonCooldown, next
+	}
+	return true, blockReasonOther, next
 }
 
 // sessionPattern matches Claude Code user_id format:
@@ -393,63 +475,110 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 //  6. conversation_id field in request body
 //  7. Stable hash from first few messages content (fallback)
 //
+// An established binding outranks credential priority: a bound credential that is
+// still available is reused even when a higher-priority credential recovers.
+// Credential priority applies to cold bindings, requests without a session, and
+// genuine bound-credential failover, so the fallback selector only ever receives the
+// highest available priority tier.
+//
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
-		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
-	}
-
 	now := time.Now()
 	auths = filterConcurrencyExcludedAuths(auths, model, opts)
-	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
-		return nil, err
+	if primaryID == "" {
+		// Keep both paths on one availability evaluation so a sessionless request cannot
+		// see a different candidate set than a session-bound one.
+		sessionlessAuths, errAvailable := getAvailableAuthsAcrossPriorities(auths, provider, model, now)
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		return s.fallback.Pick(ctx, provider, model, opts, coldStartCandidates(sessionlessAuths, provider, opts))
 	}
 
 	cacheKey := provider + "::" + primaryID + "::" + model
 
+	// Reusing an established binding is the common case and only needs an answer about
+	// one credential, so it is settled before any pool-wide work. Evaluating every
+	// candidate first would make the cheapest outcome the most expensive one.
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
-			}
+		if bound := availableAuthByID(auths, cachedAuthID, model, now); bound != nil {
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+			return bound, nil
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
-		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
-	}
-
-	if fallbackID != "" && fallbackID != primaryID {
+	} else if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
-				}
+		if cachedAuthID, okFallback := s.cache.Get(fallbackKey); okFallback {
+			if bound := availableAuthByID(auths, cachedAuthID, model, now); bound != nil {
+				s.cache.Set(cacheKey, bound.ID)
+				entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), bound.ID, provider, model)
+				return bound, nil
 			}
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+	// No usable binding: evaluate the pool and let the fallback selector choose from the
+	// highest available tier, which is what governs a cold start.
+	available, err := getAvailableAuthsAcrossPriorities(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := s.fallback.Pick(ctx, provider, model, opts, coldStartCandidates(available, provider, opts))
 	if err != nil {
 		return nil, err
 	}
 	s.cache.Set(cacheKey, auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	entry.Infof("session-affinity: no usable binding, selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// coldStartCandidates narrows an availability view down to what a new binding may pick.
+//
+// Credential priority governs a cold start, except for a downstream websocket: keeping
+// the transport intact outranks the tier, so a websocket-capable credential wins across
+// priorities. This mirrors the scheduler's own preference, which never runs while
+// session affinity is enabled because that path is served by the fallback selector.
+func coldStartCandidates(available []*Auth, provider string, opts Options) []*Auth {
+	if downstreamWebsocketFromOptions(opts) && providerPrefersWebsocketTransport(provider) {
+		if websocketAuths := websocketCapableAuths(available); len(websocketAuths) > 0 {
+			return highestPriorityAuths(websocketAuths)
+		}
+	}
+	return highestPriorityAuths(available)
+}
+
+// websocketCapableAuths keeps only credentials whose upstream can carry a websocket.
+func websocketCapableAuths(auths []*Auth) []*Auth {
+	capable := make([]*Auth, 0, len(auths))
+	for _, candidate := range auths {
+		if authWebsocketsEnabled(candidate) {
+			capable = append(capable, candidate)
+		}
+	}
+	return capable
+}
+
+// availableAuthByID resolves one credential by ID and reports it only when it is still
+// dispatchable for the model. A bound session needs exactly this answer, and asking it
+// directly avoids evaluating every other candidate to reach a foregone conclusion.
+func availableAuthByID(auths []*Auth, authID, model string, now time.Time) *Auth {
+	if authID == "" {
+		return nil
+	}
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID != authID {
+			continue
+		}
+		if blocked, _, _ := isAuthBlockedForModel(candidate, model, now); blocked {
+			return nil
+		}
+		return candidate
+	}
+	return nil
 }
 
 // selectorLogEntry handles a selector log entry.

@@ -217,8 +217,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
 	_ = ctx
-	_ = opts
-	preferWebsocket := false
+	preferWebsocket := downstreamWebsocketFromOptions(opts) && providerPrefersWebsocketTransport(providerKey)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -238,6 +237,18 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
+}
+
+// providerPrefersWebsocketTransport reports whether a provider can carry a request over
+// a websocket upstream, which is what makes a websocket-enabled credential worth
+// preferring across priority tiers.
+func providerPrefersWebsocketTransport(providerKey string) bool {
+	switch strings.ToLower(strings.TrimSpace(providerKey)) {
+	case "codex", "xai":
+		return true
+	default:
+		return false
+	}
 }
 
 // pickMixed returns the next auth and provider for a mixed-provider request.

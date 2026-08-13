@@ -104,7 +104,9 @@ func (c *SessionCache) Invalidate(sessionID string) {
 }
 
 // InvalidateAuth removes all sessions bound to a specific auth ID.
-// Used when an auth becomes unavailable.
+// Used when an auth is removed from the manager. A merely unavailable auth is not
+// invalidated here: the binding is revalidated on every pick, so it recovers with the
+// credential instead of being dropped.
 func (c *SessionCache) InvalidateAuth(authID string) {
 	if authID == "" {
 		return

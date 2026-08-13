@@ -620,7 +620,10 @@ func shouldSuspendRegistryModel(auth *Auth, model string, reason blockReason) bo
 	if state == nil {
 		return false
 	}
-	if isModelSupportResultError(state.LastError) {
+	// A revoked grant blocks dispatch for 30 minutes, so the registry must keep the
+	// model suspended for the same window. Otherwise the next reconcile would resume a
+	// model Home still refuses to dispatch.
+	if isModelSupportResultError(state.LastError) || isInvalidGrantResultError(state.LastError) {
 		return true
 	}
 	switch statusCodeFromResult(state.LastError) {
