@@ -37,16 +37,23 @@ const (
 const clusterEventAdvisoryLockKey int64 = 749327842680272317
 
 type APIKeyUpsertStats struct {
-	Created   int
-	Updated   int
-	Unchanged int
-	Restored  int
-	Removed   int
+	Created        int
+	Updated        int
+	Unchanged      int
+	Restored       int
+	Removed        int
+	RuntimeChanged bool
 }
 
 // Changed reports whether api key rows were mutated.
 func (s APIKeyUpsertStats) Changed() bool {
 	return s.Created != 0 || s.Updated != 0 || s.Restored != 0 || s.Removed != 0
+}
+
+// RequiresRuntimeRefresh reports whether the accepted API key set or its
+// dispatch-affecting bindings changed.
+func (s APIKeyUpsertStats) RequiresRuntimeRefresh() bool {
+	return s.RuntimeChanged
 }
 
 // NewRepository creates a new repository.
@@ -860,6 +867,9 @@ func replaceAPIKeysTxWithStats(ctx context.Context, tx *gorm.DB, keys []string) 
 	if tx == nil {
 		return APIKeyUpsertStats{}, fmt.Errorf("database connection is nil")
 	}
+	if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+		return APIKeyUpsertStats{}, errLock
+	}
 	keys = normalizeAPIKeys(keys)
 
 	var existing []APIKeyRecord
@@ -925,6 +935,9 @@ func upsertAPIKeysTxWithStats(ctx context.Context, tx *gorm.DB, keys []string) (
 	// Normalize source data before building the derived payload.
 	if tx == nil {
 		return APIKeyUpsertStats{}, fmt.Errorf("database connection is nil")
+	}
+	if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+		return APIKeyUpsertStats{}, errLock
 	}
 	keys = normalizeAPIKeys(keys)
 	stats := APIKeyUpsertStats{}
@@ -1096,6 +1109,12 @@ func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfig(ctx context.Contex
 		}
 	}
 	return withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		// Config replacement can emit auth or lifecycle events before it reaches
+		// the API key rows. Acquire this lock first to keep the global order
+		// API keys -> cluster events and avoid a PostgreSQL advisory-lock cycle.
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		gate, errGate := lockConcurrencyActivationGate(tx)
 		if errGate != nil {
 			return errGate

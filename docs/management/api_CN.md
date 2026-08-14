@@ -1345,6 +1345,8 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
 
 ### GET `/api-keys`
 
+响应会包含表示完整可见 API key 集合的强 `ETag` header。执行“读取-修改-写回”全量替换的客户端，应在 `PUT /api-keys` 时通过 `If-Match` 回传该值。
+
 返回 Home 接受的客户端 API keys。
 
 输入：无。
@@ -1360,6 +1362,7 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
       "api_key_id": 1,
       "api-key": "client-key-1",
       "api_key": "client-key-1",
+      "display_name": "生产环境 key",
       "user-id": 1,
       "user_id": 1,
       "channels": [1],
@@ -1372,6 +1375,7 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
       "api_key_id": 1,
       "api-key": "client-key-1",
       "api_key": "client-key-1",
+      "display_name": "生产环境 key",
       "user-id": 1,
       "user_id": 1,
       "channels": [1],
@@ -1392,6 +1396,7 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
 | `APIKeyEntry.api_key_id` | integer | `id` 的 alias。 |
 | `APIKeyEntry.api-key` | string | 客户端 API key。 |
 | `APIKeyEntry.api_key` | string | `api-key` 的 alias。 |
+| `APIKeyEntry.display_name` | string or null | 可选、可编辑的展示名称；仅作为元数据，不影响鉴权或绑定。 |
 | `APIKeyEntry.user-id` | integer or null | 绑定的 `user.id`；`null` 表示未绑定。 |
 | `APIKeyEntry.user_id` | integer or null | `user-id` 的 alias。 |
 | `APIKeyEntry.channels` | array of integer | 绑定的 channel group IDs；空数组表示不限制。 |
@@ -1404,13 +1409,14 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
 ```json
 {
   "api_key": "client-key-1",
+  "display_name": "生产环境 key",
   "user_id": 1,
   "channels": [1],
   "model_groups": [2]
 }
 ```
 
-密钥字段也接受 `api-key`、`key` 或 `value`；`user-id` 和 `model-groups` 作为别名。
+密钥字段也接受 `api-key`、`key` 或 `value`；`user-id` 和 `model-groups` 作为别名。`display_name` 可选；首尾空白会被去除，空字符串或 `null` 表示不设置展示名称。展示名称最多包含 128 个 Unicode 字符且不能包含控制字符；无效名称返回 `400 invalid_display_name`。
 
 新的密钥值会获得新的稳定标识。如果重新添加与历史软删除记录完全相同的密钥值，则恢复原记录并复用原标识。创建已存在的活跃密钥会返回 `409 api_key_exists`。
 
@@ -1423,6 +1429,7 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
     "api_key_id": 1,
     "api-key": "client-key-1",
     "api_key": "client-key-1",
+    "display_name": "生产环境 key",
     "user-id": 1,
     "user_id": 1,
     "channels": [1],
@@ -1454,6 +1461,7 @@ JSON 语法错误，或请求体无法解析到足以可靠定位具体字段时
   "api_key_entries": [
     {
       "api_key": "client-key-1",
+      "display_name": "生产环境 key",
       "user_id": 1,
       "channels": [1],
       "model_groups": [2]
@@ -1467,13 +1475,16 @@ Entry 字段：
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `api_key` | string | 条件必填 | 客户端 API key；也接受 `api-key`、`key`、`value`。 |
-| `user_id` | integer | 否 | 绑定的 `user.id`；也接受 `user-id`。 |
-| `channels` | array of integer | 否 | Channel group IDs。 |
-| `model_groups` | array of integer | 否 | Model group IDs；也接受 `model-groups`。 |
+| `display_name` | string or null | 否 | 可选展示名称，最多 128 个 Unicode 字符且不能包含控制字符。对未变化的 key 省略该字段会保留原名称；传空字符串或 `null` 会清空名称。 |
+| `user_id` | integer or null | 否 | 绑定的 `user.id`；也接受 `user-id`。对未变化的 key 省略时保留原归属；传 `0` 或 `null` 清空绑定。 |
+| `channels` | array of integer | 否 | Channel group IDs；对未变化的 key 省略时保留原 channel 绑定。 |
+| `model_groups` | array of integer | 否 | Model group IDs；也接受 `model-groups`；对未变化的 key 省略时保留原 model group 绑定。 |
 
 如果 `user_id` 引用不存在的用户，接口返回 `404 user_not_found`。
 
-`PUT` 是显式的完整列表替换操作，采用 last-write-wins 语义。对于此操作，`id` 和 `api_key_id` 仅用于响应，在结构化输入中会被忽略。未改变的密钥值保留原标识，被移除的值会软删除，新值会获得新标识；如果新值恢复了完全相同的软删除记录，则复用原标识。
+`PUT` 是显式的完整列表替换操作，采用 last-write-wins 语义；同一 key 重复出现时使用最后一条。对于此操作，`id` 和 `api_key_id` 仅用于响应，在结构化输入中会被忽略。未改变的密钥值保留原标识，被移除的值会软删除，新值会获得新标识；如果新值恢复了完全相同的软删除记录，则复用原标识。对于已有 key 值（包括正在恢复的软删除记录），省略 `display_name`、`user_id`、`channels` 或 `model_groups` 会分别保留数据库中的值，因此原始字符串 entry 也保持兼容；数据库中不存在的新 key 对省略字段使用空默认值。
+
+为兼容旧客户端，`If-Match` 为可选 header。提供该 header 时，Home 会在同一事务内将一个或多个强 ETag 与当前集合 ETag 原子核对；过期、弱、通配符或格式错误的 validator 返回 `412 api_keys_precondition_failed`，且不会修改任何 key。不提供 `If-Match` 时保留旧版无条件替换行为。显式空数组（`[]`，或任一支持的 wrapper 包含 `[]`）表示删除全部 key；`null`、null/空白/无效 entry、缺少 key 值、互相冲突的 key alias 或同时提供多个 wrapper alias 都会返回 `400`，且不修改集合。`POST`、`PUT`、`PATCH` 请求体上限为 1 MiB；超过限制返回 `413 request_body_too_large`。
 
 成功输出：
 
@@ -1483,7 +1494,7 @@ Entry 字段：
 
 ### PATCH `/api-keys`
 
-更新一个客户端 API key。优先使用稳定的 `id` / `api_key_id` 定位。旧的 `index`、`old/new` 和原始 key selector 继续作为兼容方式，后端会先将其解析到一条数据库记录，再执行定向更新。使用 `old/new` 时，如果旧值不存在，会原子创建 `new`。此接口还可以更新已有 API key 的 `user_id`、`channels` 和 `model_groups`。
+更新一个客户端 API key。优先使用稳定的 `id` / `api_key_id` 定位。旧的 `index`、`old/new` 和原始 key selector 继续作为兼容方式，后端会先将其解析到一条数据库记录，再执行定向更新。使用 `old/new` 时，如果旧值不存在，会原子创建 `new`。此接口还可以更新已有 API key 的 `display_name`、`user_id`、`channels` 和 `model_groups`。
 
 按 ID 更新：
 
@@ -1492,6 +1503,7 @@ Entry 字段：
   "id": 1,
   "value": {
     "api_key": "new-key",
+    "display_name": "生产环境 key",
     "user_id": 1,
     "channels": [1],
     "model_groups": [2]
@@ -1503,6 +1515,18 @@ Entry 字段：
 
 ```json
 { "api_key_id": 1, "channels": [1] }
+```
+
+仅更新展示名称不会轮换 key，也不会改变归属和分组绑定：
+
+```json
+{ "api_key_id": 1, "display_name": "主生产 key" }
+```
+
+传空字符串或 `null` 可以清空展示名称：
+
+```json
+{ "api_key_id": 1, "display_name": null }
 ```
 
 按下标更新：
@@ -1544,7 +1568,8 @@ Entry 字段：
 | `old` | string | 条件必填 | 要查找的旧 key。 |
 | `new` | string | 条件必填 | 新 key；旧值不存在时追加。 |
 | `api_key` | string | 条件必填 | 旧版原始 key selector；和 `id` 同时提交时必须匹配该记录；也接受 `api-key`、`key`。 |
-| `user_id` | integer | 否 | 绑定的 `user.id`；也接受 `user-id`；传 `0` 清空绑定。 |
+| `display_name` | string or null | 否 | 替换展示名称，最多 128 个 Unicode 字符且不能包含控制字符；首尾空白会被去除，空字符串或 `null` 会清空名称。 |
+| `user_id` | integer or null | 否 | 绑定的 `user.id`；也接受 `user-id`；传 `0` 或 `null` 清空绑定。 |
 | `channels` | array of integer | 否 | Channel group IDs。 |
 | `model_groups` | array of integer | 否 | Model group IDs；也接受 `model-groups`。 |
 
@@ -1557,6 +1582,7 @@ Entry 字段：
     "api_key_id": 1,
     "api-key": "client-key-1",
     "api_key": "client-key-1",
+    "display_name": "主生产 key",
     "user-id": 1,
     "user_id": 1,
     "channels": [1],

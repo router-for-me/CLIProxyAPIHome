@@ -421,4 +421,7 @@ func assertCORSHeaders(t *testing.T, resp *httptest.ResponseRecorder) {
 	if !strings.Contains(expose, "X-CPA-SUPPORT-PLUGIN") {
 		t.Fatalf("Access-Control-Expose-Headers = %q, want X-CPA-SUPPORT-PLUGIN", expose)
 	}
+	if !strings.Contains(expose, "ETag") {
+		t.Fatalf("Access-Control-Expose-Headers = %q, want ETag", expose)
+	}
 }

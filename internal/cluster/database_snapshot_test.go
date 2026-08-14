@@ -120,6 +120,39 @@ func TestDatabaseSnapshotV2RegistryExcludesMigrationOnlyModels(t *testing.T) {
 	}
 }
 
+func TestDatabaseSnapshotV4FreezesLegacyAPIKeyShape(t *testing.T) {
+	t.Parallel()
+
+	legacyModels, okLegacy := databaseSnapshotModels(3)
+	if !okLegacy {
+		t.Fatal("database snapshot v3 registry is unsupported")
+	}
+	currentModels, okCurrent := databaseSnapshotModels(databaseSnapshotFormatVersion)
+	if !okCurrent {
+		t.Fatal("current database snapshot registry is unsupported")
+	}
+
+	legacyType := databaseSnapshotModelType(t, legacyModels, "api_key")
+	if legacyType != reflect.TypeOf(&databaseSnapshotV3APIKeyRecord{}) {
+		t.Fatalf("v3 API key snapshot type = %v, want frozen legacy type", legacyType)
+	}
+	currentType := databaseSnapshotModelType(t, currentModels, "api_key")
+	if currentType != reflect.TypeOf(&APIKeyRecord{}) {
+		t.Fatalf("v4 API key snapshot type = %v, want current APIKeyRecord", currentType)
+	}
+}
+
+func databaseSnapshotModelType(t *testing.T, models []databaseModel, name string) reflect.Type {
+	t.Helper()
+	for _, model := range models {
+		if model.name == name {
+			return reflect.TypeOf(model.newRecord())
+		}
+	}
+	t.Fatalf("database snapshot model %q is missing", name)
+	return nil
+}
+
 func TestDatabaseSnapshotV1RegistryRemainsCompatible(t *testing.T) {
 	t.Parallel()
 
@@ -146,6 +179,122 @@ func TestDatabaseSnapshotV1RegistryRemainsCompatible(t *testing.T) {
 		if gotOrder := strings.Join(databaseSnapshotV2Models[index].orderBy, ","); gotOrder != "home_ip,home_port,home_started_at,node_key" {
 			t.Fatalf("current cpa_node order = %q", gotOrder)
 		}
+	}
+}
+
+func TestDatabaseSnapshotV3APIKeyRecordRemainsImportable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source := openDatabaseSnapshotSQLiteTestDB(t, filepath.Join(t.TempDir(), "source.db"))
+	if errCreate := source.Create(&APIKeyRecord{
+		APIKey:      "legacy-snapshot-key",
+		Channels:    JSONB(`[]`),
+		ModelGroups: JSONB(`[]`),
+	}).Error; errCreate != nil {
+		t.Fatalf("create source API key: %v", errCreate)
+	}
+
+	snapshotPath := filepath.Join(t.TempDir(), "legacy-v3.snapshot.zip")
+	if _, errExport := exportDatabaseSnapshotVersion(ctx, source, snapshotPath, 3); errExport != nil {
+		t.Fatalf("exportDatabaseSnapshotVersion(v3) error = %v", errExport)
+	}
+	snapshot, errOpen := OpenDatabaseSnapshot(ctx, snapshotPath)
+	if errOpen != nil {
+		t.Fatalf("OpenDatabaseSnapshot(v3) error = %v", errOpen)
+	}
+	t.Cleanup(func() {
+		if errClose := snapshot.Close(); errClose != nil {
+			t.Errorf("close v3 snapshot: %v", errClose)
+		}
+	})
+
+	target := openDatabaseSnapshotSQLiteRawTestDB(t, filepath.Join(t.TempDir(), "target.db"))
+	if _, errImport := ImportDatabaseSnapshot(ctx, target, snapshot, nil); errImport != nil {
+		t.Fatalf("ImportDatabaseSnapshot(v3) error = %v", errImport)
+	}
+	var imported APIKeyRecord
+	if errFirst := target.First(&imported, "api_key = ?", "legacy-snapshot-key").Error; errFirst != nil {
+		t.Fatalf("load imported v3 API key: %v", errFirst)
+	}
+	if imported.DisplayName != nil {
+		t.Fatalf("imported v3 display name = %q, want null", *imported.DisplayName)
+	}
+}
+
+func TestValidateDatabaseSnapshotRecordRejectsInvalidAPIKeyDisplayName(t *testing.T) {
+	model := currentDatabaseModels()[0]
+	for _, candidate := range currentDatabaseModels() {
+		if candidate.name == "api_key" {
+			model = candidate
+			break
+		}
+	}
+	db, errOpen := OpenSQLite(t.Context(), filepath.Join(t.TempDir(), "snapshot-display-name.db"))
+	if errOpen != nil {
+		t.Fatalf("OpenSQLite() error = %v", errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("db.DB() error = %v", errDB)
+	}
+	defer func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sqlite database: %v", errClose)
+		}
+	}()
+	statement := &gorm.Statement{DB: db}
+	if errParse := statement.Parse(&APIKeyRecord{}); errParse != nil {
+		t.Fatalf("parse APIKeyRecord schema: %v", errParse)
+	}
+
+	for _, displayName := range []string{
+		strings.Repeat("a", APIKeyDisplayNameMaxLength+1),
+		"invalid\nname",
+		"  padded  ",
+	} {
+		record := &APIKeyRecord{ID: 1, APIKey: "snapshot-key", DisplayName: &displayName}
+		raw, errMarshal := json.Marshal(record)
+		if errMarshal != nil {
+			t.Fatalf("marshal API key record: %v", errMarshal)
+		}
+		errValidate := validateDatabaseSnapshotRecord(t.Context(), model, statement.Schema, raw, record)
+		if errValidate == nil || !strings.Contains(errValidate.Error(), "display_name") {
+			t.Fatalf("validate display name %q error = %v, want display_name failure", displayName, errValidate)
+		}
+	}
+}
+
+func TestValidateDatabaseSnapshotExportRejectsUnnormalizedAPIKeyDisplayName(t *testing.T) {
+	model := currentDatabaseModels()[0]
+	for _, candidate := range currentDatabaseModels() {
+		if candidate.name == "api_key" {
+			model = candidate
+			break
+		}
+	}
+	db, errOpen := OpenSQLite(t.Context(), filepath.Join(t.TempDir(), "snapshot-export-display-name.db"))
+	if errOpen != nil {
+		t.Fatalf("OpenSQLite() error = %v", errOpen)
+	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("db.DB() error = %v", errDB)
+	}
+	defer func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sqlite database: %v", errClose)
+		}
+	}()
+	statement := &gorm.Statement{DB: db}
+	if errParse := statement.Parse(&APIKeyRecord{}); errParse != nil {
+		t.Fatalf("parse APIKeyRecord schema: %v", errParse)
+	}
+	displayName := "  padded  "
+	record := &APIKeyRecord{ID: 1, APIKey: "snapshot-key", DisplayName: &displayName}
+	errValidate := validateDatabaseSnapshotExportRecordEncoding(t.Context(), model, statement.Schema, record)
+	if errValidate == nil || !strings.Contains(errValidate.Error(), "display_name") {
+		t.Fatalf("export validation error = %v, want display_name failure", errValidate)
 	}
 }
 
@@ -221,6 +370,13 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	if activationGate.ActivePolicyCount != 1 {
 		t.Fatalf("imported active policy count = %d, want 1", activationGate.ActivePolicyCount)
 	}
+	var apiKey APIKeyRecord
+	if errFirst := target.First(&apiKey, "api_key = ?", "snapshot-api-key").Error; errFirst != nil {
+		t.Fatalf("load imported API key: %v", errFirst)
+	}
+	if apiKey.DisplayName == nil || *apiKey.DisplayName != "Snapshot API key" {
+		t.Fatalf("imported API key display name = %v, want %q", apiKey.DisplayName, "Snapshot API key")
+	}
 	var pluginAuth PluginStoreAuthRecord
 	if errFirst := target.First(&pluginAuth, want.pluginAuthID).Error; errFirst != nil {
 		t.Fatalf("load imported plugin auth: %v", errFirst)
@@ -276,6 +432,63 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	if createdLog.ID <= want.maximumLogID {
 		t.Fatalf("log id after import = %d, want greater than %d", createdLog.ID, want.maximumLogID)
 	}
+}
+
+func exportDatabaseSnapshotVersion(ctx context.Context, db *gorm.DB, path string, formatVersion int) (DatabaseSnapshotManifest, error) {
+	models, okModels := databaseSnapshotModels(formatVersion)
+	if !okModels {
+		return DatabaseSnapshotManifest{}, fmt.Errorf("unsupported test snapshot version %d", formatVersion)
+	}
+	file, errCreate := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errCreate != nil {
+		return DatabaseSnapshotManifest{}, errCreate
+	}
+	zipWriter := zip.NewWriter(file)
+	manifest := DatabaseSnapshotManifest{
+		Format:        databaseSnapshotFormat,
+		FormatVersion: formatVersion,
+		CreatedAt:     time.Now().UTC(),
+		SourceBackend: DatabaseBackendSQLite,
+		Tables:        make([]DatabaseSnapshotManifestTable, 0, len(models)),
+	}
+	errExport := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, model := range models {
+			entry, errEntry := zipWriter.CreateHeader(&zip.FileHeader{Name: databaseSnapshotTableEntryName(model.name), Method: zip.Deflate})
+			if errEntry != nil {
+				return errEntry
+			}
+			hasher := sha256.New()
+			rows, errRows := exportDatabaseSnapshotTable(ctx, tx, model, io.MultiWriter(entry, hasher))
+			if errRows != nil {
+				return errRows
+			}
+			manifest.Tables = append(manifest.Tables, DatabaseSnapshotManifestTable{
+				Name:    model.name,
+				Rows:    rows,
+				SHA256:  hex.EncodeToString(hasher.Sum(nil)),
+				Restore: model.restore,
+			})
+		}
+		return nil
+	})
+	if errExport == nil {
+		var manifestWriter io.Writer
+		manifestWriter, errExport = zipWriter.CreateHeader(&zip.FileHeader{Name: databaseSnapshotManifestName, Method: zip.Deflate})
+		if errExport == nil {
+			var raw []byte
+			raw, errExport = json.Marshal(manifest)
+			if errExport == nil {
+				_, errExport = manifestWriter.Write(append(raw, '\n'))
+			}
+		}
+	}
+	if errCloseZIP := zipWriter.Close(); errExport == nil && errCloseZIP != nil {
+		errExport = errCloseZIP
+	}
+	if errClose := file.Close(); errExport == nil && errClose != nil {
+		errExport = errClose
+	}
+	return manifest, errExport
 }
 
 func TestDatabaseSnapshotExportRejectsExistingFile(t *testing.T) {
@@ -1186,6 +1399,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 	channelGroupID := uint(201)
 	modelGroupID := uint(301)
 	apiKeyID := uint(401)
+	apiKeyDisplayName := "Snapshot API key"
 	usageID := uint(501)
 	pluginAuthID := uint(601)
 	authUUID := "auth-snapshot-uuid"
@@ -1208,7 +1422,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 		&UserSecurityThrottleRecord{Key: "snapshot-throttle", Count: 1, ExpiresAt: expiresAt, UpdatedAt: now},
 		&ChannelGroupRecord{ID: channelGroupID, ChannelName: "snapshot-channel", CreatedAt: now, UpdatedAt: now},
 		&ModelGroupRecord{ID: modelGroupID, GroupName: "snapshot-models", CreatedAt: now, UpdatedAt: now},
-		&APIKeyRecord{ID: apiKeyID, APIKey: "snapshot-api-key", UserID: &userID, Channels: JSONB(`[201]`), ModelGroups: JSONB(`[301]`), CreatedAt: now, UpdatedAt: now},
+		&APIKeyRecord{ID: apiKeyID, APIKey: "snapshot-api-key", DisplayName: &apiKeyDisplayName, UserID: &userID, Channels: JSONB(`[201]`), ModelGroups: JSONB(`[301]`), CreatedAt: now, UpdatedAt: now},
 		&ChannelGroupDetailRecord{ID: 211, ChannelGroupID: channelGroupID, AuthID: "auth-logical-id", CreatedAt: now, UpdatedAt: now},
 		&ModelGroupDetailRecord{ID: 311, ModelGroupID: modelGroupID, ModelID: "gpt-test", CreatedAt: now, UpdatedAt: now},
 		&UsageRecord{ID: usageID, Timestamp: now, Source: "snapshot", AuthIndex: "auth-index", InputTokens: 1, OutputTokens: 2, TotalTokens: 3, Provider: "codex", Model: "gpt-test", TokensJSON: JSONB(`{"input":1}`), FailJSON: JSONB(`null`), PayloadJSON: JSONB(`{"model":"gpt-test"}`), CreatedAt: now},

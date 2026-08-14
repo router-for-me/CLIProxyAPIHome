@@ -10,9 +10,9 @@ import (
 
 func TestDatabaseSnapshotV3IncludesCPANodeMetadata(t *testing.T) {
 	t.Parallel()
-	models, okModels := databaseSnapshotModels(databaseSnapshotFormatVersion)
+	models, okModels := databaseSnapshotModels(3)
 	if !okModels {
-		t.Fatal("current database snapshot registry is unsupported")
+		t.Fatal("database snapshot v3 registry is unsupported")
 	}
 	if len(models) != len(databaseSnapshotV2Models)+1 {
 		t.Fatalf("v3 model count = %d, want v2 count plus metadata", len(models))

@@ -65,6 +65,11 @@ func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfigAndCreatePluginTask
 	}
 	var out node.PluginTask
 	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		// Keep the same advisory-lock order as direct API key mutations before
+		// config reconciliation or plugin task creation emits cluster events.
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		gate, errGate := lockConcurrencyActivationGate(tx)
 		if errGate != nil {
 			return errGate

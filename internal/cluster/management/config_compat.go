@@ -426,11 +426,13 @@ func (h *Handler) PutSwitchPreviewModel(c *gin.Context) {
 func (h *Handler) GetAPIKeys(c *gin.Context) {
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
-	entries, errEntries := h.repo.ListAPIKeyEntries(ctx)
+	entries, etag, errEntries := h.repo.ListAPIKeyEntriesWithETag(ctx)
 	if errEntries != nil {
 		respondError(c, http.StatusInternalServerError, "api_keys_load_failed", errEntries)
 		return
 	}
+	c.Header("Cache-Control", "no-store")
+	c.Header("ETag", etag)
 	c.JSON(http.StatusOK, apiKeyEntriesResponse(entries))
 }
 
@@ -441,19 +443,30 @@ func (h *Handler) PostAPIKeys(c *gin.Context) {
 
 // PutAPIKeys replaces an api keys.
 func (h *Handler) PutAPIKeys(c *gin.Context) {
+	limitAPIKeyRequestBody(c)
 	data, errData := c.GetRawData()
 	if errData != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		respondAPIKeyRequestError(c, errData)
 		return
 	}
 	entries, errEntries := decodeAPIKeyEntryUpdates(data)
 	if errEntries != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		respondAPIKeyRequestError(c, errEntries)
 		return
 	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
-	if _, errReplace := h.repo.ReplaceAPIKeyEntries(ctx, entries); errReplace != nil {
+	var ifMatch *string
+	if values := c.Request.Header.Values("If-Match"); len(values) > 0 {
+		value := strings.Join(values, ",")
+		ifMatch = &value
+	}
+	stats, errReplace := h.repo.ReplaceAPIKeyEntriesIfMatch(ctx, entries, ifMatch)
+	if errReplace != nil {
+		if errors.Is(errReplace, cluster.ErrAPIKeyPreconditionFailed) {
+			respondError(c, http.StatusPreconditionFailed, "api_keys_precondition_failed", errReplace)
+			return
+		}
 		if cluster.IsAPIKeyConflictError(errReplace) {
 			respondError(c, http.StatusConflict, "api_key_exists", errReplace)
 			return
@@ -462,12 +475,18 @@ func (h *Handler) PutAPIKeys(c *gin.Context) {
 			respondError(c, http.StatusNotFound, "user_not_found", errReplace)
 			return
 		}
+		if errors.Is(errReplace, cluster.ErrInvalidAPIKeyDisplayName) {
+			respondError(c, http.StatusBadRequest, "invalid_display_name", errReplace)
+			return
+		}
 		respondError(c, http.StatusInternalServerError, "write_failed", errReplace)
 		return
 	}
-	if errRefresh := h.refreshConfig(ctx); errRefresh != nil {
-		respondError(c, http.StatusInternalServerError, "reload_failed", errRefresh)
-		return
+	if stats.RequiresRuntimeRefresh() {
+		if errRefresh := h.refreshConfig(ctx); errRefresh != nil {
+			respondError(c, http.StatusInternalServerError, "reload_failed", errRefresh)
+			return
+		}
 	}
 	respondOK(c)
 }
@@ -475,7 +494,7 @@ func (h *Handler) PutAPIKeys(c *gin.Context) {
 // PatchAPIKeys applies a partial update to an api keys.
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
 	if errPatch := h.patchAPIKeyEntries(c); errPatch != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errPatch.Error()})
+		respondAPIKeyRequestError(c, errPatch)
 	}
 }
 
