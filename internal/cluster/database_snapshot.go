@@ -29,7 +29,7 @@ import (
 
 const (
 	databaseSnapshotFormat        = "cliproxyapihome-database-snapshot"
-	databaseSnapshotFormatVersion = 3
+	databaseSnapshotFormatVersion = 4
 	databaseSnapshotManifestName  = "manifest.json"
 	databaseSnapshotBatchSize     = 500
 	databaseSnapshotManifestLimit = 4 << 20
@@ -635,6 +635,14 @@ func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, mo
 		}
 	}
 	switch typed := record.(type) {
+	case *APIKeyRecord:
+		normalizedDisplayName, errDisplayName := normalizeAPIKeyDisplayName(typed.DisplayName)
+		if errDisplayName != nil {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "display_name", errDisplayName.Error())
+		}
+		if !sameExactOptionalString(typed.DisplayName, normalizedDisplayName) {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "display_name", "must be normalized")
+		}
 	case *ChannelGroupDetailRecord:
 		if strings.TrimSpace(typed.AuthID) == "" {
 			return databaseSnapshotFieldError(model.name, primaryLabel, "auth_id", "must not be blank")
@@ -653,6 +661,13 @@ func validateDatabaseSnapshotRecord(ctx context.Context, model databaseModel, mo
 		}
 	}
 	return nil
+}
+
+func sameExactOptionalString(left *string, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (s *ValidatedDatabaseSnapshot) validatePostgresFields(ctx context.Context) error {
@@ -748,6 +763,15 @@ func validateDatabaseSnapshotExportRecordEncoding(ctx context.Context, model dat
 		fieldValue, _ := field.ValueOf(ctx, value)
 		if errEncoding := validateSnapshotValueEncoding(reflect.ValueOf(fieldValue)); errEncoding != nil {
 			return databaseSnapshotFieldError(model.name, primaryLabel, field.DBName, errEncoding.Error())
+		}
+	}
+	if apiKey, ok := record.(*APIKeyRecord); ok {
+		normalizedDisplayName, errDisplayName := normalizeAPIKeyDisplayName(apiKey.DisplayName)
+		if errDisplayName != nil {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "display_name", errDisplayName.Error())
+		}
+		if !sameExactOptionalString(apiKey.DisplayName, normalizedDisplayName) {
+			return databaseSnapshotFieldError(model.name, primaryLabel, "display_name", "must be normalized")
 		}
 	}
 	return nil

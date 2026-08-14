@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"gorm.io/gorm"
 )
@@ -22,17 +25,21 @@ var ErrAPIKeySelectorMismatch = errors.New("api key selector mismatch")
 type APIKeyEntry struct {
 	ID          uint
 	APIKey      string
+	DisplayName *string
 	UserID      *uint
 	Channels    []uint
 	ModelGroups []uint
 }
 
 type APIKeyEntryUpdate struct {
-	ID          uint
-	APIKey      string
-	UserID      *uint
-	Channels    *[]uint
-	ModelGroups *[]uint
+	ID             uint
+	APIKey         string
+	DisplayName    *string
+	DisplayNameSet bool
+	UserID         *uint
+	UserIDSet      bool
+	Channels       *[]uint
+	ModelGroups    *[]uint
 }
 
 type APIKeyUserUpdate struct {
@@ -48,11 +55,22 @@ type APIKeySelector struct {
 }
 
 type APIKeyAdminUpdate struct {
-	APIKey      *string
-	UserID      *uint
-	Channels    *[]uint
-	ModelGroups *[]uint
+	APIKey         *string
+	DisplayName    *string
+	DisplayNameSet bool
+	UserID         *uint
+	Channels       *[]uint
+	ModelGroups    *[]uint
 }
+
+const APIKeyDisplayNameMaxLength = 128
+
+var ErrInvalidAPIKeyDisplayName = errors.New("API key display_name is invalid")
+
+// ErrAPIKeyPreconditionFailed indicates that a conditional full-list replacement used a stale ETag.
+var ErrAPIKeyPreconditionFailed = errors.New("API key collection precondition failed")
+
+const apiKeyMutationAdvisoryLockKey int64 = 749327842680272318
 
 // IsAPIKeyConflictError reports whether an error is an API key uniqueness conflict.
 func IsAPIKeyConflictError(err error) bool {
@@ -73,25 +91,44 @@ func (r *Repository) ListAPIKeyEntries(ctx context.Context) ([]APIKeyEntry, erro
 	if errDB != nil {
 		return nil, errDB
 	}
+	return listAPIKeyEntriesTx(ctx, db)
+}
 
-	var records []APIKeyRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).Order("id").Find(&records).Error; errFind != nil {
-		return nil, errFind
+// ListAPIKeyEntriesWithETag returns one coherent collection representation and
+// a strong ETag that can guard a later full-list replacement.
+func (r *Repository) ListAPIKeyEntriesWithETag(ctx context.Context) ([]APIKeyEntry, string, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, "", errDB
 	}
 
-	out := make([]APIKeyEntry, 0, len(records))
-	for _, record := range records {
-		entry, errEntry := apiKeyEntryFromRecord(&record)
-		if errEntry != nil {
-			return nil, errEntry
+	ctx = contextOrBackground(ctx)
+	var entries []APIKeyEntry
+	var etag string
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyReadTransaction(tx); errLock != nil {
+			return errLock
 		}
-		out = append(out, entry)
-	}
-	return out, nil
+		var errEntries error
+		entries, errEntries = listAPIKeyEntriesTx(ctx, tx)
+		if errEntries != nil {
+			return errEntries
+		}
+		var errETag error
+		etag, errETag = apiKeyEntriesETag(entries)
+		return errETag
+	})
+	return entries, etag, errTransaction
 }
 
 // ReplaceAPIKeyEntries replaces active API key rows and updates explicit channel bindings.
 func (r *Repository) ReplaceAPIKeyEntries(ctx context.Context, entries []APIKeyEntryUpdate) (APIKeyUpsertStats, error) {
+	return r.ReplaceAPIKeyEntriesIfMatch(ctx, entries, nil)
+}
+
+// ReplaceAPIKeyEntriesIfMatch replaces active API key rows after optionally
+// verifying the collection ETag inside the mutation transaction.
+func (r *Repository) ReplaceAPIKeyEntriesIfMatch(ctx context.Context, entries []APIKeyEntryUpdate, ifMatch *string) (APIKeyUpsertStats, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return APIKeyUpsertStats{}, errDB
@@ -100,6 +137,22 @@ func (r *Repository) ReplaceAPIKeyEntries(ctx context.Context, entries []APIKeyE
 	ctx = contextOrBackground(ctx)
 	var stats APIKeyUpsertStats
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
+		if ifMatch != nil {
+			currentEntries, errEntries := listAPIKeyEntriesTx(ctx, tx)
+			if errEntries != nil {
+				return errEntries
+			}
+			currentETag, errETag := apiKeyEntriesETag(currentEntries)
+			if errETag != nil {
+				return errETag
+			}
+			if !apiKeyETagMatches(*ifMatch, currentETag) {
+				return ErrAPIKeyPreconditionFailed
+			}
+		}
 		var errReplace error
 		stats, errReplace = replaceAPIKeyEntriesTxWithStats(ctx, tx, entries)
 		if errReplace != nil {
@@ -109,7 +162,10 @@ func (r *Repository) ReplaceAPIKeyEntries(ctx context.Context, entries []APIKeyE
 		if deleteResult.Error != nil {
 			return deleteResult.Error
 		}
-		if !stats.Changed() && deleteResult.RowsAffected == 0 {
+		if deleteResult.RowsAffected > 0 {
+			stats.RuntimeChanged = true
+		}
+		if !stats.RequiresRuntimeRefresh() && deleteResult.RowsAffected == 0 {
 			return nil
 		}
 		return appendEvent(tx, "config", "upsert", configAPIKeysRootKey, time.Now().UTC().UnixNano())
@@ -119,22 +175,37 @@ func (r *Repository) ReplaceAPIKeyEntries(ctx context.Context, entries []APIKeyE
 
 // CreateAPIKey creates or restores one API key without replacing the full key list.
 func (r *Repository) CreateAPIKey(ctx context.Context, update APIKeyEntryUpdate) (*APIKeyRecord, error) {
+	record, _, errCreate := r.CreateAPIKeyWithRuntimeChange(ctx, update)
+	return record, errCreate
+}
+
+// CreateAPIKeyWithRuntimeChange creates or restores one API key and reports
+// whether the accepted runtime key set changed.
+func (r *Repository) CreateAPIKeyWithRuntimeChange(ctx context.Context, update APIKeyEntryUpdate) (*APIKeyRecord, bool, error) {
 	db, errDB := r.database()
 	if errDB != nil {
-		return nil, errDB
+		return nil, false, errDB
 	}
 	key := strings.TrimSpace(update.APIKey)
 	if key == "" {
-		return nil, fmt.Errorf("api key is required")
+		return nil, false, fmt.Errorf("api key is required")
 	}
 
 	userID := normalizeOptionalUserID(update.UserID)
+	var displayName *string
+	if update.DisplayNameSet {
+		var errDisplayName error
+		displayName, errDisplayName = normalizeAPIKeyDisplayName(update.DisplayName)
+		if errDisplayName != nil {
+			return nil, false, errDisplayName
+		}
+	}
 	channelsJSON := emptyAPIKeyChannelsJSON()
 	if update.Channels != nil {
 		var errChannels error
 		channelsJSON, errChannels = apiKeyChannelsJSON(*update.Channels)
 		if errChannels != nil {
-			return nil, errChannels
+			return nil, false, errChannels
 		}
 	}
 	modelGroupsJSON := emptyAPIKeyModelGroupsJSON()
@@ -142,13 +213,16 @@ func (r *Repository) CreateAPIKey(ctx context.Context, update APIKeyEntryUpdate)
 		var errModelGroups error
 		modelGroupsJSON, errModelGroups = apiKeyModelGroupsJSON(*update.ModelGroups)
 		if errModelGroups != nil {
-			return nil, errModelGroups
+			return nil, false, errModelGroups
 		}
 	}
 
 	record := &APIKeyRecord{}
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		if userID != nil {
 			if errUser := ensureUserExists(ctx, tx, *userID); errUser != nil {
 				return errUser
@@ -160,6 +234,7 @@ func (r *Repository) CreateAPIKey(ctx context.Context, update APIKeyEntryUpdate)
 		switch {
 		case errors.Is(errFirst, gorm.ErrRecordNotFound):
 			record.APIKey = key
+			record.DisplayName = displayName
 			record.UserID = userID
 			record.Channels = channelsJSON
 			record.ModelGroups = modelGroupsJSON
@@ -172,15 +247,19 @@ func (r *Repository) CreateAPIKey(ctx context.Context, update APIKeyEntryUpdate)
 		case errFirst != nil:
 			return errFirst
 		case existing.DeletedAt.Valid:
+			updates := map[string]any{
+				"user_id":      userID,
+				"channels":     channelsJSON,
+				"model_groups": modelGroupsJSON,
+				"deleted_at":   nil,
+			}
+			if update.DisplayNameSet {
+				updates["display_name"] = displayName
+			}
 			if errRestore := tx.WithContext(ctx).Unscoped().
 				Model(&APIKeyRecord{}).
 				Where("id = ?", existing.ID).
-				Updates(map[string]any{
-					"user_id":      userID,
-					"channels":     channelsJSON,
-					"model_groups": modelGroupsJSON,
-					"deleted_at":   nil,
-				}).Error; errRestore != nil {
+				Updates(updates).Error; errRestore != nil {
 				return errRestore
 			}
 			if errReload := tx.WithContext(ctx).Where("id = ?", existing.ID).First(record).Error; errReload != nil {
@@ -193,27 +272,39 @@ func (r *Repository) CreateAPIKey(ctx context.Context, update APIKeyEntryUpdate)
 		return appendEvent(tx, "config", "upsert", configAPIKeysRootKey, time.Now().UTC().UnixNano())
 	})
 	if errTransaction != nil {
-		return nil, errTransaction
+		return nil, false, errTransaction
 	}
-	return record, nil
+	return record, true, nil
 }
 
 // UpdateAPIKey updates one API key selected by stable ID or a legacy selector.
 func (r *Repository) UpdateAPIKey(ctx context.Context, selector APIKeySelector, update APIKeyAdminUpdate) (*APIKeyRecord, error) {
+	record, _, errUpdate := r.UpdateAPIKeyWithRuntimeChange(ctx, selector, update)
+	return record, errUpdate
+}
+
+// UpdateAPIKeyWithRuntimeChange updates one API key and reports whether the
+// accepted runtime key set or dispatch-affecting bindings changed.
+func (r *Repository) UpdateAPIKeyWithRuntimeChange(ctx context.Context, selector APIKeySelector, update APIKeyAdminUpdate) (*APIKeyRecord, bool, error) {
 	db, errDB := r.database()
 	if errDB != nil {
-		return nil, errDB
+		return nil, false, errDB
 	}
 	if errSelector := validateAPIKeySelector(selector); errSelector != nil {
-		return nil, errSelector
+		return nil, false, errSelector
 	}
 
 	record := &APIKeyRecord{}
+	runtimeChanged := false
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		if errFind := findAPIKeyRecord(ctx, tx, selector, record); errFind != nil {
 			return errFind
 		}
+		updates := make(map[string]any)
 		if update.APIKey != nil {
 			nextKey := strings.TrimSpace(*update.APIKey)
 			if nextKey == "" {
@@ -224,7 +315,19 @@ func (r *Repository) UpdateAPIKey(ctx context.Context, selector APIKeySelector, 
 					return errAvailable
 				}
 			}
-			record.APIKey = nextKey
+			if nextKey != strings.TrimSpace(record.APIKey) {
+				updates["api_key"] = nextKey
+				runtimeChanged = true
+			}
+		}
+		if update.DisplayNameSet {
+			nextDisplayName, errDisplayName := normalizeAPIKeyDisplayName(update.DisplayName)
+			if errDisplayName != nil {
+				return errDisplayName
+			}
+			if !sameOptionalString(record.DisplayName, nextDisplayName) {
+				updates["display_name"] = nextDisplayName
+			}
 		}
 		if update.UserID != nil {
 			nextUserID := normalizeOptionalUserID(update.UserID)
@@ -233,34 +336,60 @@ func (r *Repository) UpdateAPIKey(ctx context.Context, selector APIKeySelector, 
 					return errUser
 				}
 			}
-			record.UserID = nextUserID
+			if !sameOptionalUint(record.UserID, nextUserID) {
+				updates["user_id"] = nextUserID
+				runtimeChanged = true
+			}
 		}
 		if update.Channels != nil {
 			channelsJSON, errChannels := apiKeyChannelsJSON(*update.Channels)
 			if errChannels != nil {
 				return errChannels
 			}
-			record.Channels = channelsJSON
+			currentChannels, errCurrent := apiKeyChannelsFromJSON(record.Channels)
+			if errCurrent != nil {
+				return errCurrent
+			}
+			if !reflect.DeepEqual(currentChannels, normalizeChannelGroupIDs(*update.Channels)) {
+				updates["channels"] = channelsJSON
+				runtimeChanged = true
+			}
 		}
 		if update.ModelGroups != nil {
 			modelGroupsJSON, errModelGroups := apiKeyModelGroupsJSON(*update.ModelGroups)
 			if errModelGroups != nil {
 				return errModelGroups
 			}
-			record.ModelGroups = modelGroupsJSON
+			currentModelGroups, errCurrent := apiKeyModelGroupsFromJSON(record.ModelGroups)
+			if errCurrent != nil {
+				return errCurrent
+			}
+			if !reflect.DeepEqual(currentModelGroups, normalizeModelGroupIDs(*update.ModelGroups)) {
+				updates["model_groups"] = modelGroupsJSON
+				runtimeChanged = true
+			}
 		}
-		if errSave := tx.WithContext(ctx).Save(record).Error; errSave != nil {
-			if IsAPIKeyConflictError(errSave) {
+		if len(updates) == 0 {
+			return nil
+		}
+		if errUpdate := tx.WithContext(ctx).Model(&APIKeyRecord{}).Where("id = ?", record.ID).Updates(updates).Error; errUpdate != nil {
+			if IsAPIKeyConflictError(errUpdate) {
 				return ErrAPIKeyExists
 			}
-			return errSave
+			return errUpdate
+		}
+		if errReload := tx.WithContext(ctx).Where("id = ?", record.ID).First(record).Error; errReload != nil {
+			return errReload
+		}
+		if !runtimeChanged {
+			return nil
 		}
 		return appendEvent(tx, "config", "upsert", configAPIKeysRootKey, time.Now().UTC().UnixNano())
 	})
 	if errTransaction != nil {
-		return nil, errTransaction
+		return nil, false, errTransaction
 	}
-	return record, nil
+	return record, runtimeChanged, nil
 }
 
 // DeleteAPIKey deletes one API key selected by stable ID or a legacy selector.
@@ -275,6 +404,9 @@ func (r *Repository) DeleteAPIKey(ctx context.Context, selector APIKeySelector) 
 
 	ctx = contextOrBackground(ctx)
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		record := &APIKeyRecord{}
 		if errFind := findAPIKeyRecord(ctx, tx, selector, record); errFind != nil {
 			return errFind
@@ -339,9 +471,13 @@ func (r *Repository) UpdateAPIKeyBindings(ctx context.Context, apiKey string, us
 	record := &APIKeyRecord{}
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		if errFirst := tx.Where("api_key = ?", apiKey).First(record).Error; errFirst != nil {
 			return errFirst
 		}
+		updates := make(map[string]any)
 		if userID != nil {
 			nextUserID := normalizeOptionalUserID(userID)
 			if nextUserID != nil {
@@ -349,24 +485,29 @@ func (r *Repository) UpdateAPIKeyBindings(ctx context.Context, apiKey string, us
 					return errUser
 				}
 			}
-			record.UserID = nextUserID
+			updates["user_id"] = nextUserID
 		}
 		if channels != nil {
 			channelsJSON, errChannels := apiKeyChannelsJSON(*channels)
 			if errChannels != nil {
 				return errChannels
 			}
-			record.Channels = channelsJSON
+			updates["channels"] = channelsJSON
 		}
 		if modelGroups != nil {
 			modelGroupsJSON, errModelGroups := apiKeyModelGroupsJSON(*modelGroups)
 			if errModelGroups != nil {
 				return errModelGroups
 			}
-			record.ModelGroups = modelGroupsJSON
+			updates["model_groups"] = modelGroupsJSON
 		}
-		if errSave := tx.Save(record).Error; errSave != nil {
-			return errSave
+		if len(updates) > 0 {
+			if errUpdate := tx.WithContext(ctx).Model(&APIKeyRecord{}).Where("id = ?", record.ID).Updates(updates).Error; errUpdate != nil {
+				return errUpdate
+			}
+			if errReload := tx.WithContext(ctx).Where("id = ?", record.ID).First(record).Error; errReload != nil {
+				return errReload
+			}
 		}
 		return appendEvent(tx, "config", "upsert", configAPIKeysRootKey, time.Now().UTC().UnixNano())
 	})
@@ -414,6 +555,9 @@ func (r *Repository) CreateAPIKeyForUser(ctx context.Context, userID uint, updat
 	record := &APIKeyRecord{}
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		if errUser := ensureUserExists(ctx, tx, userID); errUser != nil {
 			return errUser
 		}
@@ -466,12 +610,15 @@ func (r *Repository) CreateAPIKeyForUser(ctx context.Context, userID uint, updat
 			if !sameOptionalUint(existing.UserID, &userID) {
 				return ErrAPIKeyExists
 			}
-			existing.Channels = channelsJSON
-			existing.ModelGroups = modelGroupsJSON
-			if errSave := tx.WithContext(ctx).Save(existing).Error; errSave != nil {
-				return errSave
+			if errUpdate := tx.WithContext(ctx).Model(&APIKeyRecord{}).Where("id = ?", existing.ID).Updates(map[string]any{
+				"channels":     channelsJSON,
+				"model_groups": modelGroupsJSON,
+			}).Error; errUpdate != nil {
+				return errUpdate
 			}
-			record = existing
+			if errReload := tx.WithContext(ctx).Where("id = ?", existing.ID).First(record).Error; errReload != nil {
+				return errReload
+			}
 		}
 		return appendEvent(tx, "config", "upsert", configAPIKeysRootKey, time.Now().UTC().UnixNano())
 	})
@@ -498,6 +645,9 @@ func (r *Repository) UpdateAPIKeyForUser(ctx context.Context, userID uint, id ui
 	record := &APIKeyRecord{}
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		query := tx.WithContext(ctx).Where("user_id = ?", userID)
 		if id > 0 {
 			query = query.Where("id = ?", id)
@@ -507,6 +657,7 @@ func (r *Repository) UpdateAPIKeyForUser(ctx context.Context, userID uint, id ui
 		if errFirst := query.First(record).Error; errFirst != nil {
 			return errFirst
 		}
+		updates := make(map[string]any)
 		if update.APIKey != nil {
 			nextKey := strings.TrimSpace(*update.APIKey)
 			if nextKey == "" {
@@ -517,24 +668,34 @@ func (r *Repository) UpdateAPIKeyForUser(ctx context.Context, userID uint, id ui
 					return errAvailable
 				}
 			}
-			record.APIKey = nextKey
+			if nextKey != strings.TrimSpace(record.APIKey) {
+				updates["api_key"] = nextKey
+			}
 		}
 		if update.Channels != nil {
 			channelsJSON, errChannels := apiKeyChannelsJSON(*update.Channels)
 			if errChannels != nil {
 				return errChannels
 			}
-			record.Channels = channelsJSON
+			updates["channels"] = channelsJSON
 		}
 		if update.ModelGroups != nil {
 			modelGroupsJSON, errModelGroups := apiKeyModelGroupsJSON(*update.ModelGroups)
 			if errModelGroups != nil {
 				return errModelGroups
 			}
-			record.ModelGroups = modelGroupsJSON
+			updates["model_groups"] = modelGroupsJSON
 		}
-		if errSave := tx.Save(record).Error; errSave != nil {
-			return errSave
+		if len(updates) > 0 {
+			if errUpdate := tx.WithContext(ctx).Model(&APIKeyRecord{}).Where("id = ?", record.ID).Updates(updates).Error; errUpdate != nil {
+				if IsAPIKeyConflictError(errUpdate) {
+					return ErrAPIKeyExists
+				}
+				return errUpdate
+			}
+			if errReload := tx.WithContext(ctx).Where("id = ?", record.ID).First(record).Error; errReload != nil {
+				return errReload
+			}
 		}
 		return appendEvent(tx, "config", "upsert", configAPIKeysRootKey, time.Now().UTC().UnixNano())
 	})
@@ -586,6 +747,9 @@ func (r *Repository) DeleteAPIKeyForUser(ctx context.Context, userID uint, id ui
 
 	ctx = contextOrBackground(ctx)
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+			return errLock
+		}
 		query := tx.WithContext(ctx).Where("user_id = ?", userID)
 		if id > 0 {
 			query = query.Where("id = ?", id)
@@ -1043,7 +1207,16 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 			continue
 		}
 		userID := normalizeOptionalUserID(entry.UserID)
-		if userID != nil {
+		userIDSet := entry.UserIDSet || entry.UserID != nil
+		var displayName *string
+		if entry.DisplayNameSet {
+			var errDisplayName error
+			displayName, errDisplayName = normalizeAPIKeyDisplayName(entry.DisplayName)
+			if errDisplayName != nil {
+				return APIKeyUpsertStats{}, errDisplayName
+			}
+		}
+		if userIDSet && userID != nil {
 			if errUser := ensureUserExists(ctx, tx, *userID); errUser != nil {
 				return APIKeyUpsertStats{}, errUser
 			}
@@ -1079,16 +1252,23 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 			if record.DeletedAt.Valid {
 				updates["deleted_at"] = nil
 				stats.Restored++
+				stats.RuntimeChanged = true
 			} else {
 				stats.Unchanged++
 			}
 			if strings.TrimSpace(record.APIKey) != key {
 				updates["api_key"] = key
 				updatedEntry = true
+				stats.RuntimeChanged = true
 			}
-			if !sameOptionalUint(record.UserID, userID) {
+			if entry.DisplayNameSet && !sameOptionalString(record.DisplayName, displayName) {
+				updates["display_name"] = displayName
+				updatedEntry = true
+			}
+			if userIDSet && !sameOptionalUint(record.UserID, userID) {
 				updates["user_id"] = userID
 				updatedEntry = true
+				stats.RuntimeChanged = true
 			}
 			if entry.Channels != nil {
 				currentChannels, errCurrent := apiKeyChannelsFromJSON(record.Channels)
@@ -1098,6 +1278,7 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 				if !reflect.DeepEqual(currentChannels, normalizeChannelGroupIDs(*entry.Channels)) {
 					updates["channels"] = channelsJSON
 					updatedEntry = true
+					stats.RuntimeChanged = true
 				}
 			}
 			if entry.ModelGroups != nil {
@@ -1108,6 +1289,7 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 				if !reflect.DeepEqual(currentModelGroups, normalizeModelGroupIDs(*entry.ModelGroups)) {
 					updates["model_groups"] = modelGroupsJSON
 					updatedEntry = true
+					stats.RuntimeChanged = true
 				}
 			}
 			if updatedEntry && !record.DeletedAt.Valid {
@@ -1127,6 +1309,7 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 
 		created := APIKeyRecord{
 			APIKey:      key,
+			DisplayName: displayName,
 			UserID:      userID,
 			Channels:    channelsJSON,
 			ModelGroups: modelGroupsJSON,
@@ -1136,6 +1319,7 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 		}
 		keepIDs[created.ID] = struct{}{}
 		stats.Created++
+		stats.RuntimeChanged = true
 	}
 
 	for _, record := range existing {
@@ -1149,6 +1333,7 @@ func replaceAPIKeyEntriesTxWithStats(ctx context.Context, tx *gorm.DB, entries [
 			return APIKeyUpsertStats{}, errDelete
 		}
 		stats.Removed++
+		stats.RuntimeChanged = true
 	}
 	return stats, nil
 }
@@ -1159,7 +1344,8 @@ func normalizeAPIKeyEntryUpdates(entries []APIKeyEntryUpdate) []APIKeyEntryUpdat
 	}
 	normalized := make([]APIKeyEntryUpdate, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index]
 		key := strings.TrimSpace(entry.APIKey)
 		if key == "" {
 			continue
@@ -1168,7 +1354,10 @@ func normalizeAPIKeyEntryUpdates(entries []APIKeyEntryUpdate) []APIKeyEntryUpdat
 			continue
 		}
 		seen[key] = struct{}{}
-		next := APIKeyEntryUpdate{ID: entry.ID, APIKey: key}
+		next := APIKeyEntryUpdate{ID: entry.ID, APIKey: key, DisplayNameSet: entry.DisplayNameSet, UserIDSet: entry.UserIDSet || entry.UserID != nil}
+		if entry.DisplayNameSet {
+			next.DisplayName = entry.DisplayName
+		}
 		next.UserID = normalizeOptionalUserID(entry.UserID)
 		if entry.Channels != nil {
 			channels := normalizeChannelGroupIDs(*entry.Channels)
@@ -1180,7 +1369,96 @@ func normalizeAPIKeyEntryUpdates(entries []APIKeyEntryUpdate) []APIKeyEntryUpdat
 		}
 		normalized = append(normalized, next)
 	}
+	for left, right := 0, len(normalized)-1; left < right; left, right = left+1, right-1 {
+		normalized[left], normalized[right] = normalized[right], normalized[left]
+	}
 	return normalized
+}
+
+func lockAPIKeyMutationTransaction(tx *gorm.DB) error {
+	if tx == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	if tx.Dialector == nil || tx.Dialector.Name() != "postgres" {
+		return nil
+	}
+	return tx.Exec("SELECT pg_advisory_xact_lock(?)", apiKeyMutationAdvisoryLockKey).Error
+}
+
+func lockAPIKeyReadTransaction(tx *gorm.DB) error {
+	if tx == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+	if tx.Dialector == nil || tx.Dialector.Name() != "postgres" {
+		return nil
+	}
+	return tx.Exec("SELECT pg_advisory_xact_lock_shared(?)", apiKeyMutationAdvisoryLockKey).Error
+}
+
+func listAPIKeyEntriesTx(ctx context.Context, db *gorm.DB) ([]APIKeyEntry, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database connection is nil")
+	}
+	var records []APIKeyRecord
+	if errFind := db.WithContext(contextOrBackground(ctx)).Order("id").Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+	entries := make([]APIKeyEntry, 0, len(records))
+	for i := range records {
+		entry, errEntry := apiKeyEntryFromRecord(&records[i])
+		if errEntry != nil {
+			return nil, errEntry
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func apiKeyEntriesETag(entries []APIKeyEntry) (string, error) {
+	hasher := sha256.New()
+	encoder := json.NewEncoder(hasher)
+	encoder.SetEscapeHTML(false)
+	for i := range entries {
+		entry := entries[i]
+		fingerprint := struct {
+			ID          uint    `json:"id"`
+			APIKey      string  `json:"api_key"`
+			DisplayName *string `json:"display_name"`
+			UserID      *uint   `json:"user_id"`
+			Channels    []uint  `json:"channels"`
+			ModelGroups []uint  `json:"model_groups"`
+		}{
+			ID:          entry.ID,
+			APIKey:      entry.APIKey,
+			DisplayName: entry.DisplayName,
+			UserID:      entry.UserID,
+			Channels:    entry.Channels,
+			ModelGroups: entry.ModelGroups,
+		}
+		if errEncode := encoder.Encode(fingerprint); errEncode != nil {
+			return "", errEncode
+		}
+	}
+	return fmt.Sprintf(`"%x"`, hasher.Sum(nil)), nil
+}
+
+func apiKeyETagMatches(ifMatch string, current string) bool {
+	current = strings.TrimSpace(current)
+	matched := false
+	for _, candidate := range strings.Split(ifMatch, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || candidate == "*" || strings.HasPrefix(candidate, "W/") || !isQuotedAPIKeyETag(candidate) {
+			return false
+		}
+		if candidate == current {
+			matched = true
+		}
+	}
+	return matched
+}
+
+func isQuotedAPIKeyETag(value string) bool {
+	return len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"'
 }
 
 func apiKeyEntryFromRecord(record *APIKeyRecord) (APIKeyEntry, error) {
@@ -1198,6 +1476,7 @@ func apiKeyEntryFromRecord(record *APIKeyRecord) (APIKeyEntry, error) {
 	return APIKeyEntry{
 		ID:          record.ID,
 		APIKey:      strings.TrimSpace(record.APIKey),
+		DisplayName: normalizedAPIKeyDisplayName(record.DisplayName),
 		UserID:      normalizeOptionalUserID(record.UserID),
 		Channels:    channels,
 		ModelGroups: modelGroups,
@@ -1238,6 +1517,49 @@ func emptyAPIKeyModelGroupsJSON() JSONB {
 func sameOptionalUint(left *uint, right *uint) bool {
 	left = normalizeOptionalUserID(left)
 	right = normalizeOptionalUserID(right)
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func normalizeAPIKeyDisplayName(displayName *string) (*string, error) {
+	if displayName == nil {
+		return nil, nil
+	}
+	value := *displayName
+	if !utf8.ValidString(value) {
+		return nil, fmt.Errorf("%w: invalid UTF-8", ErrInvalidAPIKeyDisplayName)
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return nil, fmt.Errorf("%w: control characters are not allowed", ErrInvalidAPIKeyDisplayName)
+		}
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	if utf8.RuneCountInString(value) > APIKeyDisplayNameMaxLength {
+		return nil, fmt.Errorf("%w: length exceeds %d characters", ErrInvalidAPIKeyDisplayName, APIKeyDisplayNameMaxLength)
+	}
+	return &value, nil
+}
+
+func normalizedAPIKeyDisplayName(displayName *string) *string {
+	if displayName == nil {
+		return nil
+	}
+	value := strings.TrimSpace(*displayName)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func sameOptionalString(left *string, right *string) bool {
+	left = normalizedAPIKeyDisplayName(left)
+	right = normalizedAPIKeyDisplayName(right)
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}

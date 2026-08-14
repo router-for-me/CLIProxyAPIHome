@@ -1,6 +1,10 @@
 package cluster
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
@@ -40,6 +44,23 @@ func (databaseSnapshotV1CPANodeRecord) TableName() string {
 	return "cpa_node"
 }
 
+// databaseSnapshotV3APIKeyRecord freezes the API key shape used by snapshot
+// formats v1 through v3, before display names were added.
+type databaseSnapshotV3APIKeyRecord struct {
+	ID          uint           `gorm:"column:id;primaryKey;autoIncrement;index:idx_api_key_active_order,priority:2"`
+	APIKey      string         `gorm:"column:api_key;not null;uniqueIndex"`
+	UserID      *uint          `gorm:"column:user_id;index;index:idx_api_key_user_active,priority:1"`
+	Channels    JSONB          `gorm:"column:channels"`
+	ModelGroups JSONB          `gorm:"column:model_groups"`
+	CreatedAt   time.Time      `gorm:"column:created_at"`
+	UpdatedAt   time.Time      `gorm:"column:updated_at"`
+	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at;index;index:idx_api_key_active_order,priority:1;index:idx_api_key_user_active,priority:2"`
+}
+
+func (databaseSnapshotV3APIKeyRecord) TableName() string {
+	return "api_key"
+}
+
 var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[AuthRecord]("auth", []string{"uuid"}, false, true),
 	newDatabaseModel[ConfigRecord]("config", []string{"key"}, false, true),
@@ -54,7 +75,7 @@ var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[UserSecurityThrottleRecord]("user_security_throttle", []string{"key"}, false, false),
 	newDatabaseModel[ChannelGroupRecord]("channel_group", []string{"id"}, true, true),
 	newDatabaseModel[ModelGroupRecord]("model_group", []string{"id"}, true, true),
-	newDatabaseModel[APIKeyRecord]("api_key", []string{"id"}, true, true),
+	newDatabaseModel[databaseSnapshotV3APIKeyRecord]("api_key", []string{"id"}, true, true),
 	newDatabaseModel[ChannelGroupDetailRecord]("channel_group_detail", []string{"id"}, true, true),
 	newDatabaseModel[ModelGroupDetailRecord]("model_group_detail", []string{"id"}, true, true),
 	newDatabaseModel[ClusterNodeRecord]("cluster", []string{"ip", "port"}, false, false),
@@ -75,12 +96,15 @@ var databaseSnapshotV1Models = []databaseModel{
 }
 
 // databaseSnapshotV2Models is the frozen database snapshot format v2 registry.
-var databaseSnapshotV2Models = currentDatabaseModels()
+var databaseSnapshotV2Models = databaseSnapshotV2ModelRegistry()
 
-// homeDatabaseModels is the current database snapshot registry.
-var homeDatabaseModels = append(append([]databaseModel(nil), databaseSnapshotV2Models...),
+// databaseSnapshotV3Models is the frozen database snapshot format v3 registry.
+var databaseSnapshotV3Models = append(append([]databaseModel(nil), databaseSnapshotV2Models...),
 	newDatabaseModel[CPANodeMetadataRecord]("cpa_node_metadata", []string{"node_id"}, false, true),
 )
+
+// homeDatabaseModels is the current database snapshot registry.
+var homeDatabaseModels = currentDatabaseModels()
 
 var databaseMigrationOnlyModels = []databaseModel{
 	newDatabaseModel[ClusterMasterGateRecord]("cluster_master_gate", []string{"id"}, false, false),
@@ -91,7 +115,7 @@ var databaseMigrationOnlyModels = []databaseModel{
 	newDatabaseModel[ManagementInFlightSnapshotCursorStateModelRecord]("management_in_flight_snapshot_cursor_state_models", []string{"cursor", "credential_id", "model"}, false, false),
 }
 
-func currentDatabaseModels() []databaseModel {
+func databaseSnapshotV2ModelRegistry() []databaseModel {
 	models := append([]databaseModel(nil), databaseSnapshotV1Models...)
 	for index := range models {
 		if models[index].name == "cpa_node" {
@@ -116,12 +140,25 @@ func currentDatabaseModels() []databaseModel {
 	)
 }
 
+func currentDatabaseModels() []databaseModel {
+	models := append([]databaseModel(nil), databaseSnapshotV3Models...)
+	for index := range models {
+		if models[index].name == "api_key" {
+			models[index] = newDatabaseModel[APIKeyRecord]("api_key", []string{"id"}, true, true)
+			break
+		}
+	}
+	return models
+}
+
 func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 	switch formatVersion {
 	case 1:
 		return databaseSnapshotV1Models, true
 	case 2:
 		return databaseSnapshotV2Models, true
+	case 3:
+		return databaseSnapshotV3Models, true
 	case databaseSnapshotFormatVersion:
 		return homeDatabaseModels, true
 	default:

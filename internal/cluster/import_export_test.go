@@ -69,6 +69,37 @@ xai-api-key:
 	assertActiveAuthCount(t, db, 3)
 }
 
+func TestImportLocalStatePreservesAPIKeyDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeFile(t, configPath, "api-keys:\n  - named-key\n")
+
+	db := openImportTestSQLite(t)
+	repo := NewRepository(db)
+	displayName := "Production key"
+	if _, errCreate := repo.CreateAPIKey(context.Background(), APIKeyEntryUpdate{
+		APIKey:         "named-key",
+		DisplayName:    &displayName,
+		DisplayNameSet: true,
+	}); errCreate != nil {
+		t.Fatalf("CreateAPIKey() error = %v", errCreate)
+	}
+
+	if _, errImport := ImportLocalState(context.Background(), ImportOptions{
+		ConfigPath: configPath,
+		Repository: repo,
+	}); errImport != nil {
+		t.Fatalf("ImportLocalState() error = %v", errImport)
+	}
+	entries, errList := repo.ListAPIKeyEntries(context.Background())
+	if errList != nil {
+		t.Fatalf("ListAPIKeyEntries() error = %v", errList)
+	}
+	if len(entries) != 1 || entries[0].DisplayName == nil || *entries[0].DisplayName != displayName {
+		t.Fatalf("imported API key entries = %#v, want preserved display name %q", entries, displayName)
+	}
+}
+
 func TestImportLocalStateEmitsOneConfigEventForHotOnlyCredentialConcurrencyChange(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -447,6 +478,38 @@ func TestExportLocalState_CustomOutputDirWritesAuthsUnderOutputDir(t *testing.T)
 	}
 	assertFileContains(t, filepath.Join(outputDir, "config.yaml"), "auth-dir: auths")
 	assertFileExists(t, filepath.Join(outputDir, "auths", "codex.json"))
+}
+
+func TestExportLocalStateKeepsNamedAPIKeysInLegacyStringShape(t *testing.T) {
+	outputDir := t.TempDir()
+	db := openImportTestSQLite(t)
+	repo := NewRepository(db)
+	displayName := "Production key"
+	if _, errCreate := repo.CreateAPIKey(context.Background(), APIKeyEntryUpdate{
+		APIKey:         "named-key",
+		DisplayName:    &displayName,
+		DisplayNameSet: true,
+	}); errCreate != nil {
+		t.Fatalf("CreateAPIKey() error = %v", errCreate)
+	}
+
+	if _, errExport := ExportLocalState(context.Background(), ExportOptions{
+		OutputDir:   outputDir,
+		Repository:  repo,
+		AuthDirName: "auths",
+	}); errExport != nil {
+		t.Fatalf("ExportLocalState() error = %v", errExport)
+	}
+	raw, errRead := os.ReadFile(filepath.Join(outputDir, "config.yaml"))
+	if errRead != nil {
+		t.Fatalf("read exported config: %v", errRead)
+	}
+	if !strings.Contains(string(raw), "api-keys:\n    - named-key") {
+		t.Fatalf("exported config does not keep api-keys as strings:\n%s", string(raw))
+	}
+	if strings.Contains(string(raw), "display_name") {
+		t.Fatalf("exported config unexpectedly contains Home-only display_name metadata:\n%s", string(raw))
+	}
 }
 
 func openImportTestSQLite(t *testing.T) *gorm.DB {

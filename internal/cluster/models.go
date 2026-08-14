@@ -425,6 +425,7 @@ func (UserSecurityThrottleRecord) TableName() string {
 type APIKeyRecord struct {
 	ID          uint           `gorm:"column:id;primaryKey;autoIncrement;index:idx_api_key_active_order,priority:2"`
 	APIKey      string         `gorm:"column:api_key;not null;uniqueIndex"`
+	DisplayName *string        `gorm:"column:display_name;type:text"`
 	UserID      *uint          `gorm:"column:user_id;index;index:idx_api_key_user_active,priority:1"`
 	Channels    JSONB          `gorm:"column:channels"`
 	ModelGroups JSONB          `gorm:"column:model_groups"`

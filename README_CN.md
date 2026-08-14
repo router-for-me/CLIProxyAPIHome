@@ -41,6 +41,8 @@ Home 现在始终使用数据库驱动的运行时。没有 `cluster.yaml` 时�
 
 导出默认会写出当前目录的 `config.yaml`，并把凭证写到 `~/.cli-proxy-api/`。可以通过 `-export-dir <path>` 写出 `<path>/config.yaml`，并把凭证写到 `<path>/auths/`。如果目标 `config.yaml` 已存在，或者目标凭证目录已存在且非空，导出会拒绝覆盖。
 
+`-export` / `-import` 保留旧版交换格式。API key 只会导出实际 key 值，因此 Home 数据库专属的 API key 展示名称、用户归属、channel/model group 绑定等元数据不构成完整备份。完整数据库备份和恢复应使用 `-db-export <snapshot.zip>` 与 `-db-import <snapshot.zip>`。数据库快照 v4 包含 API key 展示名称，旧版 Home 无法导入；升级前应保留数据库备份或旧版本兼容快照，以便回滚。
+
 集群模式下，Management API 会直接操作数据库中的数据。默认监听端口来自 `cluster.yaml` 的 `node.port`；也可以通过启动参数 `-addr` 覆盖监听地址。如果前置反代改变了 client 实际需要连接的端口，可以设置 `node.external-port`；未设置时，对外发布的集群节点端口仍以最终监听端口为准。
 
 RESP 密码认证已经移除。Home RESP 只接受通过 mTLS 认证的客户端；CPA 应使用 `-home-jwt` 或配置好的 TLS 材料连接。`allow-host` 只是 IP 允许列表，不是密码机制。

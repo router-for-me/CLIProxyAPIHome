@@ -41,6 +41,8 @@ To export config and credentials back to local files, run:
 
 Export writes `./config.yaml` and credential files under `~/.cli-proxy-api/` by default. Use `-export-dir <path>` to write `<path>/config.yaml` and credential files under `<path>/auths/`. It refuses to overwrite an existing `config.yaml` or a non-empty credential directory at the selected target.
 
+`-export` / `-import` preserve the legacy exchange format. API keys are exported only as their actual key values, so Home database-only metadata such as API key display names, user ownership, and channel/model-group bindings is not a complete backup. Use `-db-export <snapshot.zip>` and `-db-import <snapshot.zip>` for full database backup and restore. Database snapshot format v4 includes API key display names and cannot be imported by older Home versions. Before upgrading, retain a database backup or an older-version-compatible snapshot for rollback.
+
 In cluster mode, the Management API operates directly on database data. The default listen port comes from `node.port` in `cluster.yaml`; the startup `-addr` flag can override the listen address. Set `node.external-port` when a reverse proxy changes the port that clients must use; when omitted, the advertised cluster node port follows the final listen port.
 
 RESP password authentication has been removed. Home RESP access only accepts mTLS-authenticated clients; CPA should connect with `-home-jwt` or configured TLS material. `allow-host` is only an IP allowlist and is not a password mechanism.

@@ -1345,6 +1345,8 @@ Common errors:
 
 ### GET `/api-keys`
 
+The response includes a strong `ETag` header for the complete visible API key collection. Clients that perform a read-modify-write replacement should send this value back in `If-Match` on `PUT /api-keys`.
+
 Returns client API keys accepted by Home.
 
 Input: none.
@@ -1360,6 +1362,7 @@ Example response:
       "api_key_id": 1,
       "api-key": "client-key-1",
       "api_key": "client-key-1",
+      "display_name": "Production key",
       "user-id": 1,
       "user_id": 1,
       "channels": [1],
@@ -1372,6 +1375,7 @@ Example response:
       "api_key_id": 1,
       "api-key": "client-key-1",
       "api_key": "client-key-1",
+      "display_name": "Production key",
       "user-id": 1,
       "user_id": 1,
       "channels": [1],
@@ -1392,6 +1396,7 @@ Fields:
 | `APIKeyEntry.api_key_id` | integer | Alias of `id`. |
 | `APIKeyEntry.api-key` | string | Client API key. |
 | `APIKeyEntry.api_key` | string | Alias of `api-key`. |
+| `APIKeyEntry.display_name` | string or null | Optional editable display name. It is metadata only and does not affect authentication or bindings. |
 | `APIKeyEntry.user-id` | integer or null | Bound `user.id`; `null` means unbound. |
 | `APIKeyEntry.user_id` | integer or null | Alias of `user-id`. |
 | `APIKeyEntry.channels` | array of integer | Bound channel group IDs. An empty array is non-restrictive. |
@@ -1404,13 +1409,14 @@ Atomically creates one client API key without replacing the existing list.
 ```json
 {
   "api_key": "client-key-1",
+  "display_name": "Production key",
   "user_id": 1,
   "channels": [1],
   "model_groups": [2]
 }
 ```
 
-The request also accepts `api-key`, `key`, or `value` as the key field. `user-id` and `model-groups` are accepted as aliases.
+The request also accepts `api-key`, `key`, or `value` as the key field. `user-id` and `model-groups` are accepted as aliases. `display_name` is optional; surrounding whitespace is trimmed, and an empty string or `null` stores no display name. A display name may contain at most 128 Unicode characters and must not contain control characters. Invalid names return `400 invalid_display_name`.
 
 A new key value receives a new stable identifier. Re-adding an identical soft-deleted key restores the previous record and reuses its identifier. Creating an active duplicate returns `409 api_key_exists`.
 
@@ -1423,6 +1429,7 @@ Successful response:
     "api_key_id": 1,
     "api-key": "client-key-1",
     "api_key": "client-key-1",
+    "display_name": "Production key",
     "user-id": 1,
     "user_id": 1,
     "channels": [1],
@@ -1454,6 +1461,7 @@ Structured entries are also accepted. Wrapper keys can be `items`, `api-keys`, `
   "api_key_entries": [
     {
       "api_key": "client-key-1",
+      "display_name": "Production key",
       "user_id": 1,
       "channels": [1],
       "model_groups": [2]
@@ -1467,13 +1475,16 @@ Entry fields:
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `api_key` | string | conditionally | Client API key. Aliases: `api-key`, `key`, `value`. |
-| `user_id` | integer | no | Bound `user.id`. Alias: `user-id`. |
-| `channels` | array of integer | no | Channel group IDs. |
-| `model_groups` | array of integer | no | Model group IDs. Alias: `model-groups`. |
+| `display_name` | string or null | no | Optional display name, up to 128 Unicode characters with no control characters. Omit it to preserve the name of an unchanged key; send an empty string or `null` to clear it. |
+| `user_id` | integer or null | no | Bound `user.id`. Alias: `user-id`. Omit it to preserve an unchanged key's owner; send `0` or `null` to clear the binding. |
+| `channels` | array of integer | no | Channel group IDs. Omit it to preserve an unchanged key's channel bindings. |
+| `model_groups` | array of integer | no | Model group IDs. Alias: `model-groups`. Omit it to preserve an unchanged key's model-group bindings. |
 
 If `user_id` references a missing user, the API returns `404 user_not_found`.
 
-`PUT` is an explicit complete-list replacement operation with last-write-wins semantics. `id` and `api_key_id` are response-only for this operation and are ignored in structured input. Unchanged key values preserve their identifiers, removed values are soft-deleted, and new values receive new identifiers unless they restore an identical soft-deleted value.
+`PUT` is an explicit complete-list replacement operation with last-write-wins semantics. When the same key appears more than once, the last entry is used. `id` and `api_key_id` are response-only for this operation and are ignored in structured input. Unchanged key values preserve their identifiers, removed values are soft-deleted, and new values receive new identifiers unless they restore an identical soft-deleted value. For an existing key value, including a soft-deleted record being restored, omitting `display_name`, `user_id`, `channels`, or `model_groups` preserves the corresponding stored value; this also keeps raw string entries backward compatible. A key value with no existing record uses empty defaults for omitted fields.
+
+`If-Match` is optional for backward compatibility. When supplied, Home verifies one or more strong ETags atomically against the current collection ETag; a stale, weak, wildcard, or malformed validator returns `412 api_keys_precondition_failed` without changing any key. Omitting `If-Match` retains the legacy unconditional replacement behavior. An explicit empty array (`[]`, or one supported wrapper containing `[]`) deletes all keys. `null`, null/blank/invalid entries, missing key values, conflicting key aliases, or multiple wrapper aliases return `400` without changing the collection. `POST`, `PUT`, and `PATCH` request bodies are limited to 1 MiB; oversized requests return `413 request_body_too_large`.
 
 Successful response:
 
@@ -1483,7 +1494,7 @@ Successful response:
 
 ### PATCH `/api-keys`
 
-Updates one client API key. Stable `id` / `api_key_id` selection is preferred. Legacy `index`, `old/new`, and raw-key selectors remain available for compatibility and are resolved to one database record before the update is applied. When `old/new` is used and the old value does not exist, `new` is created atomically. This route can also update `user_id`, `channels`, and `model_groups` for an existing API key.
+Updates one client API key. Stable `id` / `api_key_id` selection is preferred. Legacy `index`, `old/new`, and raw-key selectors remain available for compatibility and are resolved to one database record before the update is applied. When `old/new` is used and the old value does not exist, `new` is created atomically. This route can also update `display_name`, `user_id`, `channels`, and `model_groups` for an existing API key.
 
 ID update:
 
@@ -1492,6 +1503,7 @@ ID update:
   "id": 1,
   "value": {
     "api_key": "new-key",
+    "display_name": "Production key",
     "user_id": 1,
     "channels": [1],
     "model_groups": [2]
@@ -1503,6 +1515,18 @@ Binding-only updates can select the record by ID without resending the key value
 
 ```json
 { "api_key_id": 1, "channels": [1] }
+```
+
+Display-name-only updates do not rotate the key or change its ownership and group bindings:
+
+```json
+{ "api_key_id": 1, "display_name": "Primary production key" }
+```
+
+Send an empty string or `null` to clear the display name:
+
+```json
+{ "api_key_id": 1, "display_name": null }
 ```
 
 Index update:
@@ -1544,7 +1568,8 @@ Fields:
 | `old` | string | conditionally | Old key to find. |
 | `new` | string | conditionally | New key; appended when `old` is not found. |
 | `api_key` | string | conditionally | Legacy raw-key target. When supplied with `id`, it must match the selected record. Aliases: `api-key`, `key`. |
-| `user_id` | integer | no | Bound `user.id`. Alias: `user-id`; `0` clears the binding. |
+| `display_name` | string or null | no | Replacement display name, up to 128 Unicode characters with no control characters. Surrounding whitespace is trimmed; an empty string or `null` clears it. |
+| `user_id` | integer or null | no | Bound `user.id`. Alias: `user-id`; `0` or `null` clears the binding. |
 | `channels` | array of integer | no | Channel group IDs. |
 | `model_groups` | array of integer | no | Model group IDs. Alias: `model-groups`. |
 
@@ -1557,6 +1582,7 @@ Successful response:
     "api_key_id": 1,
     "api-key": "client-key-1",
     "api_key": "client-key-1",
+    "display_name": "Primary production key",
     "user-id": 1,
     "user_id": 1,
     "channels": [1],
