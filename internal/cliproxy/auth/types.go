@@ -49,6 +49,9 @@ type Auth struct {
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
 	Metadata map[string]any `json:"metadata,omitempty"`
+	// RuntimeDisableCooling carries the auth-scoped cooling override in minimal
+	// in-memory projections without serializing provider metadata or secrets.
+	RuntimeDisableCooling bool `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
@@ -398,6 +401,19 @@ func (a *Auth) DisableCoolingOverride() (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+// DisableCoolingEnabled reports whether this auth has cooling disabled in
+// either its runtime projection or persisted metadata.
+func (a *Auth) DisableCoolingEnabled() bool {
+	if a == nil {
+		return false
+	}
+	if a.RuntimeDisableCooling {
+		return true
+	}
+	disabled, ok := a.DisableCoolingOverride()
+	return ok && disabled
 }
 
 // ToolPrefixDisabled returns whether the proxy_ tool name prefix should be

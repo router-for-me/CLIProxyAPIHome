@@ -620,4 +620,5 @@ type AuthIndex struct {
 	ModelsHash     string
 	Attributes     map[string]string
 	ModelMetadata  map[string]any
+	DisableCooling bool
 }

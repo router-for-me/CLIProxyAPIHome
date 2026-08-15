@@ -704,6 +704,7 @@ func (a *RuntimeAdapter) ListMinimalAuths() []*coreauth.Auth {
 func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 	// Normalize auth state before updating runtime indexes.
 	item := AuthIndex{}
+	disableCooling := auth.DisableCoolingEnabled()
 	if record != nil {
 		item.UUID = strings.TrimSpace(record.UUID)
 		item.Version = record.Version
@@ -732,6 +733,7 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 		item.ModelStates = auth.ModelStates
 		item.Attributes = cloneStringMap(auth.Attributes)
 		item.ModelMetadata = modelMetadataFromAuth(auth)
+		item.DisableCooling = disableCooling
 		if item.Version == 0 {
 			item.Version = auth.StateVersion
 		}
@@ -762,20 +764,21 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 	}
 	metadata := cloneModelMetadata(item.ModelMetadata)
 	return &coreauth.Auth{
-		ID:             uuid,
-		Index:          uuid,
-		StateVersion:   item.Version,
-		Provider:       item.Provider,
-		Label:          item.Label,
-		Prefix:         item.Prefix,
-		Status:         item.Status,
-		Disabled:       item.Disabled,
-		Unavailable:    item.Unavailable,
-		NextRetryAfter: item.NextRetryAfter,
-		Quota:          item.Quota,
-		ModelStates:    cloneModelStateMap(item.ModelStates),
-		Attributes:     attrs,
-		Metadata:       metadata,
+		ID:                    uuid,
+		Index:                 uuid,
+		StateVersion:          item.Version,
+		Provider:              item.Provider,
+		Label:                 item.Label,
+		Prefix:                item.Prefix,
+		Status:                item.Status,
+		Disabled:              item.Disabled,
+		Unavailable:           item.Unavailable,
+		NextRetryAfter:        item.NextRetryAfter,
+		Quota:                 item.Quota,
+		ModelStates:           cloneModelStateMap(item.ModelStates),
+		Attributes:            attrs,
+		Metadata:              metadata,
+		RuntimeDisableCooling: item.DisableCooling,
 	}
 }
 

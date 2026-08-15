@@ -277,7 +277,10 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 		return false
 	}
 	if m.quotaCooldownDisabledForAuth(auth) {
-		return false
+		// A cluster minimal auth carries this override outside serialized
+		// metadata. Keep quota transitions on the persisted path so a full auth
+		// snapshot is used whenever the state store is available.
+		return auth.RuntimeDisableCooling
 	}
 	// A locally visible open window means the shared row already carries this
 	// cooldown, so the failure can be absorbed without a database round-trip.
@@ -474,12 +477,8 @@ func (m *Manager) resultAuthLocked(result Result) *Auth {
 
 // quotaCooldownDisabledForAuth returns a quota cooldown disabled for auth.
 func (m *Manager) quotaCooldownDisabledForAuth(auth *Auth) bool {
-	if auth != nil {
-		if override, ok := auth.DisableCoolingOverride(); ok {
-			if override {
-				return true
-			}
-		}
+	if auth != nil && auth.DisableCoolingEnabled() {
+		return true
 	}
 	cfg, _ := m.runtimeConfig.Load().(*config.Config)
 	return cfg != nil && cfg.DisableCooling
