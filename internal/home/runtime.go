@@ -34,8 +34,9 @@ import (
 )
 
 type Runtime struct {
-	cfgMu sync.RWMutex
-	cfg   *config.Config
+	stateApplyMu sync.Mutex
+	cfgMu        sync.RWMutex
+	cfg          *config.Config
 
 	authDir    string
 	configPath string
@@ -700,6 +701,11 @@ func (r *Runtime) AuthenticateHTTPRequest(ctx context.Context, req *http.Request
 
 // ReloadAuths handles a reload auths.
 func (r *Runtime) ReloadAuths(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.stateApplyMu.Lock()
+	defer r.stateApplyMu.Unlock()
 	return r.loadAuths(coreauth.WithSkipPersist(ctx))
 }
 
@@ -710,7 +716,10 @@ func (r *Runtime) loadAuths(ctx context.Context) error {
 		return nil
 	}
 	if r.clusterAdapter != nil && r.clusterAdapter.Enabled() {
-		return r.loadClusterAuths(ctx, r.clusterAdapter)
+		if errLoad := r.loadClusterAuths(ctx, r.clusterAdapter); errLoad != nil {
+			return errLoad
+		}
+		return r.clearDisabledCooldowns(ctx)
 	}
 
 	r.cfgMu.RLock()
@@ -774,6 +783,16 @@ func (r *Runtime) loadAuths(ctx context.Context) error {
 	}
 
 	log.Infof("loaded auths (files=%d config=%d removed=%d)", len(fileAuths), len(configAuths), removed)
+	return r.clearDisabledCooldowns(ctx)
+}
+
+func (r *Runtime) clearDisabledCooldowns(ctx context.Context) error {
+	if r == nil || r.coreManager == nil {
+		return nil
+	}
+	if errClear := r.coreManager.ClearDisabledCooldownStates(ctx); errClear != nil {
+		log.WithError(errClear).Warn("home runtime: failed to persist cleared cooldown states; local scheduling state is already clear")
+	}
 	return nil
 }
 

@@ -529,7 +529,7 @@ func stringSliceContains(values []string, target string) bool {
 	return false
 }
 
-func TestPutConfigYAMLEnablesCentralCoolingAndHomeInvariants(t *testing.T) {
+func TestPutConfigYAMLPreservesGlobalDisableCoolingAndHomeInvariants(t *testing.T) {
 	db, cleanup := openManagementLogTestDB(t)
 	defer cleanup()
 
@@ -587,8 +587,8 @@ plugins:
 	if cfg["usage-statistics-enabled"] != true {
 		t.Fatalf("usage-statistics-enabled = %v, want true", cfg["usage-statistics-enabled"])
 	}
-	if cfg["disable-cooling"] != false {
-		t.Fatalf("disable-cooling = %v, want Home central cooling enabled", cfg["disable-cooling"])
+	if cfg["disable-cooling"] != true {
+		t.Fatalf("disable-cooling = %v, want Home global setting preserved", cfg["disable-cooling"])
 	}
 	if cfg["ws-auth"] != false {
 		t.Fatalf("ws-auth = %v, want false", cfg["ws-auth"])
@@ -631,8 +631,8 @@ plugins:
 	if !strings.Contains(yamlResp.Body.String(), "usage-statistics-enabled: true") {
 		t.Fatalf("config yaml = %s, want Home usage statistics forced true", yamlResp.Body.String())
 	}
-	if !strings.Contains(yamlResp.Body.String(), "disable-cooling: false") {
-		t.Fatalf("config yaml = %s, want Home central cooling enabled", yamlResp.Body.String())
+	if !strings.Contains(yamlResp.Body.String(), "disable-cooling: true") {
+		t.Fatalf("config yaml = %s, want Home global setting preserved", yamlResp.Body.String())
 	}
 	if !strings.Contains(yamlResp.Body.String(), "ws-auth: false") {
 		t.Fatalf("config yaml = %s, want Home ws-auth forced false", yamlResp.Body.String())

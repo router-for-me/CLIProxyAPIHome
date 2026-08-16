@@ -50,7 +50,7 @@ type Auth struct {
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
 	Metadata map[string]any `json:"metadata,omitempty"`
 	// RuntimeDisableCooling carries the auth-scoped cooling override in minimal
-	// in-memory projections without serializing provider metadata or secrets.
+	// projections without serializing provider metadata or secrets.
 	RuntimeDisableCooling bool `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`

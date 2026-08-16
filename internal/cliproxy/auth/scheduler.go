@@ -14,6 +14,7 @@ import (
 type schedulerStrategy int
 
 type schedulerModelResolver func(auth *Auth, routeModel string) string
+type schedulerAvailabilityResolver func(auth *Auth, now time.Time) *Auth
 
 const (
 	schedulerStrategyCustom schedulerStrategy = iota
@@ -37,6 +38,7 @@ type authScheduler struct {
 	mu            sync.Mutex
 	strategy      schedulerStrategy
 	modelResolver schedulerModelResolver
+	availability  schedulerAvailabilityResolver
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
@@ -46,6 +48,7 @@ type authScheduler struct {
 type providerScheduler struct {
 	providerKey   string
 	modelResolver schedulerModelResolver
+	availability  schedulerAvailabilityResolver
 	auths         map[string]*scheduledAuthMeta
 	modelShards   map[string]*modelScheduler
 }
@@ -63,6 +66,7 @@ type scheduledAuthMeta struct {
 type modelScheduler struct {
 	modelKey        string
 	modelResolver   schedulerModelResolver
+	availability    schedulerAvailabilityResolver
 	entries         map[string]*scheduledAuth
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
@@ -130,10 +134,11 @@ func normalizeCursor(cursor, size int) int {
 }
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
-func newAuthScheduler(selector Selector, resolver schedulerModelResolver) *authScheduler {
+func newAuthScheduler(selector Selector, modelResolver schedulerModelResolver, availabilityResolver schedulerAvailabilityResolver) *authScheduler {
 	return &authScheduler{
 		strategy:      selectorStrategy(selector),
-		modelResolver: resolver,
+		modelResolver: modelResolver,
+		availability:  availabilityResolver,
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
@@ -175,6 +180,7 @@ func (s *authScheduler) resetModelShards() {
 			continue
 		}
 		providerState.modelResolver = s.modelResolver
+		providerState.availability = s.availability
 		providerState.modelShards = make(map[string]*modelScheduler)
 	}
 	clear(s.mixedCursors)
@@ -480,6 +486,7 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 		providerState = &providerScheduler{
 			providerKey:   providerKey,
 			modelResolver: s.modelResolver,
+			availability:  s.availability,
 			auths:         make(map[string]*scheduledAuthMeta),
 			modelShards:   make(map[string]*modelScheduler),
 		}
@@ -569,6 +576,7 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 	shard := &modelScheduler{
 		modelKey:        modelKey,
 		modelResolver:   p.modelResolver,
+		availability:    p.availability,
 		entries:         make(map[string]*scheduledAuth),
 		readyByPriority: make(map[int]*readyBucket),
 	}
@@ -631,11 +639,20 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 
 	entry.meta = meta
 	entry.auth = meta.auth
+	if m.availability != nil {
+		entry.auth = m.availability(meta.auth, now)
+	}
+	if entry.auth == nil {
+		entry.state = scheduledStateBlocked
+		entry.nextRetryAt = time.Time{}
+		m.rebuildIndexesLocked()
+		return
+	}
 	entry.nextRetryAt = time.Time{}
-	runtimeModelKey := m.runtimeModelKeyForAuth(meta.auth)
-	blocked, reason, next := isAuthBlockedForModel(meta.auth, runtimeModelKey, now)
+	runtimeModelKey := m.runtimeModelKeyForAuth(entry.auth)
+	blocked, reason, next := isAuthBlockedForModel(entry.auth, runtimeModelKey, now)
 	if !blocked && runtimeModelKey != canonicalModelKey(m.modelKey) {
-		blocked, reason, next = isAuthBlockedForModel(meta.auth, m.modelKey, now)
+		blocked, reason, next = isAuthBlockedForModel(entry.auth, m.modelKey, now)
 	}
 	switch {
 	case !blocked:

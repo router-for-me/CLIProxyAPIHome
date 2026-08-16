@@ -2067,7 +2067,7 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `models` | array of `ModelAlias` | Optional upstream model aliases. |
 | `headers` | object string to string | Extra upstream request headers. |
 | `excluded-models` | array of string | Model IDs excluded from this key. |
-| `disable-cooling` | boolean | Disable quota cooldown scheduling for this credential. |
+| `disable-cooling` | boolean | Disable request-error and quota cooldown scheduling for this credential (402/403/404, 408/500/502/503/504, and model-level 429). |
 | `auth-index` | string | Compatibility credential identifier. |
 | `id` | string | Canonical immutable credential UUID. Responses and exports use this field. |
 | `uuid` | string | Legacy input-only alias for `id`; it is normalized to `id` and never returned or exported. |
@@ -2095,7 +2095,7 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `api-key-entries` | array of `OpenAICompatibilityAPIKey` | Provider API keys and optional proxies. |
 | `models` | array of `OpenAICompatibilityModel` | Model definitions and aliases. |
 | `headers` | object string to string | Extra upstream headers. |
-| `disable-cooling` | boolean | Disable quota cooldown scheduling for this provider. |
+| `disable-cooling` | boolean | Disable request-error and quota cooldown scheduling for this provider (402/403/404, 408/500/502/503/504, and model-level 429). |
 | `id` | string | Canonical immutable UUID of the fallback credential when `api-key-entries` is empty. Responses and exports use this field. |
 | `uuid` | string | Legacy input-only alias for the fallback `id`; it is normalized to `id` and never returned or exported. |
 
@@ -2692,7 +2692,7 @@ Example response:
 
 Clears Home-owned execution quota cooldown state for one credential. Without a query parameter, the operation clears quota cooldowns for every model. With `?model=<model>`, request-option suffixes such as `(high)` are removed and credential-specific public aliases or prefixes are resolved to the canonical upstream model before lookup. The compatibility route-model key is also cleared when it differs from the upstream key.
 
-Execution cooldowns are always scoped to a credential and canonical model pair; Home never creates a credential-wide execution cooldown. CPA execution results without a canonical model are ignored by the cooldown state machine. HTTP 429 results use the capped model-level exponential backoff and do not use `Retry-After` or provider `retryDelay` hints for scheduling.
+Execution cooldowns are always scoped to a credential and canonical model pair; Home never creates a credential-wide execution cooldown. CPA execution results without a canonical model are ignored by the cooldown state machine. While cooling is enabled, HTTP 429 results use the capped model-level exponential backoff and do not use `Retry-After` or provider `retryDelay` hints for scheduling. A global or credential-level `disable-cooling: true` keeps covered request failures and 429 results dispatchable and clears existing covered request-error and quota cooldowns during auth reload. HTTP 401 and model-not-supported recovery remain unchanged.
 
 This operation is idempotent. It only clears cooldown state created by quota-exceeded/HTTP 429 results: quota flags, retry deadline, and backoff level. It does not enable a manually disabled credential, clear model-level 401/403/404/5xx state, change refresh scheduling, modify provider quota snapshots, or consume provider reset credits.
 
@@ -4074,7 +4074,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `plugins.configs` | object | Per-plugin config keyed by plugin ID. Store installs write a pinned `store` manifest under each plugin entry. Home-mode CPA nodes download store entries from that manifest; Home downloads and loads them only when `load-in-home: true` is explicitly set. |
 | `usage-statistics-enabled` | boolean | Enables in-memory usage aggregation. Home forces this to `true` for downstream CPA nodes and rejects disabling it through Management API updates. |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue retention window. Default `60`, max `3600`. |
-| `disable-cooling` | boolean | Compatibility field. Home is the sole credential scheduler and always normalizes this to `false` so central quota cooldown remains enabled. Config sent to downstream CPA nodes is independently forced to `true`, disabling only CPA-local cooldown. |
+| `disable-cooling` | boolean | Globally disables Home request-error and quota cooldown scheduling (402/403/404, 408/500/502/503/504, and model-level 429). HTTP 401 and model-not-supported recovery remain unchanged. This Home-local value is persisted and applied on reload; config sent to downstream CPA nodes is independently forced to `true`. |
 | `auth-auto-refresh-workers` | integer | Overrides auth auto-refresh worker count. |
 | `request-retry` | integer | Failed request retry count. |
 | `max-retry-credentials` | integer | Max credentials to try per failed request; `<=0` means all available. |

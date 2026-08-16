@@ -4,10 +4,12 @@ import (
 	"context"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
 
 func newQuotaTestRepository(t *testing.T) *Repository {
@@ -27,6 +29,27 @@ func newQuotaTestRepository(t *testing.T) *Repository {
 		t.Fatalf("AutoMigrate returned error: %v", errMigrate)
 	}
 	return NewRepository(db)
+}
+
+type blockingStateVersionStore struct {
+	*RuntimeAdapter
+	saveStarted chan *coreauth.Auth
+	releaseSave chan struct{}
+	saveDone    chan struct{}
+	blockOnce   sync.Once
+}
+
+func (s *blockingStateVersionStore) SaveWithStateVersion(ctx context.Context, auth *coreauth.Auth) (string, int64, error) {
+	blocked := false
+	s.blockOnce.Do(func() {
+		blocked = true
+		s.saveStarted <- auth.Clone()
+		<-s.releaseSave
+	})
+	if blocked {
+		defer close(s.saveDone)
+	}
+	return s.RuntimeAdapter.SaveWithStateVersion(ctx, auth)
 }
 
 // newQuotaTestNode builds the manager view a Home node holds after loading the
@@ -381,55 +404,228 @@ func TestClusterMinimalAuthPreservesDisableCoolingForTransientResults(t *testing
 	}
 }
 
-func TestClusterMinimalAuthUsesFullAuthForDisabledQuotaResult(t *testing.T) {
-	const authID = "auth-cluster-disabled-quota"
-	const model = "gpt-5"
-	repo := newQuotaTestRepository(t)
-	ctx := context.Background()
-	seed := &coreauth.Auth{
-		ID:       authID,
-		Index:    authID,
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Metadata: map[string]any{"access_token": "preserved", "disable_cooling": true},
-	}
-	if _, errUpsert := repo.UpsertAuth(ctx, seed, "register"); errUpsert != nil {
-		t.Fatalf("UpsertAuth returned error: %v", errUpsert)
-	}
+func TestClusterDisabledCoolingFencesQueuedRequestErrorSnapshots(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusRequestTimeout,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			const authID = "auth-cluster-result-save-fence"
+			const model = "gpt-5"
+			ctx := context.Background()
+			repo := newQuotaTestRepository(t)
+			seed := &coreauth.Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"access_token":              "preserved",
+					homeConfigModelsMetadataKey: []map[string]any{{"name": model}},
+				},
+			}
+			seedRecord, errUpsert := repo.UpsertAuth(ctx, seed, "register")
+			if errUpsert != nil {
+				t.Fatalf("UpsertAuth() error = %v", errUpsert)
+			}
 
-	adapter := NewRuntimeAdapter(repo, "127.0.0.1")
-	if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
-		t.Fatalf("LoadIndex returned error: %v", errLoad)
-	}
-	minimals := adapter.ListMinimalAuths()
-	if len(minimals) != 1 {
-		t.Fatalf("minimal auths = %#v, want one auth", minimals)
-	}
-	minimal := minimals[0]
-	manager := coreauth.NewManager(adapter, nil, nil)
-	if _, errRegister := manager.Register(coreauth.WithSkipPersist(ctx), minimal); errRegister != nil {
-		t.Fatalf("Register returned error: %v", errRegister)
-	}
-	manager.MarkResult(ctx, coreauth.Result{
-		AuthID:   authID,
-		Provider: "codex",
-		Model:    model,
-		Error: &coreauth.Error{
-			Message:    "quota exhausted",
-			Retryable:  true,
-			HTTPStatus: http.StatusTooManyRequests,
-		},
-	})
+			adapter := NewRuntimeAdapter(repo, "127.0.0.1")
+			if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
+				t.Fatalf("LoadIndex() error = %v", errLoad)
+			}
+			minimals := adapter.ListMinimalAuths()
+			if len(minimals) != 1 || minimals[0] == nil {
+				t.Fatalf("ListMinimalAuths() = %#v, want one auth", minimals)
+			}
+			minimal := minimals[0]
+			if minimal.Metadata == nil || minimal.Metadata[homeConfigModelsMetadataKey] == nil {
+				t.Fatalf("minimal metadata = %#v, want Home model projection", minimal.Metadata)
+			}
+			if _, exists := minimal.Metadata["access_token"]; exists {
+				t.Fatalf("minimal metadata exposed access_token: %#v", minimal.Metadata)
+			}
 
-	persisted, _, errGet := repo.GetAuth(ctx, authID)
-	if errGet != nil {
-		t.Fatalf("GetAuth returned error: %v", errGet)
+			store := &blockingStateVersionStore{
+				RuntimeAdapter: adapter,
+				saveStarted:    make(chan *coreauth.Auth, 1),
+				releaseSave:    make(chan struct{}),
+				saveDone:       make(chan struct{}),
+			}
+			manager := coreauth.NewManager(store, nil, nil)
+			manager.SetConfig(&appconfig.Config{DisableCooling: false})
+			if _, errRegister := manager.Register(coreauth.WithSkipPersist(ctx), minimal); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			manager.MarkResult(ctx, coreauth.Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    model,
+				Error: &coreauth.Error{
+					Message:    "upstream request failed",
+					Retryable:  true,
+					HTTPStatus: statusCode,
+				},
+			})
+
+			var staleSnapshot *coreauth.Auth
+			select {
+			case staleSnapshot = <-store.saveStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("queued result snapshot did not reach SaveWithStateVersion")
+			}
+			released := false
+			t.Cleanup(func() {
+				if !released {
+					close(store.releaseSave)
+				}
+				select {
+				case <-store.saveDone:
+				case <-time.After(2 * time.Second):
+					t.Error("queued result save did not finish during cleanup")
+				}
+			})
+			staleState := staleSnapshot.ModelStates[model]
+			if staleSnapshot.StateVersion != seedRecord.Version || staleState == nil || staleState.NextRetryAfter.IsZero() {
+				t.Fatalf("queued snapshot version/state = %d/%#v, want version %d with cooldown", staleSnapshot.StateVersion, staleState, seedRecord.Version)
+			}
+
+			manager.SetConfig(&appconfig.Config{DisableCooling: true})
+			manager.MarkResult(coreauth.WithSkipPersist(ctx), coreauth.Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    model,
+				Error: &coreauth.Error{
+					Message:    "upstream request failed after cooling was disabled",
+					Retryable:  true,
+					HTTPStatus: statusCode,
+				},
+			})
+			localBeforeFence, okLocal := manager.GetByID(authID)
+			if !okLocal || localBeforeFence == nil || localBeforeFence.ModelStates[model] == nil || !localBeforeFence.ModelStates[model].NextRetryAfter.IsZero() {
+				t.Fatalf("local state before fence = %#v/%v, want a clean disabled-cooling result", localBeforeFence, okLocal)
+			}
+			if errFence := manager.FenceDisabledCooldownStates(ctx); errFence != nil {
+				t.Fatalf("FenceDisabledCooldownStates() error = %v", errFence)
+			}
+			cleared, clearedRecord, errGet := repo.GetAuth(ctx, authID)
+			if errGet != nil {
+				t.Fatalf("GetAuth() after clear error = %v", errGet)
+			}
+			if clearedRecord.Version <= seedRecord.Version {
+				t.Fatalf("clear version = %d, want fence newer than queued version %d", clearedRecord.Version, seedRecord.Version)
+			}
+			if len(cleared.ModelStates) != 0 || cleared.Unavailable || !cleared.NextRetryAfter.IsZero() {
+				t.Fatalf("persisted state after clear = %#v, want clean auth", cleared)
+			}
+
+			close(store.releaseSave)
+			released = true
+			select {
+			case <-store.saveDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("queued result save did not finish after release")
+			}
+
+			persisted, persistedRecord, errGet := repo.GetAuth(ctx, authID)
+			if errGet != nil {
+				t.Fatalf("GetAuth() after stale save error = %v", errGet)
+			}
+			if persistedRecord.Version != clearedRecord.Version {
+				t.Fatalf("stale save changed version %d -> %d", clearedRecord.Version, persistedRecord.Version)
+			}
+			if len(persisted.ModelStates) != 0 || persisted.Unavailable || !persisted.NextRetryAfter.IsZero() {
+				t.Fatalf("stale save restored cooldown: %#v", persisted)
+			}
+			if got := persisted.Metadata["access_token"]; got != "preserved" {
+				t.Fatalf("access_token after stale save = %v, want preserved", got)
+			}
+			local, ok := manager.GetByID(authID)
+			if !ok || local == nil || local.ModelStates[model] == nil || !local.ModelStates[model].NextRetryAfter.IsZero() {
+				t.Fatalf("local state after stale save = %#v/%v, want cooldown cleared", local, ok)
+			}
+		})
 	}
-	if got := persisted.Metadata["access_token"]; got != "preserved" {
-		t.Fatalf("access_token = %v, want full auth metadata preserved", got)
+}
+
+func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithDisableCooling(t *testing.T) {
+	tests := []struct {
+		name              string
+		idSuffix          string
+		credentialDisable bool
+		globalDisable     bool
+	}{
+		{name: "credential override", idSuffix: "credential", credentialDisable: true},
+		{name: "global setting", idSuffix: "global", globalDisable: true},
 	}
-	state := persisted.ModelStates[model]
-	if state == nil || !state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
-		t.Fatalf("persisted quota state = %#v, want bookkeeping without cooldown", state)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const model = "gpt-5"
+			authID := "auth-cluster-disabled-quota-" + tc.idSuffix
+			repo := newQuotaTestRepository(t)
+			ctx := context.Background()
+			metadata := map[string]any{"access_token": "preserved"}
+			if tc.credentialDisable {
+				metadata["disable_cooling"] = true
+			}
+			seed := &coreauth.Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Metadata: metadata,
+			}
+			if _, errUpsert := repo.UpsertAuth(ctx, seed, "register"); errUpsert != nil {
+				t.Fatalf("UpsertAuth returned error: %v", errUpsert)
+			}
+
+			adapter := NewRuntimeAdapter(repo, "127.0.0.1")
+			if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
+				t.Fatalf("LoadIndex returned error: %v", errLoad)
+			}
+			minimals := adapter.ListMinimalAuths()
+			if len(minimals) != 1 {
+				t.Fatalf("minimal auths = %#v, want one auth", minimals)
+			}
+			minimal := minimals[0]
+			if minimal.RuntimeDisableCooling != tc.credentialDisable {
+				t.Fatalf("RuntimeDisableCooling = %t, want %t", minimal.RuntimeDisableCooling, tc.credentialDisable)
+			}
+			manager := coreauth.NewManager(adapter, nil, nil)
+			if tc.globalDisable {
+				manager.SetConfig(&appconfig.Config{DisableCooling: true})
+			}
+			if _, errRegister := manager.Register(coreauth.WithSkipPersist(ctx), minimal); errRegister != nil {
+				t.Fatalf("Register returned error: %v", errRegister)
+			}
+			manager.MarkResult(ctx, coreauth.Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    model,
+				Error: &coreauth.Error{
+					Message:    "quota exhausted",
+					Retryable:  true,
+					HTTPStatus: http.StatusTooManyRequests,
+				},
+			})
+
+			persisted, _, errGet := repo.GetAuth(ctx, authID)
+			if errGet != nil {
+				t.Fatalf("GetAuth returned error: %v", errGet)
+			}
+			if got := persisted.Metadata["access_token"]; got != "preserved" {
+				t.Fatalf("access_token = %v, want full auth metadata preserved", got)
+			}
+			state := persisted.ModelStates[model]
+			if state == nil || state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+				t.Fatalf("persisted quota state = %#v, want no active model cooldown", state)
+			}
+		})
 	}
 }

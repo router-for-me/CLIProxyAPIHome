@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
@@ -52,7 +51,7 @@ func TestRuntimeConfigFromRootPreservesConcurrencyLimiterConfig(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigFromRootEnablesCentralCoolingAndHomeInvariants(t *testing.T) {
+func TestRuntimeConfigFromRootPreservesGlobalDisableCoolingAndHomeInvariants(t *testing.T) {
 	root := map[string]any{
 		"api-keys":                 []any{"local-key"},
 		"usage-statistics-enabled": false,
@@ -64,7 +63,7 @@ func TestRuntimeConfigFromRootEnablesCentralCoolingAndHomeInvariants(t *testing.
 		},
 	}
 
-	cfg, _, errConfig := RuntimeConfigFromRoot(root)
+	cfg, payload, errConfig := RuntimeConfigFromRoot(root)
 	if errConfig != nil {
 		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
 	}
@@ -74,8 +73,8 @@ func TestRuntimeConfigFromRootEnablesCentralCoolingAndHomeInvariants(t *testing.
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("UsageStatisticsEnabled = false, want true")
 	}
-	if cfg.DisableCooling {
-		t.Fatal("DisableCooling = true, want Home central cooling enabled")
+	if !cfg.DisableCooling {
+		t.Fatal("DisableCooling = false, want Home global cooling disabled")
 	}
 	if cfg.WebsocketAuth {
 		t.Fatal("WebsocketAuth = true, want false")
@@ -86,39 +85,69 @@ func TestRuntimeConfigFromRootEnablesCentralCoolingAndHomeInvariants(t *testing.
 	if cfg.RemoteManagement.DisableControlPanel {
 		t.Fatal("RemoteManagement.DisableControlPanel = true, want preserved false")
 	}
+	if !strings.Contains(string(payload), "disable-cooling: true") {
+		t.Fatalf("runtime payload lost Home disable-cooling setting:\n%s", payload)
+	}
 }
 
-func TestRuntimeConfigFromRootEnablesCentralQuotaCooldown(t *testing.T) {
+func TestRuntimeConfigFromRootDisablesHomeCooldowns(t *testing.T) {
 	cfg, _, errConfig := RuntimeConfigFromRoot(map[string]any{"disable-cooling": true})
 	if errConfig != nil {
 		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
 	}
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.SetConfig(cfg)
-	auth := &coreauth.Auth{ID: "central-cooling-auth", Index: "central-cooling-auth", Provider: "codex", Status: coreauth.StatusActive}
-	t.Cleanup(func() { registry.GetGlobalRegistry().ClearModelQuotaExceeded(auth.ID, "gpt-5") })
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
+	const authID = "home-global-disable-cooling"
+	const model = "gpt-5"
+	t.Cleanup(func() { registry.GetGlobalRegistry().ClearModelQuotaExceeded(authID, model) })
 
-	manager.MarkResult(context.Background(), coreauth.Result{
-		AuthID:   auth.ID,
-		Provider: auth.Provider,
-		Model:    "gpt-5",
-		Success:  false,
-		Error: &coreauth.Error{
-			Message:    "quota exhausted",
-			HTTPStatus: http.StatusTooManyRequests,
-		},
-	})
+	for _, statusCode := range []int{
+		http.StatusRequestTimeout,
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.SetConfig(cfg)
+			auth := &coreauth.Auth{ID: authID, Index: authID, Provider: "codex", Status: coreauth.StatusActive}
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
 
-	got, ok := manager.GetByID(auth.ID)
-	if !ok || got == nil || got.ModelStates["gpt-5"] == nil {
-		t.Fatalf("GetByID() missing quota state: %#v", got)
-	}
-	state := got.ModelStates["gpt-5"]
-	if !state.Unavailable || !state.Quota.Exceeded || !state.NextRetryAfter.After(time.Now()) {
-		t.Fatalf("quota state = %#v, want active central cooldown", state)
+			manager.MarkResult(context.Background(), coreauth.Result{
+				AuthID:   auth.ID,
+				Provider: auth.Provider,
+				Model:    model,
+				Success:  false,
+				Error: &coreauth.Error{
+					Message:    "upstream failure",
+					HTTPStatus: statusCode,
+				},
+			})
+
+			got, ok := manager.GetByID(auth.ID)
+			if !ok || got == nil || got.ModelStates[model] == nil {
+				t.Fatalf("GetByID() missing model state: %#v", got)
+			}
+			state := got.ModelStates[model]
+			if !state.NextRetryAfter.IsZero() {
+				t.Fatalf("status %d NextRetryAfter = %v, want zero", statusCode, state.NextRetryAfter)
+			}
+			if got.Unavailable {
+				t.Fatalf("status %d left auth unavailable with Home cooling disabled", statusCode)
+			}
+			picked, errPick := (&coreauth.FillFirstSelector{}).Pick(context.Background(), auth.Provider, model, coreauth.Options{}, []*coreauth.Auth{got})
+			if errPick != nil || picked == nil || picked.ID != auth.ID {
+				t.Fatalf("status %d auth remained undispatchable: picked=%#v err=%v", statusCode, picked, errPick)
+			}
+			if statusCode == http.StatusTooManyRequests && (state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero()) {
+				t.Fatalf("quota state = %#v, want no active quota cooldown", state.Quota)
+			}
+		})
 	}
 }
 

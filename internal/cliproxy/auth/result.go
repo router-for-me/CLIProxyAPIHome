@@ -57,6 +57,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	transition := markResultTransition{}
 	transitionVersion := int64(0)
 	var authSnapshot *Auth
+	skipResultPersist := false
+	localOnlyDisabledQuota := false
+	localAvailabilityBefore := availabilityFingerprintValue{}
+	disableCooling := false
 	resultModel := canonicalModelKey(result.Model)
 	if resultModel == "" {
 		return
@@ -70,15 +74,23 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	stateMutatorAvailable := false
 	if auth != nil {
 		resultAuthID = auth.ID
+		disableCooling = m.quotaCooldownDisabledForAuth(auth)
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
 		} else {
 			auth.Failed++
 		}
+		localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
+			!isModelSupportResultError(result.Error) &&
+			disableCooling &&
+			disabledQuotaStateAlreadyApplied(auth, resultModel)
+		if localOnlyDisabledQuota {
+			localAvailabilityBefore = availabilityFingerprint(auth, resultModel)
+		}
 		if stateMutator, ok := m.store.(StateMutator); ok {
 			stateMutatorAvailable = true
-			if m.resultNeedsGlobalTransition(auth, result, resultModel, now) {
+			if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
 				mutator = stateMutator
 			}
 		}
@@ -86,7 +98,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		// transition rather than enqueue a stale row or read the database per success;
 		// cluster events reconcile any newer authoritative state.
 		if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
-			transition = m.applyResultTransition(auth, result, resultModel, now)
+			transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
+			if localOnlyDisabledQuota {
+				skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
+			}
 			authSnapshot = auth.Clone()
 		}
 	}
@@ -101,7 +116,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
 			before := availabilityFingerprint(persisted, resultModel)
 			baseVersion := persisted.StateVersion
-			transition = m.applyResultTransition(persisted, result, resultModel, now)
+			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
 			changed := availabilityFingerprint(persisted, resultModel) != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
@@ -127,7 +142,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if !adopted {
 			transition = markResultTransition{}
 		}
-	} else {
+	} else if !skipResultPersist {
 		m.enqueueResultPersist(ctx, authSnapshot)
 	}
 
@@ -136,6 +151,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if authSnapshot != nil && authRefreshDisabled(authSnapshot) {
 		m.queueRefreshReschedule(authSnapshot.ID)
+	}
+	resultStatus := statusCodeFromResult(result.Error)
+	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
+		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
+		return
 	}
 	if transition.clearModelQuota && resultModel != "" {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(resultAuthID, resultModel)
@@ -153,8 +173,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 // applyResultTransition applies the result state machine to the provided auth
 // and reports the derived registry side effects. The auth may be the manager's
 // in-memory copy or a persisted copy loaded by a StateMutator; the function
-// must not touch manager state beyond configuration reads.
-func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel string, now time.Time) markResultTransition {
+// uses the caller's captured cooling policy and does not read manager state.
+func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel string, now time.Time, disableCooling bool) markResultTransition {
 	transition := markResultTransition{}
 	if auth == nil {
 		return transition
@@ -181,7 +201,6 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if isRequestScopedNotFoundResultError(result.Error) {
 		return transition
 	}
-	disableCooling := m.quotaCooldownDisabledForAuth(auth)
 	state := ensureModelState(auth, resultModel)
 	state.Unavailable = true
 	state.Status = StatusError
@@ -222,17 +241,25 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.shouldSuspendModel = true
 			}
 		case http.StatusTooManyRequests:
-			next, backoffLevel := nextQuotaRecoverAt(now, result.RetryAfter, state.Quota, disableCooling)
-			state.NextRetryAfter = next
-			state.QuotaResetAt = time.Time{}
-			state.Quota = QuotaState{
-				Exceeded:      true,
-				Scope:         quotaScopeModel,
-				Reason:        "quota",
-				NextRecoverAt: next,
-				BackoffLevel:  backoffLevel,
-			}
-			if !disableCooling {
+			backoffLevel := state.Quota.BackoffLevel
+			if disableCooling {
+				state.Unavailable = false
+				state.NextRetryAfter = time.Time{}
+				state.QuotaResetAt = time.Time{}
+				state.Quota = QuotaState{Scope: quotaScopeModel, Reason: "quota", BackoffLevel: backoffLevel}
+				transition.clearModelQuota = true
+				transition.shouldResumeModel = true
+			} else {
+				next, nextBackoffLevel := quotaCooldownAfterFailure(state.Quota, now)
+				state.NextRetryAfter = next
+				state.QuotaResetAt = time.Time{}
+				state.Quota = QuotaState{
+					Exceeded:      true,
+					Scope:         quotaScopeModel,
+					Reason:        "quota",
+					NextRecoverAt: next,
+					BackoffLevel:  nextBackoffLevel,
+				}
 				transition.suspendReason = "quota"
 				transition.shouldSuspendModel = true
 				transition.setModelQuota = true
@@ -247,7 +274,6 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 			state.NextRetryAfter = time.Time{}
 		}
 	}
-
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
@@ -259,7 +285,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 // atomic across Home nodes. Unauthorized transitions must preserve credentials
 // that may be refreshed concurrently, while quota (429) and clearing successes
 // need shared availability state. Other failures stay on the local path.
-func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultModel string, now time.Time) bool {
+func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultModel string, now time.Time, disableCooling bool) bool {
 	if auth == nil {
 		return false
 	}
@@ -276,11 +302,11 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	if isModelSupportResultError(result.Error) {
 		return false
 	}
-	if m.quotaCooldownDisabledForAuth(auth) {
-		// A cluster minimal auth carries this override outside serialized
-		// metadata. Keep quota transitions on the persisted path so a full auth
-		// snapshot is used whenever the state store is available.
-		return auth.RuntimeDisableCooling
+	if disableCooling {
+		// Apply disabled 429 transitions to the persisted full auth. Minimal
+		// projections intentionally omit provider credentials and must never be
+		// written back as complete auth snapshots.
+		return !disabledQuotaStateAlreadyApplied(auth, resultModel)
 	}
 	// A locally visible open window means the shared row already carries this
 	// cooldown, so the failure can be absorbed without a database round-trip.
@@ -288,6 +314,49 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 		return false
 	}
 	return true
+}
+
+// disabledQuotaStateAlreadyApplied reports whether a disabled-cooling 429 can
+// update local diagnostics without changing persisted scheduling state.
+func disabledQuotaStateAlreadyApplied(auth *Auth, resultModel string) bool {
+	if auth == nil || resultModel == "" || auth.Status != StatusError ||
+		auth.Unavailable || !auth.NextRetryAfter.IsZero() ||
+		fingerprintQuota(auth.Quota) != fingerprintQuota(aggregateModelQuota(auth.ModelStates)) {
+		return false
+	}
+	state := auth.ModelStates[resultModel]
+	if state == nil {
+		return false
+	}
+	return state.Status == StatusError &&
+		!state.Unavailable &&
+		state.NextRetryAfter.IsZero() &&
+		state.QuotaResetAt.IsZero() &&
+		!state.Quota.Exceeded &&
+		state.Quota.Scope == quotaScopeModel &&
+		state.Quota.Reason == "quota" &&
+		state.Quota.NextRecoverAt.IsZero()
+}
+
+// reconcileCoveredCooldownAfterResult derives registry state from the current
+// manager view after a covered result. This closes the race where an older
+// result finishes after a config reload has already disabled and cleared cooling.
+func (m *Manager) reconcileCoveredCooldownAfterResult(ctx context.Context, authID string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	auth, ok := m.GetByID(authID)
+	if !ok || auth == nil {
+		return
+	}
+	if m.quotaCooldownDisabledForAuth(auth) && hasDisabledCooldownState(auth) {
+		if errClear := m.ClearDisabledCooldownStates(ctx); errClear != nil {
+			log.WithError(errClear).WithField("auth_id", authID).Warn("auth manager: failed to reconcile disabled cooldown after result")
+		}
+	}
+	// Registry state is derived even when the local auth is already clean: an
+	// older transition may have reached the registry after config reconciliation.
+	m.ReconcileRegistryModelStates(ctx, authID)
 }
 
 // authQuotaWindowOpen reports whether the auth (or the given model state)
@@ -475,7 +544,8 @@ func (m *Manager) resultAuthLocked(result Result) *Auth {
 	return nil
 }
 
-// quotaCooldownDisabledForAuth returns a quota cooldown disabled for auth.
+// quotaCooldownDisabledForAuth reports whether cooldown scheduling is disabled
+// for this auth.
 func (m *Manager) quotaCooldownDisabledForAuth(auth *Auth) bool {
 	if auth != nil && auth.DisableCoolingEnabled() {
 		return true
@@ -527,9 +597,6 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	}
 	allUnavailable := true
 	earliestRetry := time.Time{}
-	quotaExceeded := false
-	quotaRecover := time.Time{}
-	maxBackoffLevel := 0
 	hasState := false
 	for _, state := range auth.ModelStates {
 		if state == nil {
@@ -555,15 +622,6 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		if !stateUnavailable {
 			allUnavailable = false
 		}
-		if state.Quota.Exceeded {
-			quotaExceeded = true
-			if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
-				quotaRecover = state.Quota.NextRecoverAt
-			}
-			if state.Quota.BackoffLevel > maxBackoffLevel {
-				maxBackoffLevel = state.Quota.BackoffLevel
-			}
-		}
 	}
 	if !hasState {
 		clearAggregatedAvailability(auth)
@@ -575,16 +633,36 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	} else {
 		auth.NextRetryAfter = time.Time{}
 	}
-	if quotaExceeded {
-		auth.Quota = QuotaState{
-			Exceeded:      true,
-			Scope:         quotaScopeModel,
-			Reason:        "quota",
-			NextRecoverAt: quotaRecover,
-			BackoffLevel:  maxBackoffLevel,
+	auth.Quota = aggregateModelQuota(auth.ModelStates)
+}
+
+// aggregateModelQuota builds the credential-level quota view derived from all
+// model states.
+func aggregateModelQuota(states map[string]*ModelState) QuotaState {
+	quotaExceeded := false
+	quotaRecover := time.Time{}
+	maxBackoffLevel := 0
+	for _, state := range states {
+		if state == nil || !state.Quota.Exceeded {
+			continue
 		}
-	} else {
-		auth.Quota = QuotaState{}
+		quotaExceeded = true
+		if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
+			quotaRecover = state.Quota.NextRecoverAt
+		}
+		if state.Quota.BackoffLevel > maxBackoffLevel {
+			maxBackoffLevel = state.Quota.BackoffLevel
+		}
+	}
+	if !quotaExceeded {
+		return QuotaState{}
+	}
+	return QuotaState{
+		Exceeded:      true,
+		Scope:         quotaScopeModel,
+		Reason:        "quota",
+		NextRecoverAt: quotaRecover,
+		BackoffLevel:  maxBackoffLevel,
 	}
 }
 
@@ -748,13 +826,6 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 		return quotaBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
-}
-
-func nextQuotaRecoverAt(now time.Time, _ *time.Duration, quota QuotaState, disableCooling bool) (time.Time, int) {
-	if disableCooling {
-		return time.Time{}, quota.BackoffLevel
-	}
-	return quotaCooldownAfterFailure(quota, now)
 }
 
 // quotaCooldownAfterFailure returns the recovery deadline and backoff level for

@@ -196,7 +196,7 @@ func TestAuthRefreshBackoffDoesNotBlockModels(t *testing.T) {
 	}
 
 	refreshRetryAt := auth.NextRefreshAfter
-	NewManager(nil, nil, nil).applyResultTransition(auth, Result{AuthID: auth.ID, Model: "gpt-5", Success: true}, "gpt-5", now)
+	NewManager(nil, nil, nil).applyResultTransition(auth, Result{AuthID: auth.ID, Model: "gpt-5", Success: true}, "gpt-5", now, false)
 	if !auth.NextRefreshAfter.Equal(refreshRetryAt) || !RefreshRetryBackoffOpen(auth, now) {
 		t.Fatalf("successful usage shortened refresh backoff: got %v, want %v", auth.NextRefreshAfter, refreshRetryAt)
 	}

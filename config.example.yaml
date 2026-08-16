@@ -178,8 +178,8 @@ max-retry-credentials: 0
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
 max-retry-interval: 30
 
-# Home always owns auth/model cooldown scheduling and normalizes this to false.
-# Home-mode CPA nodes always receive true and defer credential management to Home.
+# Disable Home request-error and quota cooldown scheduling globally when true.
+# Covers 402/403/404, 408/500/502/503/504, and model-level 429; Home-mode CPA nodes always receive true.
 disable-cooling: false
 
 # disable-image-generation supports: false (default), true, or "chat".
@@ -231,7 +231,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "AIzaSy...01"
 #     prefix: "test" # optional: require calls like "test/gemini-3-pro-preview" to target this credential
 #     base-url: "https://generativelanguage.googleapis.com"
-#     disable-cooling: false # optional: disable cooldown scheduling for this credential when true
+#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this credential
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080"
@@ -252,7 +252,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
-#     disable-cooling: false # optional: disable cooldown scheduling for this credential when true
+#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this credential
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -271,7 +271,7 @@ nonstream-keepalive-interval: 0
 # xai-api-key:
 #   - api-key: "xai-..."
 #     prefix: "xai" # optional: require calls like "xai/grok-4.5" to target this credential
-#     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
+#     disable-cooling: false # optional: per-auth override for request-error and 429 quota cooldown
 #     base-url: "https://api.x.ai/v1" # xAI-compatible Responses API endpoint
 #     websockets: true # optional: use the xAI upstream websocket transport for downstream websocket requests
 #     headers:
@@ -293,7 +293,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/claude-sonnet-latest" to target this credential
 #     base-url: "https://www.example.com" # use the custom claude API endpoint
-#     disable-cooling: false # optional: disable cooldown scheduling for this credential when true
+#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this credential
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -348,7 +348,7 @@ nonstream-keepalive-interval: 0
 #     disabled: false # optional: set to true to disable this provider without removing it
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
-#     disable-cooling: false # optional: disable cooldown scheduling for this provider's credentials when true
+#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this provider's credentials
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
