@@ -8,6 +8,7 @@ import (
 )
 
 func TestBuildConfigChangeDetailsIncludesRedactedXAIChanges(t *testing.T) {
+	disableCooling := true
 	oldCfg := &config.Config{XAIKey: []config.XAIKey{{
 		APIKey:  "old-secret",
 		BaseURL: "https://api.x.ai/v1",
@@ -18,7 +19,7 @@ func TestBuildConfigChangeDetailsIncludesRedactedXAIChanges(t *testing.T) {
 		Priority:       8,
 		BaseURL:        "https://api.x.ai/v1",
 		Websockets:     true,
-		DisableCooling: true,
+		DisableCooling: &disableCooling,
 		Models:         []config.XAIModel{{Name: "grok-4.5", Alias: "grok-latest", ForceMapping: true}},
 	}}}
 
@@ -26,7 +27,7 @@ func TestBuildConfigChangeDetailsIncludesRedactedXAIChanges(t *testing.T) {
 	for _, want := range []string{
 		"xai[0].priority: 0 -> 8",
 		"xai[0].websockets: false -> true",
-		"xai[0].disable-cooling: false -> true",
+		"xai[0].disable-cooling: inherit -> true",
 		"xai[0].api-key: updated",
 		"xai[0].models: updated",
 	} {

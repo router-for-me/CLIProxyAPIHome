@@ -620,5 +620,7 @@ type AuthIndex struct {
 	ModelsHash     string
 	Attributes     map[string]string
 	ModelMetadata  map[string]any
-	DisableCooling bool
+	// DisableCooling carries the optional credential override. Nil inherits the
+	// Home global setting.
+	DisableCooling *bool
 }

@@ -315,7 +315,7 @@ func TestClusterAuthIndexCarriesCooldownState(t *testing.T) {
 		t.Fatalf("expected one minimal auth, got %d", len(minimals))
 	}
 	minimal := minimals[0]
-	if !minimal.RuntimeDisableCooling {
+	if minimal.RuntimeDisableCooling == nil || !*minimal.RuntimeDisableCooling {
 		t.Fatal("expected minimal auth to preserve disable-cooling override")
 	}
 	if !minimal.NextRetryAfter.Equal(recover) {
@@ -370,7 +370,7 @@ func TestClusterMinimalAuthPreservesDisableCoolingForTransientResults(t *testing
 				t.Fatalf("LoadIndex returned error: %v", errLoad)
 			}
 			minimals := adapter.ListMinimalAuths()
-			if len(minimals) != 1 || !minimals[0].RuntimeDisableCooling {
+			if len(minimals) != 1 || minimals[0].RuntimeDisableCooling == nil || !*minimals[0].RuntimeDisableCooling {
 				t.Fatalf("minimal auth = %#v, want runtime disable-cooling", minimals)
 			}
 
@@ -554,14 +554,17 @@ func TestClusterDisabledCoolingFencesQueuedRequestErrorSnapshots(t *testing.T) {
 	}
 }
 
-func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithDisableCooling(t *testing.T) {
+func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithCoolingOverride(t *testing.T) {
 	tests := []struct {
 		name              string
 		idSuffix          string
+		credentialSet     bool
 		credentialDisable bool
 		globalDisable     bool
+		wantCooldown      bool
 	}{
-		{name: "credential override", idSuffix: "credential", credentialDisable: true},
+		{name: "credential disable override", idSuffix: "credential-disabled", credentialSet: true, credentialDisable: true},
+		{name: "credential enable overrides global", idSuffix: "credential-enabled", credentialSet: true, globalDisable: true, wantCooldown: true},
 		{name: "global setting", idSuffix: "global", globalDisable: true},
 	}
 	for _, tc := range tests {
@@ -571,8 +574,8 @@ func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithDisableCooling(t *testi
 			repo := newQuotaTestRepository(t)
 			ctx := context.Background()
 			metadata := map[string]any{"access_token": "preserved"}
-			if tc.credentialDisable {
-				metadata["disable_cooling"] = true
+			if tc.credentialSet {
+				metadata["disable_cooling"] = tc.credentialDisable
 			}
 			seed := &coreauth.Auth{
 				ID:       authID,
@@ -594,8 +597,12 @@ func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithDisableCooling(t *testi
 				t.Fatalf("minimal auths = %#v, want one auth", minimals)
 			}
 			minimal := minimals[0]
-			if minimal.RuntimeDisableCooling != tc.credentialDisable {
-				t.Fatalf("RuntimeDisableCooling = %t, want %t", minimal.RuntimeDisableCooling, tc.credentialDisable)
+			if tc.credentialSet {
+				if minimal.RuntimeDisableCooling == nil || *minimal.RuntimeDisableCooling != tc.credentialDisable {
+					t.Fatalf("runtime override = %#v, want %t", minimal.RuntimeDisableCooling, tc.credentialDisable)
+				}
+			} else if minimal.RuntimeDisableCooling != nil {
+				t.Fatalf("runtime override = %#v, want nil", minimal.RuntimeDisableCooling)
 			}
 			manager := coreauth.NewManager(adapter, nil, nil)
 			if tc.globalDisable {
@@ -623,7 +630,11 @@ func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithDisableCooling(t *testi
 				t.Fatalf("access_token = %v, want full auth metadata preserved", got)
 			}
 			state := persisted.ModelStates[model]
-			if state == nil || state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+			if tc.wantCooldown {
+				if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.NextRetryAfter.IsZero() || state.Quota.NextRecoverAt.IsZero() {
+					t.Fatalf("persisted quota state = %#v, want active model cooldown", state)
+				}
+			} else if state == nil || state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
 				t.Fatalf("persisted quota state = %#v, want no active model cooldown", state)
 			}
 		})

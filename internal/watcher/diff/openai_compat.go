@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -71,6 +72,9 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	details := make([]string, 0, 3)
 	if oldEntry.Disabled != newEntry.Disabled {
 		details = append(details, fmt.Sprintf("disabled %t -> %t", oldEntry.Disabled, newEntry.Disabled))
+	}
+	if !reflect.DeepEqual(oldEntry.DisableCooling, newEntry.DisableCooling) {
+		details = append(details, fmt.Sprintf("disable-cooling %s -> %s", formatOptionalBool(oldEntry.DisableCooling), formatOptionalBool(newEntry.DisableCooling)))
 	}
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))

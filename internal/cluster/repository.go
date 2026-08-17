@@ -428,7 +428,6 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 	out := make([]AuthIndex, 0, len(records))
 	for i, record := range records {
 		auth := auths[i]
-		disableCooling := auth.DisableCoolingEnabled()
 		out = append(out, AuthIndex{
 			UUID:           record.UUID,
 			Version:        record.Version,
@@ -447,7 +446,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 			ModelsHash:     record.ModelsHash,
 			Attributes:     auth.Attributes,
 			ModelMetadata:  modelMetadataFromAuth(auth),
-			DisableCooling: disableCooling,
+			DisableCooling: cloneOptionalBool(auth.DisableCoolingOverride()),
 		})
 	}
 	return out, nil

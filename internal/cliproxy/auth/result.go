@@ -547,8 +547,10 @@ func (m *Manager) resultAuthLocked(result Result) *Auth {
 // quotaCooldownDisabledForAuth reports whether cooldown scheduling is disabled
 // for this auth.
 func (m *Manager) quotaCooldownDisabledForAuth(auth *Auth) bool {
-	if auth != nil && auth.DisableCoolingEnabled() {
-		return true
+	if auth != nil {
+		if disabled := auth.DisableCoolingOverride(); disabled != nil {
+			return *disabled
+		}
 	}
 	cfg, _ := m.runtimeConfig.Load().(*config.Config)
 	return cfg != nil && cfg.DisableCooling

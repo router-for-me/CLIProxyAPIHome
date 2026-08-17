@@ -179,6 +179,7 @@ max-retry-credentials: 0
 max-retry-interval: 30
 
 # Disable Home request-error and quota cooldown scheduling globally when true.
+# A credential/provider disable-cooling value, when present, overrides this global value.
 # Covers 402/403/404, 408/500/502/503/504, and model-level 429; Home-mode CPA nodes always receive true.
 disable-cooling: false
 
@@ -231,7 +232,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "AIzaSy...01"
 #     prefix: "test" # optional: require calls like "test/gemini-3-pro-preview" to target this credential
 #     base-url: "https://generativelanguage.googleapis.com"
-#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this credential
+#     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080"
@@ -252,7 +253,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
-#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this credential
+#     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -271,7 +272,7 @@ nonstream-keepalive-interval: 0
 # xai-api-key:
 #   - api-key: "xai-..."
 #     prefix: "xai" # optional: require calls like "xai/grok-4.5" to target this credential
-#     disable-cooling: false # optional: per-auth override for request-error and 429 quota cooldown
+#     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
 #     base-url: "https://api.x.ai/v1" # xAI-compatible Responses API endpoint
 #     websockets: true # optional: use the xAI upstream websocket transport for downstream websocket requests
 #     headers:
@@ -293,7 +294,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/claude-sonnet-latest" to target this credential
 #     base-url: "https://www.example.com" # use the custom claude API endpoint
-#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this credential
+#     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -348,7 +349,7 @@ nonstream-keepalive-interval: 0
 #     disabled: false # optional: set to true to disable this provider without removing it
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
-#     disable-cooling: false # optional: disable request-error and 429 quota cooldown for this provider's credentials
+#     disable-cooling: false # optional provider override: true disables cooling, false enables it; omit to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
@@ -378,6 +379,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "vk-123..."                        # x-goog-api-key header
 #     prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
 #     base-url: "https://example.com/api"         # optional, e.g. https://zenmux.ai/api; falls back to Google Vertex when omitted
+#     disable-cooling: false                       # optional override: true disables cooling, false enables it; omit to inherit global
 #     proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
 #     # proxy-url: "direct" # optional: explicit direct connect for this credential
 #     headers:

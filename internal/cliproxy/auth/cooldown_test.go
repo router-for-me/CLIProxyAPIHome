@@ -616,15 +616,18 @@ func TestFenceDisabledCooldownStatesMutatesCleanQueuedAuth(t *testing.T) {
 func TestBuildDispatchCandidateAppliesCurrentDisableCoolingPolicy(t *testing.T) {
 	now := time.Now().UTC()
 	const model = "gpt-5"
+	disableCooling := true
+	enableCooling := false
 	tests := []struct {
-		name              string
-		globalDisable     bool
-		credentialDisable bool
-		wantAvailable     bool
+		name               string
+		globalDisable      bool
+		credentialOverride *bool
+		wantAvailable      bool
 	}{
 		{name: "cooling enabled", wantAvailable: false},
 		{name: "global disable", globalDisable: true, wantAvailable: true},
-		{name: "credential disable", credentialDisable: true, wantAvailable: true},
+		{name: "credential disable", credentialOverride: &disableCooling, wantAvailable: true},
+		{name: "credential enable overrides global", globalDisable: true, credentialOverride: &enableCooling, wantAvailable: false},
 	}
 
 	for _, tc := range tests {
@@ -635,7 +638,7 @@ func TestBuildDispatchCandidateAppliesCurrentDisableCoolingPolicy(t *testing.T) 
 				Index:                 authID,
 				Provider:              "codex",
 				Status:                StatusError,
-				RuntimeDisableCooling: tc.credentialDisable,
+				RuntimeDisableCooling: tc.credentialOverride,
 				ModelStates: map[string]*ModelState{
 					model: {
 						Status:         StatusError,

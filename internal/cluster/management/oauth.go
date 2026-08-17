@@ -578,11 +578,10 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 		entry["updated_at"] = auth.UpdatedAt
 		entry["modtime"] = auth.UpdatedAt
 	}
-	// Surface the cooling override so the management UI can read back a
-	// persisted disable-cooling state (mirrors apiKeyAuthToMap). True-only:
-	// emit the field only when the override is explicitly set to true.
-	if disabledCooling, okDisableCooling := auth.DisableCoolingOverride(); okDisableCooling && disabledCooling {
-		entry["disable-cooling"] = true
+	// Surface the cooling override so the management UI can distinguish an
+	// explicit false value from an absent override (mirrors apiKeyAuthToMap).
+	if disabledCooling := auth.DisableCoolingOverride(); disabledCooling != nil {
+		entry["disable-cooling"] = *disabledCooling
 	}
 	return entry
 }
@@ -626,6 +625,11 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 			return false, fmt.Errorf("invalid field %s", fieldPath)
 		}
 		metadataPath := oauthMetadataFieldPath(fieldPath)
+		if metadataPath == "disable_cooling" {
+			// Keep one canonical key so a PATCH using the public hyphenated alias
+			// cannot be shadowed by a previously stored legacy value.
+			delete(auth.Metadata, "disable-cooling")
+		}
 		if metadataPath == "headers" {
 			applyOAuthHeadersPatch(auth, value)
 		} else if errSet := setOAuthMetadataValue(auth.Metadata, metadataPath, value); errSet != nil {
@@ -677,10 +681,14 @@ func removeOAuthFieldPatchConcurrencyFields(fields map[string]json.RawMessage) {
 }
 
 func oauthMetadataFieldPath(path string) string {
-	if strings.TrimSpace(path) == "proxy-url" {
+	switch strings.TrimSpace(path) {
+	case "proxy-url":
 		return "proxy_url"
+	case "disable-cooling":
+		return "disable_cooling"
+	default:
+		return path
 	}
-	return path
 }
 
 func rootOAuthField(path string) string {

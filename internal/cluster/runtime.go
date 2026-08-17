@@ -81,6 +81,7 @@ func (a *RuntimeAdapter) LoadIndex(ctx context.Context) error {
 		item.Attributes = cloneStringMap(item.Attributes)
 		item.ModelMetadata = cloneModelMetadata(item.ModelMetadata)
 		item.ModelStates = cloneModelStateMap(item.ModelStates)
+		item.DisableCooling = cloneOptionalBool(item.DisableCooling)
 		next[uuid] = item
 		nextVersions[uuid] = item.Version
 	}
@@ -414,6 +415,7 @@ func (a *RuntimeAdapter) cacheAuthSnapshot(uuid string, record *AuthRecord, auth
 	}
 	cached := auth.Clone()
 	cached.StateVersion = item.Version
+	cached.RuntimeDisableCooling = cloneOptionalBool(item.DisableCooling)
 	a.fullCache[uuid] = cached
 	return true
 }
@@ -456,6 +458,7 @@ func (a *RuntimeAdapter) storeAuthIndexLocked(uuid string, item AuthIndex) {
 	item.Attributes = cloneStringMap(item.Attributes)
 	item.ModelMetadata = cloneModelMetadata(item.ModelMetadata)
 	item.ModelStates = cloneModelStateMap(item.ModelStates)
+	item.DisableCooling = cloneOptionalBool(item.DisableCooling)
 	a.index[uuid] = item
 	a.versions[uuid] = item.Version
 }
@@ -658,6 +661,7 @@ func (a *RuntimeAdapter) GetFullAuth(ctx context.Context, uuid string) (*coreaut
 		}
 		cached := auth.Clone()
 		cached.StateVersion = item.Version
+		cached.RuntimeDisableCooling = cloneOptionalBool(item.DisableCooling)
 		a.fullCache[uuid] = cached
 		a.mu.Unlock()
 		return cached.Clone(), nil
@@ -704,7 +708,7 @@ func (a *RuntimeAdapter) ListMinimalAuths() []*coreauth.Auth {
 func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 	// Normalize auth state before updating runtime indexes.
 	item := AuthIndex{}
-	disableCooling := auth.DisableCoolingEnabled()
+	disableCooling := cloneOptionalBool(auth.DisableCoolingOverride())
 	if record != nil {
 		item.UUID = strings.TrimSpace(record.UUID)
 		item.Version = record.Version
@@ -778,7 +782,7 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 		ModelStates:           cloneModelStateMap(item.ModelStates),
 		Attributes:            attrs,
 		Metadata:              metadata,
-		RuntimeDisableCooling: item.DisableCooling,
+		RuntimeDisableCooling: cloneOptionalBool(item.DisableCooling),
 	}
 }
 
@@ -804,6 +808,14 @@ func cloneModelStateMap(in map[string]*coreauth.ModelState) map[string]*coreauth
 		out[key] = state.Clone()
 	}
 	return out
+}
+
+func cloneOptionalBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 // cloneModelMetadata clones model metadata.

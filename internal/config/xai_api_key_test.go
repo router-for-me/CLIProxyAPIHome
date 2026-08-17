@@ -72,7 +72,7 @@ func TestLoadConfigOptionalParsesAndSanitizesXAIKeys(t *testing.T) {
         force-mapping: true
     excluded-models:
       - " GROK-3-* "
-    disable-cooling: true
+    disable-cooling: false
   - api-key: "dropped"
     base-url: " "
 `)
@@ -91,7 +91,7 @@ func TestLoadConfigOptionalParsesAndSanitizesXAIKeys(t *testing.T) {
 	if entry.APIKey != " xai-key " || entry.BaseURL != "https://api.x.ai/v1" {
 		t.Fatalf("xAI key/base URL = %q/%q", entry.APIKey, entry.BaseURL)
 	}
-	if entry.Prefix != "grok" || entry.Priority != 9 || !entry.Websockets || !entry.DisableCooling {
+	if entry.Prefix != "grok" || entry.Priority != 9 || !entry.Websockets || entry.DisableCooling == nil || *entry.DisableCooling {
 		t.Fatalf("xAI routing fields = %+v", entry)
 	}
 	if entry.Headers["X-Test"] != "value" || len(entry.ExcludedModels) != 1 || entry.ExcludedModels[0] != "grok-3-*" {
