@@ -172,6 +172,9 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	if errUnmarshalRoot := yaml.Unmarshal(out, &root); errUnmarshalRoot != nil {
 		return nil, fmt.Errorf("home runtime: unmarshal downstream config root: %w", errUnmarshalRoot)
 	}
+	if root == nil {
+		root = make(map[string]any)
+	}
 	appconfig.ApplyDownstreamHomeModeScalars(root)
 	forced, errMarshalRoot := yaml.Marshal(root)
 	if errMarshalRoot != nil {

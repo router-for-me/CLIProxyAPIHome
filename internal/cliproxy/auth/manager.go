@@ -86,6 +86,8 @@ type Manager struct {
 	resultPersistMu      sync.Mutex
 	resultPersistWake    chan struct{}
 	resultPersistPending map[string]*Auth
+	resultPersistActive  map[string]struct{}
+	cooldownFencePending map[string]struct{}
 }
 
 // NewManager creates a new manager.
@@ -100,13 +102,19 @@ func NewManager(store Store, selector Selector, _ any) *Manager {
 		indexAuth:            make(map[string]*Auth),
 		resultPersistWake:    make(chan struct{}, 1),
 		resultPersistPending: make(map[string]*Auth),
+		resultPersistActive:  make(map[string]struct{}),
+		cooldownFencePending: make(map[string]struct{}),
 	}
 	mgr.runtimeConfig.Store(&internalconfig.Config{})
 	// atomic.Value requires non-nil initial value.
 	mgr.oauthModelAlias.Store(&oauthModelAliasTable{})
-	mgr.scheduler = newAuthScheduler(selector, func(auth *Auth, routeModel string) string {
-		return mgr.resolveDispatchModel(auth, routeModel).Model
-	})
+	mgr.scheduler = newAuthScheduler(
+		selector,
+		func(auth *Auth, routeModel string) string {
+			return mgr.resolveDispatchModel(auth, routeModel).Model
+		},
+		mgr.effectiveAvailabilityAuth,
+	)
 	return mgr
 }
 
@@ -409,6 +417,12 @@ func (m *Manager) enqueueResultPersist(ctx context.Context, auth *Auth) {
 		if m.resultPersistPending == nil {
 			m.resultPersistPending = make(map[string]*Auth)
 		}
+		if m.resultPersistActive == nil {
+			m.resultPersistActive = make(map[string]struct{})
+		}
+		if m.cooldownFencePending == nil {
+			m.cooldownFencePending = make(map[string]struct{})
+		}
 		m.resultPersistMu.Unlock()
 		go m.runResultPersistWorker()
 	})
@@ -453,10 +467,19 @@ func (m *Manager) flushResultPersistQueue() {
 		}
 		pending := m.resultPersistPending
 		m.resultPersistPending = make(map[string]*Auth, len(pending))
+		if m.resultPersistActive == nil {
+			m.resultPersistActive = make(map[string]struct{}, len(pending))
+		}
+		for authID := range pending {
+			m.resultPersistActive[authID] = struct{}{}
+		}
 		m.resultPersistMu.Unlock()
 
-		for _, auth := range pending {
+		for authID, auth := range pending {
 			_ = m.persist(context.Background(), auth)
+			m.resultPersistMu.Lock()
+			delete(m.resultPersistActive, authID)
+			m.resultPersistMu.Unlock()
 		}
 	}
 }
@@ -548,8 +571,10 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 	// Registry IDs are client-visible route models, while execution state is
 	// keyed by the credential-specific upstream model. Keep both so aliases and
 	// credential prefixes reconcile against the same state used by Dispatch.
-	models := make(map[string]string, len(auth.ModelStates))
-	for model := range auth.ModelStates {
+	now := time.Now()
+	authForAvailability := m.effectiveAvailabilityAuth(auth, now)
+	models := make(map[string]string, len(authForAvailability.ModelStates))
+	for model := range authForAvailability.ModelStates {
 		if model = canonicalModelKey(model); model != "" {
 			models[model] = model
 		}
@@ -563,18 +588,17 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 			continue
 		}
 		stateModel := canonicalModelKey(registryModel)
-		if resolved := m.resolveDispatchModel(auth, registryModel); resolved.Key != "" {
+		if resolved := m.resolveDispatchModel(authForAvailability, registryModel); resolved.Key != "" {
 			stateModel = resolved.Key
 		}
 		models[registryModel] = stateModel
 	}
 
-	now := time.Now()
 	for registryModel, stateModel := range models {
-		blocked, reason, _ := isAuthBlockedForModel(auth, stateModel, now)
+		blocked, reason, _ := isAuthBlockedForModel(authForAvailability, stateModel, now)
 		legacyModel := canonicalModelKey(registryModel)
 		if !blocked && stateModel != legacyModel {
-			if legacyBlocked, legacyReason, _ := isAuthBlockedForModel(auth, legacyModel, now); legacyBlocked {
+			if legacyBlocked, legacyReason, _ := isAuthBlockedForModel(authForAvailability, legacyModel, now); legacyBlocked {
 				blocked = true
 				reason = legacyReason
 				stateModel = legacyModel
@@ -586,7 +610,7 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 			modelRegistry.ClearModelQuotaExceeded(auth.ID, registryModel)
 		}
 
-		if !blocked || !shouldSuspendRegistryModel(auth, stateModel, reason) {
+		if !blocked || !shouldSuspendRegistryModel(authForAvailability, stateModel, reason) {
 			modelRegistry.ResumeClientModel(auth.ID, registryModel)
 			continue
 		}
@@ -597,7 +621,7 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 		case blockReasonDisabled:
 			suspendReason = "disabled"
 		default:
-			if state := auth.ModelStates[stateModel]; state != nil && strings.TrimSpace(state.StatusMessage) != "" {
+			if state := authForAvailability.ModelStates[stateModel]; state != nil && strings.TrimSpace(state.StatusMessage) != "" {
 				suspendReason = strings.TrimSpace(state.StatusMessage)
 			}
 		}
@@ -666,12 +690,13 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 }
 
 type dispatchCandidate struct {
-	auth          *Auth
-	providerKey   string
-	upstreamModel string
-	upstreamKey   string
-	forceMapping  bool
-	originalAlias string
+	auth             *Auth
+	availabilityAuth *Auth
+	providerKey      string
+	upstreamModel    string
+	upstreamKey      string
+	forceMapping     bool
+	originalAlias    string
 }
 
 func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel, credentialPolicy string, now time.Time) (dispatchCandidate, bool, blockReason, time.Time) {
@@ -691,21 +716,35 @@ func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel, cr
 	if strings.TrimSpace(resolved.Model) == "" {
 		return dispatchCandidate{}, false, blockReasonOther, time.Time{}
 	}
-	blocked, reason, next := isAuthBlockedForModel(auth, resolved.Key, now)
+	authForAvailability := m.effectiveAvailabilityAuth(auth, now)
+	blocked, reason, next := isAuthBlockedForModel(authForAvailability, resolved.Key, now)
 	if !blocked && resolved.Key != canonicalModelKey(routeModel) {
-		blocked, reason, next = isAuthBlockedForModel(auth, routeModel, now)
+		blocked, reason, next = isAuthBlockedForModel(authForAvailability, routeModel, now)
 	}
 	if blocked {
 		return dispatchCandidate{}, false, reason, next
 	}
 	return dispatchCandidate{
-		auth:          auth,
-		providerKey:   providerKey,
-		upstreamModel: resolved.Model,
-		upstreamKey:   resolved.Key,
-		forceMapping:  resolved.ForceMapping,
-		originalAlias: resolved.OriginalAlias,
+		auth:             auth,
+		availabilityAuth: authForAvailability,
+		providerKey:      providerKey,
+		upstreamModel:    resolved.Model,
+		upstreamKey:      resolved.Key,
+		forceMapping:     resolved.ForceMapping,
+		originalAlias:    resolved.OriginalAlias,
 	}, true, blockReasonNone, time.Time{}
+}
+
+// effectiveAvailabilityAuth applies the current cooling policy to a scheduling
+// view without mutating the full credential returned to the executor. This
+// keeps disable-cooling effective even while persisted cleanup is retrying.
+func (m *Manager) effectiveAvailabilityAuth(auth *Auth, now time.Time) *Auth {
+	if auth == nil || !m.quotaCooldownDisabledForAuth(auth) || !hasDisabledCooldownState(auth) {
+		return auth
+	}
+	effective := auth.Clone()
+	clearDisabledCooldownState(effective, now)
+	return effective
 }
 
 func dispatchUnavailableError(routeModel, provider string, total int, cooldownCount int, earliest time.Time, now time.Time) error {
@@ -864,7 +903,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				continue
 			}
 			dispatchCandidates = append(dispatchCandidates, dispatchCandidate)
-			availableAuths = append(availableAuths, candidate)
+			availableAuths = append(availableAuths, dispatchCandidate.availabilityAuth)
 		}
 		m.mu.RUnlock()
 
@@ -918,7 +957,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 		tried[auth.ID] = struct{}{}
 
-		fullAuth, okFull, errFull := m.resolveFullDispatchAuth(ctx, auth)
+		// Selectors operate on the effective availability view, while execution
+		// must still resolve the original full credential snapshot.
+		fullAuth, okFull, errFull := m.resolveFullDispatchAuth(ctx, selectedCandidate.auth)
 		if errFull != nil {
 			return nil, errFull
 		}

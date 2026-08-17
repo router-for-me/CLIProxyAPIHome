@@ -229,14 +229,14 @@ func TestAuthFileEntryEmitsDisableCoolingOverride(t *testing.T) {
 			t.Fatalf("disable-cooling present = %#v, want absent", entry["disable-cooling"])
 		}
 	})
-	t.Run("omits when override is explicitly false", func(t *testing.T) {
+	t.Run("emits when override is explicitly false", func(t *testing.T) {
 		entry := authFileEntry(&coreauth.Auth{
 			ID:       "codex-auth",
 			Provider: "codex",
 			Metadata: map[string]any{"type": "codex", "disable_cooling": false},
 		})
-		if _, ok := entry["disable-cooling"]; ok {
-			t.Fatalf("disable-cooling present = %#v, want absent (override is true-only)", entry["disable-cooling"])
+		if got, ok := entry["disable-cooling"]; !ok || got != false {
+			t.Fatalf("disable-cooling = %#v (present=%t), want false", entry["disable-cooling"], ok)
 		}
 	})
 }
@@ -266,7 +266,7 @@ func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {
 	var payload struct {
 		Files []struct {
 			ID             string `json:"id"`
-			DisableCooling bool   `json:"disable-cooling"`
+			DisableCooling *bool  `json:"disable-cooling"`
 		} `json:"files"`
 	}
 	if errDecode := json.Unmarshal(listResponse.Body.Bytes(), &payload); errDecode != nil {
@@ -275,7 +275,7 @@ func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {
 	if len(payload.Files) != 1 {
 		t.Fatalf("files = %#v, want one item", payload.Files)
 	}
-	if file := payload.Files[0]; file.ID != "oauth-cooling" || !file.DisableCooling {
+	if file := payload.Files[0]; file.ID != "oauth-cooling" || file.DisableCooling == nil || !*file.DisableCooling {
 		t.Fatalf("file = %#v, want disable-cooling round-tripped to true", file)
 	}
 
@@ -283,8 +283,53 @@ func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {
 	if errAuth != nil {
 		t.Fatalf("GetAuth() error = %v", errAuth)
 	}
-	if disabled, ok := persisted.DisableCoolingOverride(); !ok || !disabled {
-		t.Fatalf("persisted override = (%t, %t), want (true, true)", disabled, ok)
+	if disabled := persisted.DisableCoolingOverride(); disabled == nil || !*disabled {
+		t.Fatalf("persisted override = %#v, want true", disabled)
+	}
+
+	patchFalseResponse := httptest.NewRecorder()
+	patchFalseRequest := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{
+		"id":"oauth-cooling",
+		"disable_cooling":false
+	}`))
+	patchFalseRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(patchFalseResponse, patchFalseRequest)
+	if patchFalseResponse.Code != http.StatusOK {
+		t.Fatalf("PATCH false status = %d body=%s", patchFalseResponse.Code, patchFalseResponse.Body.String())
+	}
+
+	listFalseResponse := httptest.NewRecorder()
+	engine.ServeHTTP(listFalseResponse, httptest.NewRequest(http.MethodGet, "/auth-files", nil))
+	if errDecode := json.Unmarshal(listFalseResponse.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode false GET response: %v", errDecode)
+	}
+	if len(payload.Files) != 1 || payload.Files[0].DisableCooling == nil || *payload.Files[0].DisableCooling {
+		t.Fatalf("files = %#v, want explicit disable-cooling false", payload.Files)
+	}
+	persisted, _, errAuth = handler.repo.GetAuth(t.Context(), "oauth-cooling")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() after false patch error = %v", errAuth)
+	}
+	if disabled := persisted.DisableCoolingOverride(); disabled == nil || *disabled {
+		t.Fatalf("persisted override = %#v, want false", disabled)
+	}
+
+	patchHyphenResponse := httptest.NewRecorder()
+	patchHyphenRequest := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{
+		"id":"oauth-cooling",
+		"disable-cooling":true
+	}`))
+	patchHyphenRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(patchHyphenResponse, patchHyphenRequest)
+	if patchHyphenResponse.Code != http.StatusOK {
+		t.Fatalf("PATCH hyphenated true status = %d body=%s", patchHyphenResponse.Code, patchHyphenResponse.Body.String())
+	}
+	persisted, _, errAuth = handler.repo.GetAuth(t.Context(), "oauth-cooling")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() after hyphenated true patch error = %v", errAuth)
+	}
+	if disabled := persisted.DisableCoolingOverride(); disabled == nil || !*disabled {
+		t.Fatalf("persisted override after hyphenated patch = %#v, want true", disabled)
 	}
 }
 

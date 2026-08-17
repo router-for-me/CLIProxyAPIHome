@@ -41,6 +41,10 @@ type VertexCompatKey struct {
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling overrides the global cooling policy for this credential when set.
+	// True disables request-error and quota cooldowns; false explicitly enables them.
+	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
 // GetAPIKey returns an api key.

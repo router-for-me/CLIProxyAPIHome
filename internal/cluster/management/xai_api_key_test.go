@@ -114,7 +114,7 @@ func TestXAIAPIKeyManagementCRUD(t *testing.T) {
 	}
 
 	patchResp := httptest.NewRecorder()
-	patchReq := httptest.NewRequest(http.MethodPatch, "/xai-api-key", strings.NewReader(`{"match":"xai-key","value":{"priority":11,"websockets":false}}`))
+	patchReq := httptest.NewRequest(http.MethodPatch, "/xai-api-key", strings.NewReader(`{"match":"xai-key","value":{"priority":11,"websockets":false,"disable-cooling":false}}`))
 	patchReq.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(patchResp, patchReq)
 	if patchResp.Code != http.StatusOK {
@@ -129,6 +129,9 @@ func TestXAIAPIKeyManagementCRUD(t *testing.T) {
 	}
 	if item["disabled"] != true {
 		t.Fatalf("PATCH unexpectedly enabled credential: %#v", item)
+	}
+	if item["disable-cooling"] != false {
+		t.Fatalf("PATCH disable-cooling = %#v, want false", item["disable-cooling"])
 	}
 
 	replaceResp := httptest.NewRecorder()

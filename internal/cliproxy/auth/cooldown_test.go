@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -153,6 +155,757 @@ func TestClearModelQuotaCooldownKeepsLegacyMergeTimestamp(t *testing.T) {
 	}
 }
 
+func TestClearDisabledCooldownStatesClearsCoolingAndPreservesOtherErrors(t *testing.T) {
+	now := time.Now().UTC()
+	transientRetry := now.Add(5 * time.Minute)
+	quotaRetry := now.Add(10 * time.Minute)
+	unauthorizedRetry := now.Add(15 * time.Minute)
+	unsupportedRetry := now.Add(20 * time.Minute)
+	const authID = "auth-clear-disabled-cooling"
+
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusError,
+		Metadata: map[string]any{"email": "user@example.com"},
+		ModelStates: map[string]*ModelState{
+			"transient": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: transientRetry,
+				LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+				UpdatedAt:      now,
+			},
+			"quota": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: quotaRetry,
+				LastError:      &Error{Message: "rate limited", HTTPStatus: http.StatusTooManyRequests},
+				Quota:          QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota", NextRecoverAt: quotaRetry},
+				UpdatedAt:      now,
+			},
+			"unauthorized": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: unauthorizedRetry,
+				LastError:      &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized},
+				UpdatedAt:      now,
+			},
+			"unsupported": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: unsupportedRetry,
+				LastError:      &Error{Message: "model not supported", HTTPStatus: http.StatusBadRequest},
+				UpdatedAt:      now,
+			},
+		},
+	}}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	if got := store.mutationCount(); got != 1 {
+		t.Fatalf("database mutation count = %d, want 1", got)
+	}
+
+	assertState := func(auth *Auth, model string) *ModelState {
+		t.Helper()
+		state := auth.ModelStates[model]
+		if state == nil {
+			t.Fatalf("ModelStates[%s] missing in %#v", model, auth.ModelStates)
+		}
+		return state
+	}
+	persisted := store.persistedSnapshot()
+	transient := assertState(persisted, "transient")
+	if transient.Unavailable || !transient.NextRetryAfter.IsZero() || transient.LastError == nil || transient.LastError.HTTPStatus != http.StatusServiceUnavailable || !transient.UpdatedAt.Equal(now) {
+		t.Fatalf("persisted transient state = %#v, want dispatchable state with error retained", transient)
+	}
+	quota := assertState(persisted, "quota")
+	if quota.Unavailable || !quota.NextRetryAfter.IsZero() || quota.Quota.Exceeded || quota.QuotaResetAt.IsZero() || !quota.UpdatedAt.Equal(now) {
+		t.Fatalf("persisted quota state = %#v, want quota cooldown cleared", quota)
+	}
+	unauthorized := assertState(persisted, "unauthorized")
+	if !unauthorized.Unavailable || !unauthorized.NextRetryAfter.Equal(unauthorizedRetry) {
+		t.Fatalf("persisted unauthorized state = %#v, want preserved", unauthorized)
+	}
+	unsupported := assertState(persisted, "unsupported")
+	if !unsupported.Unavailable || !unsupported.NextRetryAfter.Equal(unsupportedRetry) {
+		t.Fatalf("persisted unsupported state = %#v, want preserved", unsupported)
+	}
+
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil {
+		t.Fatalf("GetByID(%s) missing local auth", authID)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(local, "transient", time.Now()); blocked {
+		t.Fatal("transient model remained blocked after clearing disabled cooldown")
+	}
+	if blocked, reason, _ := isAuthBlockedForModel(local, "quota", time.Now()); blocked || reason != blockReasonNone {
+		t.Fatalf("quota model block = %v/%v, want dispatchable", blocked, reason)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(local, "unauthorized", time.Now()); !blocked {
+		t.Fatal("unauthorized model was cleared unexpectedly")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(local, "unsupported", time.Now()); !blocked {
+		t.Fatal("unsupported model was cleared unexpectedly")
+	}
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("second ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	if got := store.mutationCount(); got != 1 {
+		t.Fatalf("database mutation count after clean reload = %d, want 1", got)
+	}
+}
+
+func TestClearDisabledCooldownStatesClearsLegacyCredentialQuota(t *testing.T) {
+	tests := []struct {
+		name              string
+		globalDisable     bool
+		credentialDisable bool
+		exceeded          bool
+		withModelState    bool
+	}{
+		{name: "global setting", globalDisable: true, exceeded: true},
+		{name: "credential override with clean model", credentialDisable: true, exceeded: true, withModelState: true},
+		{name: "recovery timestamp without exceeded flag", globalDisable: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			retryAt := now.Add(10 * time.Minute)
+			authID := "auth-clear-legacy-credential-quota-" + strings.ReplaceAll(tc.name, " ", "-")
+			metadata := map[string]any{"access_token": "preserved"}
+			if tc.credentialDisable {
+				metadata["disable_cooling"] = true
+			}
+			persistedAuth := &Auth{
+				ID:             authID,
+				Index:          authID,
+				Provider:       "codex",
+				Status:         StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+				LastError:      &Error{Message: "quota exhausted", HTTPStatus: http.StatusTooManyRequests},
+				Quota: QuotaState{
+					Exceeded:      tc.exceeded,
+					Scope:         "credential",
+					Reason:        "quota",
+					NextRecoverAt: retryAt,
+					BackoffLevel:  4,
+				},
+				Metadata: metadata,
+			}
+			if tc.withModelState {
+				persistedAuth.ModelStates = map[string]*ModelState{"gpt-5": {Status: StatusActive, UpdatedAt: now}}
+			}
+			store := &fakeMutatorStore{persisted: persistedAuth}
+			manager := NewManager(store, nil, nil)
+			manager.SetConfig(&internalconfig.Config{DisableCooling: tc.globalDisable})
+			if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+				t.Fatalf("ClearDisabledCooldownStates() error = %v", errClear)
+			}
+			persisted := store.persistedSnapshot()
+			if persisted.Unavailable || !persisted.NextRetryAfter.IsZero() || persisted.Quota.Exceeded || !persisted.Quota.NextRecoverAt.IsZero() {
+				t.Fatalf("persisted credential quota state = %#v, want dispatchable", persisted)
+			}
+			if persisted.Status != StatusActive || persisted.StatusMessage != "" || persisted.LastError != nil {
+				t.Fatalf("persisted credential status = %#v, want active", persisted)
+			}
+			if got := persisted.Metadata["access_token"]; got != "preserved" {
+				t.Fatalf("access_token = %v, want preserved", got)
+			}
+			if got := store.mutationCount(); got != 1 {
+				t.Fatalf("database mutation count = %d, want 1", got)
+			}
+
+			if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+				t.Fatalf("second ClearDisabledCooldownStates() error = %v", errClear)
+			}
+			if got := store.mutationCount(); got != 1 {
+				t.Fatalf("database mutation count after cleared cooldown = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestClearDisabledCooldownStatePreservesNewerUncoveredModelError(t *testing.T) {
+	observedAt := time.Now().UTC()
+	clearAt := observedAt.Add(time.Minute)
+	auth := &Auth{
+		ID:       "auth-clear-request-timestamp",
+		Index:    "auth-clear-request-timestamp",
+		Provider: "codex",
+		Status:   StatusError,
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: observedAt.Add(5 * time.Minute),
+				LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+				UpdatedAt:      observedAt,
+			},
+		},
+	}
+
+	if changed := clearDisabledCooldownState(auth, clearAt); !changed {
+		t.Fatal("clearDisabledCooldownState() did not clear request cooldown")
+	}
+	persistedState := auth.ModelStates["gpt-5"]
+	if !persistedState.UpdatedAt.Equal(observedAt) {
+		t.Fatalf("cleared request UpdatedAt = %v, want original %v", persistedState.UpdatedAt, observedAt)
+	}
+
+	newerUnsupported := &ModelState{
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: clearAt.Add(12 * time.Hour),
+		LastError:      &Error{Message: "model not supported", HTTPStatus: http.StatusBadRequest},
+		UpdatedAt:      observedAt.Add(30 * time.Second),
+	}
+	merged := MergePersistedModelState(persistedState, newerUnsupported)
+	if merged == nil || merged.LastError == nil || merged.LastError.HTTPStatus != http.StatusBadRequest || !merged.NextRetryAfter.Equal(newerUnsupported.NextRetryAfter) {
+		t.Fatalf("merged state = %#v, want newer uncovered model error preserved", merged)
+	}
+}
+
+func TestDisabledQuotaResultResumesRegistryModel(t *testing.T) {
+	const authID = "auth-disabled-quota-registry"
+	const model = "disabled-quota-registry-model"
+
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model, Object: "model", Type: "openai"}})
+	modelRegistry.SuspendClientModel(authID, model, "not_found")
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+	if registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("test setup did not suspend model")
+	}
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Error:    &Error{Message: "quota exhausted", HTTPStatus: http.StatusTooManyRequests},
+	})
+
+	got, ok := manager.GetByID(authID)
+	if !ok || got == nil || got.ModelStates[model] == nil {
+		t.Fatalf("GetByID() missing model state: %#v", got)
+	}
+	state := got.ModelStates[model]
+	if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("disabled quota state = %#v, want dispatchable", state)
+	}
+	if !registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("registry remained suspended after disabled 429 result")
+	}
+}
+
+func TestClearDisabledCooldownStatesPreservesDisabledAuthState(t *testing.T) {
+	now := time.Now().UTC()
+	quotaState := quotaCooldownModelState(now, 10*time.Minute)
+	transientState := &ModelState{
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(5 * time.Minute),
+		LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+		UpdatedAt:      now,
+	}
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:             "auth-clear-disabled-auth",
+		Index:          "auth-clear-disabled-auth",
+		Provider:       "codex",
+		Disabled:       true,
+		Status:         StatusDisabled,
+		StatusMessage:  "disabled via management API",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Hour),
+		Quota:          quotaState.Quota,
+		ModelStates: map[string]*ModelState{
+			"quota":     quotaState,
+			"transient": transientState,
+		},
+	}}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	persisted := store.persistedSnapshot()
+	if !persisted.Disabled || persisted.Status != StatusDisabled || persisted.StatusMessage != "disabled via management API" || !persisted.Unavailable || !persisted.NextRetryAfter.After(now) {
+		t.Fatalf("disabled auth state = %#v, want preserved", persisted)
+	}
+	if persisted.ModelStates["quota"].Quota.Exceeded || !persisted.ModelStates["quota"].NextRetryAfter.IsZero() {
+		t.Fatalf("disabled quota model state = %#v, want quota cooldown cleared", persisted.ModelStates["quota"])
+	}
+	if persisted.ModelStates["transient"].LastError == nil || persisted.ModelStates["transient"].LastError.HTTPStatus != http.StatusServiceUnavailable || !persisted.ModelStates["transient"].NextRetryAfter.IsZero() {
+		t.Fatalf("disabled transient model state = %#v, want retry cleared with error retained", persisted.ModelStates["transient"])
+	}
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("second ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	if got := store.mutationCount(); got != 1 {
+		t.Fatalf("database mutation count after clean reload = %d, want 1", got)
+	}
+}
+
+func TestClearDisabledCooldownStatesAdoptsAlreadyClearedPersistedState(t *testing.T) {
+	now := time.Now().UTC()
+	localState := &ModelState{
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(5 * time.Minute),
+		LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+		UpdatedAt:      now,
+	}
+	const authID = "auth-clear-disabled-authoritative"
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Disabled: true,
+		Status:   StatusDisabled,
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {Status: StatusActive},
+		},
+	}}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID: authID, Index: authID, Provider: "codex", Status: StatusActive,
+		ModelStates: map[string]*ModelState{"gpt-5": localState},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || !local.Disabled || local.Status != StatusDisabled {
+		t.Fatalf("local auth = %#v/%v, want persisted disabled state", local, ok)
+	}
+	state := local.ModelStates["gpt-5"]
+	if state == nil || state.Unavailable || !state.NextRetryAfter.IsZero() {
+		t.Fatalf("local model state = %#v, want stale cooldown cleared", state)
+	}
+}
+
+func TestClearDisabledCooldownStatesCanRetryAfterMutationFailure(t *testing.T) {
+	const authID = "auth-clear-disabled-retry"
+	now := time.Now().UTC()
+	store := &fakeMutatorStore{
+		persisted: &Auth{
+			ID:       authID,
+			Index:    authID,
+			Provider: "codex",
+			Status:   StatusError,
+			ModelStates: map[string]*ModelState{
+				"gpt-5": {
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: now.Add(time.Minute),
+					LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+				},
+			},
+		},
+		mutateErr: errors.New("database temporarily unavailable"),
+	}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear == nil {
+		t.Fatal("ClearDisabledCooldownStates() succeeded during mutation failure")
+	}
+	if state := store.persistedSnapshot().ModelStates["gpt-5"]; state == nil || state.NextRetryAfter.IsZero() {
+		t.Fatalf("persisted state after failed clear = %#v, want cooldown retained", state)
+	}
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || local.ModelStates["gpt-5"] == nil || !local.ModelStates["gpt-5"].NextRetryAfter.IsZero() || local.ModelStates["gpt-5"].Unavailable {
+		t.Fatalf("local state after failed persistence = %#v, want cooldown cleared", local)
+	}
+
+	store.mu.Lock()
+	store.mutateErr = nil
+	store.mu.Unlock()
+	if _, errUpdate := manager.Update(WithSkipPersist(context.Background()), store.persistedSnapshot()); errUpdate != nil {
+		t.Fatalf("Update() reload error = %v", errUpdate)
+	}
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() retry error = %v", errClear)
+	}
+	if state := store.persistedSnapshot().ModelStates["gpt-5"]; state == nil || !state.NextRetryAfter.IsZero() || state.Unavailable {
+		t.Fatalf("persisted state after retry = %#v, want cleared", state)
+	}
+}
+
+func TestClearDisabledCooldownStatesSkipsCleanAuthMutation(t *testing.T) {
+	const authID = "auth-clear-disabled-clean"
+	store := &fakeMutatorStore{
+		persisted: &Auth{ID: authID, Index: authID, Provider: "codex", Status: StatusActive},
+		mutateErr: errors.New("mutation should not be called"),
+	}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() clean auth error = %v", errClear)
+	}
+}
+
+func TestFenceDisabledCooldownStatesMutatesCleanQueuedAuth(t *testing.T) {
+	const authID = "auth-fence-disabled-clean"
+	store := &fakeMutatorStore{
+		persisted: &Auth{ID: authID, Index: authID, Provider: "codex", Status: StatusActive},
+	}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	if errFence := manager.FenceDisabledCooldownStates(context.Background()); errFence != nil {
+		t.Fatalf("FenceDisabledCooldownStates() clean error = %v", errFence)
+	}
+	if got := store.mutationCount(); got != 0 {
+		t.Fatalf("clean auth database mutations = %d, want zero without a queued snapshot", got)
+	}
+	manager.resultPersistMu.Lock()
+	manager.resultPersistActive[authID] = struct{}{}
+	manager.resultPersistMu.Unlock()
+
+	if errFence := manager.FenceDisabledCooldownStates(context.Background()); errFence != nil {
+		t.Fatalf("FenceDisabledCooldownStates() error = %v", errFence)
+	}
+	if got := store.mutationCount(); got != 1 {
+		t.Fatalf("database mutation count = %d, want one revision fence", got)
+	}
+}
+
+func TestBuildDispatchCandidateAppliesCurrentDisableCoolingPolicy(t *testing.T) {
+	now := time.Now().UTC()
+	const model = "gpt-5"
+	disableCooling := true
+	enableCooling := false
+	tests := []struct {
+		name               string
+		globalDisable      bool
+		credentialOverride *bool
+		wantAvailable      bool
+	}{
+		{name: "cooling enabled", wantAvailable: false},
+		{name: "global disable", globalDisable: true, wantAvailable: true},
+		{name: "credential disable", credentialOverride: &disableCooling, wantAvailable: true},
+		{name: "credential enable overrides global", globalDisable: true, credentialOverride: &enableCooling, wantAvailable: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			authID := "auth-dispatch-policy-" + strings.ReplaceAll(tc.name, " ", "-")
+			auth := &Auth{
+				ID:                    authID,
+				Index:                 authID,
+				Provider:              "codex",
+				Status:                StatusError,
+				RuntimeDisableCooling: tc.credentialOverride,
+				ModelStates: map[string]*ModelState{
+					model: {
+						Status:         StatusError,
+						Unavailable:    true,
+						NextRetryAfter: now.Add(time.Minute),
+						LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+					},
+				},
+			}
+			manager := NewManager(nil, nil, nil)
+			registerDispatchTestAuth(t, manager, auth, model)
+			manager.SetConfig(&internalconfig.Config{DisableCooling: tc.globalDisable})
+
+			_, available, _, _ := manager.buildDispatchCandidate(auth, auth.Provider, model, "", now)
+			if available != tc.wantAvailable {
+				t.Fatalf("buildDispatchCandidate() available = %t, want %t", available, tc.wantAvailable)
+			}
+			state := auth.ModelStates[model]
+			if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+				t.Fatalf("source auth was mutated while deriving availability: %#v", state)
+			}
+			decision, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, model, Options{})
+			if tc.wantAvailable {
+				if errDispatch != nil || decision == nil || decision.Auth == nil || decision.Auth.ID != authID {
+					t.Fatalf("Dispatch() = %#v, %v; want auth %s", decision, errDispatch, authID)
+				}
+			} else if errDispatch == nil {
+				t.Fatalf("Dispatch() = %#v, nil; want cooldown error", decision)
+			}
+		})
+	}
+}
+
+func TestDispatchSessionAffinityUsesEffectiveAvailabilityAfterHotSwitch(t *testing.T) {
+	const authID = "auth-session-affinity-hot-switch"
+	const model = "session-affinity-hot-switch-model"
+	now := time.Now().UTC()
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &FillFirstSelector{},
+		TTL:      time.Minute,
+	})
+	t.Cleanup(selector.Stop)
+	manager := NewManager(nil, selector, nil)
+	registerDispatchTestAuth(t, manager, &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusError,
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+			},
+		},
+	}, model)
+	opts := Options{Headers: http.Header{"X-Session-ID": []string{"hot-switch-session"}}}
+
+	if decision, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, model, opts); errDispatch == nil {
+		t.Fatalf("Dispatch() before hot switch = %#v, nil; want cooldown error", decision)
+	}
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+
+	decision, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, model, opts)
+	if errDispatch != nil || decision == nil || decision.Auth == nil || decision.Auth.ID != authID {
+		t.Fatalf("Dispatch() after hot switch = %#v, %v; want auth %s", decision, errDispatch, authID)
+	}
+	source, ok := manager.GetByID(authID)
+	if !ok || source.ModelStates[model] == nil || !source.ModelStates[model].Unavailable || source.ModelStates[model].NextRetryAfter.IsZero() {
+		t.Fatalf("source auth after effective selection = %#v, want persisted cooldown unchanged", source)
+	}
+}
+
+func TestReconcileRegistryModelStatesUsesEffectiveAvailabilityAfterHotSwitch(t *testing.T) {
+	const authID = "auth-registry-effective-hot-switch"
+	const model = "registry-effective-hot-switch-model"
+	now := time.Now().UTC()
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model, Object: "model", Type: "openai"}})
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusError,
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+			},
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	modelRegistry.SuspendClientModel(authID, model, "upstream unavailable")
+	if registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("test setup did not suspend model")
+	}
+
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	manager.ReconcileRegistryModelStates(context.Background(), authID)
+
+	if !registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("registry remained suspended after disable-cooling hot switch")
+	}
+	source, ok := manager.GetByID(authID)
+	if !ok || source.ModelStates[model] == nil || !source.ModelStates[model].Unavailable || source.ModelStates[model].NextRetryAfter.IsZero() {
+		t.Fatalf("source auth after registry reconciliation = %#v, want persisted cooldown unchanged", source)
+	}
+}
+
+func TestCoveredResultReconcilesLateRegistryTransitionAfterHotSwitch(t *testing.T) {
+	const authID = "auth-registry-late-transition"
+	const model = "registry-late-transition-model"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model, Object: "model", Type: "openai"}})
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	// Simulate an older result transition reaching the registry after config
+	// cleanup has already left the authoritative manager state dispatchable.
+	modelRegistry.SuspendClientModel(authID, model, "payment_required")
+	if registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("test setup did not apply the late registry transition")
+	}
+
+	manager.reconcileCoveredCooldownAfterResult(context.Background(), authID)
+	if !registryHasAvailableModel(modelRegistry, model) {
+		t.Fatal("late registry transition remained after current-state reconciliation")
+	}
+}
+
+func TestClearDisabledCooldownStatesClearsStackedQuotaAndPreservesUnauthorized(t *testing.T) {
+	const authID = "auth-clear-disabled-stacked-quota"
+	const model = "gpt-5"
+	now := time.Now().UTC()
+	retryAt := now.Add(time.Minute)
+	unauthorized := &Error{Message: "expired access token", HTTPStatus: http.StatusUnauthorized}
+	quota := QuotaState{
+		Exceeded:      true,
+		Scope:         quotaScopeModel,
+		Reason:        "quota",
+		NextRecoverAt: now.Add(10 * time.Minute),
+	}
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: retryAt,
+		LastError:      cloneError(unauthorized),
+		Quota:          quota,
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+				LastError:      cloneError(unauthorized),
+				Quota:          quota,
+				UpdatedAt:      now,
+			},
+		},
+	}}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	if got := store.mutationCount(); got != 1 {
+		t.Fatalf("database mutation count = %d, want 1", got)
+	}
+
+	persisted := store.persistedSnapshot()
+	state := persisted.ModelStates[model]
+	if state == nil || state.Quota.Exceeded || state.QuotaResetAt.IsZero() {
+		t.Fatalf("persisted model state = %#v, want quota cleared", state)
+	}
+	if !state.Unavailable || !state.NextRetryAfter.Equal(retryAt) || state.LastError == nil || state.LastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("persisted model state = %#v, want unauthorized cooldown preserved", state)
+	}
+	if persisted.Quota.Exceeded {
+		t.Fatalf("persisted auth quota = %#v, want cleared", persisted.Quota)
+	}
+	if !persisted.Unavailable || !persisted.NextRetryAfter.Equal(retryAt) || persisted.LastError == nil || persisted.LastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("persisted auth state = %#v, want unauthorized cooldown preserved", persisted)
+	}
+}
+
+func TestClearDisabledCooldownStatesClearsStackedQuotaAndRequestError(t *testing.T) {
+	const authID = "auth-clear-disabled-stacked-request-error"
+	const model = "gpt-5"
+	now := time.Now().UTC()
+	requestRetryAt := now.Add(time.Minute)
+	quotaRetryAt := now.Add(10 * time.Minute)
+	quota := QuotaState{
+		Exceeded:      true,
+		Scope:         quotaScopeModel,
+		Reason:        "quota",
+		NextRecoverAt: quotaRetryAt,
+		BackoffLevel:  2,
+	}
+	requestError := &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: requestRetryAt,
+		LastError:      cloneError(requestError),
+		Quota:          quota,
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: requestRetryAt,
+				LastError:      cloneError(requestError),
+				Quota:          quota,
+				UpdatedAt:      now,
+			},
+		},
+	}}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&internalconfig.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(context.Background(), store.persistedSnapshot()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	persisted := store.persistedSnapshot()
+	state := persisted.ModelStates[model]
+	if state == nil || state.Quota.Exceeded || state.Unavailable || !state.NextRetryAfter.IsZero() || state.QuotaResetAt.IsZero() || state.LastError == nil || state.LastError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("persisted model state = %#v, want quota and request cooldown cleared", state)
+	}
+	if persisted.Quota.Exceeded || persisted.Unavailable || !persisted.NextRetryAfter.IsZero() {
+		t.Fatalf("persisted auth state = %#v, want dispatchable aggregate", persisted)
+	}
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("second ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	if got := store.mutationCount(); got != 1 {
+		t.Fatalf("database mutation count after cleared cooldown = %d, want 1", got)
+	}
+}
+
 func TestClearQuotaCooldownOverridesNewerLocalQuotaTimestamp(t *testing.T) {
 	const authID = "auth-reset-newer-local-quota"
 	const model = "gpt-5"
@@ -172,6 +925,8 @@ func TestClearQuotaCooldownOverridesNewerLocalQuotaTimestamp(t *testing.T) {
 
 	// A repeated 429 inside the open window stays local but advances the
 	// execution timestamp beyond the persisted quota snapshot.
+	// Cross one coarse Windows clock tick so the ordering assertion is stable.
+	time.Sleep(20 * time.Millisecond)
 	manager.MarkResult(context.Background(), quotaResult(authID, model))
 	localBefore, ok := manager.GetByID(authID)
 	if !ok || localBefore.ModelStates[model] == nil || !localBefore.ModelStates[model].UpdatedAt.After(persistedBefore.UpdatedAt) {

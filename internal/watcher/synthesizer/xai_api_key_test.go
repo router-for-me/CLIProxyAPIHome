@@ -9,6 +9,7 @@ import (
 
 func TestConfigSynthesizerBuildsXAIAPIKeyAuth(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
+	disableCooling := true
 	cfg := &appconfig.Config{
 		XAIKey: []appconfig.XAIKey{{
 			APIKey:         "xai-key",
@@ -19,7 +20,7 @@ func TestConfigSynthesizerBuildsXAIAPIKeyAuth(t *testing.T) {
 			ProxyURL:       "socks5://proxy.example:1080",
 			Headers:        map[string]string{"X-Test": "value"},
 			ExcludedModels: []string{"grok-3-*"},
-			DisableCooling: true,
+			DisableCooling: &disableCooling,
 			Models: []appconfig.XAIModel{{
 				Name:         "grok-4.5",
 				Alias:        "grok-latest",
@@ -53,8 +54,8 @@ func TestConfigSynthesizerBuildsXAIAPIKeyAuth(t *testing.T) {
 	if auth.Attributes["excluded_models"] != "grok-3-*" || auth.ProxyURL != "socks5://proxy.example:1080" {
 		t.Fatalf("auth exclusion/proxy = %q/%q", auth.Attributes["excluded_models"], auth.ProxyURL)
 	}
-	if disabled, ok := auth.DisableCoolingOverride(); !ok || !disabled {
-		t.Fatalf("DisableCoolingOverride() = %t/%t, want true/true", disabled, ok)
+	if disabled := auth.DisableCoolingOverride(); disabled == nil || !*disabled {
+		t.Fatalf("DisableCoolingOverride() = %#v, want true", disabled)
 	}
 
 	rawModels, okModels := auth.Metadata[homeConfigModelsMetadataKey].([]map[string]any)

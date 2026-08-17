@@ -115,6 +115,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
 			}
+			if !reflect.DeepEqual(o.DisableCooling, n.DisableCooling) {
+				changes = append(changes, fmt.Sprintf("gemini[%d].disable-cooling: %s -> %s", i, formatOptionalBool(o.DisableCooling), formatOptionalBool(n.DisableCooling)))
+			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].api-key: updated", i))
 			}
@@ -149,6 +152,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("claude[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
+			}
+			if !reflect.DeepEqual(o.DisableCooling, n.DisableCooling) {
+				changes = append(changes, fmt.Sprintf("claude[%d].disable-cooling: %s -> %s", i, formatOptionalBool(o.DisableCooling), formatOptionalBool(n.DisableCooling)))
 			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("claude[%d].api-key: updated", i))
@@ -202,6 +208,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if o.AlphaSearch != n.AlphaSearch {
 				changes = append(changes, fmt.Sprintf("codex[%d].alpha-search: %t -> %t", i, o.AlphaSearch, n.AlphaSearch))
 			}
+			if !reflect.DeepEqual(o.DisableCooling, n.DisableCooling) {
+				changes = append(changes, fmt.Sprintf("codex[%d].disable-cooling: %s -> %s", i, formatOptionalBool(o.DisableCooling), formatOptionalBool(n.DisableCooling)))
+			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("codex[%d].api-key: updated", i))
 			}
@@ -243,8 +252,8 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if o.Websockets != n.Websockets {
 				changes = append(changes, fmt.Sprintf("xai[%d].websockets: %t -> %t", i, o.Websockets, n.Websockets))
 			}
-			if o.DisableCooling != n.DisableCooling {
-				changes = append(changes, fmt.Sprintf("xai[%d].disable-cooling: %t -> %t", i, o.DisableCooling, n.DisableCooling))
+			if !reflect.DeepEqual(o.DisableCooling, n.DisableCooling) {
+				changes = append(changes, fmt.Sprintf("xai[%d].disable-cooling: %s -> %s", i, formatOptionalBool(o.DisableCooling), formatOptionalBool(n.DisableCooling)))
 			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("xai[%d].api-key: updated", i))
@@ -322,6 +331,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
 			}
+			if !reflect.DeepEqual(o.DisableCooling, n.DisableCooling) {
+				changes = append(changes, fmt.Sprintf("vertex[%d].disable-cooling: %s -> %s", i, formatOptionalBool(o.DisableCooling), formatOptionalBool(n.DisableCooling)))
+			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].api-key: updated", i))
 			}
@@ -342,6 +354,13 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 
 	return changes
+}
+
+func formatOptionalBool(value *bool) string {
+	if value == nil {
+		return "inherit"
+	}
+	return fmt.Sprintf("%t", *value)
 }
 
 // trimStrings handles a trim strings.

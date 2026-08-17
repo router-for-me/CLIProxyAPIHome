@@ -446,6 +446,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 			ModelsHash:     record.ModelsHash,
 			Attributes:     auth.Attributes,
 			ModelMetadata:  modelMetadataFromAuth(auth),
+			DisableCooling: cloneOptionalBool(auth.DisableCoolingOverride()),
 		})
 	}
 	return out, nil

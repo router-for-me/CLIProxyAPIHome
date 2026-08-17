@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
 
 // fakeMutatorStore is a Store with StateMutator support backed by one shared
@@ -16,6 +18,7 @@ type fakeMutatorStore struct {
 	persisted *Auth
 	mutateErr error
 	mutations int
+	attempts  int
 	saves     int
 }
 
@@ -36,6 +39,7 @@ func (s *fakeMutatorStore) Delete(context.Context, string) error { return nil }
 func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.attempts++
 	if s.mutateErr != nil {
 		return nil, s.mutateErr
 	}
@@ -60,6 +64,18 @@ func (s *fakeMutatorStore) mutationCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mutations
+}
+
+func (s *fakeMutatorStore) mutationAttemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func (s *fakeMutatorStore) saveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saves
 }
 
 // newHomeNodeManager registers the minimal auth view a Home node holds after
@@ -145,6 +161,135 @@ func TestMarkResultQuotaEscalationIsAtomicAcrossManagers(t *testing.T) {
 
 	if store.saves != 0 {
 		t.Fatalf("expected no Save calls on the mutator path, got %d", store.saves)
+	}
+}
+
+func TestMarkResultDisabledQuotaSkipsRepeatedPersistence(t *testing.T) {
+	const authID = "auth-disabled-quota-local-repeat"
+	const model = "gpt-5"
+	ctx := context.Background()
+	seed := &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "preserved"},
+	}
+	store := &fakeMutatorStore{persisted: seed.Clone()}
+	manager := NewManager(store, nil, nil)
+	manager.SetConfig(&config.Config{DisableCooling: true})
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(ctx, quotaResult(authID, model))
+	if attempts := store.mutationAttemptCount(); attempts != 1 {
+		t.Fatalf("mutation attempts after first 429 = %d, want 1", attempts)
+	}
+	if mutations := store.mutationCount(); mutations != 1 {
+		t.Fatalf("changed mutations after first 429 = %d, want 1", mutations)
+	}
+
+	manager.MarkResult(ctx, quotaResult(authID, model))
+	manager.flushResultPersistQueue()
+	if attempts := store.mutationAttemptCount(); attempts != 1 {
+		t.Fatalf("mutation attempts after repeated 429 = %d, want 1", attempts)
+	}
+	if saves := store.saveCount(); saves != 0 {
+		t.Fatalf("Save() calls after repeated 429 = %d, want 0", saves)
+	}
+
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || local.ModelStates[model] == nil {
+		t.Fatalf("GetByID() missing disabled quota state: %#v", local)
+	}
+	state := local.ModelStates[model]
+	if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("repeated disabled quota state = %#v, want dispatchable", state)
+	}
+	if got := store.persistedSnapshot().Metadata["access_token"]; got != "preserved" {
+		t.Fatalf("persisted access_token = %v, want preserved", got)
+	}
+}
+
+func TestResultRoutingAndTransitionUseCapturedDisableCooling(t *testing.T) {
+	const model = "gpt-5"
+	result := quotaResult("auth-config-snapshot", model)
+	now := time.Now().UTC()
+
+	t.Run("captured disabled state survives cooling enable", func(t *testing.T) {
+		manager := NewManager(nil, nil, nil)
+		manager.SetConfig(&config.Config{DisableCooling: false})
+		auth := &Auth{
+			ID:       result.AuthID,
+			Index:    result.AuthID,
+			Provider: result.Provider,
+			Status:   StatusError,
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status: StatusError,
+					Quota:  QuotaState{Scope: quotaScopeModel, Reason: "quota"},
+				},
+			},
+		}
+
+		if needsGlobal := manager.resultNeedsGlobalTransition(auth, result, model, now, true); needsGlobal {
+			t.Fatal("captured disable-cooling result unexpectedly required a repeated global transition")
+		}
+		manager.applyResultTransition(auth, result, model, now, true)
+		state := auth.ModelStates[model]
+		if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+			t.Fatalf("captured disabled state = %#v, want dispatchable", state)
+		}
+	})
+
+	t.Run("captured enabled state survives cooling disable", func(t *testing.T) {
+		manager := NewManager(nil, nil, nil)
+		manager.SetConfig(&config.Config{DisableCooling: true})
+		auth := &Auth{ID: result.AuthID, Index: result.AuthID, Provider: result.Provider, Status: StatusActive}
+
+		if needsGlobal := manager.resultNeedsGlobalTransition(auth, result, model, now, false); !needsGlobal {
+			t.Fatal("captured cooling-enabled result skipped its first global transition")
+		}
+		manager.applyResultTransition(auth, result, model, now, false)
+		state := auth.ModelStates[model]
+		if state == nil || !state.Unavailable || !state.Quota.Exceeded || !state.NextRetryAfter.After(now) || !state.Quota.NextRecoverAt.After(now) {
+			t.Fatalf("captured cooling-enabled state = %#v, want active quota cooldown", state)
+		}
+	})
+}
+
+func TestDisabledQuotaStateAlreadyAppliedAcceptsOtherModelQuota(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{
+		Status: StatusError,
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status: StatusError,
+				Quota:  QuotaState{Scope: quotaScopeModel, Reason: "quota"},
+			},
+			"gpt-5-mini": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				Quota: QuotaState{
+					Exceeded:      true,
+					Scope:         quotaScopeModel,
+					Reason:        "quota",
+					NextRecoverAt: now.Add(time.Minute),
+					BackoffLevel:  2,
+				},
+			},
+		},
+	}
+	auth.Quota = aggregateModelQuota(auth.ModelStates)
+
+	if !disabledQuotaStateAlreadyApplied(auth, "gpt-5") {
+		t.Fatal("disabled quota marker was rejected because another model owns the aggregate quota")
+	}
+	auth.Quota = QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota", NextRecoverAt: now.Add(2 * time.Minute), BackoffLevel: 3}
+	if disabledQuotaStateAlreadyApplied(auth, "gpt-5") {
+		t.Fatal("disabled quota marker accepted a stale aggregate quota")
 	}
 }
 
@@ -413,5 +558,66 @@ func TestMarkResultDoesNotHoldManagerLockDuringStateMutation(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("MarkResult did not finish after mutation was released")
+	}
+}
+
+func TestMarkResultReconcilesCoolingDisabledDuringQuotaMutation(t *testing.T) {
+	const authID = "auth-cluster-config-race"
+	const model = "gpt-5"
+	store := &blockingMutatorStore{
+		fakeMutatorStore: fakeMutatorStore{
+			persisted: &Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   StatusActive,
+				Metadata: map[string]any{"access_token": "preserved"},
+			},
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := newHomeNodeManager(t, &store.fakeMutatorStore, authID)
+	manager.SetStore(store)
+	manager.SetConfig(&config.Config{DisableCooling: false})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.MarkResult(context.Background(), quotaResult(authID, model))
+	}()
+
+	select {
+	case <-store.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("quota mutation was never invoked")
+	}
+
+	manager.SetConfig(&config.Config{DisableCooling: true})
+	if errClear := manager.ClearDisabledCooldownStates(context.Background()); errClear != nil {
+		t.Fatalf("pre-commit ClearDisabledCooldownStates() error = %v", errClear)
+	}
+	close(store.release)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkResult did not finish after mutation release")
+	}
+
+	persisted := store.persistedSnapshot()
+	state := persisted.ModelStates[model]
+	if state == nil || state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("persisted state after config race = %#v, want dispatchable", state)
+	}
+	if got := persisted.Metadata["access_token"]; got != "preserved" {
+		t.Fatalf("persisted access_token = %v, want preserved", got)
+	}
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || local.ModelStates[model] == nil || local.ModelStates[model].Unavailable || local.ModelStates[model].Quota.Exceeded {
+		t.Fatalf("local state after config race = %#v, want dispatchable", local)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 2 {
+		t.Fatalf("mutation attempts = %d, want quota transition plus compensating clear", attempts)
 	}
 }

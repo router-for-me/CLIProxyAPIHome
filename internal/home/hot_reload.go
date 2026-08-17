@@ -40,7 +40,7 @@ func (r *Runtime) startFileWatcher(ctx context.Context, configPath string) error
 			}
 		},
 		OnAuthChange: func(ctx context.Context) {
-			if errReload := r.loadAuths(ctx); errReload != nil {
+			if errReload := r.ReloadAuths(ctx); errReload != nil {
 				log.Errorf("auth reload failed: %v", errReload)
 			}
 		},
@@ -65,13 +65,72 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 	if r == nil {
 		return nil
 	}
+	r.stateApplyMu.Lock()
+	defer r.stateApplyMu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
-	oldCfg := r.Config()
+	r.cfgMu.RLock()
+	oldCfg := r.cfg
+	oldAuthDir := r.authDir
+	r.cfgMu.RUnlock()
+	globalDisableCoolingActivated := oldCfg != nil && !oldCfg.DisableCooling && cfg.DisableCooling
+	globalDisableCoolingDeactivated := oldCfg != nil && oldCfg.DisableCooling && !cfg.DisableCooling
+	if globalDisableCoolingDeactivated && r.coreManager != nil {
+		if errFence := r.coreManager.FenceDisabledCooldownStates(ctx); errFence != nil {
+			return fmt.Errorf("home runtime: fence disabled cooldown state before re-enabling cooling: %w", errFence)
+		}
+	}
+
+	if !r.clusterAutoRefreshGated() && strings.TrimSpace(cfg.AuthDir) != "" {
+		if errEnsure := os.MkdirAll(cfg.AuthDir, 0o755); errEnsure != nil {
+			return fmt.Errorf("home runtime: ensure auth dir: %w", errEnsure)
+		}
+	}
+	if errPluginSync := r.syncPluginStoreManifests(ctx, cfg); errPluginSync != nil {
+		return errPluginSync
+	}
+
+	store := coreauth.GetTokenStore()
+	if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
+		dirSetter.SetBaseDir(cfg.AuthDir)
+	}
+
+	if r.coreManager != nil {
+		r.coreManager.SetConfig(cfg)
+		r.coreManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
+		r.coreManager.SetSelector(selectorFromConfig(cfg))
+	}
+	r.applyPluginConfig(ctx, cfg)
+
+	r.cfgMu.Lock()
+	r.cfg = cfg
+	r.authDir = cfg.AuthDir
+	r.cfgMu.Unlock()
+
+	if errReload := r.loadAuths(coreauth.WithSkipPersist(ctx)); errReload != nil {
+		if r.coreManager != nil {
+			r.coreManager.SetConfig(oldCfg)
+			if oldCfg == nil {
+				r.coreManager.SetOAuthModelAlias(nil)
+			} else {
+				r.coreManager.SetOAuthModelAlias(oldCfg.OAuthModelAlias)
+			}
+			r.coreManager.SetSelector(selectorFromConfig(oldCfg))
+		}
+		r.applyPluginConfig(ctx, oldCfg)
+		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
+			dirSetter.SetBaseDir(oldAuthDir)
+		}
+		r.cfgMu.Lock()
+		r.cfg = oldCfg
+		r.authDir = oldAuthDir
+		r.cfgMu.Unlock()
+		return errReload
+	}
 
 	currentLevel := log.GetLevel()
 	if cfg.Debug {
@@ -84,40 +143,15 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 	}
 	logConfigChanges(oldCfg, cfg)
 
-	store := coreauth.GetTokenStore()
-	if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
-		dirSetter.SetBaseDir(cfg.AuthDir)
-	}
-
-	if r.coreManager != nil {
-		r.coreManager.SetConfig(cfg)
-		r.coreManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
-		r.coreManager.SetSelector(selectorFromConfig(cfg))
-	}
 	r.deleteRemovedPluginArtifacts(ctx, oldCfg, cfg)
-	if errPluginSync := r.syncPluginStoreManifests(ctx, cfg); errPluginSync != nil {
-		return errPluginSync
-	}
-	r.applyPluginConfig(ctx, cfg)
-
 	configaccess.Register(&cfg.SDKConfig)
 	r.refreshAccessProviders()
-
-	if !r.clusterAutoRefreshGated() && strings.TrimSpace(cfg.AuthDir) != "" {
-		if errEnsure := os.MkdirAll(cfg.AuthDir, 0o755); errEnsure != nil {
-			return fmt.Errorf("home runtime: ensure auth dir: %w", errEnsure)
-		}
-	}
-
 	managementasset.SetCurrentConfig(cfg)
 
-	r.cfgMu.Lock()
-	r.cfg = cfg
-	r.authDir = cfg.AuthDir
-	r.cfgMu.Unlock()
-
-	if errReload := r.loadAuths(coreauth.WithSkipPersist(ctx)); errReload != nil {
-		return errReload
+	if globalDisableCoolingActivated && r.coreManager != nil {
+		if errFence := r.coreManager.FenceDisabledCooldownStates(ctx); errFence != nil {
+			log.WithError(errFence).Warn("home runtime: failed to fence disabled cooldown state; dispatch policy remains active")
+		}
 	}
 	return nil
 }

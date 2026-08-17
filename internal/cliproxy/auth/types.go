@@ -49,6 +49,9 @@ type Auth struct {
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
 	Metadata map[string]any `json:"metadata,omitempty"`
+	// RuntimeDisableCooling carries the auth-scoped cooling override in minimal
+	// projections without serializing provider metadata or secrets.
+	RuntimeDisableCooling *bool `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
@@ -204,13 +207,17 @@ func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
 	return out
 }
 
-// Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
+// Clone copies the Auth structure, duplicating mutable fields to avoid accidental mutation.
 func (a *Auth) Clone() *Auth {
 	// Keep validation before state changes so failures leave existing data intact.
 	if a == nil {
 		return nil
 	}
 	copyAuth := *a
+	if a.RuntimeDisableCooling != nil {
+		disableCooling := *a.RuntimeDisableCooling
+		copyAuth.RuntimeDisableCooling = &disableCooling
+	}
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {
@@ -375,29 +382,30 @@ func (a *Auth) ProxyInfo() string {
 }
 
 // DisableCoolingOverride returns the auth-scoped disable_cooling override when present.
-// This override is true-only: false is treated as unset so the global flag can still apply.
-// The value is read from metadata key "disable_cooling" (or legacy "disable-cooling").
-func (a *Auth) DisableCoolingOverride() (bool, bool) {
-	if a == nil || a.Metadata == nil {
-		return false, false
+// Runtime projections take precedence over metadata.
+// Metadata is read from "disable_cooling" (or legacy "disable-cooling").
+// Callers must treat the returned pointer as read-only.
+func (a *Auth) DisableCoolingOverride() *bool {
+	if a == nil {
+		return nil
+	}
+	if a.RuntimeDisableCooling != nil {
+		return a.RuntimeDisableCooling
+	}
+	if a.Metadata == nil {
+		return nil
 	}
 	if val, ok := a.Metadata["disable_cooling"]; ok {
 		if parsed, okParse := parseBoolAny(val); okParse {
-			if !parsed {
-				return false, false
-			}
-			return parsed, true
+			return &parsed
 		}
 	}
 	if val, ok := a.Metadata["disable-cooling"]; ok {
 		if parsed, okParse := parseBoolAny(val); okParse {
-			if !parsed {
-				return false, false
-			}
-			return parsed, true
+			return &parsed
 		}
 	}
-	return false, false
+	return nil
 }
 
 // ToolPrefixDisabled returns whether the proxy_ tool name prefix should be

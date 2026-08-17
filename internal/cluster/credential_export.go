@@ -180,6 +180,7 @@ func credentialVertexKey(auth *coreauth.Auth) appconfig.VertexCompatKey {
 		Models:         credentialVertexModels(auth),
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
+		DisableCooling: credentialDisableCooling(auth),
 	}
 }
 
@@ -264,7 +265,7 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 		prefix,
 		strconv.Itoa(priority),
 		credentialHeadersKey(headers),
-		strconv.FormatBool(disableCooling),
+		optionalBoolKey(disableCooling),
 		representation,
 	}, "\x00")
 
@@ -511,17 +512,16 @@ func credentialPriority(auth *coreauth.Auth) int {
 	return value
 }
 
-// credentialDisableCooling restores the disable-cooling value from auth metadata.
-func credentialDisableCooling(auth *coreauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
+// credentialDisableCooling restores the optional disable-cooling override.
+func credentialDisableCooling(auth *coreauth.Auth) *bool {
+	return cloneOptionalBool(auth.DisableCoolingOverride())
+}
+
+func optionalBoolKey(value *bool) string {
+	if value == nil {
+		return "inherit"
 	}
-	for _, key := range []string{"disable_cooling", "disable-cooling"} {
-		if value, ok := boolFromAny(auth.Metadata[key]); ok {
-			return value
-		}
-	}
-	return false
+	return strconv.FormatBool(*value)
 }
 
 // credentialExcludedModels restores the excluded model list from auth attributes.

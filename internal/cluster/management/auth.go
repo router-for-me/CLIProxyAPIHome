@@ -627,8 +627,8 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 	if excluded := apiKeyExcludedModels(auth); len(excluded) > 0 {
 		item["excluded-models"] = excluded
 	}
-	if disabledCooling, okDisableCooling := auth.DisableCoolingOverride(); okDisableCooling && disabledCooling {
-		item["disable-cooling"] = true
+	if disabledCooling := auth.DisableCoolingOverride(); disabledCooling != nil {
+		item["disable-cooling"] = *disabledCooling
 	}
 	switch key {
 	case "codex-api-key", "xai-api-key", "gemini-api-key", "vertex-api-key", "claude-api-key":

@@ -70,8 +70,8 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			"api_key": key,
 		}
 		metadata := map[string]any{}
-		if entry.DisableCooling {
-			metadata["disable_cooling"] = true
+		if entry.DisableCooling != nil {
+			metadata["disable_cooling"] = *entry.DisableCooling
 		}
 		addConfigModelsToMetadata(metadata, buildConfigModels(entry.Models, "google", "gemini", now))
 		if entry.Priority != 0 {
@@ -128,8 +128,8 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			"api_key": key,
 		}
 		metadata := map[string]any{}
-		if ck.DisableCooling {
-			metadata["disable_cooling"] = true
+		if ck.DisableCooling != nil {
+			metadata["disable_cooling"] = *ck.DisableCooling
 		}
 		addConfigModelsToMetadata(metadata, buildConfigModels(ck.Models, "anthropic", "claude", now))
 		if ck.Priority != 0 {
@@ -195,8 +195,8 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 			"api_key": key,
 		}
 		metadata := map[string]any{}
-		if entry.DisableCooling {
-			metadata["disable_cooling"] = true
+		if entry.DisableCooling != nil {
+			metadata["disable_cooling"] = *entry.DisableCooling
 		}
 		modelOwner := provider
 		modelType := provider
@@ -282,8 +282,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
-			if disableCooling {
-				metadata["disable_cooling"] = true
+			if disableCooling != nil {
+				metadata["disable_cooling"] = *disableCooling
 			}
 			addConfigModelsToMetadata(metadata, buildOpenAICompatibilityModels(compat.Models, compat.Name, now))
 			if compat.Priority != 0 {
@@ -326,8 +326,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
-			if disableCooling {
-				metadata["disable_cooling"] = true
+			if disableCooling != nil {
+				metadata["disable_cooling"] = *disableCooling
 			}
 			addConfigModelsToMetadata(metadata, buildOpenAICompatibilityModels(compat.Models, compat.Name, now))
 			if compat.Priority != 0 {
@@ -382,6 +382,9 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			"provider_key": providerName,
 		}
 		metadata := map[string]any{}
+		if compat.DisableCooling != nil {
+			metadata["disable_cooling"] = *compat.DisableCooling
+		}
 		addConfigModelsToMetadata(metadata, buildConfigModels(compat.Models, "google", "vertex", now))
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)

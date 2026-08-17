@@ -19,6 +19,7 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 		testConfigAPIKeyAuth("claude-id", "claude", "config:claude[token]", "claude-key"),
 		testConfigAPIKeyAuth("codex-file-id", "codex", "auth-file.json", "ignored-key"),
 	}
+	auths[3].Metadata = map[string]any{"disable_cooling": false}
 
 	counts := ApplyCredentialConfigToRoot(root, auths)
 	if counts.GeminiKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.ClaudeKeys != 1 {
@@ -46,6 +47,12 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	xaiKeys, ok := root["xai-api-key"].([]appconfig.XAIKey)
 	if !ok || len(xaiKeys) != 1 || xaiKeys[0].APIKey != "xai-key" {
 		t.Fatalf("unexpected xai-api-key root value: %#v", root["xai-api-key"])
+	}
+	if xaiKeys[0].DisableCooling == nil || *xaiKeys[0].DisableCooling {
+		t.Fatalf("xAI disable-cooling override = %#v, want explicit false", xaiKeys[0].DisableCooling)
+	}
+	if geminiKeys[0].DisableCooling != nil {
+		t.Fatalf("Gemini disable-cooling override = %#v, want inherited setting", geminiKeys[0].DisableCooling)
 	}
 	claudeKeys, ok := root["claude-api-key"].([]appconfig.ClaudeKey)
 	if !ok || len(claudeKeys) != 1 || claudeKeys[0].APIKey != "claude-key" {

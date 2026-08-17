@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -23,11 +24,69 @@ type CooldownClearResult struct {
 }
 
 type cooldownClearTransition struct {
-	clearedModels []string
+	clearedModels     []string
+	clearedCredential bool
 }
 
 func (t cooldownClearTransition) changed() bool {
-	return len(t.clearedModels) > 0
+	return t.clearedCredential || len(t.clearedModels) > 0
+}
+
+type cooldownMutationResult struct {
+	authSnapshot *Auth
+	changed      bool
+	adopted      bool
+}
+
+// mutateCooldownState applies one cooldown transition to the authoritative
+// auth row and synchronizes the local scheduler and registry with the result.
+// Both operator resets and global disable-cooling use this same pipeline so
+// persisted state remains authoritative across Home nodes. persistUnchanged
+// advances the row revision even when the stored state is already clean, which
+// fences older result snapshots still waiting in the asynchronous save queue.
+func (m *Manager) mutateCooldownState(ctx context.Context, credentialID string, now time.Time, persistUnchanged bool, mutate func(*Auth) bool) (cooldownMutationResult, error) {
+	result := cooldownMutationResult{}
+	if m == nil {
+		return result, errors.New("auth manager: nil manager")
+	}
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return result, errors.New("auth manager: missing auth id")
+	}
+	if mutate == nil {
+		return result, errors.New("auth manager: missing cooldown mutation")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	mutator, ok := store.(StateMutator)
+	if !ok || mutator == nil {
+		return result, ErrCooldownMutationUnsupported
+	}
+
+	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) bool {
+		result.changed = mutate(auth)
+		return result.changed || persistUnchanged
+	})
+	if errMutate != nil {
+		return result, errMutate
+	}
+	if persisted == nil {
+		return result, errors.New("auth manager: cooldown reset returned no auth")
+	}
+
+	result.authSnapshot, result.adopted = m.adoptPersistedCooldownState(persisted, now)
+	if result.adopted && result.authSnapshot != nil {
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(result.authSnapshot)
+		}
+		m.ReconcileRegistryModelStates(ctx, credentialID)
+	}
+	return result, nil
 }
 
 // ClearQuotaCooldown atomically clears model quota cooldown state for one
@@ -49,17 +108,9 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 		ctx = context.Background()
 	}
 
-	m.mu.RLock()
-	store := m.store
-	m.mu.RUnlock()
-	mutator, ok := store.(StateMutator)
-	if !ok || mutator == nil {
-		return result, ErrCooldownMutationUnsupported
-	}
-
 	now := time.Now().UTC()
 	transition := cooldownClearTransition{}
-	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) bool {
+	mutation, errMutate := m.mutateCooldownState(ctx, credentialID, now, false, func(auth *Auth) bool {
 		modelKeys := []string(nil)
 		if requestedModel != "" {
 			resolvedModel := requestedModel
@@ -74,30 +125,318 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 				modelKeys = append(modelKeys, requestedModel)
 			}
 		}
-		transition = clearQuotaCooldownState(auth, modelKeys, now)
+		transition = clearQuotaCooldownState(auth, modelKeys, now, false)
 		return transition.changed()
 	})
 	if errMutate != nil {
 		return result, errMutate
 	}
-	if persisted == nil {
-		return result, errors.New("auth manager: cooldown reset returned no auth")
-	}
 
-	authSnapshot, adopted := m.adoptPersistedCooldownState(persisted, now)
-	if adopted && m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
-	}
-	if adopted {
-		m.ReconcileRegistryModelStates(ctx, credentialID)
-	}
-
-	result.Cleared = transition.changed()
+	result.Cleared = mutation.changed
 	result.ClearedModels = append([]string(nil), transition.clearedModels...)
 	return result, nil
 }
 
-func clearQuotaCooldownState(auth *Auth, models []string, now time.Time) cooldownClearTransition {
+// ClearDisabledCooldownStates clears request-error and quota cooldown state
+// covered by the global or auth-scoped disable-cooling setting.
+// Cluster-backed stores are mutated through StateMutator so the persisted row
+// remains authoritative across Home nodes.
+func (m *Manager) ClearDisabledCooldownStates(ctx context.Context) error {
+	return m.clearDisabledCooldownStates(ctx, false)
+}
+
+// FenceDisabledCooldownStates clears covered cooldown state and advances the
+// revision of auths with queued result snapshots or a prior failed cleanup. It
+// is used when global disable-cooling changes so older asynchronous snapshots
+// cannot restore a cooldown after the configuration switch.
+func (m *Manager) FenceDisabledCooldownStates(ctx context.Context) error {
+	return m.clearDisabledCooldownStates(ctx, true)
+}
+
+func (m *Manager) clearDisabledCooldownStates(ctx context.Context, forceFence bool) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	m.resultPersistMu.Lock()
+	fenceAuthIDs := make(map[string]struct{}, len(m.cooldownFencePending)+len(m.resultPersistPending)+len(m.resultPersistActive))
+	for authID := range m.cooldownFencePending {
+		fenceAuthIDs[authID] = struct{}{}
+	}
+	if forceFence {
+		for authID := range m.resultPersistPending {
+			fenceAuthIDs[authID] = struct{}{}
+		}
+		for authID := range m.resultPersistActive {
+			fenceAuthIDs[authID] = struct{}{}
+		}
+	}
+	m.resultPersistMu.Unlock()
+
+	m.mu.RLock()
+	store := m.store
+	authIDs := make([]string, 0, len(m.auths))
+	for authID, auth := range m.auths {
+		_, needsFence := fenceAuthIDs[authID]
+		if strings.TrimSpace(authID) != "" &&
+			m.quotaCooldownDisabledForAuth(auth) &&
+			(needsFence || hasDisabledCooldownState(auth)) {
+			authIDs = append(authIDs, authID)
+		}
+	}
+	m.mu.RUnlock()
+	sort.Strings(authIDs)
+	if len(authIDs) == 0 {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	mutator, hasMutator := store.(StateMutator)
+	if !hasMutator || mutator == nil {
+		if forceFence {
+			m.resultPersistMu.Lock()
+			if m.cooldownFencePending == nil {
+				m.cooldownFencePending = make(map[string]struct{}, len(authIDs))
+			}
+			for _, authID := range authIDs {
+				m.cooldownFencePending[authID] = struct{}{}
+			}
+			m.resultPersistMu.Unlock()
+			return ErrCooldownMutationUnsupported
+		}
+		var firstErr error
+		failedAuthIDs := make(map[string]struct{})
+		for _, authID := range authIDs {
+			_, needsFence := fenceAuthIDs[authID]
+			snapshot, changed := m.clearLocalDisabledCooldownState(ctx, authID, now)
+			if snapshot == nil {
+				continue
+			}
+			if needsFence {
+				failedAuthIDs[authID] = struct{}{}
+				if firstErr == nil {
+					firstErr = ErrCooldownMutationUnsupported
+				}
+			}
+			if !changed {
+				continue
+			}
+			if errPersist := m.persist(ctx, snapshot); errPersist != nil {
+				failedAuthIDs[authID] = struct{}{}
+				if firstErr == nil {
+					firstErr = errPersist
+				}
+			}
+		}
+		m.resultPersistMu.Lock()
+		if m.cooldownFencePending == nil {
+			m.cooldownFencePending = make(map[string]struct{}, len(failedAuthIDs))
+		}
+		for _, authID := range authIDs {
+			if _, failed := failedAuthIDs[authID]; failed {
+				m.cooldownFencePending[authID] = struct{}{}
+			} else {
+				delete(m.cooldownFencePending, authID)
+			}
+		}
+		m.resultPersistMu.Unlock()
+		return firstErr
+	}
+
+	var firstErr error
+	failedAuthIDs := make(map[string]struct{})
+	for _, authID := range authIDs {
+		_, errMutate := m.mutateCooldownState(ctx, authID, now, true, func(auth *Auth) bool {
+			return clearDisabledCooldownState(auth, now)
+		})
+		if errMutate != nil {
+			failedAuthIDs[authID] = struct{}{}
+			// The config switch must take effect locally even when the shared row
+			// cannot be updated yet. A later auth reload will retry persistence.
+			m.clearLocalDisabledCooldownState(ctx, authID, now)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("clear disabled cooldown state for %s: %w", authID, errMutate)
+			}
+			continue
+		}
+
+		// The persisted row may already be clear while this node still has a
+		// local cooldown from an older observation. The shared mutation pipeline
+		// first adopts the authoritative row; this local pass then removes only
+		// the covered cooldown fields that the merge intentionally retained.
+		m.clearLocalDisabledCooldownState(ctx, authID, now)
+	}
+	m.resultPersistMu.Lock()
+	if m.cooldownFencePending == nil {
+		m.cooldownFencePending = make(map[string]struct{}, len(failedAuthIDs))
+	}
+	for _, authID := range authIDs {
+		if _, failed := failedAuthIDs[authID]; failed {
+			m.cooldownFencePending[authID] = struct{}{}
+		} else {
+			delete(m.cooldownFencePending, authID)
+		}
+	}
+	m.resultPersistMu.Unlock()
+	return firstErr
+}
+
+func (m *Manager) clearLocalDisabledCooldownState(ctx context.Context, authID string, now time.Time) (*Auth, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.Lock()
+	auth := m.auths[authID]
+	if auth == nil {
+		m.mu.Unlock()
+		return nil, false
+	}
+	changed := clearDisabledCooldownState(auth, now)
+	snapshot := auth.Clone()
+	m.mu.Unlock()
+	if changed {
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(snapshot)
+		}
+		m.ReconcileRegistryModelStates(ctx, authID)
+	}
+	return snapshot, changed
+}
+
+func hasDisabledCooldownState(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
+			return true
+		}
+		if state.Status == StatusDisabled {
+			continue
+		}
+		status := statusCodeFromResult(state.LastError)
+		legacyRequestError := status == 0 && !state.Quota.Exceeded
+		quotaOwnsRetry := state.Quota.Exceeded && state.NextRetryAfter.Equal(state.Quota.NextRecoverAt)
+		if !state.NextRetryAfter.IsZero() && !quotaOwnsRetry && (legacyRequestError || isRequestErrorCooldownStatus(status)) {
+			return true
+		}
+	}
+	if auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() {
+		return true
+	}
+	if auth.Disabled || auth.Status == StatusDisabled || len(auth.ModelStates) > 0 {
+		return false
+	}
+	authStatus := statusCodeFromResult(auth.LastError)
+	legacyRequestError := authStatus == 0 && !auth.Quota.Exceeded
+	quotaOwnsRetry := auth.Quota.Exceeded && auth.NextRetryAfter.Equal(auth.Quota.NextRecoverAt)
+	return !auth.NextRetryAfter.IsZero() && !quotaOwnsRetry && (legacyRequestError || isRequestErrorCooldownStatus(authStatus))
+}
+
+func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	quotaTransition := clearQuotaCooldownState(auth, nil, now, true)
+
+	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
+	disabledStatus := auth.Status
+	disabledMessage := auth.StatusMessage
+	disabledLastError := cloneError(auth.LastError)
+	disabledUnavailable := auth.Unavailable
+	disabledRetryAfter := auth.NextRetryAfter
+	disabledQuota := auth.Quota
+	authStatus := statusCodeFromResult(auth.LastError)
+	preserveAuthState := auth.LastError != nil &&
+		!isRequestErrorCooldownStatus(authStatus) &&
+		!authErrorMirroredByModel(auth)
+	preservedUnavailable := auth.Unavailable
+	preservedRetryAfter := auth.NextRetryAfter
+	changed := quotaTransition.changed()
+
+	for _, state := range auth.ModelStates {
+		if state == nil || state.Status == StatusDisabled {
+			continue
+		}
+		status := statusCodeFromResult(state.LastError)
+		legacyRequestError := status == 0 && !state.Quota.Exceeded
+		quotaOwnsRetry := state.Quota.Exceeded && state.NextRetryAfter.Equal(state.Quota.NextRecoverAt)
+		if state.NextRetryAfter.IsZero() || quotaOwnsRetry || (!legacyRequestError && !isRequestErrorCooldownStatus(status)) {
+			continue
+		}
+		if state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) {
+			state.Unavailable = true
+			state.NextRetryAfter = state.Quota.NextRecoverAt
+		} else {
+			state.Unavailable = false
+			state.NextRetryAfter = time.Time{}
+		}
+		// Keep the execution timestamp so this reset cannot overwrite a newer
+		// non-covered model error observed by another Home node.
+		changed = true
+	}
+
+	legacyAuthRequestError := authStatus == 0 && !auth.Quota.Exceeded
+	quotaOwnsAuthRetry := auth.Quota.Exceeded && auth.NextRetryAfter.Equal(auth.Quota.NextRecoverAt)
+	clearAuthRetry := !wasDisabled && len(auth.ModelStates) == 0 && !auth.NextRetryAfter.IsZero() &&
+		!quotaOwnsAuthRetry && (legacyAuthRequestError || isRequestErrorCooldownStatus(authStatus))
+	if clearAuthRetry {
+		if auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now) {
+			auth.Unavailable = true
+			auth.NextRetryAfter = auth.Quota.NextRecoverAt
+		} else {
+			auth.Unavailable = false
+			auth.NextRetryAfter = time.Time{}
+		}
+		auth.UpdatedAt = now
+		changed = true
+	}
+
+	if !changed {
+		return false
+	}
+	if len(auth.ModelStates) > 0 {
+		updateAggregatedAvailability(auth, now)
+	}
+	if wasDisabled {
+		auth.Disabled = true
+		auth.Status = disabledStatus
+		auth.StatusMessage = disabledMessage
+		auth.LastError = disabledLastError
+		auth.Unavailable = disabledUnavailable
+		auth.NextRetryAfter = disabledRetryAfter
+		auth.Quota = disabledQuota
+	} else if preserveAuthState {
+		auth.Unavailable = preservedUnavailable
+		auth.NextRetryAfter = preservedRetryAfter
+	}
+	auth.UpdatedAt = now
+	return true
+}
+
+func isRequestErrorCooldownStatus(status int) bool {
+	switch status {
+	case http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusRequestTimeout,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func clearQuotaCooldownState(auth *Auth, models []string, now time.Time, clearCredentialQuota bool) cooldownClearTransition {
 	transition := cooldownClearTransition{}
 	if auth == nil {
 		return transition
@@ -110,7 +449,8 @@ func clearQuotaCooldownState(auth *Auth, models []string, now time.Time) cooldow
 	disabledUnavailable := auth.Unavailable
 	disabledRetryAfter := auth.NextRetryAfter
 
-	preserveLegacyCredentialQuota := hasLegacyCredentialQuota(auth)
+	preserveLegacyCredentialQuota := !clearCredentialQuota && hasLegacyCredentialQuota(auth)
+	clearLegacyCredentialQuota := clearCredentialQuota && (auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero())
 	preservedAuthQuota := auth.Quota
 	preservedAuthStatus := auth.Status
 	preservedAuthMessage := auth.StatusMessage
@@ -148,6 +488,10 @@ func clearQuotaCooldownState(auth *Auth, models []string, now time.Time) cooldow
 			}
 			transition.clearedModels = append(transition.clearedModels, modelID)
 		}
+	}
+	if clearLegacyCredentialQuota {
+		auth.Quota = QuotaState{}
+		transition.clearedCredential = true
 	}
 
 	if !transition.changed() {
@@ -226,11 +570,11 @@ func hasLegacyCredentialQuota(auth *Auth) bool {
 }
 
 func clearModelQuotaCooldown(state *ModelState, now time.Time) bool {
-	if state == nil || !state.Quota.Exceeded {
+	if state == nil || (!state.Quota.Exceeded && state.Quota.NextRecoverAt.IsZero()) {
 		return false
 	}
 	quotaOwnsAvailability := state.LastError == nil || statusCodeFromResult(state.LastError) == http.StatusTooManyRequests
-	state.Quota = QuotaState{}
+	clearModelQuotaState(state, now)
 	if state.Status != StatusDisabled && quotaOwnsAvailability {
 		state.Status = StatusActive
 		state.StatusMessage = ""
@@ -238,11 +582,18 @@ func clearModelQuotaCooldown(state *ModelState, now time.Time) bool {
 		state.Unavailable = false
 		state.NextRetryAfter = time.Time{}
 	}
+	return true
+}
+
+func clearModelQuotaState(state *ModelState, now time.Time) bool {
+	if state == nil || (!state.Quota.Exceeded && state.Quota.NextRecoverAt.IsZero()) {
+		return false
+	}
+	state.Quota = QuotaState{}
 	// Keep the execution timestamp unchanged. Older Home versions merge model
-	// states only by UpdatedAt, so advancing it for an operator reset would let
-	// the cleared quota snapshot overwrite a newer local 401/403/404/5xx state
-	// during a rolling upgrade. QuotaResetAt carries the mutation timestamp for
-	// reset-aware peers and state-version fingerprints.
+	// states only by UpdatedAt, so advancing it for a reset would let the cleared
+	// quota snapshot overwrite a newer local 401/403/404/5xx state during a
+	// rolling upgrade. QuotaResetAt carries the mutation timestamp instead.
 	state.QuotaResetAt = now
 	return true
 }

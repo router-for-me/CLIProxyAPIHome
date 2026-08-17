@@ -2067,7 +2067,7 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `models` | array of `ModelAlias` | 可选上游模型 alias。 |
 | `headers` | object string to string | 额外上游请求头。 |
 | `excluded-models` | array of string | 该 key 排除的模型 ID。 |
-| `disable-cooling` | boolean | 对该凭证禁用 quota cooldown 调度。 |
+| `disable-cooling` | boolean | 可选凭证级覆盖，优先于全局设置。`true` 禁用请求错误及 quota cooldown，`false` 显式启用；省略时继承全局值。覆盖 402/403/404、408/500/502/503/504 和模型级 429。 |
 | `auth-index` | string | Compatibility credential identifier。 |
 | `id` | string | 规范且不可变的 credential UUID。响应和导出使用此字段。 |
 | `uuid` | string | 仅用于兼容输入的旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
@@ -2095,7 +2095,7 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `api-key-entries` | array of `OpenAICompatibilityAPIKey` | Provider API keys 和可选代理。 |
 | `models` | array of `OpenAICompatibilityModel` | 模型定义和 alias。 |
 | `headers` | object string to string | 额外上游 headers。 |
-| `disable-cooling` | boolean | 对该 provider 禁用 quota cooldown 调度。 |
+| `disable-cooling` | boolean | 可选 provider 级覆盖，优先于全局设置并作用于其全部凭证。`true` 禁用请求错误及 quota cooldown，`false` 显式启用；省略时继承全局值。覆盖 402/403/404、408/500/502/503/504 和模型级 429。 |
 | `id` | string | `api-key-entries` 为空时 fallback credential 的规范且不可变 UUID。响应和导出使用此字段。 |
 | `uuid` | string | fallback `id` 的仅输入兼容旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
 
@@ -2231,6 +2231,8 @@ Selector 字段：
 
 `PATCH` 不使用 body 中的 `auth_index` 作为 DB ID selector；按 ID patch 请使用 `id` 或 `uuid`。
 
+在 `value` 中，`disable-cooling` 接受 boolean 覆盖值。设为 `null` 会清除现有覆盖并继承全局设置；省略该字段则保留当前覆盖不变。
+
 成功输出：
 
 ```json
@@ -2295,6 +2297,7 @@ Query 参数：
       "priority": 10,
       "note": "operator note",
       "websockets": true,
+      "disable-cooling": false,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2312,6 +2315,7 @@ Query 参数：
 | `priority` | integer | 凭证选择优先级；未设置时省略。 |
 | `note` | string | 运维备注；为空时省略。 |
 | `websockets` | boolean | 实际生效的运行时 WebSocket 标志。 |
+| `disable-cooling` | boolean | 可选凭证级冷却覆盖。`true` 禁用冷却，`false` 显式启用；未设置时省略该字段并继承全局设置。 |
 
 ### GET `/auth-files/models?name=<name-or-id>`
 
@@ -2482,6 +2486,7 @@ Selector 字段：
 | `note` | string | 操作备注；空值清空。 |
 | `websockets` | boolean or string bool | 支持的 auth 的 runtime websocket flag。 |
 | `disabled` | boolean or string bool | 更新 auth disabled state 和 status。 |
+| `disable-cooling` | boolean 或 `null` | 凭证级 cooling 覆盖。`true` 禁用冷却，`false` 启用冷却，`null` 清除覆盖并继承全局设置。该 hyphenated response 字段可直接用于此 PATCH 接口。 |
 | 任意 nested path | any valid JSON | 可以设置任意 metadata path，例如 `token.access_token`。 |
 
 输出示例：
@@ -2691,7 +2696,7 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 
 清除一个凭证中由 Home 管理的执行 quota cooldown。不带 query 参数时，会清除全部模型的 quota cooldown；带 `?model=<model>` 时，会先移除请求选项后缀（例如 `(high)`），再按目标凭证把公开 alias 或 prefix 解析为 canonical upstream model 后查找。若兼容用的 route-model key 与 upstream key 不同，也会一并清除。
 
-执行 cooldown 始终限定到 credential 与 canonical model 的组合；Home 不会创建凭证级执行 cooldown。缺少 canonical model 的 CPA 执行结果不会进入 cooldown 状态机。HTTP 429 始终使用有上限的模型级指数退避，不使用 `Retry-After` 或 provider `retryDelay` 提示进行调度。
+执行 cooldown 始终限定到 credential 与 canonical model 的组合；Home 不会创建凭证级执行 cooldown。缺少 canonical model 的 CPA 执行结果不会进入 cooldown 状态机。有效策略优先采用凭证/provider 的显式 `disable-cooling`，没有覆盖时才继承全局值：`true` 会让受覆盖的请求错误及 429 结果保持可调度，并在 auth reload 时清除已有且受覆盖的请求错误和 quota cooldown；`false` 会显式启用冷却。启用冷却时，HTTP 429 使用有上限的模型级指数退避，不使用 `Retry-After` 或 provider `retryDelay` 提示进行调度。HTTP 401 与 model-not-supported 的恢复逻辑不受影响。
 
 该操作是幂等的，只清除 quota-exceeded/HTTP 429 产生的 cooldown 状态，包括 quota 标记、retry deadline 和 backoff level。它不会启用人工 disabled 的凭证，不会清除模型级 401/403/404/5xx 状态，不会改变 refresh 调度、修改 provider quota snapshot，也不会消费 provider reset credit。
 
@@ -4043,7 +4048,7 @@ DELETE query：
 | `plugins.configs` | object | 以插件 ID 为 key 的单插件配置。插件商店安装会在插件条目下写入固定 `store` manifest；Home-mode CPA 节点根据该 manifest 下载产物，Home 仅在显式设置 `load-in-home: true` 时下载并加载。 |
 | `usage-statistics-enabled` | boolean | 启用内存 usage aggregation。Home 会向下游 CPA 强制为 `true`，并拒绝通过 Management API 关闭。 |
 | `redis-usage-queue-retention-seconds` | integer | Usage queue 保留窗口；默认 `60`，最大 `3600`。 |
-| `disable-cooling` | boolean | 兼容字段。Home 是唯一的凭证调度器，会始终将该值规范为 `false`，确保中央 quota cooldown 启用；发送给下游 CPA 的配置会独立强制为 `true`，仅禁用 CPA 本地 cooldown。 |
+| `disable-cooling` | boolean | 全局禁用 Home 的请求错误及 quota cooldown 调度（402/403/404、408/500/502/503/504 和模型级 429）；仅在凭证/provider 未显式设置同名字段时生效。凭证/provider 的 `true` 或 `false` 均优先于全局值。HTTP 401 与 model-not-supported 的恢复逻辑不受影响。该值仅作用于 Home，会持久化并在重载时生效；发送给下游 CPA 的配置会独立强制为 `true`。 |
 | `auth-auto-refresh-workers` | integer | 覆盖 auth auto-refresh worker 数量。 |
 | `request-retry` | integer | 失败请求重试次数。 |
 | `max-retry-credentials` | integer | 一个失败请求最多尝试的凭证数量；`<=0` 表示所有可用凭证。 |

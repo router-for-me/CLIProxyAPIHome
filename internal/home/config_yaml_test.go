@@ -109,3 +109,19 @@ plugins:
 
 	assertNotContains("head comment")
 }
+
+func TestSanitizeConfigYAMLForDownstreamNullDocumentAppliesHomeModeScalars(t *testing.T) {
+	out, errSanitize := sanitizeConfigYAMLForDownstream([]byte("null\n"))
+	if errSanitize != nil {
+		t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+	}
+	for _, expected := range []string{
+		"usage-statistics-enabled: true",
+		"disable-cooling: true",
+		"ws-auth: false",
+	} {
+		if !strings.Contains(string(out), expected) {
+			t.Fatalf("downstream config = %q, want %q", out, expected)
+		}
+	}
+}
