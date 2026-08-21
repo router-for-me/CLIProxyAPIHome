@@ -19,6 +19,12 @@ const AllowedModelIDsMetadataKey = "allowed_model_ids"
 // current request retry round in Options.Metadata.
 const ExcludedAuthIDsMetadataKey = "excluded_auth_ids"
 
+// RequestRetryRoundMetadataKey stores the zero-based request retry round in
+// Options.Metadata. Round zero is the initial credential round.
+const RequestRetryRoundMetadataKey = "request_retry_round"
+
+const requestRetryDefaultMetadataKey = "request_retry_default"
+
 // ExcludedConcurrencyCandidatesMetadataKey stores candidates rejected by atomic
 // concurrency admission during this dispatch attempt.
 const ExcludedConcurrencyCandidatesMetadataKey = "excluded_concurrency_candidates"
@@ -38,4 +44,75 @@ type Options struct {
 	Query           url.Values
 	OriginalRequest []byte
 	Metadata        map[string]any
+}
+
+func requestRetryRoundFromOptions(opts Options) int {
+	if opts.Metadata == nil {
+		return 0
+	}
+	switch value := opts.Metadata[RequestRetryRoundMetadataKey].(type) {
+	case int:
+		if value > 0 {
+			return value
+		}
+	case int64:
+		if value > 0 {
+			return int(value)
+		}
+	case float64:
+		if value > 0 && value == float64(int(value)) {
+			return int(value)
+		}
+	}
+	return 0
+}
+
+func requestRetryRoundMetadataPresent(opts Options) bool {
+	if opts.Metadata == nil {
+		return false
+	}
+	_, ok := opts.Metadata[RequestRetryRoundMetadataKey]
+	return ok
+}
+
+func requestRetryDefaultFromOptions(opts Options) int {
+	if opts.Metadata == nil {
+		return 0
+	}
+	switch value := opts.Metadata[requestRetryDefaultMetadataKey].(type) {
+	case int:
+		if value > 0 {
+			return value
+		}
+	case int64:
+		if value > 0 {
+			return int(value)
+		}
+	case float64:
+		if value > 0 && value == float64(int(value)) {
+			return int(value)
+		}
+	}
+	return 0
+}
+
+func withRequestRetryDispatchMetadata(opts Options, round, defaultRetry int) Options {
+	metadata := make(map[string]any, len(opts.Metadata)+2)
+	for key, value := range opts.Metadata {
+		metadata[key] = value
+	}
+	if round > 0 {
+		metadata[RequestRetryRoundMetadataKey] = round
+	} else if requestRetryRoundMetadataPresent(opts) {
+		metadata[RequestRetryRoundMetadataKey] = 0
+	} else {
+		delete(metadata, RequestRetryRoundMetadataKey)
+	}
+	if defaultRetry > 0 {
+		metadata[requestRetryDefaultMetadataKey] = defaultRetry
+	} else {
+		delete(metadata, requestRetryDefaultMetadataKey)
+	}
+	opts.Metadata = metadata
+	return opts
 }

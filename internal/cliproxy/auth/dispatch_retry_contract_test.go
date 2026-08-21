@@ -63,6 +63,11 @@ func TestDispatchClassifiesExcludedCredentialsForNextRetryRound(t *testing.T) {
 			manager := NewManager(nil, test.selector, nil)
 			cooldownZero := dispatchRetryCooldownAuth("retry-round-cooldown-zero-"+test.name, 0)
 			cooldownTwo := dispatchRetryCooldownAuth("retry-round-cooldown-two-"+test.name, 2)
+			now := time.Now()
+			cooldownZero.ModelStates["gpt"].NextRetryAfter = now.Add(5 * time.Second)
+			cooldownZero.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(5 * time.Second)
+			cooldownTwo.ModelStates["gpt"].NextRetryAfter = now.Add(time.Minute)
+			cooldownTwo.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(time.Minute)
 			registerDispatchTestAuth(t, manager, cooldownZero, "gpt")
 			registerDispatchTestAuth(t, manager, cooldownTwo, "gpt")
 
@@ -80,10 +85,249 @@ func TestDispatchClassifiesExcludedCredentialsForNextRetryRound(t *testing.T) {
 			if retryLimit, ok := cooldownErr.RequestRetryLimit(); !ok || retryLimit != 2 {
 				t.Fatalf("RequestRetryLimit() = (%d, %t), want (2, true)", retryLimit, ok)
 			}
-			if retryAfter := cooldownErr.RetryAfter(); retryAfter == nil || *retryAfter <= 0 {
-				t.Fatalf("RetryAfter() = %v, want positive next-round cooldown", retryAfter)
+			if retryAfter := cooldownErr.RetryAfter(); retryAfter == nil || *retryAfter <= 0 || *retryAfter >= 30*time.Second {
+				t.Fatalf("RetryAfter() = %v, want legacy omitted-round short cooldown", retryAfter)
 			}
 		})
+	}
+}
+
+func TestDispatchExplicitInitialRetryRoundClassifiesRoundOneAvailability(t *testing.T) {
+	selectors := []struct {
+		name     string
+		selector Selector
+	}{
+		{name: "scheduler fast path", selector: &RoundRobinSelector{}},
+		{name: "custom selector path", selector: firstCandidateSelector{}},
+	}
+	for _, test := range selectors {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, test.selector, nil)
+			cooldownZero := dispatchRetryCooldownAuth("retry-round-explicit-zero-"+test.name, 0)
+			cooldownTwo := dispatchRetryCooldownAuth("retry-round-explicit-two-"+test.name, 2)
+			now := time.Now()
+			cooldownZero.ModelStates["gpt"].NextRetryAfter = now.Add(5 * time.Second)
+			cooldownZero.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(5 * time.Second)
+			cooldownTwo.ModelStates["gpt"].NextRetryAfter = now.Add(time.Minute)
+			cooldownTwo.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(time.Minute)
+			registerDispatchTestAuth(t, manager, cooldownZero, "gpt")
+			registerDispatchTestAuth(t, manager, cooldownTwo, "gpt")
+
+			decision, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, "gpt", Options{Metadata: map[string]any{
+				ExcludedAuthIDsMetadataKey:   []string{cooldownZero.ID, cooldownTwo.ID},
+				RequestRetryRoundMetadataKey: 0,
+			}})
+			if decision != nil {
+				t.Fatalf("Dispatch() decision = %#v, want nil", decision)
+			}
+			var cooldownErr *modelCooldownError
+			if !errors.As(errDispatch, &cooldownErr) || cooldownErr == nil {
+				t.Fatalf("Dispatch() error = %T %v, want model cooldown", errDispatch, errDispatch)
+			}
+			if retryLimit, ok := cooldownErr.RequestRetryLimit(); !ok || retryLimit != 2 {
+				t.Fatalf("RequestRetryLimit() = (%d, %t), want (2, true)", retryLimit, ok)
+			}
+			if retryAfter := cooldownErr.RetryAfter(); retryAfter == nil || *retryAfter <= 30*time.Second {
+				t.Fatalf("RetryAfter() = %v, want only round-one credential cooldown", retryAfter)
+			}
+		})
+	}
+}
+
+func TestDispatchRetryRoundFiltersCredentialWindows(t *testing.T) {
+	selectors := []struct {
+		name     string
+		selector Selector
+	}{
+		{name: "scheduler fast path", selector: &RoundRobinSelector{}},
+		{name: "custom selector path", selector: firstCandidateSelector{}},
+	}
+	for _, test := range selectors {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, test.selector, nil)
+			manager.SetConfig(&internalconfig.Config{RequestRetry: 3})
+			auths := []*Auth{
+				{ID: "retry-window-a-" + test.name, Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": 3}},
+				{ID: "retry-window-b-" + test.name, Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": 2}},
+				{ID: "retry-window-c-" + test.name, Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": 2}},
+			}
+			for _, auth := range auths {
+				registerDispatchTestAuth(t, manager, auth, "gpt")
+			}
+
+			for retryRound := 0; retryRound <= 4; retryRound++ {
+				for _, auth := range auths {
+					metadata := map[string]any{AllowedAuthIDsMetadataKey: []string{auth.ID}}
+					if retryRound > 0 {
+						metadata[RequestRetryRoundMetadataKey] = retryRound
+					}
+					decision, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, "gpt", Options{Metadata: metadata})
+					wantEligible := retryRound == 0 || effectiveRequestRetry(auth, 3) >= retryRound
+					if !wantEligible {
+						if decision != nil || errDispatch == nil {
+							t.Fatalf("round %d auth %s = decision %#v, error %v; want no candidate", retryRound, auth.ID, decision, errDispatch)
+						}
+						continue
+					}
+					if errDispatch != nil || decision == nil || decision.Auth == nil || decision.Auth.ID != auth.ID {
+						t.Fatalf("round %d auth %s = decision %#v, error %v; want selected auth", retryRound, auth.ID, decision, errDispatch)
+					}
+					if decision.RequestRetry != effectiveRequestRetry(auth, 3) {
+						t.Fatalf("round %d auth %s request_retry = %d, want %d", retryRound, auth.ID, decision.RequestRetry, effectiveRequestRetry(auth, 3))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDispatchRetryRoundInheritanceAndExplicitZero(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetConfig(&internalconfig.Config{RequestRetry: 3})
+	auths := []*Auth{
+		{ID: "retry-inherit-unset", Provider: "codex", Status: StatusActive},
+		{ID: "retry-inherit-negative", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": -1}},
+		{ID: "retry-explicit-zero", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": 0}},
+		{ID: "retry-explicit-low", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": 2}},
+		{ID: "retry-explicit-high", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"request_retry": 5}},
+	}
+	for _, auth := range auths {
+		registerDispatchTestAuth(t, manager, auth, "gpt")
+	}
+
+	for _, test := range []struct {
+		id           string
+		retryRound   int
+		wantEligible bool
+	}{
+		{id: "retry-inherit-unset", retryRound: 3, wantEligible: true},
+		{id: "retry-inherit-negative", retryRound: 3, wantEligible: true},
+		{id: "retry-explicit-zero", retryRound: 1, wantEligible: false},
+		{id: "retry-explicit-low", retryRound: 3, wantEligible: false},
+		{id: "retry-explicit-high", retryRound: 4, wantEligible: true},
+	} {
+		t.Run(test.id, func(t *testing.T) {
+			decision, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, "gpt", Options{Metadata: map[string]any{
+				AllowedAuthIDsMetadataKey:    []string{test.id},
+				RequestRetryRoundMetadataKey: test.retryRound,
+			}})
+			if test.wantEligible {
+				if errDispatch != nil || decision == nil || decision.Auth == nil || decision.Auth.ID != test.id {
+					t.Fatalf("Dispatch() = decision %#v, error %v; want %s", decision, errDispatch, test.id)
+				}
+				return
+			}
+			if decision != nil || errDispatch == nil {
+				t.Fatalf("Dispatch() = decision %#v, error %v; want no candidate", decision, errDispatch)
+			}
+		})
+	}
+}
+
+func TestDispatchRetryRoundCooldownIgnoresExhaustedCredential(t *testing.T) {
+	selectors := []struct {
+		name     string
+		selector Selector
+	}{
+		{name: "scheduler fast path", selector: &RoundRobinSelector{}},
+		{name: "custom selector path", selector: firstCandidateSelector{}},
+	}
+	for _, test := range selectors {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, test.selector, nil)
+			manager.SetConfig(&internalconfig.Config{RequestRetry: 3})
+			exhausted := dispatchRetryCooldownAuth("retry-round-exhausted-"+test.name, 2)
+			eligible := dispatchRetryCooldownAuth("retry-round-eligible-cooldown-"+test.name, 3)
+			now := time.Now()
+			exhausted.ModelStates["gpt"].NextRetryAfter = now.Add(2 * time.Minute)
+			exhausted.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(2 * time.Minute)
+			eligible.ModelStates["gpt"].NextRetryAfter = now.Add(10 * time.Millisecond)
+			eligible.ModelStates["gpt"].Quota.NextRecoverAt = now.Add(10 * time.Millisecond)
+			registerDispatchTestAuth(t, manager, exhausted, "gpt")
+			registerDispatchTestAuth(t, manager, eligible, "gpt")
+
+			_, errDispatch := manager.Dispatch(context.Background(), []string{"codex"}, "gpt", Options{Metadata: map[string]any{
+				RequestRetryRoundMetadataKey: 3,
+			}})
+			var cooldownErr *modelCooldownError
+			if !errors.As(errDispatch, &cooldownErr) || cooldownErr == nil {
+				t.Fatalf("Dispatch() error = %T %v, want model cooldown", errDispatch, errDispatch)
+			}
+			if retryAfter := cooldownErr.RetryAfter(); retryAfter == nil || *retryAfter > time.Second {
+				t.Fatalf("RetryAfter() = %v, want only the eligible credential's short cooldown", retryAfter)
+			}
+			if retryLimit, ok := cooldownErr.RequestRetryLimit(); !ok || retryLimit != 3 {
+				t.Fatalf("RequestRetryLimit() = (%d, %t), want 3", retryLimit, ok)
+			}
+		})
+	}
+}
+
+func TestDispatchRetryRoundMetadataPreservesExplicitZero(t *testing.T) {
+	explicit := withRequestRetryDispatchMetadata(Options{Metadata: map[string]any{
+		RequestRetryRoundMetadataKey: 0,
+	}}, 0, 3)
+	if value, ok := explicit.Metadata[RequestRetryRoundMetadataKey]; !ok || value != 0 {
+		t.Fatalf("explicit zero retry round metadata = %#v, want present integer zero", explicit.Metadata)
+	}
+
+	omitted := withRequestRetryDispatchMetadata(Options{}, 0, 3)
+	if _, ok := omitted.Metadata[RequestRetryRoundMetadataKey]; ok {
+		t.Fatalf("omitted retry round unexpectedly became explicit: %#v", omitted.Metadata)
+	}
+}
+
+func TestDispatchRetryRoundUsesCapturedDefaultAfterConfigReload(t *testing.T) {
+	selectors := []struct {
+		name     string
+		selector Selector
+	}{
+		{name: "scheduler fast path", selector: &RoundRobinSelector{}},
+		{name: "custom selector path", selector: firstCandidateSelector{}},
+	}
+	tests := []struct {
+		name            string
+		capturedDefault int
+		runtimeDefault  int
+		wantEligible    bool
+	}{
+		{name: "captured positive then runtime zero", capturedDefault: 3, runtimeDefault: 0, wantEligible: true},
+		{name: "captured zero then runtime positive", capturedDefault: 0, runtimeDefault: 3, wantEligible: false},
+	}
+	for selectorIndex, selectorTest := range selectors {
+		for testIndex, test := range tests {
+			t.Run(selectorTest.name+"/"+test.name, func(t *testing.T) {
+				manager := NewManager(nil, selectorTest.selector, nil)
+				manager.SetConfig(&internalconfig.Config{RequestRetry: test.capturedDefault})
+				authID := fmt.Sprintf("retry-default-snapshot-%d-%d", selectorIndex, testIndex)
+				registerDispatchTestAuth(t, manager, &Auth{ID: authID, Provider: "codex", Status: StatusActive}, "gpt")
+				opts := withRequestRetryDispatchMetadata(Options{Metadata: map[string]any{
+					RequestRetryRoundMetadataKey: 2,
+				}}, 2, test.capturedDefault)
+
+				// Simulate a config reload after Dispatch captured its default.
+				manager.SetConfig(&internalconfig.Config{RequestRetry: test.runtimeDefault})
+				summary := manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", opts, nil, test.capturedDefault)
+				picked, _, errPick := manager.scheduler.pickMixed(context.Background(), []string{"codex"}, "gpt", opts, nil)
+
+				if test.wantEligible {
+					if summary.total != 1 || !summary.hasRequestRetry || summary.requestRetry != test.capturedDefault {
+						t.Fatalf("captured summary = %#v, want one eligible credential with request-retry %d", summary, test.capturedDefault)
+					}
+					if errPick != nil || picked == nil || picked.ID != authID {
+						t.Fatalf("captured scheduler pick = auth %#v, error %v; want %s", picked, errPick, authID)
+					}
+					return
+				}
+
+				if summary.total != 0 || summary.hasRequestRetry {
+					t.Fatalf("captured summary = %#v, want no round-two credential", summary)
+				}
+				if errPick == nil || picked != nil {
+					t.Fatalf("captured scheduler pick = auth %#v, error %v; want no round-two credential", picked, errPick)
+				}
+			})
+		}
 	}
 }
 
@@ -497,7 +741,7 @@ func TestSchedulerDispatchAvailabilitySummaryMatchesScan(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			indexed := manager.scheduler.summarizeDispatchAvailability(test.providers, test.model, test.opts, test.excluded, 3)
-			scanned := manager.scanDispatchAvailability(test.providers, test.model, test.opts, test.excluded)
+			scanned := manager.scanDispatchAvailability(test.providers, test.model, test.opts, test.excluded, 3)
 			assertDispatchAvailabilitySummaryEqual(t, indexed, scanned)
 		})
 	}
@@ -514,7 +758,7 @@ func TestSchedulerDispatchAvailabilityAggregateRefreshesAfterMutation(t *testing
 	assertSummary := func(wantRetry int) {
 		t.Helper()
 		indexed := manager.scheduler.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 2)
-		scanned := manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil)
+		scanned := manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 2)
 		assertDispatchAvailabilitySummaryEqual(t, indexed, scanned)
 		if indexed.requestRetry != wantRetry {
 			t.Fatalf("request retry = %d, want %d", indexed.requestRetry, wantRetry)
@@ -547,7 +791,7 @@ func TestSchedulerDispatchAvailabilityAggregateRefreshesAfterMutation(t *testing
 	}
 	manager.SetConfig(&internalconfig.Config{RequestRetry: 6})
 	indexed := manager.scheduler.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 6)
-	scanned := manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil)
+	scanned := manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 6)
 	assertDispatchAvailabilitySummaryEqual(t, indexed, scanned)
 	if indexed.requestRetry != 6 {
 		t.Fatalf("request retry after config reload = %d, want 6", indexed.requestRetry)
@@ -556,7 +800,7 @@ func TestSchedulerDispatchAvailabilityAggregateRefreshesAfterMutation(t *testing
 	registry.GetGlobalRegistry().RegisterClient(overridden.ID, "codex", []*registry.ModelInfo{{ID: "other", Object: "model", Type: "openai"}})
 	manager.RefreshSchedulerEntry(overridden.ID)
 	indexed = manager.scheduler.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 6)
-	scanned = manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil)
+	scanned = manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 6)
 	assertDispatchAvailabilitySummaryEqual(t, indexed, scanned)
 	if indexed.total != 0 {
 		t.Fatalf("summary total after registry refresh = %d, want 0", indexed.total)
@@ -602,20 +846,20 @@ func BenchmarkDispatchAvailabilitySummary(b *testing.B) {
 			modelRegistry.UnregisterClient(authID)
 		}
 	})
-	manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil)
+	manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 2)
 
 	b.Run("scheduler-index", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ReportMetric(credentialCount, "credentials")
 		for i := 0; i < b.N; i++ {
-			manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil)
+			manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 2)
 		}
 	})
 	b.Run("full-scan", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ReportMetric(credentialCount, "credentials")
 		for i := 0; i < b.N; i++ {
-			manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil)
+			manager.scanDispatchAvailability([]string{"codex"}, "gpt", Options{}, nil, 2)
 		}
 	})
 
@@ -624,14 +868,14 @@ func BenchmarkDispatchAvailabilitySummary(b *testing.B) {
 		b.ReportAllocs()
 		b.ReportMetric(credentialCount, "credentials")
 		for i := 0; i < b.N; i++ {
-			manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", allowedOpts, nil)
+			manager.summarizeDispatchAvailability([]string{"codex"}, "gpt", allowedOpts, nil, 2)
 		}
 	})
 	b.Run("full-scan-allowlist", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ReportMetric(credentialCount, "credentials")
 		for i := 0; i < b.N; i++ {
-			manager.scanDispatchAvailability([]string{"codex"}, "gpt", allowedOpts, nil)
+			manager.scanDispatchAvailability([]string{"codex"}, "gpt", allowedOpts, nil, 2)
 		}
 	})
 }

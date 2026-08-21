@@ -4055,8 +4055,8 @@ DELETE query：
 | `redis-usage-queue-retention-seconds` | integer | Usage queue 保留窗口；默认 `60`，最大 `3600`。 |
 | `disable-cooling` | boolean | 全局禁用 Home 的请求错误及 quota cooldown 调度（402/403/404、408/500/502/503/504 和模型级 429）；仅在凭证/provider 未显式设置同名字段时生效。凭证/provider 的 `true` 或 `false` 均优先于全局值。HTTP 401 与 model-not-supported 的恢复逻辑不受影响。该值仅作用于 Home，会持久化并在重载时生效；发送给下游 CPA 的配置会独立强制为 `true`。 |
 | `auth-auto-refresh-workers` | integer | 覆盖 auth auto-refresh worker 数量。 |
-| `request-retry` | integer | 由 CPA 执行层使用：首轮凭证遍历因 HTTP 403、408、429、500、502、503 或 504 耗尽后允许的额外重试轮数；`0` 表示不进行额外轮次，但首轮仍会按 `max-retry-credentials` 尝试多个凭证。凭证/provider 的显式覆盖优先；未设置或负值时继承该全局值。新的 CPA-to-Home RESP payload 会在当前轮排除已尝试凭证；未携带该字段的旧 payload 为兼容旧 CPA，仍使用 count 上限。 |
-| `max-retry-credentials` | integer | 每个凭证重试轮最多尝试的不同凭证数；`<=0` 表示该轮尝试所有可用凭证。 |
+| `request-retry` | integer | 由 CPA 执行层使用：首轮凭证遍历因 HTTP 403、408、429、500、502、503 或 504 耗尽后允许的额外重试轮数。第 `0` 轮是首轮；第 `r` 个额外轮只允许有效 `request-retry` 至少为 `r` 的凭证。凭证/provider 的显式非负覆盖优先；未设置或负值继承全局值，显式 `0` 只允许第 `0` 轮。Home 返回的 `request_retry` 是当前候选集合的最大值，仅作为 CPA 请求级外层上限；每轮凭证资格由 Home 单独过滤。新的 CPA-to-Home RESP payload 在首轮显式携带 `retry_round: 0`，额外轮次依次递增，并排除当前轮已尝试凭证；未携带这些字段的旧 payload 为兼容旧 CPA，仍使用 count 上限。 |
+| `max-retry-credentials` | integer | 完成轮次过滤后，每个凭证重试轮最多尝试的不同凭证数；`<=0` 表示该轮尝试所有可用凭证。因该上限跳过的凭证仍按其有效重试窗口老化，因此该设置不保证每个凭证实际获得配置的重试次数。 |
 | `max-retry-interval` | integer | CPA 开始新一轮凭证重试前允许等待的最大剩余冷却秒数。只有至少一个合格凭证会在该阈值内恢复时才会等待；剩余冷却时间超过该阈值的凭证不会触发该轮重试。`<=0` 仅允许无需等待冷却即可立即开始的轮次。 |
 | `quota-exceeded.switch-project` | boolean | Gemini quota error 时切换 project。 |
 | `quota-exceeded.switch-preview-model` | boolean | Quota error 时切换到 preview model。 |

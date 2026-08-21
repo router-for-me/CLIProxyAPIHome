@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -227,6 +228,11 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		return nil, "", &reply
 	}
 	count := dispatchCount(jsonArg)
+	retryRound, retryRoundPresent, validRetryRound := dispatchRetryRound(jsonArg)
+	if !validRetryRound {
+		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
+		return nil, "", &reply
+	}
 	excludedAuthIDs, hasExcludedAuthIDs, validExcludedAuthIDs := dispatchExcludedAuthIDs(jsonArg)
 	if !validExcludedAuthIDs {
 		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
@@ -263,10 +269,12 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
 	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, excludedAuthIDs, pinnedAuthID, home.DispatchConcurrencyContext{
-		Fingerprint:     env.ConnectionLifetime.Fingerprint,
-		ConnectedAt:     env.ConnectionLifetime.ConnectedAt,
-		Controlled:      env.ConnectionLifetime.Controlled,
-		ProtocolVersion: concurrencyReq.Protocol,
+		Fingerprint:       env.ConnectionLifetime.Fingerprint,
+		ConnectedAt:       env.ConnectionLifetime.ConnectedAt,
+		Controlled:        env.ConnectionLifetime.Controlled,
+		ProtocolVersion:   concurrencyReq.Protocol,
+		RetryRound:        retryRound,
+		RetryRoundPresent: retryRoundPresent,
 		PrepareResponse: func(result *home.DispatchResult) ([]byte, []byte, error) {
 			unaccounted, accounted, errPrepare := prepareDispatchResponse(result, userAPIKey)
 			if errPrepare != nil {
@@ -286,6 +294,22 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	}
 
 	return result, userAPIKey, nil
+}
+
+func dispatchRetryRound(jsonArg string) (int, bool, bool) {
+	value := gjson.Get(jsonArg, "retry_round")
+	if !value.Exists() {
+		return 0, false, true
+	}
+	if value.Type != gjson.Number {
+		return 0, true, false
+	}
+	raw := strings.TrimSpace(value.Raw)
+	parsed, errParse := strconv.ParseInt(raw, 10, 64)
+	if errParse != nil || parsed < 0 || parsed > int64(^uint(0)>>1) {
+		return 0, true, false
+	}
+	return int(parsed), true, true
 }
 
 // dispatchCount handles a dispatch count.

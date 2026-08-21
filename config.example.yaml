@@ -169,17 +169,23 @@ force-model-prefix: false
 passthrough-headers: false
 
 # Number of additional credential retry rounds used by downstream CPA after
-# the first round exhausts its eligible credentials. A value of 0 still allows
-# the first round to try multiple credentials; Home RESP dispatch itself only
-# excludes credentials already tried in the current round for the new payload;
-# legacy payloads without that field retain the count-based cap for compatibility.
+# the first round exhausts its eligible credentials. Round 0 is the initial
+# round; round r only admits credentials whose effective request-retry is at
+# least r. Explicit non-negative credential/provider overrides take precedence;
+# omitted or negative overrides inherit this global value, and explicit 0 only
+# admits round 0. New CPA nodes send retry_round=0 for the initial round and
+# increment it for additional rounds so Home can apply this filtering.
+# A value of 0 still allows the first round to try multiple credentials;
+# legacy payloads without retry_round/excluded_auth_ids retain the count cap.
 # Additional rounds apply to HTTP 403, 408, 429, 500, 502, 503, and 504 failures.
 # Credential/provider overrides take precedence; 0 disables additional rounds,
 # while an omitted or negative override inherits this global setting.
 request-retry: 3
 
-# Maximum number of different credentials to try in each credential retry round.
-# Set to 0 to keep legacy behavior (try all available credentials).
+# Maximum number of different credentials to try in each credential retry round
+# after the per-credential round filter. Set to 0 to try all available
+# credentials; credentials skipped by this cap still age with the global round
+# number, so the cap does not guarantee an actual retry count per credential.
 max-retry-credentials: 0
 
 # Maximum cooldown wait in seconds between retry rounds.

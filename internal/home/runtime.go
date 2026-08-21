@@ -150,7 +150,12 @@ type DispatchConcurrencyContext struct {
 	ConnectedAt     time.Time
 	Controlled      bool
 	ProtocolVersion int
-	PrepareResponse DispatchResponsePreparer
+	// RetryRound carries the zero-based CPA request retry round.
+	RetryRound int
+	// RetryRoundPresent distinguishes an explicit wire retry_round=0 from an
+	// omitted field used by legacy CPA nodes.
+	RetryRoundPresent bool
+	PrepareResponse   DispatchResponsePreparer
 }
 
 type ClusterAdapter interface {
@@ -859,6 +864,9 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	if credentialPolicy = strings.TrimSpace(credentialPolicy); credentialPolicy != "" {
 		metadata[coreauth.CredentialPolicyMetadataKey] = credentialPolicy
+	}
+	if concurrencyCtx.RetryRoundPresent || concurrencyCtx.RetryRound > 0 {
+		metadata[coreauth.RequestRetryRoundMetadataKey] = concurrencyCtx.RetryRound
 	}
 	if len(excludedAuthIDs) > 0 {
 		metadata[coreauth.ExcludedAuthIDsMetadataKey] = append([]string(nil), excludedAuthIDs...)

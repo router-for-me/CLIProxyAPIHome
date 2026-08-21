@@ -851,6 +851,12 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 
 	routeModel := strings.TrimSpace(requestedModel)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	defaultRequestRetry := 0
+	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil && cfg.RequestRetry > 0 {
+		defaultRequestRetry = cfg.RequestRetry
+	}
+	opts = withRequestRetryDispatchMetadata(opts, requestRetryRoundFromOptions(opts), defaultRequestRetry)
+	retryRound := requestRetryRoundFromOptions(opts)
 	credentialPolicy := credentialPolicyFromOptions(opts)
 	if normalizedPolicy, okPolicy := NormalizeCredentialPolicy(credentialPolicy); !okPolicy {
 		return nil, &Error{Code: "unsupported_credential_policy", Message: "unsupported credential policy " + strconv.Quote(credentialPolicy)}
@@ -863,7 +869,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if !modelAllowedByID(routeKey, allowedModelIDs) {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, opts, nil)
+	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, opts, nil, defaultRequestRetry)
 	requestRetry := retrySummary.requestRetry
 	if !retrySummary.hasRequestRetry || requestRetry < 0 {
 		requestRetry = 0
@@ -874,7 +880,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		for {
 			auth, providerKey, errPick := m.scheduler.pickMixed(ctx, providers, routeModel, opts, tried)
 			if errPick != nil {
-				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried)
+				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
 			}
 			if auth == nil {
 				return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -894,7 +900,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				fullProviderKey = providerKey
 			}
 			fullCandidate, okCandidate, _, _ := m.buildDispatchCandidate(fullAuth, fullProviderKey, routeModel, credentialPolicy, time.Now())
-			if !okCandidate || concurrencyCandidateExcluded(opts, fullAuth.ID, fullCandidate.upstreamKey) {
+			if !okCandidate || !requestRetryRoundAllowed(fullAuth, retryRound, defaultRequestRetry) || concurrencyCandidateExcluded(opts, fullAuth.ID, fullCandidate.upstreamKey) {
 				continue
 			}
 			upstream := strings.TrimSpace(fullCandidate.upstreamModel)
@@ -939,6 +945,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
+			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
+				continue
+			}
 			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
 				continue
 			}
@@ -976,7 +985,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 
 		if len(availableAuths) == 0 {
 			errUnavailable := dispatchUnavailableError(routeModel, providerForSelector, totalCandidates, cooldownCount, earliest, now)
-			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried)
+			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
 		}
 
 		var auth *Auth
@@ -1031,7 +1040,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		if errFull != nil {
 			return nil, errFull
 		}
-		if !okFull {
+		if !okFull || !requestRetryRoundAllowed(fullAuth, retryRound, defaultRequestRetry) {
 			continue
 		}
 
@@ -1062,18 +1071,14 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	}
 }
 
-func (m *Manager) summarizeDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}) dispatchAvailabilitySummary {
+func (m *Manager) summarizeDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}, defaultRequestRetry int) dispatchAvailabilitySummary {
 	if m != nil && m.scheduler != nil && !m.hasPluginScheduler() && m.useSchedulerFastPath() {
-		defaultRetry := 0
-		if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil && cfg.RequestRetry > 0 {
-			defaultRetry = cfg.RequestRetry
-		}
-		return m.scheduler.summarizeDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRetry)
+		return m.scheduler.summarizeDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRequestRetry)
 	}
-	return m.scanDispatchAvailability(providers, routeModel, opts, excludedAuthIDs)
+	return m.scanDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRequestRetry)
 }
 
-func (m *Manager) scanDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}) dispatchAvailabilitySummary {
+func (m *Manager) scanDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}, defaultRequestRetry int) dispatchAvailabilitySummary {
 	summary := dispatchAvailabilitySummary{now: time.Now()}
 	if m == nil {
 		return summary
@@ -1090,14 +1095,14 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	}
 	credentialPolicy := credentialPolicyFromOptions(opts)
 	registryRef := registry.GetGlobalRegistry()
-	defaultRetry := 0
-	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil && cfg.RequestRetry > 0 {
-		defaultRetry = cfg.RequestRetry
-	}
+	retryRound := requestRetryRoundFromOptions(opts)
 
 	m.mu.RLock()
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
+			continue
+		}
+		if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
 			continue
 		}
 		if _, excluded := excludedAuthIDs[strings.TrimSpace(candidate.ID)]; excluded {
@@ -1126,13 +1131,7 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 			continue
 		}
 		summary.total++
-		retryLimit := defaultRetry
-		if override, ok := candidate.RequestRetryOverride(); ok {
-			retryLimit = override
-		}
-		if retryLimit < 0 {
-			retryLimit = 0
-		}
+		retryLimit := effectiveRequestRetry(candidate, defaultRequestRetry)
 		if !summary.hasRequestRetry || retryLimit > summary.requestRetry {
 			summary.requestRetry = retryLimit
 		}
@@ -1149,7 +1148,7 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	return summary
 }
 
-func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs map[string]struct{}) error {
+func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs map[string]struct{}, defaultRequestRetry int) error {
 	if m == nil || errDispatch == nil {
 		return errDispatch
 	}
@@ -1161,7 +1160,12 @@ func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers 
 		// credential round. Classify the error against the next round, where CPA
 		// resets those exclusions, so retry timing reflects the credentials that
 		// will actually be eligible then.
-		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, nil)
+		nextRound := requestRetryRoundFromOptions(opts)
+		if requestRetryRoundMetadataPresent(opts) {
+			nextRound++
+		}
+		nextRoundOpts := withRequestRetryDispatchMetadata(opts, nextRound, defaultRequestRetry)
+		summary = m.summarizeDispatchAvailability(providers, routeModel, nextRoundOpts, nil, defaultRequestRetry)
 		provider := "mixed"
 		if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
 			provider = normalizedProviders[0]
@@ -1171,7 +1175,7 @@ func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers 
 	}
 
 	if !hasSummary {
-		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, triedAuthIDs)
+		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, triedAuthIDs, defaultRequestRetry)
 		if summary.total > 0 && summary.cooldownCount == summary.total && !summary.earliest.IsZero() {
 			provider := "mixed"
 			if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {

@@ -321,7 +321,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	predicate := schedulerPredicate(tried, allowedAuthIDsFromOptions(opts), credentialPolicyFromOptions(opts))
+	predicate := schedulerPredicate(tried, allowedAuthIDsFromOptions(opts), credentialPolicyFromOptions(opts), requestRetryRoundFromOptions(opts), requestRetryDefaultFromOptions(opts))
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
@@ -362,7 +362,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		strategy = s.strategy
 	}
 
-	predicate := schedulerPredicate(tried, allowedAuthIDsFromOptions(opts), credentialPolicyFromOptions(opts))
+	predicate := schedulerPredicate(tried, allowedAuthIDsFromOptions(opts), credentialPolicyFromOptions(opts), requestRetryRoundFromOptions(opts), requestRetryDefaultFromOptions(opts))
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
@@ -477,6 +477,7 @@ func (s *authScheduler) summarizeDispatchAvailability(providers []string, model 
 	}
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	credentialPolicy := credentialPolicyFromOptions(opts)
+	retryRound := requestRetryRoundFromOptions(opts)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -512,12 +513,15 @@ func (s *authScheduler) summarizeDispatchAvailability(providers []string, model 
 			if entry == nil || !credentialPolicyAllows(credentialPolicy, entry.auth) {
 				continue
 			}
+			if !requestRetryRoundAllowed(entry.auth, retryRound, defaultRequestRetry) {
+				continue
+			}
 			aggregate.add(entry)
 		}
 		return aggregate.summary(now, defaultRequestRetry)
 	}
 
-	if len(excludedAuthIDs) == 0 {
+	if len(excludedAuthIDs) == 0 && retryRound == 0 {
 		for _, shard := range shards {
 			switch credentialPolicy {
 			case "":
@@ -544,6 +548,9 @@ func (s *authScheduler) summarizeDispatchAvailability(providers []string, model 
 				continue
 			}
 			if !credentialPolicyAllows(credentialPolicy, entry.auth) {
+				continue
+			}
+			if !requestRetryRoundAllowed(entry.auth, retryRound, defaultRequestRetry) {
 				continue
 			}
 			aggregate.add(entry)

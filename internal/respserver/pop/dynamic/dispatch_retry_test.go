@@ -85,6 +85,44 @@ func TestHandleAuthExcludesCredentialsFromCurrentRetryRound(t *testing.T) {
 	}
 }
 
+func TestHandleAuthRetryRoundProtocolValidation(t *testing.T) {
+	runtime := newAuthValidateRuntime(t, context.Background(), "dispatch-client-key", "deleted-dispatch-client-key")
+	runtime.CoreManager().SetFullAuthResolver(nil)
+	runtime.CoreManager().SetSelector(&coreauth.RoundRobinSelector{})
+	runtime.CoreManager().SetConfig(&appconfig.Config{RequestRetry: 3})
+	const authID = "retry-round-wire-auth"
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := runtime.CoreManager().Register(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"api_key": authID},
+		Metadata:   map[string]any{"request_retry": 3},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	validPayloads := []string{
+		`{"type":"auth","model":"gpt","headers":{"x-api-key":"dispatch-client-key"}}`,
+		`{"type":"auth","model":"gpt","retry_round":0,"headers":{"x-api-key":"dispatch-client-key"}}`,
+		`{"type":"auth","model":"gpt","retry_round":1,"headers":{"x-api-key":"dispatch-client-key"}}`,
+	}
+	for _, payload := range validPayloads {
+		reply := handleAuth(context.Background(), dispatch.Env{Runtime: runtime}, []string{"RPOP", payload})
+		if authIDGot := gjson.Get(string(reply.BulkString), "auth.id").String(); authIDGot != authID {
+			t.Fatalf("payload %s selected auth %q, want %q; body=%s", payload, authIDGot, authID, string(reply.BulkString))
+		}
+	}
+	for _, raw := range []string{"-1", "1.5", `"1"`, "null", "true"} {
+		payload := `{"type":"auth","model":"gpt","retry_round":` + raw + `,"headers":{"x-api-key":"dispatch-client-key"}}`
+		reply := handleAuth(context.Background(), dispatch.Env{Runtime: runtime}, []string{"RPOP", payload})
+		if got := gjson.Get(string(reply.BulkString), "error.type").String(); got != "error" {
+			t.Fatalf("retry_round=%s error type = %q, want error; body=%s", raw, got, string(reply.BulkString))
+		}
+	}
+}
+
 func TestBuildDispatchErrorJSONPreservesModelCooldownRetryAfter(t *testing.T) {
 	tests := []struct {
 		name         string

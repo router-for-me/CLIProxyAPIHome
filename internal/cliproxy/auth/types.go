@@ -451,6 +451,23 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
+func effectiveRequestRetry(auth *Auth, defaultRequestRetry int) int {
+	if defaultRequestRetry < 0 {
+		defaultRequestRetry = 0
+	}
+	if override, ok := auth.RequestRetryOverride(); ok {
+		return override
+	}
+	return defaultRequestRetry
+}
+
+func requestRetryRoundAllowed(auth *Auth, retryRound, defaultRequestRetry int) bool {
+	if retryRound <= 0 {
+		return true
+	}
+	return effectiveRequestRetry(auth, defaultRequestRetry) >= retryRound
+}
+
 // parseBoolAny parses a bool any.
 func parseBoolAny(val any) (bool, bool) {
 	// Validate input data before converting it into runtime state.

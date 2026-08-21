@@ -223,10 +223,19 @@ func normalizedAllowedModelID(modelID string) string {
 	return strings.ToLower(modelID)
 }
 
-func schedulerPredicate(tried map[string]struct{}, allowed map[string]struct{}, credentialPolicy string) func(*scheduledAuth) bool {
+func schedulerPredicate(tried map[string]struct{}, allowed map[string]struct{}, credentialPolicy string, retryRound, defaultRequestRetry int) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
 			return false
+		}
+		if retryRound > 0 {
+			limit := defaultRequestRetry
+			if entry.hasRequestRetryOverride {
+				limit = entry.requestRetryOverride
+			}
+			if limit < retryRound {
+				return false
+			}
 		}
 		if len(tried) > 0 {
 			if _, ok := tried[entry.auth.ID]; ok {
