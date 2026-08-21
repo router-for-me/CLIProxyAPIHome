@@ -54,6 +54,82 @@ func TestApplyOAuthFieldPatchArbitraryFields(t *testing.T) {
 	}
 }
 
+func TestApplyOAuthFieldPatchRejectsConflictingRequestRetryAliases(t *testing.T) {
+	patches := []string{
+		`{"request-retry":2,"request_retry":3}`,
+		`{" request-retry ":2,"request_retry":3}`,
+		`{"request_retry":2,"request-retry.child":3}`,
+	}
+	for _, patch := range patches {
+		auth := &coreauth.Auth{
+			ID:         "codex-auth",
+			Provider:   "codex",
+			Attributes: map[string]string{"priority": "10"},
+			Metadata:   map[string]any{"type": "codex", "request_retry": 1},
+		}
+		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch))
+		if errPatch == nil || changed {
+			t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want unchanged conflict error", patch, changed, errPatch)
+		}
+		if got, ok := auth.RequestRetryOverride(); !ok || got != 1 {
+			t.Fatalf("request retry override after rejected patch %s = (%d, %t), want (1, true)", patch, got, ok)
+		}
+		if auth.Attributes["priority"] != "10" {
+			t.Fatalf("attributes changed after rejected patch %s: %#v", patch, auth.Attributes)
+		}
+	}
+}
+
+func TestApplyOAuthFieldPatchRejectsInvalidRequestRetryAtomically(t *testing.T) {
+	patches := []string{
+		`{"priority":20,"request-retry":"2"}`,
+		`{"priority":20,"request_retry":true}`,
+		`{"priority":20,"request-retry":1.5}`,
+		`{"priority":20,"request-retry":1e2}`,
+		`{"priority":20,"request-retry":{}}`,
+		`{"priority":20,"request_retry.child":2}`,
+	}
+	for _, patch := range patches {
+		auth := &coreauth.Auth{
+			ID:         "codex-auth",
+			Provider:   "codex",
+			Attributes: map[string]string{"priority": "10"},
+			Metadata:   map[string]any{"type": "codex", "priority": 10, "request_retry": 1},
+		}
+		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch))
+		if errPatch == nil || changed {
+			t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want unchanged validation error", patch, changed, errPatch)
+		}
+		if got, ok := auth.RequestRetryOverride(); !ok || got != 1 {
+			t.Fatalf("request retry override after rejected patch %s = (%d, %t), want (1, true)", patch, got, ok)
+		}
+		if got := auth.Metadata["priority"]; got != 10 || auth.Attributes["priority"] != "10" {
+			t.Fatalf("priority changed after rejected patch %s: metadata=%#v attributes=%#v", patch, auth.Metadata, auth.Attributes)
+		}
+	}
+}
+
+func TestApplyOAuthFieldPatchNegativeRequestRetryClearsOverride(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "codex-auth",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "request_retry": 1, "request-retry": 2},
+	}
+	changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"request-retry":-1}`))
+	if errPatch != nil || !changed {
+		t.Fatalf("applyOAuthFieldPatch() = (%t, %v), want successful clear", changed, errPatch)
+	}
+	if got, ok := auth.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("request retry override after negative patch = (%d, %t), want inherited", got, ok)
+	}
+	if _, exists := auth.Metadata["request_retry"]; exists {
+		t.Fatalf("canonical request_retry remains after clear: %#v", auth.Metadata)
+	}
+	if _, exists := auth.Metadata["request-retry"]; exists {
+		t.Fatalf("legacy request-retry remains after clear: %#v", auth.Metadata)
+	}
+}
+
 func TestAuthFileEntryIncludesEditableMetadata(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "codex-auth",
@@ -239,6 +315,106 @@ func TestAuthFileEntryEmitsDisableCoolingOverride(t *testing.T) {
 			t.Fatalf("disable-cooling = %#v (present=%t), want false", entry["disable-cooling"], ok)
 		}
 	})
+}
+
+func TestAuthFileEntryEmitsRequestRetryOverride(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		want     int
+		present  bool
+	}{
+		{name: "canonical", metadata: map[string]any{"type": "codex", "request_retry": 2}, want: 2, present: true},
+		{name: "legacy", metadata: map[string]any{"type": "codex", "request-retry": 0}, present: true},
+		{name: "unset", metadata: map[string]any{"type": "codex"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entry := authFileEntry(&coreauth.Auth{ID: "codex-auth", Provider: "codex", Metadata: test.metadata})
+			got, present := entry["request-retry"]
+			if present != test.present {
+				t.Fatalf("request-retry present = %t, want %t (entry=%#v)", present, test.present, entry)
+			}
+			if present && got != test.want {
+				t.Fatalf("request-retry = %#v, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPatchAuthFileFieldsRoundTripsRequestRetry(t *testing.T) {
+	handler, engine, _, closeRepo := newConcurrencyManagementTestServer(t)
+	defer closeRepo()
+	seedOAuthAuth(t, handler.repo, "oauth-retry")
+	engine.GET("/auth-files", handler.ListAuthFiles)
+
+	patchResponse := httptest.NewRecorder()
+	patchRequest := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{
+		"id":"oauth-retry",
+		"request-retry":2
+	}`))
+	patchRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(patchResponse, patchRequest)
+	if patchResponse.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", patchResponse.Code, patchResponse.Body.String())
+	}
+
+	listResponse := httptest.NewRecorder()
+	engine.ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/auth-files", nil))
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", listResponse.Code, listResponse.Body.String())
+	}
+	var payload struct {
+		Files []struct {
+			ID           string `json:"id"`
+			RequestRetry *int   `json:"request-retry"`
+		} `json:"files"`
+	}
+	if errDecode := json.Unmarshal(listResponse.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode GET response: %v", errDecode)
+	}
+	if len(payload.Files) != 1 || payload.Files[0].ID != "oauth-retry" || payload.Files[0].RequestRetry == nil || *payload.Files[0].RequestRetry != 2 {
+		t.Fatalf("files = %#v, want request-retry 2", payload.Files)
+	}
+
+	persisted, _, errAuth := handler.repo.GetAuth(t.Context(), "oauth-retry")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if got, ok := persisted.RequestRetryOverride(); !ok || got != 2 {
+		t.Fatalf("persisted request retry override = (%d, %t), want (2, true)", got, ok)
+	}
+	if _, exists := persisted.Metadata["request-retry"]; exists {
+		t.Fatalf("legacy request-retry metadata remains after hyphenated PATCH: %#v", persisted.Metadata)
+	}
+
+	clearResponse := httptest.NewRecorder()
+	clearRequest := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{
+		"id":"oauth-retry",
+		"request_retry":null
+	}`))
+	clearRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(clearResponse, clearRequest)
+	if clearResponse.Code != http.StatusOK {
+		t.Fatalf("PATCH clear status = %d body=%s", clearResponse.Code, clearResponse.Body.String())
+	}
+
+	persisted, _, errAuth = handler.repo.GetAuth(t.Context(), "oauth-retry")
+	if errAuth != nil {
+		t.Fatalf("GetAuth(after clear) error = %v", errAuth)
+	}
+	if got, ok := persisted.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("persisted request retry override after clear = (%d, %t), want inherited", got, ok)
+	}
+	listResponse = httptest.NewRecorder()
+	engine.ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/auth-files", nil))
+	payload.Files = nil
+	if errDecode := json.Unmarshal(listResponse.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode GET after clear: %v", errDecode)
+	}
+	if len(payload.Files) != 1 || payload.Files[0].RequestRetry != nil {
+		t.Fatalf("files after clear = %#v, want omitted request-retry", payload.Files)
+	}
 }
 
 func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {

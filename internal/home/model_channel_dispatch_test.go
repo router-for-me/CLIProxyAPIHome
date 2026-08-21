@@ -94,3 +94,30 @@ func TestDispatchForAPIKeyFailsClosedForEmptyModelChannel(t *testing.T) {
 		t.Fatalf("DispatchForAPIKey() result = %#v, want nil", result)
 	}
 }
+
+func TestDispatchForAPIKeyIntersectsPinnedAuthWithChannel(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	modelID := "gpt-pinned-model"
+	for _, authID := range []string{"auth-a", "auth-b"} {
+		registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: modelID, Object: "model", Type: "openai"}})
+		if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive}); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", authID, errRegister)
+		}
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+
+	adapter := &modelChannelDispatchTestAdapter{
+		allowedAuthIDs:  []string{"auth-b"},
+		allowedModelIDs: []string{modelID},
+	}
+	runtime := &Runtime{coreManager: manager, clusterAdapter: adapter}
+	result, errDispatch := runtime.dispatchForAPIKey(context.Background(), modelID, nil, "client-key", "", nil, "auth-b", DispatchConcurrencyContext{})
+	if errDispatch != nil || result == nil || result.AuthID != "auth-b" {
+		t.Fatalf("allowed pinned dispatch = (%#v, %v), want auth-b", result, errDispatch)
+	}
+
+	result, errDispatch = runtime.dispatchForAPIKey(context.Background(), modelID, nil, "client-key", "", nil, "auth-a", DispatchConcurrencyContext{})
+	if errDispatch == nil || result != nil {
+		t.Fatalf("channel-disallowed pinned dispatch = (%#v, %v), want fail-closed error", result, errDispatch)
+	}
+}

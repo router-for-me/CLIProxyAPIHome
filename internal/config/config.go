@@ -103,12 +103,17 @@ type Config struct {
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
 
-	// RequestRetry defines the retry times when the request failed.
+	// RequestRetry defines the number of additional credential retry rounds for
+	// downstream CPA execution after the first round exhausts its credentials.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
-	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
+	// MaxRetryCredentials defines the maximum number of different credentials to
+	// try in each credential retry round.
 	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
-	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
+	// MaxRetryInterval defines the maximum positive cooldown wait, in seconds,
+	// allowed before starting another credential retry round. A non-positive value
+	// forbids positive cooldown waits; it does not disable same-round credential
+	// failover or immediate additional rounds allowed by RequestRetry.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
@@ -410,6 +415,10 @@ type ClaudeKey struct {
 	// True disables request-error and quota cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
+	// RequestRetry optionally overrides the global number of additional retry rounds.
+	// Nil or a negative value inherits the global setting; zero disables additional rounds.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
+
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 
@@ -482,6 +491,10 @@ type CodexKey struct {
 	// DisableCooling overrides the global cooling policy for this credential when set.
 	// True disables request-error and quota cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// RequestRetry optionally overrides the global number of additional retry rounds.
+	// Nil or a negative value inherits the global setting; zero disables additional rounds.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 }
 
 // GetAPIKey returns an api key.
@@ -558,6 +571,10 @@ type GeminiKey struct {
 	// DisableCooling overrides the global cooling policy for this credential when set.
 	// True disables request-error and quota cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// RequestRetry optionally overrides the global number of additional retry rounds.
+	// Nil or a negative value inherits the global setting; zero disables additional rounds.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 }
 
 // GetAPIKey returns an api key.
@@ -616,6 +633,10 @@ type OpenAICompatibility struct {
 	// DisableCooling overrides the global cooling policy for this provider when set.
 	// True disables request-error and quota cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// RequestRetry optionally overrides the global number of additional retry rounds.
+	// Nil or a negative value inherits the global setting; zero disables additional rounds.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

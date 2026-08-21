@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"sync"
@@ -330,6 +331,45 @@ func TestClusterAuthIndexCarriesCooldownState(t *testing.T) {
 	}
 	if !state.Quota.NextRecoverAt.Equal(recover) {
 		t.Fatalf("expected minimal model window %v, got %v", recover, state.Quota.NextRecoverAt)
+	}
+}
+
+func TestClusterAuthIndexProjectsRequestRetryWithoutSecrets(t *testing.T) {
+	for _, requestRetry := range []int{0, 2} {
+		t.Run(fmt.Sprintf("request-retry-%d", requestRetry), func(t *testing.T) {
+			authID := fmt.Sprintf("auth-cluster-request-retry-%d", requestRetry)
+			repo := newQuotaTestRepository(t)
+			ctx := context.Background()
+			seed := &coreauth.Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{
+					"access_token":  "must-not-be-projected",
+					"request_retry": requestRetry,
+				},
+			}
+			if _, errUpsert := repo.UpsertAuth(ctx, seed, "register"); errUpsert != nil {
+				t.Fatalf("UpsertAuth() error = %v", errUpsert)
+			}
+
+			adapter := NewRuntimeAdapter(repo, "127.0.0.1")
+			if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
+				t.Fatalf("LoadIndex() error = %v", errLoad)
+			}
+			minimals := adapter.ListMinimalAuths()
+			if len(minimals) != 1 || minimals[0] == nil {
+				t.Fatalf("ListMinimalAuths() = %#v, want one auth", minimals)
+			}
+			minimal := minimals[0]
+			if got, ok := minimal.RequestRetryOverride(); !ok || got != requestRetry {
+				t.Fatalf("minimal request-retry override = (%d, %t), want (%d, true)", got, ok, requestRetry)
+			}
+			if _, exists := minimal.Metadata["access_token"]; exists {
+				t.Fatalf("minimal metadata exposed access_token: %#v", minimal.Metadata)
+			}
+		})
 	}
 }
 

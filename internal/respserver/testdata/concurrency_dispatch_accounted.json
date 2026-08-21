@@ -1,6 +1,7 @@
 {
   "model": "gpt",
   "provider": "codex",
+  "request_retry": 0,
   "auth_index": "cred-1",
   "user_api_key": "user-key",
   "auth": {

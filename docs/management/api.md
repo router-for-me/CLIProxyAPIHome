@@ -2068,6 +2068,7 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `headers` | object string to string | Extra upstream request headers. |
 | `excluded-models` | array of string | Model IDs excluded from this key. |
 | `disable-cooling` | boolean | Optional credential override that takes precedence over the global setting. `true` disables request-error and quota cooldowns; `false` explicitly enables them; omission inherits the global value. Covers 402/403/404, 408/500/502/503/504, and model-level 429. |
+| `request-retry` | integer | Optional credential override for additional retry rounds. `0` disables additional rounds; omission or a negative value inherits the global setting. |
 | `auth-index` | string | Compatibility credential identifier. |
 | `id` | string | Canonical immutable credential UUID. Responses and exports use this field. |
 | `uuid` | string | Legacy input-only alias for `id`; it is normalized to `id` and never returned or exported. |
@@ -2096,6 +2097,7 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `models` | array of `OpenAICompatibilityModel` | Model definitions and aliases. |
 | `headers` | object string to string | Extra upstream headers. |
 | `disable-cooling` | boolean | Optional provider override that takes precedence over the global setting for all of its credentials. `true` disables request-error and quota cooldowns; `false` explicitly enables them; omission inherits the global value. Covers 402/403/404, 408/500/502/503/504, and model-level 429. |
+| `request-retry` | integer | Optional provider override for additional retry rounds across all of its credentials. `0` disables additional rounds; omission or a negative value inherits the global setting. |
 | `id` | string | Canonical immutable UUID of the fallback credential when `api-key-entries` is empty. Responses and exports use this field. |
 | `uuid` | string | Legacy input-only alias for the fallback `id`; it is normalized to `id` and never returned or exported. |
 
@@ -2156,6 +2158,7 @@ Example response:
       "proxy-url": "",
       "disabled": false,
       "priority": 10,
+      "request-retry": 2,
       "headers": { "X-Test": "1" },
       "models": [
         { "name": "gemini-upstream", "alias": "gemini-alias" }
@@ -2231,7 +2234,7 @@ Selector fields:
 
 `PATCH` does not use body `auth_index` as the DB ID selector. Use `id` or `uuid` for ID-based patching.
 
-Within `value`, `disable-cooling` accepts a boolean override. Set it to `null` to clear an existing override and inherit the global setting; omitting it leaves the current override unchanged.
+Within `value`, `disable-cooling` accepts a boolean override and `request-retry` accepts an integer additional-round override. Set either field to `null`, or set `request-retry` to a negative value, to clear its existing override and inherit the global setting; omitting a field leaves its current override unchanged.
 
 Successful response:
 
@@ -2298,6 +2301,7 @@ Example response:
       "note": "operator note",
       "websockets": true,
       "disable-cooling": false,
+      "request-retry": 2,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2317,6 +2321,7 @@ the current value without downloading the credential JSON:
 | `note` | string | Operator note; omitted when empty. |
 | `websockets` | boolean | Effective runtime websocket flag. |
 | `disable-cooling` | boolean | Optional credential cooling override. `true` disables cooling, `false` explicitly enables it, and the field is omitted when unset so the credential inherits the global setting. |
+| `request-retry` | integer | Optional credential override for additional retry rounds. `0` disables additional rounds, and the field is omitted when unset so the credential inherits the global setting. |
 
 ### GET `/auth-files/models?name=<name-or-id>`
 
@@ -2488,6 +2493,7 @@ Editable fields:
 | `websockets` | boolean or string bool | Runtime websocket flag for supported auths. |
 | `disabled` | boolean or string bool | Updates auth disabled state and status. |
 | `disable-cooling` | boolean or `null` | Credential cooling override. `true` disables cooling, `false` enables it, and `null` clears the override so the credential inherits the global setting. The hyphenated response field is accepted directly by this PATCH route. |
+| `request-retry` | integer or `null` | Additional credential retry-round override. `0` disables additional rounds; `null` or a negative value inherits the global setting. Both `request-retry` and `request_retry` are accepted, but they cannot appear together. |
 | any nested path | any valid JSON | Sets arbitrary metadata paths such as `token.access_token`. |
 
 Example response:
@@ -4081,9 +4087,9 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `redis-usage-queue-retention-seconds` | integer | Usage queue retention window. Default `60`, max `3600`. |
 | `disable-cooling` | boolean | Globally disables Home request-error and quota cooldown scheduling (402/403/404, 408/500/502/503/504, and model-level 429) only when a credential/provider does not explicitly set the same field. An explicit credential/provider `true` or `false` takes precedence. HTTP 401 and model-not-supported recovery remain unchanged. This Home-local value is persisted and applied on reload; config sent to downstream CPA nodes is independently forced to `true`. |
 | `auth-auto-refresh-workers` | integer | Overrides auth auto-refresh worker count. |
-| `request-retry` | integer | Failed request retry count. |
-| `max-retry-credentials` | integer | Max credentials to try per failed request; `<=0` means all available. |
-| `max-retry-interval` | integer | Max wait seconds before retrying cooled-down credentials. |
+| `request-retry` | integer | Used by the CPA execution layer: additional retry rounds after the first credential round is exhausted on HTTP 403, 408, 429, 500, 502, 503, or 504; `0` disables additional rounds but the first round can still try multiple credentials. An explicit credential/provider override takes precedence; omission or a negative override inherits this global value. New CPA-to-Home RESP payloads exclude credentials already tried in the current round; legacy payloads without that field retain the count-based cap for compatibility. |
+| `max-retry-credentials` | integer | Maximum different credentials tried in each credential retry round; `<=0` means all available credentials in that round. |
+| `max-retry-interval` | integer | Maximum remaining cooldown in seconds that CPA may wait before starting a new credential retry round. A round waits only when at least one eligible credential will recover within this threshold; credentials with a longer remaining cooldown do not trigger it. `<=0` permits only rounds that can start immediately without a cooldown wait. |
 | `quota-exceeded.switch-project` | boolean | Switches Gemini project on quota errors. |
 | `quota-exceeded.switch-preview-model` | boolean | Switches to preview model on quota errors. |
 | `quota-exceeded.antigravity-credits` | boolean | Uses Antigravity credits as last-resort Claude fallback. |

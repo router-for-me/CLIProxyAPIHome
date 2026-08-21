@@ -98,6 +98,62 @@ func allowedModelIDsFromOptions(opts Options) map[string]struct{} {
 	return allowed
 }
 
+func excludedAuthIDsFromOptions(opts Options) map[string]struct{} {
+	if opts.Metadata == nil {
+		return nil
+	}
+	raw, ok := opts.Metadata[ExcludedAuthIDsMetadataKey]
+	if !ok {
+		return nil
+	}
+
+	excluded := make(map[string]struct{})
+	switch values := raw.(type) {
+	case []string:
+		for _, value := range values {
+			if authID := strings.TrimSpace(value); authID != "" {
+				excluded[authID] = struct{}{}
+			}
+		}
+	case []any:
+		for _, value := range values {
+			if authID := strings.TrimSpace(toString(value)); authID != "" {
+				excluded[authID] = struct{}{}
+			}
+		}
+	case map[string]struct{}:
+		for value := range values {
+			if authID := strings.TrimSpace(value); authID != "" {
+				excluded[authID] = struct{}{}
+			}
+		}
+	case map[string]bool:
+		for value, enabled := range values {
+			if !enabled {
+				continue
+			}
+			if authID := strings.TrimSpace(value); authID != "" {
+				excluded[authID] = struct{}{}
+			}
+		}
+	}
+	if len(excluded) == 0 {
+		return nil
+	}
+	return excluded
+}
+
+func cloneAuthIDSet(source map[string]struct{}) map[string]struct{} {
+	if len(source) == 0 {
+		return make(map[string]struct{})
+	}
+	clone := make(map[string]struct{}, len(source))
+	for authID := range source {
+		clone[authID] = struct{}{}
+	}
+	return clone
+}
+
 func excludedConcurrencyCandidatesFromOptions(opts Options) []ExcludedConcurrencyCandidate {
 	if opts.Metadata == nil {
 		return nil

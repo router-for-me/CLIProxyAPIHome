@@ -165,6 +165,7 @@ func credentialGeminiKey(auth *coreauth.Auth) appconfig.GeminiKey {
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
 		DisableCooling: credentialDisableCooling(auth),
+		RequestRetry:   credentialRequestRetry(auth),
 	}
 }
 
@@ -181,6 +182,7 @@ func credentialVertexKey(auth *coreauth.Auth) appconfig.VertexCompatKey {
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
 		DisableCooling: credentialDisableCooling(auth),
+		RequestRetry:   credentialRequestRetry(auth),
 	}
 }
 
@@ -199,6 +201,7 @@ func credentialCodexKey(auth *coreauth.Auth) appconfig.CodexKey {
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
 		DisableCooling: credentialDisableCooling(auth),
+		RequestRetry:   credentialRequestRetry(auth),
 	}
 }
 
@@ -216,6 +219,7 @@ func credentialXAIKey(auth *coreauth.Auth) appconfig.XAIKey {
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
 		DisableCooling: credentialDisableCooling(auth),
+		RequestRetry:   credentialRequestRetry(auth),
 	}
 }
 
@@ -232,6 +236,7 @@ func credentialClaudeKey(auth *coreauth.Auth) appconfig.ClaudeKey {
 		Headers:        credentialHeaders(auth),
 		ExcludedModels: credentialExcludedModels(auth),
 		DisableCooling: credentialDisableCooling(auth),
+		RequestRetry:   credentialRequestRetry(auth),
 	}
 }
 
@@ -253,6 +258,7 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 	priority := credentialPriority(auth)
 	headers := credentialHeaders(auth)
 	disableCooling := credentialDisableCooling(auth)
+	requestRetry := credentialRequestRetry(auth)
 	apiKey := authAttribute(auth, "api_key")
 	proxyURL := strings.TrimSpace(auth.ProxyURL)
 	representation := "nested"
@@ -266,6 +272,7 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 		strconv.Itoa(priority),
 		credentialHeadersKey(headers),
 		optionalBoolKey(disableCooling),
+		optionalIntKey(requestRetry),
 		representation,
 	}, "\x00")
 
@@ -281,6 +288,7 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 				Models:         credentialOpenAIModels(auth),
 				Headers:        headers,
 				DisableCooling: disableCooling,
+				RequestRetry:   requestRetry,
 			},
 			SeenEntry:   make(map[string]struct{}),
 			SortKey:     groupKey,
@@ -522,6 +530,22 @@ func optionalBoolKey(value *bool) string {
 		return "inherit"
 	}
 	return strconv.FormatBool(*value)
+}
+
+// credentialRequestRetry restores the optional additional-round override.
+func credentialRequestRetry(auth *coreauth.Auth) *int {
+	value, ok := auth.RequestRetryOverride()
+	if !ok {
+		return nil
+	}
+	return &value
+}
+
+func optionalIntKey(value *int) string {
+	if value == nil {
+		return "inherit"
+	}
+	return strconv.Itoa(*value)
 }
 
 // credentialExcludedModels restores the excluded model list from auth attributes.

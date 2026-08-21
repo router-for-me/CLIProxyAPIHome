@@ -786,16 +786,23 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 	}
 }
 
-// modelMetadataFromAuth keeps only Home-owned metadata needed for model registration.
+// modelMetadataFromAuth keeps only Home-owned metadata needed for minimal
+// runtime scheduling and model registration.
 func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
-	if auth == nil || auth.Metadata == nil {
+	if auth == nil {
 		return nil
 	}
-	raw, ok := auth.Metadata[homeConfigModelsMetadataKey]
-	if !ok || raw == nil {
+	metadata := make(map[string]any, 2)
+	if raw, ok := auth.Metadata[homeConfigModelsMetadataKey]; ok && raw != nil {
+		metadata[homeConfigModelsMetadataKey] = raw
+	}
+	if requestRetry, ok := auth.RequestRetryOverride(); ok {
+		metadata["request_retry"] = requestRetry
+	}
+	if len(metadata) == 0 {
 		return nil
 	}
-	return map[string]any{homeConfigModelsMetadataKey: raw}
+	return metadata
 }
 
 // cloneModelStateMap clones a per-model state map.

@@ -17,12 +17,16 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 		testConfigAPIKeyAuth("codex-id", "codex", "config:codex[token]", "codex-key"),
 		testConfigAPIKeyAuth("xai-id", "xai", "config:xai[token]", "xai-key"),
 		testConfigAPIKeyAuth("claude-id", "claude", "config:claude[token]", "claude-key"),
+		testConfigAPIKeyAuth("compat-id", "compat", "config:compat[token]", "compat-key"),
 		testConfigAPIKeyAuth("codex-file-id", "codex", "auth-file.json", "ignored-key"),
 	}
-	auths[3].Metadata = map[string]any{"disable_cooling": false}
+	auths[3].Metadata = map[string]any{"disable_cooling": false, "request_retry": 0}
+	auths[5].Attributes["compat_name"] = "compat"
+	auths[5].Attributes["provider_key"] = "compat"
+	auths[5].Metadata = map[string]any{"request_retry": 2}
 
 	counts := ApplyCredentialConfigToRoot(root, auths)
-	if counts.GeminiKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.ClaudeKeys != 1 {
+	if counts.GeminiKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.ClaudeKeys != 1 || counts.OpenAICompatibility != 1 {
 		t.Fatalf("unexpected credential counts: %#v", counts)
 	}
 	if got := root["debug"]; got != true {
@@ -51,6 +55,9 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	if xaiKeys[0].DisableCooling == nil || *xaiKeys[0].DisableCooling {
 		t.Fatalf("xAI disable-cooling override = %#v, want explicit false", xaiKeys[0].DisableCooling)
 	}
+	if xaiKeys[0].RequestRetry == nil || *xaiKeys[0].RequestRetry != 0 {
+		t.Fatalf("xAI request-retry override = %#v, want explicit zero", xaiKeys[0].RequestRetry)
+	}
 	if geminiKeys[0].DisableCooling != nil {
 		t.Fatalf("Gemini disable-cooling override = %#v, want inherited setting", geminiKeys[0].DisableCooling)
 	}
@@ -60,6 +67,10 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	}
 	if vertexKeys[0].ID != "vertex-id" || codexKeys[0].ID != "codex-id" || xaiKeys[0].ID != "xai-id" || claudeKeys[0].ID != "claude-id" {
 		t.Fatalf("provider credential IDs were not exported")
+	}
+	compat, ok := root["openai-compatibility"].([]appconfig.OpenAICompatibility)
+	if !ok || len(compat) != 1 || compat[0].RequestRetry == nil || *compat[0].RequestRetry != 2 {
+		t.Fatalf("OpenAI compatibility request-retry override = %#v, want 2", root["openai-compatibility"])
 	}
 }
 

@@ -2068,6 +2068,7 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `headers` | object string to string | 额外上游请求头。 |
 | `excluded-models` | array of string | 该 key 排除的模型 ID。 |
 | `disable-cooling` | boolean | 可选凭证级覆盖，优先于全局设置。`true` 禁用请求错误及 quota cooldown，`false` 显式启用；省略时继承全局值。覆盖 402/403/404、408/500/502/503/504 和模型级 429。 |
+| `request-retry` | integer | 可选凭证级额外重试轮次覆盖。`0` 禁用额外轮次；省略或负值继承全局设置。 |
 | `auth-index` | string | Compatibility credential identifier。 |
 | `id` | string | 规范且不可变的 credential UUID。响应和导出使用此字段。 |
 | `uuid` | string | 仅用于兼容输入的旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
@@ -2096,6 +2097,7 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `models` | array of `OpenAICompatibilityModel` | 模型定义和 alias。 |
 | `headers` | object string to string | 额外上游 headers。 |
 | `disable-cooling` | boolean | 可选 provider 级覆盖，优先于全局设置并作用于其全部凭证。`true` 禁用请求错误及 quota cooldown，`false` 显式启用；省略时继承全局值。覆盖 402/403/404、408/500/502/503/504 和模型级 429。 |
+| `request-retry` | integer | 可选 provider 级额外重试轮次覆盖，作用于其全部凭证。`0` 禁用额外轮次；省略或负值继承全局设置。 |
 | `id` | string | `api-key-entries` 为空时 fallback credential 的规范且不可变 UUID。响应和导出使用此字段。 |
 | `uuid` | string | fallback `id` 的仅输入兼容旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
 
@@ -2231,7 +2233,7 @@ Selector 字段：
 
 `PATCH` 不使用 body 中的 `auth_index` 作为 DB ID selector；按 ID patch 请使用 `id` 或 `uuid`。
 
-在 `value` 中，`disable-cooling` 接受 boolean 覆盖值。设为 `null` 会清除现有覆盖并继承全局设置；省略该字段则保留当前覆盖不变。
+在 `value` 中，`disable-cooling` 接受 boolean 覆盖值，`request-retry` 接受整数额外重试轮次覆盖。将任一字段设为 `null` 会清除现有覆盖并继承全局设置；将 `request-retry` 设为负值也会清除覆盖；省略字段则保留其当前覆盖不变。
 
 成功输出：
 
@@ -2298,6 +2300,7 @@ Query 参数：
       "note": "operator note",
       "websockets": true,
       "disable-cooling": false,
+      "request-retry": 2,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "modtime": "2026-05-27T10:00:00Z"
@@ -2316,6 +2319,7 @@ Query 参数：
 | `note` | string | 运维备注；为空时省略。 |
 | `websockets` | boolean | 实际生效的运行时 WebSocket 标志。 |
 | `disable-cooling` | boolean | 可选凭证级冷却覆盖。`true` 禁用冷却，`false` 显式启用；未设置时省略该字段并继承全局设置。 |
+| `request-retry` | integer | 可选凭证级额外重试轮次覆盖。`0` 禁用额外轮次；未设置时省略该字段并继承全局设置。 |
 
 ### GET `/auth-files/models?name=<name-or-id>`
 
@@ -2487,6 +2491,7 @@ Selector 字段：
 | `websockets` | boolean or string bool | 支持的 auth 的 runtime websocket flag。 |
 | `disabled` | boolean or string bool | 更新 auth disabled state 和 status。 |
 | `disable-cooling` | boolean 或 `null` | 凭证级 cooling 覆盖。`true` 禁用冷却，`false` 启用冷却，`null` 清除覆盖并继承全局设置。该 hyphenated response 字段可直接用于此 PATCH 接口。 |
+| `request-retry` | integer 或 `null` | 凭证级额外重试轮次覆盖。`0` 禁用额外轮次；`null` 或负值继承全局设置。接受 `request-retry` 和 `request_retry`，但两者不能同时出现。 |
 | 任意 nested path | any valid JSON | 可以设置任意 metadata path，例如 `token.access_token`。 |
 
 输出示例：
@@ -4050,9 +4055,9 @@ DELETE query：
 | `redis-usage-queue-retention-seconds` | integer | Usage queue 保留窗口；默认 `60`，最大 `3600`。 |
 | `disable-cooling` | boolean | 全局禁用 Home 的请求错误及 quota cooldown 调度（402/403/404、408/500/502/503/504 和模型级 429）；仅在凭证/provider 未显式设置同名字段时生效。凭证/provider 的 `true` 或 `false` 均优先于全局值。HTTP 401 与 model-not-supported 的恢复逻辑不受影响。该值仅作用于 Home，会持久化并在重载时生效；发送给下游 CPA 的配置会独立强制为 `true`。 |
 | `auth-auto-refresh-workers` | integer | 覆盖 auth auto-refresh worker 数量。 |
-| `request-retry` | integer | 失败请求重试次数。 |
-| `max-retry-credentials` | integer | 一个失败请求最多尝试的凭证数量；`<=0` 表示所有可用凭证。 |
-| `max-retry-interval` | integer | 重试 cooled-down credentials 前的最大等待秒数。 |
+| `request-retry` | integer | 由 CPA 执行层使用：首轮凭证遍历因 HTTP 403、408、429、500、502、503 或 504 耗尽后允许的额外重试轮数；`0` 表示不进行额外轮次，但首轮仍会按 `max-retry-credentials` 尝试多个凭证。凭证/provider 的显式覆盖优先；未设置或负值时继承该全局值。新的 CPA-to-Home RESP payload 会在当前轮排除已尝试凭证；未携带该字段的旧 payload 为兼容旧 CPA，仍使用 count 上限。 |
+| `max-retry-credentials` | integer | 每个凭证重试轮最多尝试的不同凭证数；`<=0` 表示该轮尝试所有可用凭证。 |
+| `max-retry-interval` | integer | CPA 开始新一轮凭证重试前允许等待的最大剩余冷却秒数。只有至少一个合格凭证会在该阈值内恢复时才会等待；剩余冷却时间超过该阈值的凭证不会触发该轮重试。`<=0` 仅允许无需等待冷却即可立即开始的轮次。 |
 | `quota-exceeded.switch-project` | boolean | Gemini quota error 时切换 project。 |
 | `quota-exceeded.switch-preview-model` | boolean | Quota error 时切换到 preview model。 |
 | `quota-exceeded.antigravity-credits` | boolean | Claude 最后兜底使用 Antigravity credits。 |

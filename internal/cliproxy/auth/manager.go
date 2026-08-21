@@ -699,6 +699,69 @@ type dispatchCandidate struct {
 	originalAlias    string
 }
 
+type dispatchAvailabilitySummary struct {
+	now             time.Time
+	total           int
+	cooldownCount   int
+	earliest        time.Time
+	requestRetry    int
+	hasRequestRetry bool
+}
+
+func isDispatchRetryRoundCooldown(auth *Auth, model string, now time.Time) bool {
+	if auth == nil || strings.TrimSpace(model) == "" || len(auth.ModelStates) == 0 {
+		return false
+	}
+	state := auth.ModelStates[model]
+	if state == nil {
+		state = auth.ModelStates[canonicalModelKey(model)]
+	}
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) {
+		return false
+	}
+	if state.LastError == nil {
+		return state.Quota.Exceeded
+	}
+	switch statusCodeFromResult(state.LastError) {
+	case http.StatusForbidden,
+		http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyDispatchAvailability(auth *Auth, blockedModel string, blocked bool, reason blockReason, next time.Time, now time.Time) (bool, blockReason, time.Time) {
+	if !blocked {
+		return true, blockReasonNone, time.Time{}
+	}
+
+	// Dispatch retry rounds may wait for transient upstream failures without
+	// exposing those failures as quota state to the model registry.
+	retryRoundCooldown := isDispatchRetryRoundCooldown(auth, blockedModel, now)
+	if reason == blockReasonCooldown && !retryRoundCooldown {
+		reason = blockReasonOther
+	} else if reason == blockReasonOther && retryRoundCooldown {
+		reason = blockReasonCooldown
+	}
+	return false, reason, next
+}
+
+func dispatchAvailabilityForModel(auth *Auth, resolvedModel, routeModel string, now time.Time) (bool, blockReason, time.Time) {
+	blockedModel := resolvedModel
+	blocked, reason, next := isAuthBlockedForModel(auth, blockedModel, now)
+	if !blocked && resolvedModel != canonicalModelKey(routeModel) {
+		blockedModel = routeModel
+		blocked, reason, next = isAuthBlockedForModel(auth, blockedModel, now)
+	}
+	return classifyDispatchAvailability(auth, blockedModel, blocked, reason, next, now)
+}
+
 func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel, credentialPolicy string, now time.Time) (dispatchCandidate, bool, blockReason, time.Time) {
 	authForResolution := auth
 	if auth != nil && strings.TrimSpace(auth.Provider) == "" {
@@ -717,11 +780,8 @@ func (m *Manager) buildDispatchCandidate(auth *Auth, providerKey, routeModel, cr
 		return dispatchCandidate{}, false, blockReasonOther, time.Time{}
 	}
 	authForAvailability := m.effectiveAvailabilityAuth(auth, now)
-	blocked, reason, next := isAuthBlockedForModel(authForAvailability, resolved.Key, now)
-	if !blocked && resolved.Key != canonicalModelKey(routeModel) {
-		blocked, reason, next = isAuthBlockedForModel(authForAvailability, routeModel, now)
-	}
-	if blocked {
+	available, reason, next := dispatchAvailabilityForModel(authForAvailability, resolved.Key, routeModel, now)
+	if !available {
 		return dispatchCandidate{}, false, reason, next
 	}
 	return dispatchCandidate{
@@ -797,19 +857,24 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	} else {
 		credentialPolicy = normalizedPolicy
 	}
-	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	allowedModelIDs := allowedModelIDsFromOptions(opts)
+	excludedAuthIDs := excludedAuthIDsFromOptions(opts)
 	routeKey := canonicalModelKey(routeModel)
 	if !modelAllowedByID(routeKey, allowedModelIDs) {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, opts, nil)
+	requestRetry := retrySummary.requestRetry
+	if !retrySummary.hasRequestRetry || requestRetry < 0 {
+		requestRetry = 0
+	}
 
 	if !m.hasPluginScheduler() && m.useSchedulerFastPath() {
-		tried := make(map[string]struct{})
+		tried := cloneAuthIDSet(excludedAuthIDs)
 		for {
 			auth, providerKey, errPick := m.scheduler.pickMixed(ctx, providers, routeModel, opts, tried)
 			if errPick != nil {
-				return nil, errPick
+				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried)
 			}
 			if auth == nil {
 				return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -840,6 +905,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				Auth:          fullAuth.Clone(),
 				Provider:      fullProviderKey,
 				UpstreamModel: upstream,
+				RequestRetry:  requestRetry,
 				PooledModels:  false,
 				ForceMapping:  fullCandidate.forceMapping,
 				OriginalAlias: fullCandidate.originalAlias,
@@ -847,6 +913,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 	}
 
+	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	normalizedProviders := normalizeProviderKeys(providers)
 	if len(normalizedProviders) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -857,7 +924,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	}
 	registryRef := registry.GetGlobalRegistry()
 
-	tried := make(map[string]struct{})
+	tried := cloneAuthIDSet(excludedAuthIDs)
 	for {
 		now := time.Now()
 		m.mu.RLock()
@@ -872,7 +939,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
+			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
 				continue
 			}
 			if !authAllowedByID(candidate.ID, allowedAuthIDs) {
@@ -908,7 +975,8 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		m.mu.RUnlock()
 
 		if len(availableAuths) == 0 {
-			return nil, dispatchUnavailableError(routeModel, providerForSelector, totalCandidates, cooldownCount, earliest, now)
+			errUnavailable := dispatchUnavailableError(routeModel, providerForSelector, totalCandidates, cooldownCount, earliest, now)
+			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried)
 		}
 
 		var auth *Auth
@@ -986,11 +1054,142 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			Auth:          fullAuth.Clone(),
 			Provider:      providerKey,
 			UpstreamModel: upstream,
+			RequestRetry:  requestRetry,
 			PooledModels:  false,
 			ForceMapping:  fullCandidate.forceMapping,
 			OriginalAlias: fullCandidate.originalAlias,
 		}, nil
 	}
+}
+
+func (m *Manager) summarizeDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}) dispatchAvailabilitySummary {
+	if m != nil && m.scheduler != nil && !m.hasPluginScheduler() && m.useSchedulerFastPath() {
+		defaultRetry := 0
+		if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil && cfg.RequestRetry > 0 {
+			defaultRetry = cfg.RequestRetry
+		}
+		return m.scheduler.summarizeDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRetry)
+	}
+	return m.scanDispatchAvailability(providers, routeModel, opts, excludedAuthIDs)
+}
+
+func (m *Manager) scanDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}) dispatchAvailabilitySummary {
+	summary := dispatchAvailabilitySummary{now: time.Now()}
+	if m == nil {
+		return summary
+	}
+	normalizedProviders := normalizeProviderKeys(providers)
+	if len(normalizedProviders) == 0 {
+		return summary
+	}
+	routeKey := canonicalModelKey(routeModel)
+	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
+	allowedModelIDs := allowedModelIDsFromOptions(opts)
+	if !modelAllowedByID(routeKey, allowedModelIDs) {
+		return summary
+	}
+	credentialPolicy := credentialPolicyFromOptions(opts)
+	registryRef := registry.GetGlobalRegistry()
+	defaultRetry := 0
+	if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil && cfg.RequestRetry > 0 {
+		defaultRetry = cfg.RequestRetry
+	}
+
+	m.mu.RLock()
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
+			continue
+		}
+		if _, excluded := excludedAuthIDs[strings.TrimSpace(candidate.ID)]; excluded {
+			continue
+		}
+		if !authAllowedByID(candidate.ID, allowedAuthIDs) {
+			continue
+		}
+		providerKey := strings.ToLower(strings.TrimSpace(candidate.Provider))
+		if providerKey == "" || !containsProvider(normalizedProviders, providerKey) {
+			continue
+		}
+		if routeKey != "" && (registryRef == nil || !registryRef.ClientSupportsModel(candidate.ID, routeKey)) {
+			continue
+		}
+		if !credentialPolicyAllows(credentialPolicy, candidate) {
+			continue
+		}
+		resolved := m.resolveDispatchModel(candidate, routeModel)
+		if strings.TrimSpace(resolved.Model) == "" {
+			continue
+		}
+		authForAvailability := m.effectiveAvailabilityAuth(candidate, summary.now)
+		available, reason, next := dispatchAvailabilityForModel(authForAvailability, resolved.Key, routeModel, summary.now)
+		if !available && reason != blockReasonCooldown {
+			continue
+		}
+		summary.total++
+		retryLimit := defaultRetry
+		if override, ok := candidate.RequestRetryOverride(); ok {
+			retryLimit = override
+		}
+		if retryLimit < 0 {
+			retryLimit = 0
+		}
+		if !summary.hasRequestRetry || retryLimit > summary.requestRetry {
+			summary.requestRetry = retryLimit
+		}
+		summary.hasRequestRetry = true
+		if available {
+			continue
+		}
+		summary.cooldownCount++
+		if !next.IsZero() && (summary.earliest.IsZero() || next.Before(summary.earliest)) {
+			summary.earliest = next
+		}
+	}
+	m.mu.RUnlock()
+	return summary
+}
+
+func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs map[string]struct{}) error {
+	if m == nil || errDispatch == nil {
+		return errDispatch
+	}
+
+	var summary dispatchAvailabilitySummary
+	hasSummary := false
+	if len(roundExcludedAuthIDs) > 0 {
+		// A failed selection with round exclusions marks the end of the current
+		// credential round. Classify the error against the next round, where CPA
+		// resets those exclusions, so retry timing reflects the credentials that
+		// will actually be eligible then.
+		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, nil)
+		provider := "mixed"
+		if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
+			provider = normalizedProviders[0]
+		}
+		errDispatch = dispatchUnavailableError(routeModel, provider, summary.total, summary.cooldownCount, summary.earliest, summary.now)
+		hasSummary = true
+	}
+
+	if !hasSummary {
+		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, triedAuthIDs)
+		if summary.total > 0 && summary.cooldownCount == summary.total && !summary.earliest.IsZero() {
+			provider := "mixed"
+			if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
+				provider = normalizedProviders[0]
+			}
+			errDispatch = dispatchUnavailableError(routeModel, provider, summary.total, summary.cooldownCount, summary.earliest, summary.now)
+		}
+	}
+
+	var cooldownErr *modelCooldownError
+	if !errors.As(errDispatch, &cooldownErr) || cooldownErr == nil {
+		return errDispatch
+	}
+	if summary.hasRequestRetry {
+		cooldownErr.requestRetry = summary.requestRetry
+		cooldownErr.hasRequestRetry = true
+	}
+	return errDispatch
 }
 
 // resolveFullDispatchAuth resolves a full dispatch auth.

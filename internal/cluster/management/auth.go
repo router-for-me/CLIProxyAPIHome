@@ -630,6 +630,9 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 	if disabledCooling := auth.DisableCoolingOverride(); disabledCooling != nil {
 		item["disable-cooling"] = *disabledCooling
 	}
+	if requestRetry, ok := auth.RequestRetryOverride(); ok {
+		item["request-retry"] = requestRetry
+	}
 	switch key {
 	case "codex-api-key", "xai-api-key", "gemini-api-key", "vertex-api-key", "claude-api-key":
 		models := credentialAPIKeyModels(auth)

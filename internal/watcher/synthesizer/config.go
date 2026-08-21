@@ -73,6 +73,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 		if entry.DisableCooling != nil {
 			metadata["disable_cooling"] = *entry.DisableCooling
 		}
+		addRequestRetryToMetadata(entry.RequestRetry, metadata)
 		addConfigModelsToMetadata(metadata, buildConfigModels(entry.Models, "google", "gemini", now))
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
@@ -131,6 +132,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.DisableCooling != nil {
 			metadata["disable_cooling"] = *ck.DisableCooling
 		}
+		addRequestRetryToMetadata(ck.RequestRetry, metadata)
 		addConfigModelsToMetadata(metadata, buildConfigModels(ck.Models, "anthropic", "claude", now))
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
@@ -198,6 +200,7 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		if entry.DisableCooling != nil {
 			metadata["disable_cooling"] = *entry.DisableCooling
 		}
+		addRequestRetryToMetadata(entry.RequestRetry, metadata)
 		modelOwner := provider
 		modelType := provider
 		if provider == "codex" {
@@ -266,6 +269,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 		base := strings.TrimSpace(compat.BaseURL)
 		disableCooling := compat.DisableCooling
+		requestRetry := compat.RequestRetry
 
 		// Handle new APIKeyEntries format (preferred)
 		createdEntries := 0
@@ -285,6 +289,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if disableCooling != nil {
 				metadata["disable_cooling"] = *disableCooling
 			}
+			addRequestRetryToMetadata(requestRetry, metadata)
 			addConfigModelsToMetadata(metadata, buildOpenAICompatibilityModels(compat.Models, compat.Name, now))
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
@@ -329,6 +334,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if disableCooling != nil {
 				metadata["disable_cooling"] = *disableCooling
 			}
+			addRequestRetryToMetadata(requestRetry, metadata)
 			addConfigModelsToMetadata(metadata, buildOpenAICompatibilityModels(compat.Models, compat.Name, now))
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
@@ -385,6 +391,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		if compat.DisableCooling != nil {
 			metadata["disable_cooling"] = *compat.DisableCooling
 		}
+		addRequestRetryToMetadata(compat.RequestRetry, metadata)
 		addConfigModelsToMetadata(metadata, buildConfigModels(compat.Models, "google", "vertex", now))
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)
@@ -549,6 +556,14 @@ func addConfigModelsToMetadata(metadata map[string]any, models []*registry.Model
 		return
 	}
 	metadata[homeConfigModelsMetadataKey] = payload
+}
+
+// addRequestRetryToMetadata copies a non-negative credential retry override.
+func addRequestRetryToMetadata(requestRetry *int, metadata map[string]any) {
+	if requestRetry == nil || *requestRetry < 0 || metadata == nil {
+		return
+	}
+	metadata["request_retry"] = *requestRetry
 }
 
 // modelInfoMetadataPayload handles a model info metadata payload.

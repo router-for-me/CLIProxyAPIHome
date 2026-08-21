@@ -153,6 +153,9 @@ func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]
 		if errSet := set("provider", strings.TrimSpace(result.Provider)); errSet != nil {
 			return nil, errSet
 		}
+		if errSet := set("request_retry", result.RequestRetry); errSet != nil {
+			return nil, errSet
+		}
 		if result.ForceMapping && strings.TrimSpace(result.OriginalAlias) != "" {
 			if errSet := set("force_mapping", true); errSet != nil {
 				return nil, errSet
@@ -218,10 +221,20 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageMissingModel)))
 		return nil, "", &reply
 	}
-	count := dispatchCount(jsonArg)
 	credentialPolicy, errPolicy := dispatchCredentialPolicy(jsonArg)
 	if errPolicy != nil {
 		reply := dispatch.BulkString([]byte(buildErrorJSON(errPolicy.Error())))
+		return nil, "", &reply
+	}
+	count := dispatchCount(jsonArg)
+	excludedAuthIDs, hasExcludedAuthIDs, validExcludedAuthIDs := dispatchExcludedAuthIDs(jsonArg)
+	if !validExcludedAuthIDs {
+		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
+		return nil, "", &reply
+	}
+	pinnedAuthID, validPinnedAuthID := dispatchPinnedAuthID(jsonArg)
+	if !validPinnedAuthID {
+		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
 		return nil, "", &reply
 	}
 
@@ -236,18 +249,20 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		return nil, "", &reply
 	}
 
-	if dispatchRetryExceeded(env.Runtime, count) {
-		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.TypeRequestRetryExceeded + ": " + homeerrors.MessageRequestRetryExceeded)))
-		return nil, "", &reply
-	}
-
 	userAPIKey := ""
 	if authRes != nil {
 		userAPIKey = authRes.Principal
 	}
 
+	// Older CPA nodes use count as the Home-side retry limit. Keep that
+	// contract when the new per-round exclusion field is absent.
+	if !hasExcludedAuthIDs && dispatchRetryExceeded(env.Runtime, count) {
+		reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.TypeRequestRetryExceeded + ": " + homeerrors.MessageRequestRetryExceeded)))
+		return nil, "", &reply
+	}
+
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
-	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, home.DispatchConcurrencyContext{
+	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, excludedAuthIDs, pinnedAuthID, home.DispatchConcurrencyContext{
 		Fingerprint:     env.ConnectionLifetime.Fingerprint,
 		ConnectedAt:     env.ConnectionLifetime.ConnectedAt,
 		Controlled:      env.ConnectionLifetime.Controlled,
@@ -282,6 +297,50 @@ func dispatchCount(jsonArg string) int {
 	return count
 }
 
+func dispatchExcludedAuthIDs(jsonArg string) ([]string, bool, bool) {
+	values := gjson.Get(jsonArg, "excluded_auth_ids")
+	if !values.Exists() {
+		return nil, false, true
+	}
+	if !values.IsArray() {
+		return nil, true, false
+	}
+	seen := make(map[string]struct{})
+	excluded := make([]string, 0, len(values.Array()))
+	valid := true
+	values.ForEach(func(_, value gjson.Result) bool {
+		if value.Type != gjson.String {
+			valid = false
+			return false
+		}
+		authID := strings.TrimSpace(value.String())
+		if authID == "" {
+			return true
+		}
+		if _, ok := seen[authID]; ok {
+			return true
+		}
+		seen[authID] = struct{}{}
+		excluded = append(excluded, authID)
+		return true
+	})
+	if !valid {
+		return nil, true, false
+	}
+	return excluded, true, true
+}
+
+func dispatchPinnedAuthID(jsonArg string) (string, bool) {
+	value := gjson.Get(jsonArg, "pinned_auth_id")
+	if !value.Exists() || value.Type == gjson.Null {
+		return "", true
+	}
+	if value.Type != gjson.String {
+		return "", false
+	}
+	return strings.TrimSpace(value.String()), true
+}
+
 func dispatchCredentialPolicy(jsonArg string) (string, error) {
 	policy := strings.TrimSpace(gjson.Get(jsonArg, "credential_policy").String())
 	normalized, okPolicy := coreauth.NormalizeCredentialPolicy(policy)
@@ -291,7 +350,8 @@ func dispatchCredentialPolicy(jsonArg string) (string, error) {
 	return normalized, nil
 }
 
-// dispatchRetryExceeded handles a dispatch retry exceeded.
+// dispatchRetryExceeded preserves the legacy count-based contract for older
+// CPA nodes that do not send per-round exclusions.
 func dispatchRetryExceeded(rt *home.Runtime, count int) bool {
 	if count <= 1 || rt == nil {
 		return false
@@ -451,6 +511,33 @@ func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
 		if cluster.IsConcurrencySaturated(admissionErr) {
 			out, _ = sjson.Set(out, "error.retryable", true)
 			out, _ = sjson.Set(out, "error.retry_after_ms", concurrencyRetryAfterMS(runtime, admissionErr.RetryAfterMS))
+		}
+		return out
+	}
+	var retryAfterErr interface {
+		ErrorCode() string
+		ErrorMessage() string
+		RetryAfter() *time.Duration
+	}
+	if errors.As(errDispatch, &retryAfterErr) && retryAfterErr != nil {
+		out := "{}"
+		out, _ = sjson.Set(out, "error.type", retryAfterErr.ErrorCode())
+		out, _ = sjson.Set(out, "error.message", retryAfterErr.ErrorMessage())
+		out, _ = sjson.Set(out, "error.retryable", true)
+		if retryAfter := retryAfterErr.RetryAfter(); retryAfter != nil && *retryAfter > 0 {
+			retryAfterMS := retryAfter.Milliseconds()
+			if *retryAfter%time.Millisecond != 0 {
+				retryAfterMS++
+			}
+			out, _ = sjson.Set(out, "error.retry_after_ms", retryAfterMS)
+		}
+		var retryLimitErr interface {
+			RequestRetryLimit() (int, bool)
+		}
+		if errors.As(errDispatch, &retryLimitErr) && retryLimitErr != nil {
+			if retryLimit, ok := retryLimitErr.RequestRetryLimit(); ok && retryLimit >= 0 {
+				out, _ = sjson.Set(out, "error.request_retry", retryLimit)
+			}
 		}
 		return out
 	}

@@ -801,6 +801,7 @@ type DispatchResult struct {
 	AccessToken   string
 	BaseURL       string
 	APIKey        string
+	RequestRetry  int
 	ForceMapping  bool
 	OriginalAlias string
 
@@ -816,15 +817,17 @@ type DispatchResult struct {
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
 func (r *Runtime) DispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string) (*DispatchResult, error) {
-	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, "", DispatchConcurrencyContext{})
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, "", nil, "", DispatchConcurrencyContext{})
 }
 
-// DispatchForAPIKeyWithConcurrency performs dispatch and atomic admission for a RESP request.
-func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
-	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, credentialPolicy, concurrencyCtx)
+// DispatchForAPIKeyWithConcurrency performs dispatch and atomic admission for
+// a RESP request while applying retry-round exclusions and an optional pinned
+// credential constraint.
+func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, excludedAuthIDs []string, pinnedAuthID string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+	return r.dispatchForAPIKey(ctx, reqModel, headers, apiKey, credentialPolicy, excludedAuthIDs, pinnedAuthID, concurrencyCtx)
 }
 
-func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
+func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, excludedAuthIDs []string, pinnedAuthID string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
 	opts := coreauth.Options{}
 	if headers != nil {
 		opts.Headers = headers.Clone()
@@ -832,6 +835,20 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey, reqModel)
 	if errAllowed != nil {
 		return nil, errAllowed
+	}
+	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
+	if pinnedAuthID != "" {
+		pinnedAllowed := allowedAuthIDs == nil
+		for _, allowedAuthID := range allowedAuthIDs {
+			if strings.TrimSpace(allowedAuthID) == pinnedAuthID {
+				pinnedAllowed = true
+				break
+			}
+		}
+		allowedAuthIDs = []string{}
+		if pinnedAllowed {
+			allowedAuthIDs = append(allowedAuthIDs, pinnedAuthID)
+		}
 	}
 	metadata := make(map[string]any)
 	if allowedAuthIDs != nil {
@@ -842,6 +859,9 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	if credentialPolicy = strings.TrimSpace(credentialPolicy); credentialPolicy != "" {
 		metadata[coreauth.CredentialPolicyMetadataKey] = credentialPolicy
+	}
+	if len(excludedAuthIDs) > 0 {
+		metadata[coreauth.ExcludedAuthIDsMetadataKey] = append([]string(nil), excludedAuthIDs...)
 	}
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
@@ -912,6 +932,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 		result := &DispatchResult{
 			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
+			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
 			AuthID: auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
 			Concurrency: ConcurrencyAdmissionResult{CredentialID: auth.ID, Model: concurrencyModel},

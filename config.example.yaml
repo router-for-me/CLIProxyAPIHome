@@ -168,14 +168,23 @@ force-model-prefix: false
 # Default is false (disabled).
 passthrough-headers: false
 
-# Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
+# Number of additional credential retry rounds used by downstream CPA after
+# the first round exhausts its eligible credentials. A value of 0 still allows
+# the first round to try multiple credentials; Home RESP dispatch itself only
+# excludes credentials already tried in the current round for the new payload;
+# legacy payloads without that field retain the count-based cap for compatibility.
+# Additional rounds apply to HTTP 403, 408, 429, 500, 502, 503, and 504 failures.
+# Credential/provider overrides take precedence; 0 disables additional rounds,
+# while an omitted or negative override inherits this global setting.
 request-retry: 3
 
-# Maximum number of different credentials to try for one failed request.
+# Maximum number of different credentials to try in each credential retry round.
 # Set to 0 to keep legacy behavior (try all available credentials).
 max-retry-credentials: 0
 
-# Maximum wait time in seconds for a cooled-down credential before triggering a retry.
+# Maximum cooldown wait in seconds between retry rounds.
+# Set to 0 or below to never wait for credential cooldown.
+# Retry rounds that need no wait remain controlled by request-retry.
 max-retry-interval: 30
 
 # Disable Home request-error and quota cooldown scheduling globally when true.
@@ -233,6 +242,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/gemini-3-pro-preview" to target this credential
 #     base-url: "https://generativelanguage.googleapis.com"
 #     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
+#     request-retry: 3 # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080"
@@ -254,6 +264,7 @@ nonstream-keepalive-interval: 0
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
 #     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
+#     request-retry: 3 # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -273,6 +284,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "xai-..."
 #     prefix: "xai" # optional: require calls like "xai/grok-4.5" to target this credential
 #     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
+#     request-retry: 3 # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     base-url: "https://api.x.ai/v1" # xAI-compatible Responses API endpoint
 #     websockets: true # optional: use the xAI upstream websocket transport for downstream websocket requests
 #     headers:
@@ -295,6 +307,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/claude-sonnet-latest" to target this credential
 #     base-url: "https://www.example.com" # use the custom claude API endpoint
 #     disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
+#     request-retry: 3 # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -350,6 +363,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
 #     disable-cooling: false # optional provider override: true disables cooling, false enables it; omit to inherit global
+#     request-retry: 3 # optional per-provider override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
@@ -380,6 +394,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
 #     base-url: "https://example.com/api"         # optional, e.g. https://zenmux.ai/api; falls back to Google Vertex when omitted
 #     disable-cooling: false                       # optional override: true disables cooling, false enables it; omit to inherit global
+#     request-retry: 3                             # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
 #     # proxy-url: "direct" # optional: explicit direct connect for this credential
 #     headers:

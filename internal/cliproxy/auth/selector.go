@@ -42,9 +42,50 @@ const (
 )
 
 type modelCooldownError struct {
-	model    string
-	resetIn  time.Duration
-	provider string
+	model           string
+	resetIn         time.Duration
+	provider        string
+	requestRetry    int
+	hasRequestRetry bool
+}
+
+// ErrorCode identifies the structured dispatch error exposed to CPA.
+func (e *modelCooldownError) ErrorCode() string {
+	return "model_cooldown"
+}
+
+// ErrorMessage returns the stable human-readable dispatch error message.
+func (e *modelCooldownError) ErrorMessage() string {
+	if e == nil {
+		return "all credentials are cooling down"
+	}
+	modelName := e.model
+	if modelName == "" {
+		modelName = "requested model"
+	}
+	message := fmt.Sprintf("All credentials for model %s are cooling down", modelName)
+	if e.provider != "" {
+		message = fmt.Sprintf("%s via provider %s", message, e.provider)
+	}
+	return message
+}
+
+// RetryAfter returns the earliest credential recovery delay.
+func (e *modelCooldownError) RetryAfter() *time.Duration {
+	if e == nil || e.resetIn <= 0 {
+		return nil
+	}
+	value := e.resetIn
+	return &value
+}
+
+// RequestRetryLimit returns the effective additional-round limit for the
+// credentials represented by this cooldown error.
+func (e *modelCooldownError) RequestRetryLimit() (int, bool) {
+	if e == nil || !e.hasRequestRetry {
+		return 0, false
+	}
+	return e.requestRetry, true
 }
 
 // newModelCooldownError creates a model cooldown error.
@@ -62,14 +103,7 @@ func newModelCooldownError(model, provider string, resetIn time.Duration) *model
 // Error returns the error message.
 func (e *modelCooldownError) Error() string {
 	// Keep validation before state changes so failures leave existing data intact.
-	modelName := e.model
-	if modelName == "" {
-		modelName = "requested model"
-	}
-	message := fmt.Sprintf("All credentials for model %s are cooling down", modelName)
-	if e.provider != "" {
-		message = fmt.Sprintf("%s via provider %s", message, e.provider)
-	}
+	message := e.ErrorMessage()
 	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0

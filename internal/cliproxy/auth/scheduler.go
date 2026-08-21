@@ -55,30 +55,112 @@ type providerScheduler struct {
 
 // scheduledAuthMeta stores the immutable scheduling fields derived from an auth snapshot.
 type scheduledAuthMeta struct {
-	auth              *Auth
-	providerKey       string
-	priority          int
-	websocketEnabled  bool
-	supportedModelSet map[string]struct{}
+	auth               *Auth
+	providerKey        string
+	priority           int
+	websocketEnabled   bool
+	supportedModelSet  map[string]struct{}
+	registeredModelSet map[string]struct{}
 }
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
-	modelKey        string
-	modelResolver   schedulerModelResolver
-	availability    schedulerAvailabilityResolver
-	entries         map[string]*scheduledAuth
-	priorityOrder   []int
-	readyByPriority map[int]*readyBucket
-	blocked         cooldownQueue
+	modelKey              string
+	modelResolver         schedulerModelResolver
+	availability          schedulerAvailabilityResolver
+	entries               map[string]*scheduledAuth
+	priorityOrder         []int
+	readyByPriority       map[int]*readyBucket
+	blocked               cooldownQueue
+	retryRoundAll         dispatchAvailabilityAggregate
+	retryRoundAlphaSearch dispatchAvailabilityAggregate
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
 type scheduledAuth struct {
-	meta        *scheduledAuthMeta
-	auth        *Auth
-	state       scheduledState
-	nextRetryAt time.Time
+	meta                    *scheduledAuthMeta
+	auth                    *Auth
+	schedulerEligible       bool
+	state                   scheduledState
+	nextRetryAt             time.Time
+	retryRoundEligible      bool
+	retryRoundCooldown      bool
+	retryRoundNext          time.Time
+	requestRetryOverride    int
+	hasRequestRetryOverride bool
+	alphaSearchAllowed      bool
+}
+
+// dispatchAvailabilityAggregate stores request-independent retry-round state
+// for a provider/model shard.
+type dispatchAvailabilityAggregate struct {
+	total                      int
+	cooldownCount              int
+	earliest                   time.Time
+	inheritedRequestRetryCount int
+	maxRequestRetryOverride    int
+	hasRequestRetryOverride    bool
+}
+
+func (a *dispatchAvailabilityAggregate) add(entry *scheduledAuth) {
+	if a == nil || entry == nil || !entry.retryRoundEligible {
+		return
+	}
+	a.total++
+	if entry.hasRequestRetryOverride {
+		if !a.hasRequestRetryOverride || entry.requestRetryOverride > a.maxRequestRetryOverride {
+			a.maxRequestRetryOverride = entry.requestRetryOverride
+		}
+		a.hasRequestRetryOverride = true
+	} else {
+		a.inheritedRequestRetryCount++
+	}
+	if !entry.retryRoundCooldown {
+		return
+	}
+	a.cooldownCount++
+	if !entry.retryRoundNext.IsZero() && (a.earliest.IsZero() || entry.retryRoundNext.Before(a.earliest)) {
+		a.earliest = entry.retryRoundNext
+	}
+}
+
+func (a *dispatchAvailabilityAggregate) merge(other dispatchAvailabilityAggregate) {
+	if a == nil || other.total == 0 {
+		return
+	}
+	a.total += other.total
+	a.cooldownCount += other.cooldownCount
+	a.inheritedRequestRetryCount += other.inheritedRequestRetryCount
+	if !other.earliest.IsZero() && (a.earliest.IsZero() || other.earliest.Before(a.earliest)) {
+		a.earliest = other.earliest
+	}
+	if other.hasRequestRetryOverride && (!a.hasRequestRetryOverride || other.maxRequestRetryOverride > a.maxRequestRetryOverride) {
+		a.maxRequestRetryOverride = other.maxRequestRetryOverride
+	}
+	a.hasRequestRetryOverride = a.hasRequestRetryOverride || other.hasRequestRetryOverride
+}
+
+func (a dispatchAvailabilityAggregate) summary(now time.Time, defaultRequestRetry int) dispatchAvailabilitySummary {
+	summary := dispatchAvailabilitySummary{
+		now:           now,
+		total:         a.total,
+		cooldownCount: a.cooldownCount,
+		earliest:      a.earliest,
+	}
+	if a.total == 0 {
+		return summary
+	}
+	if defaultRequestRetry < 0 {
+		defaultRequestRetry = 0
+	}
+	if a.inheritedRequestRetryCount > 0 {
+		summary.requestRetry = defaultRequestRetry
+	}
+	if a.hasRequestRetryOverride && a.maxRequestRetryOverride > summary.requestRetry {
+		summary.requestRetry = a.maxRequestRetryOverride
+	}
+	summary.hasRequestRetry = true
+	return summary
 }
 
 // readyBucket keeps the ready views for one priority level.
@@ -378,6 +460,98 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 }
 
+// summarizeDispatchAvailability reads retry-round state from the same
+// provider/model shards used by built-in credential selection.
+func (s *authScheduler) summarizeDispatchAvailability(providers []string, model string, opts Options, excludedAuthIDs map[string]struct{}, defaultRequestRetry int) dispatchAvailabilitySummary {
+	now := time.Now()
+	if s == nil {
+		return dispatchAvailabilitySummary{now: now}
+	}
+	normalized := normalizeProviderKeys(providers)
+	if len(normalized) == 0 {
+		return dispatchAvailabilitySummary{now: now}
+	}
+	modelKey := canonicalModelKey(model)
+	if !modelAllowedByID(modelKey, allowedModelIDsFromOptions(opts)) {
+		return dispatchAvailabilitySummary{now: now}
+	}
+	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
+	credentialPolicy := credentialPolicyFromOptions(opts)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	providerSet := make(map[string]struct{}, len(normalized))
+	shards := make(map[string]*modelScheduler, len(normalized))
+	for _, providerKey := range normalized {
+		providerSet[providerKey] = struct{}{}
+		providerState := s.providers[providerKey]
+		if providerState == nil {
+			continue
+		}
+		if shard := providerState.ensureModelLocked(modelKey, now); shard != nil {
+			shards[providerKey] = shard
+		}
+	}
+
+	aggregate := dispatchAvailabilityAggregate{}
+	if allowedAuthIDs != nil {
+		for authID := range allowedAuthIDs {
+			if _, excluded := excludedAuthIDs[authID]; excluded {
+				continue
+			}
+			providerKey := s.authProviders[authID]
+			if _, requested := providerSet[providerKey]; !requested {
+				continue
+			}
+			shard := shards[providerKey]
+			if shard == nil {
+				continue
+			}
+			entry := shard.entries[authID]
+			if entry == nil || !credentialPolicyAllows(credentialPolicy, entry.auth) {
+				continue
+			}
+			aggregate.add(entry)
+		}
+		return aggregate.summary(now, defaultRequestRetry)
+	}
+
+	if len(excludedAuthIDs) == 0 {
+		for _, shard := range shards {
+			switch credentialPolicy {
+			case "":
+				aggregate.merge(shard.retryRoundAll)
+			case CredentialPolicyCodexAlphaSearchV1:
+				aggregate.merge(shard.retryRoundAlphaSearch)
+			default:
+				for _, entry := range shard.entries {
+					if credentialPolicyAllows(credentialPolicy, entry.auth) {
+						aggregate.add(entry)
+					}
+				}
+			}
+		}
+		return aggregate.summary(now, defaultRequestRetry)
+	}
+
+	// Exclusions created while resolving stale full credentials only occur on
+	// the exhausted slow path. Scan the already-resolved shard entries there
+	// instead of returning to the full manager credential set.
+	for _, shard := range shards {
+		for authID, entry := range shard.entries {
+			if _, excluded := excludedAuthIDs[authID]; excluded {
+				continue
+			}
+			if !credentialPolicyAllows(credentialPolicy, entry.auth) {
+				continue
+			}
+			aggregate.add(entry)
+		}
+	}
+	return aggregate.summary(now, defaultRequestRetry)
+}
+
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, predicate func(*scheduledAuth) bool) error {
 	// Build the candidate view before applying availability rules.
@@ -498,37 +672,45 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
 func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	supportedModelSet, registeredModelSet := supportedModelSetsForAuth(auth.ID)
 	return &scheduledAuthMeta{
-		auth:              auth,
-		providerKey:       providerKey,
-		priority:          authPriority(auth),
-		websocketEnabled:  authWebsocketsEnabled(auth),
-		supportedModelSet: supportedModelSetForAuth(auth.ID),
+		auth:               auth,
+		providerKey:        providerKey,
+		priority:           authPriority(auth),
+		websocketEnabled:   authWebsocketsEnabled(auth),
+		supportedModelSet:  supportedModelSet,
+		registeredModelSet: registeredModelSet,
 	}
 }
 
-// supportedModelSetForAuth snapshots the registry models currently registered for an auth.
-func supportedModelSetForAuth(authID string) map[string]struct{} {
+// supportedModelSetsForAuth snapshots both canonical scheduler models and the
+// exact registry IDs used by dispatch availability filtering.
+func supportedModelSetsForAuth(authID string) (map[string]struct{}, map[string]struct{}) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		return nil
+		return nil, nil
 	}
 	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
 	if len(models) == 0 {
-		return nil
+		return nil, nil
 	}
-	set := make(map[string]struct{}, len(models))
+	canonicalSet := make(map[string]struct{}, len(models))
+	registeredSet := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		if model == nil {
 			continue
+		}
+		registeredModelKey := strings.ToLower(strings.TrimSpace(model.ID))
+		if registeredModelKey != "" {
+			registeredSet[registeredModelKey] = struct{}{}
 		}
 		modelKey := canonicalModelKey(model.ID)
 		if modelKey == "" {
 			continue
 		}
-		set[modelKey] = struct{}{}
+		canonicalSet[modelKey] = struct{}{}
 	}
-	return set
+	return canonicalSet, registeredSet
 }
 
 // upsertAuthLocked updates every existing model shard that can reference the auth metadata.
@@ -541,7 +723,7 @@ func (p *providerScheduler) upsertAuthLocked(meta *scheduledAuthMeta, now time.T
 		if shard == nil {
 			continue
 		}
-		if !meta.supportsModel(modelKey) {
+		if !meta.supportsModel(modelKey) && !meta.hasRegisteredModel(modelKey) {
 			shard.removeEntryLocked(meta.auth.ID)
 			continue
 		}
@@ -581,11 +763,17 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		readyByPriority: make(map[int]*readyBucket),
 	}
 	for _, meta := range p.auths {
-		if meta == nil || !meta.supportsModel(modelKey) {
+		if meta == nil || meta.auth == nil || (!meta.supportsModel(modelKey) && !meta.hasRegisteredModel(modelKey)) {
 			continue
 		}
-		shard.upsertEntryLocked(meta, now)
+		entry := &scheduledAuth{meta: meta, auth: meta.auth}
+		if shard.availability != nil {
+			entry.auth = shard.availability(meta.auth, now)
+		}
+		shard.refreshEntryStateLocked(entry, now)
+		shard.entries[meta.auth.ID] = entry
 	}
+	shard.rebuildIndexesLocked()
 	p.modelShards[modelKey] = shard
 	return shard
 }
@@ -617,42 +805,44 @@ func (m *scheduledAuthMeta) supportsModel(modelKey string) bool {
 	return ok
 }
 
-// upsertEntryLocked updates or inserts one auth entry and rebuilds indexes when ordering changes.
-func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Time) {
-	// Keep validation before state changes so failures leave existing data intact.
-	if m == nil || meta == nil || meta.auth == nil {
+func (m *scheduledAuthMeta) hasRegisteredModel(modelKey string) bool {
+	modelKey = strings.ToLower(strings.TrimSpace(modelKey))
+	if modelKey == "" {
+		return true
+	}
+	if m == nil || len(m.registeredModelSet) == 0 {
+		return false
+	}
+	_, ok := m.registeredModelSet[modelKey]
+	return ok
+}
+
+func (m *modelScheduler) refreshEntryStateLocked(entry *scheduledAuth, now time.Time) {
+	if entry == nil {
 		return
 	}
-	entry, ok := m.entries[meta.auth.ID]
-	if !ok || entry == nil {
-		entry = &scheduledAuth{}
-		m.entries[meta.auth.ID] = entry
-	}
-	previousState := entry.state
-	previousNextRetryAt := entry.nextRetryAt
-	previousPriority := 0
-	previousWebsocketEnabled := false
-	if entry.meta != nil {
-		previousPriority = entry.meta.priority
-		previousWebsocketEnabled = entry.meta.websocketEnabled
+	entry.state = scheduledStateBlocked
+	entry.nextRetryAt = time.Time{}
+	entry.schedulerEligible = false
+	entry.retryRoundEligible = false
+	entry.retryRoundCooldown = false
+	entry.retryRoundNext = time.Time{}
+	entry.requestRetryOverride = 0
+	entry.hasRequestRetryOverride = false
+	entry.alphaSearchAllowed = false
+	if m == nil || entry.auth == nil {
+		return
 	}
 
-	entry.meta = meta
-	entry.auth = meta.auth
-	if m.availability != nil {
-		entry.auth = m.availability(meta.auth, now)
-	}
-	if entry.auth == nil {
-		entry.state = scheduledStateBlocked
-		entry.nextRetryAt = time.Time{}
-		m.rebuildIndexesLocked()
-		return
-	}
-	entry.nextRetryAt = time.Time{}
+	entry.requestRetryOverride, entry.hasRequestRetryOverride = entry.auth.RequestRetryOverride()
+	entry.alphaSearchAllowed = credentialPolicyAllows(CredentialPolicyCodexAlphaSearchV1, entry.auth)
+	entry.schedulerEligible = entry.meta != nil && entry.meta.supportsModel(m.modelKey)
 	runtimeModelKey := m.runtimeModelKeyForAuth(entry.auth)
-	blocked, reason, next := isAuthBlockedForModel(entry.auth, runtimeModelKey, now)
+	blockedModel := runtimeModelKey
+	blocked, reason, next := isAuthBlockedForModel(entry.auth, blockedModel, now)
 	if !blocked && runtimeModelKey != canonicalModelKey(m.modelKey) {
-		blocked, reason, next = isAuthBlockedForModel(entry.auth, m.modelKey, now)
+		blockedModel = m.modelKey
+		blocked, reason, next = isAuthBlockedForModel(entry.auth, blockedModel, now)
 	}
 	switch {
 	case !blocked:
@@ -666,8 +856,67 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.state = scheduledStateBlocked
 		entry.nextRetryAt = next
 	}
+	if entry.meta == nil || !entry.meta.hasRegisteredModel(canonicalModelKey(m.modelKey)) {
+		return
+	}
 
-	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
+	available, retryReason, retryNext := classifyDispatchAvailability(entry.auth, blockedModel, blocked, reason, next, now)
+	if !available && retryReason != blockReasonCooldown {
+		return
+	}
+	entry.retryRoundEligible = true
+	if !available {
+		entry.retryRoundCooldown = true
+		entry.retryRoundNext = retryNext
+	}
+}
+
+// upsertEntryLocked updates or inserts one auth entry and rebuilds indexes when ordering changes.
+func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Time) {
+	// Keep validation before state changes so failures leave existing data intact.
+	if m == nil || meta == nil || meta.auth == nil {
+		return
+	}
+	entry, ok := m.entries[meta.auth.ID]
+	if !ok || entry == nil {
+		entry = &scheduledAuth{}
+		m.entries[meta.auth.ID] = entry
+	}
+	previousState := entry.state
+	previousNextRetryAt := entry.nextRetryAt
+	previousSchedulerEligible := entry.schedulerEligible
+	previousRetryRoundEligible := entry.retryRoundEligible
+	previousRetryRoundCooldown := entry.retryRoundCooldown
+	previousRetryRoundNext := entry.retryRoundNext
+	previousRequestRetryOverride := entry.requestRetryOverride
+	previousHasRequestRetryOverride := entry.hasRequestRetryOverride
+	previousAlphaSearchAllowed := entry.alphaSearchAllowed
+	previousPriority := 0
+	previousWebsocketEnabled := false
+	if entry.meta != nil {
+		previousPriority = entry.meta.priority
+		previousWebsocketEnabled = entry.meta.websocketEnabled
+	}
+
+	entry.meta = meta
+	entry.auth = meta.auth
+	if m.availability != nil {
+		entry.auth = m.availability(meta.auth, now)
+	}
+	m.refreshEntryStateLocked(entry, now)
+
+	if ok &&
+		previousState == entry.state &&
+		previousNextRetryAt.Equal(entry.nextRetryAt) &&
+		previousSchedulerEligible == entry.schedulerEligible &&
+		previousRetryRoundEligible == entry.retryRoundEligible &&
+		previousRetryRoundCooldown == entry.retryRoundCooldown &&
+		previousRetryRoundNext.Equal(entry.retryRoundNext) &&
+		previousRequestRetryOverride == entry.requestRetryOverride &&
+		previousHasRequestRetryOverride == entry.hasRequestRetryOverride &&
+		previousAlphaSearchAllowed == entry.alphaSearchAllowed &&
+		previousPriority == meta.priority &&
+		previousWebsocketEnabled == meta.websocketEnabled {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -697,27 +946,11 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 			continue
 		}
 		if entry.nextRetryAt.IsZero() || entry.nextRetryAt.After(now) {
-			continue
+			// blocked is ordered by retry deadline with zero deadlines last, so
+			// no later entry can be promoted during this pass.
+			break
 		}
-		runtimeModelKey := m.runtimeModelKeyForAuth(entry.auth)
-		blocked, reason, next := isAuthBlockedForModel(entry.auth, runtimeModelKey, now)
-		if !blocked && runtimeModelKey != canonicalModelKey(m.modelKey) {
-			blocked, reason, next = isAuthBlockedForModel(entry.auth, m.modelKey, now)
-		}
-		switch {
-		case !blocked:
-			entry.state = scheduledStateReady
-			entry.nextRetryAt = time.Time{}
-		case reason == blockReasonCooldown:
-			entry.state = scheduledStateCooldown
-			entry.nextRetryAt = next
-		case reason == blockReasonDisabled:
-			entry.state = scheduledStateDisabled
-			entry.nextRetryAt = time.Time{}
-		default:
-			entry.state = scheduledStateBlocked
-			entry.nextRetryAt = next
-		}
+		m.refreshEntryStateLocked(entry, now)
 		changed = true
 	}
 	if changed {
@@ -845,8 +1078,11 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
+		if entry == nil || !entry.schedulerEligible {
+			continue
+		}
 		total++
-		if entry == nil || entry.auth == nil {
+		if entry.auth == nil {
 			continue
 		}
 		if entry.state != scheduledStateCooldown {
@@ -877,9 +1113,22 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 	m.readyByPriority = make(map[int]*readyBucket)
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
+	m.retryRoundAll = dispatchAvailabilityAggregate{}
+	m.retryRoundAlphaSearch = dispatchAvailabilityAggregate{}
 	priorityBuckets := make(map[int][]*scheduledAuth)
 	for _, entry := range m.entries {
 		if entry == nil || entry.auth == nil {
+			continue
+		}
+		m.retryRoundAll.add(entry)
+		if entry.alphaSearchAllowed {
+			m.retryRoundAlphaSearch.add(entry)
+		}
+		if !entry.schedulerEligible {
+			switch entry.state {
+			case scheduledStateCooldown, scheduledStateBlocked:
+				m.blocked = append(m.blocked, entry)
+			}
 			continue
 		}
 		switch entry.state {

@@ -583,6 +583,9 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 	if disabledCooling := auth.DisableCoolingOverride(); disabledCooling != nil {
 		entry["disable-cooling"] = *disabledCooling
 	}
+	if requestRetry, ok := auth.RequestRetryOverride(); ok {
+		entry["request-retry"] = requestRetry
+	}
 	return entry
 }
 
@@ -607,6 +610,70 @@ func authFileDisplayName(auth *coreauth.Auth) string {
 // applyOAuthFieldPatch applies an o auth field patch.
 func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage) (bool, error) {
 	// Resolve credential context before calling upstream OAuth services.
+	normalizedPaths := make(map[string]string, len(fields))
+	pathOwners := make(map[string]string, len(fields))
+	orderedPaths := make([]string, 0, len(fields))
+	for key := range fields {
+		fieldPath := strings.TrimSpace(key)
+		if fieldPath == "" {
+			return false, fmt.Errorf("field name is required")
+		}
+		metadataPath := oauthMetadataFieldPath(fieldPath)
+		for _, part := range strings.Split(metadataPath, ".") {
+			if part == "" {
+				return false, fmt.Errorf("invalid field path: %s", fieldPath)
+			}
+		}
+		if previousKey, exists := pathOwners[metadataPath]; exists {
+			return false, fmt.Errorf("fields %s and %s resolve to the same metadata path", previousKey, key)
+		}
+		normalizedPaths[key] = metadataPath
+		pathOwners[metadataPath] = key
+		orderedPaths = append(orderedPaths, metadataPath)
+	}
+	sort.Strings(orderedPaths)
+	for parentIndex, parentPath := range orderedPaths {
+		for childIndex := parentIndex + 1; childIndex < len(orderedPaths); childIndex++ {
+			childPath := orderedPaths[childIndex]
+			if strings.HasPrefix(childPath, parentPath+".") {
+				return false, fmt.Errorf("fields %s and %s overlap", pathOwners[parentPath], pathOwners[childPath])
+			}
+		}
+	}
+	decodedValues := make(map[string]any, len(fields))
+	for key, rawValue := range fields {
+		fieldPath := strings.TrimSpace(key)
+		metadataPath := normalizedPaths[key]
+		value, errDecode := decodeOAuthFieldPatchValue(rawValue)
+		if errDecode != nil {
+			return false, fmt.Errorf("invalid field %s", fieldPath)
+		}
+		if rootOAuthField(metadataPath) == "request_retry" {
+			if metadataPath != "request_retry" {
+				return false, fmt.Errorf("invalid field %s", fieldPath)
+			}
+			if value != nil {
+				number, okNumber := value.(json.Number)
+				if !okNumber {
+					return false, fmt.Errorf("invalid field %s", fieldPath)
+				}
+				parsed, errInt := number.Int64()
+				if errInt != nil {
+					return false, fmt.Errorf("invalid field %s", fieldPath)
+				}
+				normalized := int(parsed)
+				if int64(normalized) != parsed {
+					return false, fmt.Errorf("invalid field %s", fieldPath)
+				}
+				if normalized < 0 {
+					value = nil
+				} else {
+					value = normalized
+				}
+			}
+		}
+		decodedValues[key] = value
+	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -615,20 +682,24 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 	}
 	changed := false
 	touchedRoots := make(map[string]struct{}, len(fields))
-	for key, rawValue := range fields {
-		fieldPath := strings.TrimSpace(key)
-		if fieldPath == "" {
-			return false, fmt.Errorf("field name is required")
-		}
-		value, errDecode := decodeOAuthFieldPatchValue(rawValue)
-		if errDecode != nil {
-			return false, fmt.Errorf("invalid field %s", fieldPath)
-		}
-		metadataPath := oauthMetadataFieldPath(fieldPath)
+	for key := range fields {
+		value := decodedValues[key]
+		metadataPath := normalizedPaths[key]
 		if metadataPath == "disable_cooling" {
 			// Keep one canonical key so a PATCH using the public hyphenated alias
 			// cannot be shadowed by a previously stored legacy value.
 			delete(auth.Metadata, "disable-cooling")
+		}
+		if metadataPath == "request_retry" {
+			delete(auth.Metadata, "request-retry")
+			if value == nil {
+				delete(auth.Metadata, "request_retry")
+				if root := rootOAuthField(metadataPath); root != "" {
+					touchedRoots[root] = struct{}{}
+				}
+				changed = true
+				continue
+			}
 		}
 		if metadataPath == "headers" {
 			applyOAuthHeadersPatch(auth, value)
@@ -681,14 +752,19 @@ func removeOAuthFieldPatchConcurrencyFields(fields map[string]json.RawMessage) {
 }
 
 func oauthMetadataFieldPath(path string) string {
-	switch strings.TrimSpace(path) {
-	case "proxy-url":
-		return "proxy_url"
-	case "disable-cooling":
-		return "disable_cooling"
-	default:
-		return path
+	parts := strings.Split(strings.TrimSpace(path), ".")
+	for index := range parts {
+		parts[index] = strings.TrimSpace(parts[index])
 	}
+	switch parts[0] {
+	case "proxy-url":
+		parts[0] = "proxy_url"
+	case "disable-cooling":
+		parts[0] = "disable_cooling"
+	case "request-retry":
+		parts[0] = "request_retry"
+	}
+	return strings.Join(parts, ".")
 }
 
 func rootOAuthField(path string) string {

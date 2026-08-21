@@ -5,6 +5,7 @@ type DispatchDecision struct {
 	Auth          *Auth
 	Provider      string
 	UpstreamModel string
+	RequestRetry  int
 	PooledModels  bool
 	ForceMapping  bool
 	OriginalAlias string

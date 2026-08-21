@@ -45,6 +45,10 @@ type VertexCompatKey struct {
 	// DisableCooling overrides the global cooling policy for this credential when set.
 	// True disables request-error and quota cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// RequestRetry optionally overrides the global number of additional retry rounds.
+	// Nil or a negative value inherits the global setting; zero disables additional rounds.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 }
 
 // GetAPIKey returns an api key.

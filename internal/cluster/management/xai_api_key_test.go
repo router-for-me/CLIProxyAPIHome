@@ -40,7 +40,8 @@ func TestXAIAPIKeyManagementCRUD(t *testing.T) {
             "force-mapping":true
         }],
         "excluded-models":["grok-3-*"],
-        "disable-cooling":true
+        "disable-cooling":true,
+        "request-retry":2
     }]`
 	putResp := httptest.NewRecorder()
 	putReq := httptest.NewRequest(http.MethodPut, "/xai-api-key", strings.NewReader(putBody))
@@ -104,6 +105,9 @@ func TestXAIAPIKeyManagementCRUD(t *testing.T) {
 	if item["disable-cooling"] != true || item["disabled"] != true {
 		t.Fatalf("GET disable-cooling/disabled = %#v/%#v", item["disable-cooling"], item["disabled"])
 	}
+	if item["request-retry"] != float64(2) {
+		t.Fatalf("GET request-retry = %#v, want 2", item["request-retry"])
+	}
 	models, okModels := item["models"].([]any)
 	if !okModels || len(models) != 1 {
 		t.Fatalf("GET models = %#v", item["models"])
@@ -132,6 +136,28 @@ func TestXAIAPIKeyManagementCRUD(t *testing.T) {
 	}
 	if item["disable-cooling"] != false {
 		t.Fatalf("PATCH disable-cooling = %#v, want false", item["disable-cooling"])
+	}
+	if item["request-retry"] != float64(2) {
+		t.Fatalf("PATCH unrelated fields lost request-retry: %#v", item)
+	}
+
+	clearRetryResp := httptest.NewRecorder()
+	clearRetryReq := httptest.NewRequest(http.MethodPatch, "/xai-api-key", strings.NewReader(`{"match":"xai-key","value":{"request-retry":null}}`))
+	clearRetryReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(clearRetryResp, clearRetryReq)
+	if clearRetryResp.Code != http.StatusOK {
+		t.Fatalf("PATCH clear request-retry status = %d body=%s", clearRetryResp.Code, clearRetryResp.Body.String())
+	}
+	item = getXAIAPIKeyItem(t, engine)
+	if _, exists := item["request-retry"]; exists {
+		t.Fatalf("PATCH null request-retry still present: %#v", item)
+	}
+	storedAuth, _, errGet = repo.GetAuth(context.Background(), auths[0].ID)
+	if errGet != nil {
+		t.Fatalf("GetAuth(after request-retry clear) error = %v", errGet)
+	}
+	if got, ok := storedAuth.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("request retry override after clear = (%d, %t), want inherited", got, ok)
 	}
 
 	replaceResp := httptest.NewRecorder()

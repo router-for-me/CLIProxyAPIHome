@@ -15,6 +15,10 @@ const AllowedAuthIDsMetadataKey = "allowed_auth_ids"
 // AllowedModelIDsMetadataKey stores the model allowlist in Options.Metadata.
 const AllowedModelIDsMetadataKey = "allowed_model_ids"
 
+// ExcludedAuthIDsMetadataKey stores credential IDs already attempted for the
+// current request retry round in Options.Metadata.
+const ExcludedAuthIDsMetadataKey = "excluded_auth_ids"
+
 // ExcludedConcurrencyCandidatesMetadataKey stores candidates rejected by atomic
 // concurrency admission during this dispatch attempt.
 const ExcludedConcurrencyCandidatesMetadataKey = "excluded_concurrency_candidates"
