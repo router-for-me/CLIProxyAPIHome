@@ -45,10 +45,11 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 	existingID := "10101010-1010-4010-8010-101010101010"
 
 	tests := []struct {
-		name     string
-		existing []*coreauth.Auth
-		next     []*coreauth.Auth
-		wantIDs  []string
+		name          string
+		existing      []*coreauth.Auth
+		next          []*coreauth.Auth
+		wantIDs       []string
+		wantGenerated []bool
 	}{
 		{
 			name: "exact current source",
@@ -58,7 +59,8 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 			next: []*coreauth.Auth{{
 				ID: "20202020-2020-4020-8020-202020202020", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"},
 			}},
-			wantIDs: []string{existingID},
+			wantIDs:       []string{existingID},
+			wantGenerated: []bool{false},
 		},
 		{
 			name: "legacy Gemini source",
@@ -68,7 +70,8 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 			next: []*coreauth.Auth{{
 				ID: "30303030-3030-4030-8030-303030303030", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"},
 			}},
-			wantIDs: []string{existingID},
+			wantIDs:       []string{existingID},
+			wantGenerated: []bool{false},
 		},
 		{
 			name: "legacy UUID is claimed once",
@@ -79,7 +82,8 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 				{ID: "40404040-4040-4040-8040-404040404040", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
 				{ID: "50505050-5050-4050-8050-505050505050", Provider: "gemini", Attributes: map[string]string{"source": geminiSourceForTest("shared-key", "https://gemini.example.test", "http://proxy-b.example.test", "team-b"), "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
 			},
-			wantIDs: []string{existingID, "50505050-5050-4050-8050-505050505050"},
+			wantIDs:       []string{existingID, "50505050-5050-4050-8050-505050505050"},
+			wantGenerated: []bool{false, true},
 		},
 		{
 			name: "stored routing identity wins legacy fallback order",
@@ -90,7 +94,8 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 				{ID: "51515151-5151-4151-8151-515151515151", Provider: "gemini", Prefix: "team-a", ProxyURL: "http://proxy-a.example.test", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
 				{ID: "52525252-5252-4252-8252-525252525252", Provider: "gemini", Prefix: "team-b", ProxyURL: "http://proxy-b.example.test", Attributes: map[string]string{"source": geminiSourceForTest("shared-key", "https://gemini.example.test", "http://proxy-b.example.test", "team-b"), "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
 			},
-			wantIDs: []string{"51515151-5151-4151-8151-515151515151", existingID},
+			wantIDs:       []string{"51515151-5151-4151-8151-515151515151", existingID},
+			wantGenerated: []bool{true, false},
 		},
 		{
 			name: "explicit UUID reserves existing credential",
@@ -101,7 +106,8 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 				{ID: existingID, Provider: "gemini", Attributes: map[string]string{"source": "config:gemini[explicit]", "api_key": "explicit"}},
 				{ID: "60606060-6060-4060-8060-606060606060", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
 			},
-			wantIDs: []string{existingID, "60606060-6060-4060-8060-606060606060"},
+			wantIDs:       []string{existingID, "60606060-6060-4060-8060-606060606060"},
+			wantGenerated: []bool{false, true},
 		},
 	}
 
@@ -119,6 +125,10 @@ func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
 				}
 				if testCase.next[i].Attributes["cluster_uuid"] != "" && testCase.next[i].Attributes["cluster_uuid"] != wantID {
 					t.Fatalf("next[%d] cluster_uuid = %q, want %q", i, testCase.next[i].Attributes["cluster_uuid"], wantID)
+				}
+				gotGenerated := testCase.next[i].Attributes["provider_credential_id_generated"] == "true"
+				if gotGenerated != testCase.wantGenerated[i] {
+					t.Fatalf("next[%d] generated marker = %t, want %t", i, gotGenerated, testCase.wantGenerated[i])
 				}
 			}
 		})

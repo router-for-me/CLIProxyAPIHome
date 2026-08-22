@@ -103,6 +103,7 @@ func ReuseGeneratedProviderCredentialIDs(existing, next []*coreauth.Auth) {
 			auth.ID = previous.ID
 			auth.Index = previous.ID
 			auth.Attributes["cluster_uuid"] = previous.ID
+			delete(auth.Attributes, "provider_credential_id_generated")
 			claimed[previous.ID] = struct{}{}
 			reused[auth] = struct{}{}
 			return
