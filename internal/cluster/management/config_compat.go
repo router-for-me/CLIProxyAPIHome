@@ -285,6 +285,21 @@ func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntConfigField(c, "request-retry", func(cfg *appconfig.Config, value int) { cfg.RequestRetry = value })
 }
 
+// GetMaxRetryCredentials returns the maximum number of retry credentials.
+func (h *Handler) GetMaxRetryCredentials(c *gin.Context) {
+	_, cancel, cfg, ok := h.loadRuntimeConfig(c)
+	if !ok {
+		return
+	}
+	defer cancel()
+	c.JSON(http.StatusOK, gin.H{"max-retry-credentials": cfg.MaxRetryCredentials})
+}
+
+// PutMaxRetryCredentials replaces the maximum number of retry credentials.
+func (h *Handler) PutMaxRetryCredentials(c *gin.Context) {
+	h.updateIntConfigField(c, "max-retry-credentials", func(cfg *appconfig.Config, value int) { cfg.MaxRetryCredentials = value })
+}
+
 // GetMaxRetryInterval returns a max retry interval.
 func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
 	_, cancel, cfg, ok := h.loadRuntimeConfig(c)

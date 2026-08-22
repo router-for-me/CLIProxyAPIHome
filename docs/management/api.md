@@ -209,6 +209,9 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/logs-max-total-size-mb` |
 | `PATCH` | `/logs-max-total-size-mb` |
 | `PUT` | `/logs-max-total-size-mb` |
+| `GET` | `/max-retry-credentials` |
+| `PATCH` | `/max-retry-credentials` |
+| `PUT` | `/max-retry-credentials` |
 | `GET` | `/max-retry-interval` |
 | `PATCH` | `/max-retry-interval` |
 | `PUT` | `/max-retry-interval` |
@@ -476,6 +479,8 @@ These routes write the corresponding config root into the cluster repository and
 | `PUT/PATCH` | `/request-log` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/request-retry` | none | `{ "request-retry": number }` |
 | `PUT/PATCH` | `/request-retry` | `{ "value": number }` | `{ "status": "ok" }` |
+| `GET` | `/max-retry-credentials` | none | `{ "max-retry-credentials": number }` |
+| `PUT/PATCH` | `/max-retry-credentials` | `{ "value": number }` | `{ "status": "ok" }` |
 | `GET` | `/max-retry-interval` | none | `{ "max-retry-interval": number }` |
 | `PUT/PATCH` | `/max-retry-interval` | `{ "value": number }` | `{ "status": "ok" }` |
 | `GET` | `/force-model-prefix` | none | `{ "force-model-prefix": boolean }` |

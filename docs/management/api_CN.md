@@ -209,6 +209,9 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/logs-max-total-size-mb` |
 | `PATCH` | `/logs-max-total-size-mb` |
 | `PUT` | `/logs-max-total-size-mb` |
+| `GET` | `/max-retry-credentials` |
+| `PATCH` | `/max-retry-credentials` |
+| `PUT` | `/max-retry-credentials` |
 | `GET` | `/max-retry-interval` |
 | `PATCH` | `/max-retry-interval` |
 | `PUT` | `/max-retry-interval` |
@@ -476,6 +479,8 @@ openai-compatibility
 | `PUT/PATCH` | `/request-log` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/request-retry` | 无 | `{ "request-retry": number }` |
 | `PUT/PATCH` | `/request-retry` | `{ "value": number }` | `{ "status": "ok" }` |
+| `GET` | `/max-retry-credentials` | 无 | `{ "max-retry-credentials": number }` |
+| `PUT/PATCH` | `/max-retry-credentials` | `{ "value": number }` | `{ "status": "ok" }` |
 | `GET` | `/max-retry-interval` | 无 | `{ "max-retry-interval": number }` |
 | `PUT/PATCH` | `/max-retry-interval` | `{ "value": number }` | `{ "status": "ok" }` |
 | `GET` | `/force-model-prefix` | 无 | `{ "force-model-prefix": boolean }` |
