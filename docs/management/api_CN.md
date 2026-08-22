@@ -2247,9 +2247,11 @@ Selector 字段：
 | `name` | string | OpenAI-compatible provider name 或 auth label。 |
 | `id` | string | DB auth ID。 |
 | `uuid` | string | `id` 的 alias。 |
-| query `base-url` | string | 可选 base URL，用于消除 API-key 匹配歧义。 |
+| query `base-url` | string | 可选 base URL，用于缩小 API-key 匹配范围。 |
 
 `PATCH` 不使用 body 中的 `auth_index` 作为 DB ID selector；按 ID patch 请使用 `id` 或 `uuid`。
+
+如果 selector 仍匹配多条凭证，请求会被拒绝。当相同 API key 和 base URL 的条目通过 `prefix`、`proxy-url` 或 `headers` 区分时，应使用 `id`、`uuid` 或 `index` 精确选择一条凭证。
 
 在 `value` 中，`disable-cooling` 接受 boolean 覆盖值，`request-retry` 接受整数额外重试轮次覆盖。将任一字段设为 `null` 会清除现有覆盖并继承全局设置；将 `request-retry` 设为负值也会清除覆盖；省略字段则保留其当前覆盖不变。
 
@@ -2274,9 +2276,11 @@ Query 参数：
 | `api-key` | string | API-key 值。 |
 | `api_key` | string | `api-key` 的 alias。 |
 | `match` | string | `api-key` 的 alias。 |
-| `base-url` | string | 可选 base URL，用于消除歧义。 |
+| `base-url` | string | 可选 base URL，用于缩小 API-key 匹配范围。 |
 | `base_url` | string | `base-url` 的 alias。 |
 | `name` | string | Provider 或 compatibility name。 |
+
+如果 selector 仍匹配多条凭证，请求会被拒绝。请使用 `id`、`uuid`、`auth_index` 或 `index` 精确删除一条凭证。
 
 成功输出：
 

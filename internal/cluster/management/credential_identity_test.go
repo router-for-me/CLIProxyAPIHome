@@ -77,6 +77,53 @@ func TestPatchAPIKeyPreservesCredentialUUID(t *testing.T) {
 	}
 }
 
+func TestFindAPIKeyAuthRejectsAmbiguousRoutingIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		body string
+	}{
+		{
+			name: "Gemini",
+			key:  "gemini-api-key",
+			body: `[
+				{"api-key":"shared-key","base-url":"https://gemini.example.test","prefix":"team-a"},
+				{"api-key":"shared-key","base-url":"https://gemini.example.test","prefix":"team-b"}
+			]`,
+		},
+		{
+			name: "Interactions",
+			key:  "interactions-api-key",
+			body: `[
+				{"api-key":"shared-key","base-url":"https://interactions.example.test","headers":{"X-Team":"a"}},
+				{"api-key":"shared-key","base-url":"https://interactions.example.test","headers":{"X-Team":"b"}}
+			]`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &Handler{}
+			auths, errSynthesize := handler.synthesizeAPIKeyBody(tc.key, []byte(tc.body))
+			if errSynthesize != nil {
+				t.Fatal(errSynthesize)
+			}
+			if len(auths) != 2 {
+				t.Fatalf("synthesized auth count = %d, want 2", len(auths))
+			}
+
+			baseURL := auths[0].Attributes["base_url"]
+			target, ambiguous := findAPIKeyAuth(auths, tc.key, apiKeyIdentifier{
+				APIKey:  "shared-key",
+				BaseURL: baseURL,
+			})
+			if target != nil || !ambiguous {
+				t.Fatalf("findAPIKeyAuth() = (%#v, %t), want (nil, true)", target, ambiguous)
+			}
+		})
+	}
+}
+
 func TestPutGeminiKeyReusesLegacyGeneratedCredentialUUID(t *testing.T) {
 	db, cleanup := openManagementLogTestDB(t)
 	defer cleanup()

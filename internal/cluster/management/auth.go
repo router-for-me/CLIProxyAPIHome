@@ -187,7 +187,7 @@ func (h *Handler) patchAPIKey(c *gin.Context, key string) {
 	}
 	target, ambiguous := findAPIKeyAuth(auths, key, patch.Identifier(c))
 	if ambiguous {
-		respondError(c, http.StatusBadRequest, "multiple items match api-key; base-url is required", nil)
+		respondError(c, http.StatusBadRequest, "multiple items match; id or index is required", nil)
 		return
 	}
 	if target == nil {
@@ -257,7 +257,7 @@ func (h *Handler) deleteAPIKey(c *gin.Context, key string) {
 	bodyID := apiKeyIdentifierFromRequest(c)
 	target, ambiguous := findAPIKeyAuth(auths, key, bodyID)
 	if ambiguous {
-		respondError(c, http.StatusBadRequest, "multiple items match api-key; base-url is required", nil)
+		respondError(c, http.StatusBadRequest, "multiple items match; id or index is required", nil)
 		return
 	}
 	if target == nil {
@@ -535,7 +535,7 @@ func findAPIKeyAuth(auths []*coreauth.Auth, key string, identifier apiKeyIdentif
 			matches = append(matches, auth)
 		}
 	}
-	if identifier.APIKey != "" && identifier.BaseURL == "" && len(matches) > 1 {
+	if len(matches) > 1 {
 		return nil, true
 	}
 	if len(matches) > 0 {

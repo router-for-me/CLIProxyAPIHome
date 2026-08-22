@@ -2248,9 +2248,11 @@ Selector fields:
 | `name` | string | OpenAI-compatible provider name or auth label. |
 | `id` | string | DB auth ID. |
 | `uuid` | string | Alias of `id`. |
-| query `base-url` | string | Optional base URL to disambiguate API-key matches. |
+| query `base-url` | string | Optional base URL to narrow API-key matches. |
 
 `PATCH` does not use body `auth_index` as the DB ID selector. Use `id` or `uuid` for ID-based patching.
+
+Selectors that still match multiple credentials are rejected. Use `id`, `uuid`, or `index` to select one credential when routing fields such as `prefix`, `proxy-url`, or `headers` distinguish entries with the same API key and base URL.
 
 Within `value`, `disable-cooling` accepts a boolean override and `request-retry` accepts an integer additional-round override. Set either field to `null`, or set `request-retry` to a negative value, to clear its existing override and inherit the global setting; omitting a field leaves its current override unchanged.
 
@@ -2275,9 +2277,11 @@ Query parameters:
 | `api-key` | string | API-key value. |
 | `api_key` | string | Alias of `api-key`. |
 | `match` | string | Alias of `api-key`. |
-| `base-url` | string | Optional base URL to disambiguate. |
+| `base-url` | string | Optional base URL to narrow API-key matches. |
 | `base_url` | string | Alias of `base-url`. |
 | `name` | string | Provider or compatibility name. |
+
+Selectors that still match multiple credentials are rejected. Use `id`, `uuid`, `auth_index`, or `index` to delete exactly one credential.
 
 Successful response:
 
