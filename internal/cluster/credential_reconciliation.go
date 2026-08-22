@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -50,6 +51,73 @@ func (r *Repository) ListAuthsUnscoped(ctx context.Context, tx *gorm.DB) ([]*cor
 		auths = append(auths, auth)
 	}
 	return auths, nil
+}
+
+// ReuseGeneratedProviderCredentialIDs maps generated IDs back to existing provider credentials.
+// Exact current sources are claimed before the legacy Gemini source fallback is considered.
+func ReuseGeneratedProviderCredentialIDs(existing, next []*coreauth.Auth) {
+	existingBySource := make(map[string][]*coreauth.Auth, len(existing))
+	for _, auth := range existing {
+		if auth == nil || auth.Attributes == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		source := strings.TrimSpace(auth.Attributes["source"])
+		if source == "" {
+			continue
+		}
+		key := auth.Provider + "\x00" + source
+		existingBySource[key] = append(existingBySource[key], auth)
+		if legacySource := synthesizer.LegacyGeminiConfigSource(auth); legacySource == source {
+			currentSource := synthesizer.GeminiConfigSource(auth)
+			if currentSource != "" && currentSource != source {
+				currentKey := auth.Provider + "\x00" + currentSource
+				existingBySource[currentKey] = append(existingBySource[currentKey], auth)
+			}
+		}
+	}
+
+	claimed := make(map[string]struct{}, len(next))
+	reused := make(map[*coreauth.Auth]struct{}, len(next))
+	for _, auth := range next {
+		if auth == nil || auth.Attributes == nil || auth.Attributes["provider_credential_id_generated"] == "true" {
+			continue
+		}
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			claimed[id] = struct{}{}
+		}
+	}
+	claim := func(auth *coreauth.Auth, source string) {
+		if auth == nil || auth.Attributes == nil || source == "" || auth.Attributes["provider_credential_id_generated"] != "true" {
+			return
+		}
+		if _, done := reused[auth]; done {
+			return
+		}
+		for _, previous := range existingBySource[auth.Provider+"\x00"+source] {
+			if previous == nil {
+				continue
+			}
+			if _, used := claimed[previous.ID]; used {
+				continue
+			}
+			auth.ID = previous.ID
+			auth.Index = previous.ID
+			auth.Attributes["cluster_uuid"] = previous.ID
+			delete(auth.Attributes, "provider_credential_id_generated")
+			claimed[previous.ID] = struct{}{}
+			reused[auth] = struct{}{}
+			return
+		}
+	}
+
+	for _, auth := range next {
+		if auth != nil && auth.Attributes != nil {
+			claim(auth, strings.TrimSpace(auth.Attributes["source"]))
+		}
+	}
+	for _, auth := range next {
+		claim(auth, synthesizer.LegacyGeminiConfigSource(auth))
+	}
 }
 
 // ReconcileProviderAuths atomically updates one provider config credential set.
@@ -229,6 +297,8 @@ func isProviderAuthForConfigKey(auth *coreauth.Auth, key string) bool {
 	switch strings.TrimSpace(key) {
 	case "gemini-api-key":
 		return auth.Provider == "gemini" && strings.HasPrefix(source, "config:gemini[")
+	case "interactions-api-key":
+		return auth.Provider == "gemini-interactions" && strings.HasPrefix(source, "config:interactions[")
 	case "vertex-api-key":
 		return auth.Provider == "vertex" && strings.HasPrefix(source, "config:vertex-apikey[")
 	case "codex-api-key":

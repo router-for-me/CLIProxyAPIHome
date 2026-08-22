@@ -31,6 +31,18 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) { h.patchAPIKey(c, "gemini-api-
 // DeleteGeminiKey deletes a gemini key.
 func (h *Handler) DeleteGeminiKey(c *gin.Context) { h.deleteAPIKey(c, "gemini-api-key") }
 
+// GetInteractionsKeys returns native Interactions keys.
+func (h *Handler) GetInteractionsKeys(c *gin.Context) { h.getAPIKeyList(c, "interactions-api-key") }
+
+// PutInteractionsKeys replaces native Interactions keys.
+func (h *Handler) PutInteractionsKeys(c *gin.Context) { h.putAPIKeyList(c, "interactions-api-key") }
+
+// PatchInteractionsKey applies a partial update to a native Interactions key.
+func (h *Handler) PatchInteractionsKey(c *gin.Context) { h.patchAPIKey(c, "interactions-api-key") }
+
+// DeleteInteractionsKey deletes a native Interactions key.
+func (h *Handler) DeleteInteractionsKey(c *gin.Context) { h.deleteAPIKey(c, "interactions-api-key") }
+
 // GetVertexCompatKeys returns a vertex compat keys.
 func (h *Handler) GetVertexCompatKeys(c *gin.Context) { h.getAPIKeyList(c, "vertex-api-key") }
 
@@ -274,6 +286,12 @@ func (h *Handler) synthesizeAPIKeyBody(key string, body []byte) ([]*coreauth.Aut
 			return nil, errDecode
 		}
 		cfg.GeminiKey = entries
+	case "interactions-api-key":
+		var entries []appconfig.GeminiKey
+		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
+			return nil, errDecode
+		}
+		cfg.InteractionsKey = entries
 	case "vertex-api-key":
 		var entries []appconfig.VertexCompatKey
 		if errDecode := decodeListBody(body, key, &entries); errDecode != nil {
@@ -311,6 +329,7 @@ func (h *Handler) synthesizeAPIKeyBody(key string, body []byte) ([]*coreauth.Aut
 		return nil, errNormalizeIDs
 	}
 	cfg.SanitizeGeminiKeys()
+	cfg.SanitizeInteractionsKeys()
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
@@ -341,29 +360,7 @@ func (h *Handler) replaceAPIKeyAuths(ctx context.Context, key string, next []*co
 	if errExisting != nil {
 		return errExisting
 	}
-	existingBySource := make(map[string]*coreauth.Auth, len(existing))
-	for _, auth := range existing {
-		if !isAPIKeyAuthForKey(auth, key) || auth.Attributes == nil {
-			continue
-		}
-		source := strings.TrimSpace(auth.Attributes["source"])
-		if source != "" {
-			existingBySource[auth.Provider+"\x00"+source] = auth
-		}
-	}
-	for _, auth := range next {
-		if auth == nil || auth.Attributes == nil {
-			continue
-		}
-		source := strings.TrimSpace(auth.Attributes["source"])
-		previous := existingBySource[auth.Provider+"\x00"+source]
-		if previous == nil || auth.Attributes["provider_credential_id_generated"] != "true" {
-			continue
-		}
-		auth.ID = previous.ID
-		auth.Index = previous.Index
-		auth.Attributes["cluster_uuid"] = previous.ID
-	}
+	cluster.ReuseGeneratedProviderCredentialIDs(existing, next)
 	return h.repo.ReconcileProviderAuths(ctx, key, next, nil)
 }
 
@@ -549,13 +546,20 @@ func findAPIKeyAuth(auths []*coreauth.Auth, key string, identifier apiKeyIdentif
 
 // isAPIKeyAuthForKey reports whether api key auth for key.
 func isAPIKeyAuthForKey(auth *coreauth.Auth, key string) bool {
-	if auth == nil || auth.Attributes == nil || strings.TrimSpace(auth.Attributes["api_key"]) == "" && key != "openai-compatibility" {
+	if auth == nil || auth.Attributes == nil {
 		return false
+	}
+	if strings.TrimSpace(auth.Attributes["api_key"]) == "" && key != "openai-compatibility" {
+		if (key != "gemini-api-key" && key != "interactions-api-key") || strings.TrimSpace(auth.Attributes["base_url"]) == "" {
+			return false
+		}
 	}
 	source := strings.TrimSpace(auth.Attributes["source"])
 	switch key {
 	case "gemini-api-key":
 		return auth.Provider == "gemini" && strings.HasPrefix(source, "config:gemini[")
+	case "interactions-api-key":
+		return auth.Provider == "gemini-interactions" && strings.HasPrefix(source, "config:interactions[")
 	case "claude-api-key":
 		return auth.Provider == "claude" && strings.HasPrefix(source, "config:claude[")
 	case "codex-api-key":
@@ -634,7 +638,7 @@ func apiKeyAuthToMap(auth *coreauth.Auth, key string) map[string]any {
 		item["request-retry"] = requestRetry
 	}
 	switch key {
-	case "codex-api-key", "xai-api-key", "gemini-api-key", "vertex-api-key", "claude-api-key":
+	case "codex-api-key", "xai-api-key", "gemini-api-key", "interactions-api-key", "vertex-api-key", "claude-api-key":
 		models := credentialAPIKeyModels(auth)
 		if len(models) > 0 {
 			item["models"] = models

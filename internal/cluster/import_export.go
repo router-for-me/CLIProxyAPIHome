@@ -558,20 +558,12 @@ func importConfigRoot(ctx context.Context, repo *Repository, root map[string]any
 }
 
 func collectImportConfigAuths(ctx context.Context, repo *Repository, cfg *appconfig.Config, authDir string, now time.Time, pending map[string]*coreauth.Auth, order *[]string, stats *ImportStats) error {
-	existingBySource := make(map[string]string)
+	var existing []*coreauth.Auth
 	if repo != nil {
-		existing, errList := repo.ListAuths(ctx)
+		var errList error
+		existing, errList = repo.ListAuths(ctx)
 		if errList != nil {
 			return errList
-		}
-		for _, auth := range existing {
-			if auth == nil || auth.Attributes == nil {
-				continue
-			}
-			source := strings.TrimSpace(auth.Attributes["source"])
-			if source != "" {
-				existingBySource[auth.Provider+"\\x00"+source] = auth.ID
-			}
 		}
 	}
 	sctx := &synthesizer.SynthesisContext{
@@ -579,17 +571,12 @@ func collectImportConfigAuths(ctx context.Context, repo *Repository, cfg *appcon
 		AuthDir:     authDir,
 		Now:         now,
 		IDGenerator: synthesizer.NewStableIDGenerator(),
-		UUIDForAuth: func(auth *coreauth.Auth) string {
-			if auth == nil || auth.Attributes == nil {
-				return ""
-			}
-			return existingBySource[auth.Provider+"\\x00"+strings.TrimSpace(auth.Attributes["source"])]
-		},
 	}
 	auths, errSynthesize := synthesizer.NewConfigSynthesizer().Synthesize(sctx)
 	if errSynthesize != nil {
 		return errSynthesize
 	}
+	ReuseGeneratedProviderCredentialIDs(existing, auths)
 	for _, auth := range auths {
 		if errAdd := addImportAuth(pending, order, stats, auth); errAdd != nil {
 			return errAdd
@@ -677,6 +664,7 @@ func addImportAuth(pending map[string]*coreauth.Auth, order *[]string, stats *Im
 
 var providerCredentialConfigKeys = []string{
 	"gemini-api-key",
+	"interactions-api-key",
 	"vertex-api-key",
 	"codex-api-key",
 	"xai-api-key",

@@ -142,6 +142,7 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 		"auth-dir",
 		"tls",
 		"gemini-api-key",
+		"interactions-api-key",
 		"codex-api-key",
 		"xai-api-key",
 		"claude-api-key",

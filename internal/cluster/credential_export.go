@@ -17,6 +17,7 @@ import (
 // CredentialConfigCounts reports how many auth-backed config entries were restored.
 type CredentialConfigCounts struct {
 	GeminiKeys          int
+	InteractionsKeys    int
 	VertexKeys          int
 	CodexKeys           int
 	XAIKeys             int
@@ -53,6 +54,7 @@ type credentialOpenAICompatGroup struct {
 func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, result *CredentialConfigCounts) {
 	// Normalize source data before building the derived payload.
 	geminiKeys := make([]appconfig.GeminiKey, 0)
+	interactionsKeys := make([]appconfig.GeminiKey, 0)
 	vertexKeys := make([]appconfig.VertexCompatKey, 0)
 	codexKeys := make([]appconfig.CodexKey, 0)
 	xaiKeys := make([]appconfig.XAIKey, 0)
@@ -63,6 +65,8 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 		switch credentialConfigAuthKind(auth) {
 		case "gemini-api-key":
 			geminiKeys = append(geminiKeys, credentialGeminiKey(auth))
+		case "interactions-api-key":
+			interactionsKeys = append(interactionsKeys, credentialGeminiKey(auth))
 		case "vertex-api-key":
 			vertexKeys = append(vertexKeys, credentialVertexKey(auth))
 		case "codex-api-key":
@@ -79,6 +83,10 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 	if len(geminiKeys) > 0 {
 		root["gemini-api-key"] = geminiKeys
 		result.GeminiKeys = len(geminiKeys)
+	}
+	if len(interactionsKeys) > 0 {
+		root["interactions-api-key"] = interactionsKeys
+		result.InteractionsKeys = len(interactionsKeys)
 	}
 	if len(vertexKeys) > 0 {
 		root["vertex-api-key"] = vertexKeys
@@ -125,6 +133,8 @@ func credentialConfigAuthKind(auth *coreauth.Auth) string {
 	switch {
 	case auth.Provider == "gemini" && strings.HasPrefix(source, "config:gemini["):
 		return "gemini-api-key"
+	case auth.Provider == "gemini-interactions" && strings.HasPrefix(source, "config:interactions["):
+		return "interactions-api-key"
 	case auth.Provider == "vertex" && strings.HasPrefix(source, "config:vertex-apikey["):
 		return "vertex-api-key"
 	case auth.Provider == "codex" && strings.HasPrefix(source, "config:codex["):
@@ -324,7 +334,12 @@ func credentialGeminiModels(auth *coreauth.Auth) []appconfig.GeminiModel {
 	pairs := credentialModelPairs(auth)
 	out := make([]appconfig.GeminiModel, 0, len(pairs))
 	for _, pair := range pairs {
-		out = append(out, appconfig.GeminiModel{Name: pair.Name, Alias: pair.Alias})
+		out = append(out, appconfig.GeminiModel{
+			Name:         pair.Name,
+			Alias:        pair.Alias,
+			DisplayName:  pair.DisplayName,
+			ForceMapping: pair.ForceMapping,
+		})
 	}
 	return out
 }

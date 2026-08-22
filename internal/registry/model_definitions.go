@@ -84,6 +84,7 @@ func GetAllStaticModelDefinitions() map[string][]*ModelInfo {
 	channels := []string{
 		"claude",
 		"gemini",
+		"gemini-interactions",
 		"vertex",
 		"codex-free",
 		"codex-team",
@@ -278,6 +279,7 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 // Supported channels:
 //   - claude
 //   - gemini
+//   - gemini-interactions
 //   - vertex
 //   - codex
 //   - kimi
@@ -292,6 +294,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	case "claude":
 		models = GetClaudeModels()
 	case "gemini":
+		models = GetGeminiModels()
+	case "gemini-interactions":
 		models = GetGeminiModels()
 	case "vertex":
 		models = GetGeminiVertexModels()

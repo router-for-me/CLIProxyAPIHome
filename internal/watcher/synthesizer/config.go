@@ -16,7 +16,7 @@ import (
 const homeConfigModelsMetadataKey = "home_config_models"
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
-// It handles Gemini, Claude, Codex, xAI, OpenAI-compat, and Vertex-compat providers.
+// It handles Gemini, Interactions, Claude, Codex, xAI, OpenAI-compat, and Vertex-compat providers.
 type ConfigSynthesizer struct{}
 
 // NewConfigSynthesizer creates a new ConfigSynthesizer instance.
@@ -33,6 +33,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
+	// Native Interactions API Keys
+	out = append(out, s.synthesizeInteractionsKeys(ctx)...)
 	// Claude API Keys
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
 	// Codex API Keys
@@ -49,25 +51,80 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.
 func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	return s.synthesizeGeminiKeyEntries(ctx, ctx.Config.GeminiKey, "gemini:apikey", "gemini", "gemini-apikey", "gemini")
+}
+
+// LegacyGeminiConfigSource returns the source used before Gemini routing fields became part of credential identity.
+func LegacyGeminiConfigSource(auth *coreauth.Auth) string {
+	if auth == nil || auth.Provider != "gemini" || auth.Attributes == nil {
+		return ""
+	}
+	if !strings.HasPrefix(strings.TrimSpace(auth.Attributes["source"]), "config:gemini[") {
+		return ""
+	}
+	key := strings.TrimSpace(auth.Attributes["api_key"])
+	if key == "" {
+		return ""
+	}
+	_, token := NewStableIDGenerator().Next("gemini:apikey", key, strings.TrimSpace(auth.Attributes["base_url"]))
+	return fmt.Sprintf("config:gemini[%s]", token)
+}
+
+// GeminiConfigSource derives the current source from a stored Gemini credential identity.
+func GeminiConfigSource(auth *coreauth.Auth) string {
+	if auth == nil || auth.Provider != "gemini" || auth.Attributes == nil {
+		return ""
+	}
+	key := strings.TrimSpace(auth.Attributes["api_key"])
+	base := strings.TrimSpace(auth.Attributes["base_url"])
+	if key == "" && base == "" {
+		return ""
+	}
+	headers := make(map[string]string)
+	for name, value := range auth.Attributes {
+		if strings.HasPrefix(name, "header:") {
+			headers[strings.TrimPrefix(name, "header:")] = value
+		}
+	}
+	_, token := NewStableIDGenerator().Next(
+		"gemini:apikey",
+		key,
+		base,
+		strings.TrimSpace(auth.ProxyURL),
+		strings.TrimSpace(auth.Prefix),
+		appconfig.FormatSortedHeaders(headers),
+	)
+	return fmt.Sprintf("config:gemini[%s]", token)
+}
+
+// synthesizeInteractionsKeys creates Auth entries for native Interactions API keys.
+func (s *ConfigSynthesizer) synthesizeInteractionsKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	return s.synthesizeGeminiKeyEntries(ctx, ctx.Config.InteractionsKey, "gemini-interactions:apikey", "interactions", "interactions-apikey", "gemini-interactions")
+}
+
+func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, entries []appconfig.GeminiKey, idKind, sourceName, label, provider string) []*coreauth.Auth {
 	// Normalize source data before building the derived payload.
 	cfg := ctx.Config
 	now := ctx.Now
 	idGen := ctx.IDGenerator
 
-	out := make([]*coreauth.Auth, 0, len(cfg.GeminiKey))
-	for i := range cfg.GeminiKey {
-		entry := cfg.GeminiKey[i]
+	out := make([]*coreauth.Auth, 0, len(entries))
+	for i := range entries {
+		entry := entries[i]
 		key := strings.TrimSpace(entry.APIKey)
-		if key == "" {
+		base := strings.TrimSpace(entry.BaseURL)
+		if key == "" && base == "" {
 			continue
 		}
 		prefix := strings.TrimSpace(entry.Prefix)
-		base := strings.TrimSpace(entry.BaseURL)
 		proxyURL := strings.TrimSpace(entry.ProxyURL)
-		id, token := idGen.Next("gemini:apikey", key, base)
+		id, token := idGen.Next(idKind, key, base, proxyURL, prefix, appconfig.FormatSortedHeaders(entry.Headers))
 		attrs := map[string]string{
-			"source":  fmt.Sprintf("config:gemini[%s]", token),
-			"api_key": key,
+			"source":       fmt.Sprintf("config:%s[%s]", sourceName, token),
+			"config_index": strconv.Itoa(i),
+		}
+		if key != "" {
+			attrs["api_key"] = key
 		}
 		metadata := map[string]any{}
 		if entry.DisableCooling != nil {
@@ -87,8 +144,8 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 		addConfigHeadersToAttrs(entry.Headers, attrs)
 		a := &coreauth.Auth{
 			ID:         id,
-			Provider:   "gemini",
-			Label:      "gemini-apikey",
+			Provider:   provider,
+			Label:      label,
 			Prefix:     prefix,
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,

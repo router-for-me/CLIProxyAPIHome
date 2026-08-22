@@ -3,6 +3,7 @@ package home
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -177,6 +178,19 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		if len(configModels) > 0 {
 			models = configModels
 		} else if entry := r.resolveConfigGeminiKey(cfg, a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildGeminiConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "gemini-interactions":
+		models = registry.GetGeminiModels()
+		if len(configModels) > 0 {
+			models = configModels
+		} else if entry := r.resolveConfigInteractionsKey(cfg, a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildGeminiConfigModels(entry)
 			}
@@ -436,7 +450,22 @@ func (r *Runtime) resolveConfigClaudeKey(cfg *config.Config, auth *coreauth.Auth
 // resolveConfigGeminiKey resolves a config gemini key.
 func (r *Runtime) resolveConfigGeminiKey(cfg *config.Config, auth *coreauth.Auth) *config.GeminiKey {
 	// Normalize source data before building the derived payload.
-	if auth == nil || cfg == nil {
+	if cfg == nil {
+		return nil
+	}
+	return resolveConfigGeminiKeyEntry(auth, cfg.GeminiKey)
+}
+
+// resolveConfigInteractionsKey resolves a config native Interactions key.
+func (r *Runtime) resolveConfigInteractionsKey(cfg *config.Config, auth *coreauth.Auth) *config.GeminiKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveConfigGeminiKeyEntry(auth, cfg.InteractionsKey)
+}
+
+func resolveConfigGeminiKeyEntry(auth *coreauth.Auth, entries []config.GeminiKey) *config.GeminiKey {
+	if auth == nil {
 		return nil
 	}
 	var attrKey, attrBase string
@@ -444,18 +473,32 @@ func (r *Runtime) resolveConfigGeminiKey(cfg *config.Config, auth *coreauth.Auth
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range cfg.GeminiKey {
-		entry := &cfg.GeminiKey[i]
+	matchesCredentials := func(entry config.GeminiKey) bool {
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
-		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
-			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
-				return entry
-			}
-			continue
+		if attrKey != "" && attrBase != "" {
+			return strings.EqualFold(cfgKey, attrKey) && strings.EqualFold(cfgBase, attrBase)
 		}
-		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
-			return entry
+		if attrKey != "" {
+			return strings.EqualFold(cfgKey, attrKey) && (cfgBase == "" || strings.EqualFold(cfgBase, attrBase))
+		}
+		return attrBase != "" && strings.EqualFold(cfgBase, attrBase)
+	}
+	if auth.Attributes != nil {
+		index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes["config_index"]))
+		if errIndex == nil && index >= 0 && index < len(entries) && matchesCredentials(entries[index]) {
+			return &entries[index]
+		}
+	}
+	for i := range entries {
+		entry := entries[i]
+		if matchesCredentials(entry) && strings.EqualFold(strings.TrimSpace(entry.Prefix), strings.TrimSpace(auth.Prefix)) && strings.EqualFold(strings.TrimSpace(entry.ProxyURL), strings.TrimSpace(auth.ProxyURL)) {
+			return &entries[i]
+		}
+	}
+	for i := range entries {
+		if matchesCredentials(entries[i]) {
+			return &entries[i]
 		}
 	}
 	return nil

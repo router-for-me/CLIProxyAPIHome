@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
 )
 
 func TestSynthesizeAPIKeyBodyRejectsInvalidIDBeforeSanitize(t *testing.T) {
@@ -73,6 +74,49 @@ func TestPatchAPIKeyPreservesCredentialUUID(t *testing.T) {
 	}
 	if len(auths) != 1 || auths[0].ID != "11111111-1111-4111-8111-111111111111" || auths[0].Attributes["api_key"] != "new" {
 		t.Fatalf("patched auth = %#v", auths)
+	}
+}
+
+func TestPutGeminiKeyReusesLegacyGeneratedCredentialUUID(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	repo := cluster.NewRepository(db)
+	id := "12121212-1212-4212-8212-121212121212"
+	_, token := synthesizer.NewStableIDGenerator().Next("gemini:apikey", "shared-key", "https://gemini.example.test")
+	legacy := &coreauth.Auth{
+		ID:       id,
+		Index:    id,
+		Provider: "gemini",
+		Prefix:   "team-a",
+		ProxyURL: "http://proxy.example.test",
+		Disabled: true,
+		Status:   coreauth.StatusDisabled,
+		Attributes: map[string]string{
+			"source":        "config:gemini[" + token + "]",
+			"api_key":       "shared-key",
+			"base_url":      "https://gemini.example.test",
+			"header:X-Test": "one",
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(context.Background(), legacy, "create"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+
+	handler := NewHandler(repo, nil, "127.0.0.1", 0)
+	engine := gin.New()
+	engine.PUT("/gemini-api-key", handler.PutGeminiKeys)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/gemini-api-key", strings.NewReader(`[{"api-key":"shared-key","base-url":"https://gemini.example.test","proxy-url":"http://proxy.example.test","prefix":"team-a","headers":{"X-Test":"one"}}]`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d body=%s", response.Code, response.Body.String())
+	}
+	auths, errAuths := repo.ListAuths(context.Background())
+	if errAuths != nil {
+		t.Fatal(errAuths)
+	}
+	if len(auths) != 1 || auths[0].ID != id || !auths[0].Disabled {
+		t.Fatalf("reconciled legacy Gemini auths = %#v", auths)
 	}
 }
 

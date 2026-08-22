@@ -199,6 +199,10 @@ The table below is extracted from the final Home route registry built by `intern
 | `PATCH` | `/gemini-api-key` |
 | `PUT` | `/gemini-api-key` |
 | `GET` | `/get-auth-status` |
+| `DELETE` | `/interactions-api-key` |
+| `GET` | `/interactions-api-key` |
+| `PATCH` | `/interactions-api-key` |
+| `PUT` | `/interactions-api-key` |
 | `GET` | `/kimi-auth-url` |
 | `GET` | `/latest-version` |
 | `GET` | `/logging-to-file` |
@@ -209,6 +213,9 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/logs-max-total-size-mb` |
 | `PATCH` | `/logs-max-total-size-mb` |
 | `PUT` | `/logs-max-total-size-mb` |
+| `GET` | `/max-retry-credentials` |
+| `PATCH` | `/max-retry-credentials` |
+| `PUT` | `/max-retry-credentials` |
 | `GET` | `/max-retry-interval` |
 | `PATCH` | `/max-retry-interval` |
 | `PUT` | `/max-retry-interval` |
@@ -358,6 +365,7 @@ Example response:
   "antigravity-signature-cache-enabled": true,
   "antigravity-signature-bypass-strict": false,
   "gemini-api-key": [],
+  "interactions-api-key": [],
   "codex-api-key": [],
   "xai-api-key": [],
   "codex-header-defaults": {
@@ -436,6 +444,7 @@ Home persists non-credential roots into the config snapshot. Credential roots in
 ```text
 auth-dir
 gemini-api-key
+interactions-api-key
 vertex-api-key
 codex-api-key
 xai-api-key
@@ -476,6 +485,8 @@ These routes write the corresponding config root into the cluster repository and
 | `PUT/PATCH` | `/request-log` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/request-retry` | none | `{ "request-retry": number }` |
 | `PUT/PATCH` | `/request-retry` | `{ "value": number }` | `{ "status": "ok" }` |
+| `GET` | `/max-retry-credentials` | none | `{ "max-retry-credentials": number }` |
+| `PUT/PATCH` | `/max-retry-credentials` | `{ "value": number }` | `{ "status": "ok" }` |
 | `GET` | `/max-retry-interval` | none | `{ "max-retry-interval": number }` |
 | `PUT/PATCH` | `/max-retry-interval` | `{ "value": number }` | `{ "status": "ok" }` |
 | `GET` | `/force-model-prefix` | none | `{ "force-model-prefix": boolean }` |
@@ -2025,6 +2036,11 @@ PUT    /gemini-api-key
 PATCH  /gemini-api-key
 DELETE /gemini-api-key
 
+GET    /interactions-api-key
+PUT    /interactions-api-key
+PATCH  /interactions-api-key
+DELETE /interactions-api-key
+
 GET    /claude-api-key
 PUT    /claude-api-key
 PATCH  /claude-api-key
@@ -2059,7 +2075,7 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `api-key` | string | Upstream Gemini API key. |
+| `api-key` | string | Upstream Gemini API key. May be empty when `base-url` is non-empty, for example when custom `headers` provide upstream authentication. |
 | `priority` | integer | Higher priority credentials are selected first. |
 | `prefix` | string | Optional model namespace prefix. |
 | `base-url` | string | Optional Gemini API base URL override. |
@@ -2073,6 +2089,8 @@ Home synthesizes DB auth records from these config-like payloads. xAI API-key us
 | `id` | string | Canonical immutable credential UUID. Responses and exports use this field. |
 | `uuid` | string | Legacy input-only alias for `id`; it is normalized to `id` and never returned or exported. |
 | `disabled` | boolean | Read-only DB auth disabled flag. Use `PATCH /auth-files/status` to change it. |
+
+`GeminiKey` is used by both `gemini-api-key` and `interactions-api-key`; the latter creates `gemini-interactions` credentials for native Interactions execution. At least one of `api-key` or `base-url` must be non-empty. Entries with the same API key and base URL remain distinct when their `prefix`, `proxy-url`, or normalized `headers` differ.
 
 `ClaudeKey`, `CodexKey`, `XAIKey`, and `VertexCompatKey` use the same common fields. `XAIKey` uses the native xAI executor and requires `base-url` (normally `https://api.x.ai/v1`). Additional notable fields:
 
@@ -3514,6 +3532,7 @@ Supported channels:
 ```text
 claude
 gemini
+gemini-interactions
 vertex
 codex
 codex-free
@@ -4100,6 +4119,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `antigravity-signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `antigravity-signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
 | `gemini-api-key` | array of `GeminiKey` | Gemini API-key credentials; use provider-key routes. |
+| `interactions-api-key` | array of `GeminiKey` | Native Google Interactions API-key credentials; use provider-key routes. |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials; use provider-key routes. |
 | `xai-api-key` | array of `XAIKey` | Native xAI API-key credentials; use provider-key routes. |
 | `codex-header-defaults.user-agent` | string | Default Codex User-Agent. |

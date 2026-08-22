@@ -21,6 +21,13 @@ func TestConfigSynthesizerPreservesExplicitFalseCoolingOverrides(t *testing.T) {
 			}}},
 		},
 		{
+			name: "interactions",
+			cfg: &appconfig.Config{InteractionsKey: []appconfig.GeminiKey{{
+				APIKey:         "interactions-key",
+				DisableCooling: &disableCooling,
+			}}},
+		},
+		{
 			name: "claude",
 			cfg: &appconfig.Config{ClaudeKey: []appconfig.ClaudeKey{{
 				APIKey:         "claude-key",

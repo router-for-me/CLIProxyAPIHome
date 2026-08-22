@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -59,6 +60,8 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 	switch provider {
 	case "gemini":
 		upstreamModel = resolveUpstreamModelForGeminiAPIKey(cfg, auth, requestedModel)
+	case "gemini-interactions":
+		upstreamModel = resolveUpstreamModelForInteractionsAPIKey(cfg, auth, requestedModel)
 	case "claude":
 		upstreamModel = resolveUpstreamModelForClaudeAPIKey(cfg, auth, requestedModel)
 	case "codex":
@@ -229,6 +232,8 @@ func metadataBool(value any) bool {
 type apiKeyConfigEntry interface {
 	GetAPIKey() string
 	GetBaseURL() string
+	GetPrefix() string
+	GetProxyURL() string
 }
 
 // resolveAPIKeyConfig resolves an api key config.
@@ -242,30 +247,38 @@ func resolveAPIKeyConfig[T apiKeyConfigEntry](entries []T, auth *Auth) *T {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range entries {
-		entry := &entries[i]
-		cfgKey := strings.TrimSpace((*entry).GetAPIKey())
-		cfgBase := strings.TrimSpace((*entry).GetBaseURL())
+	matchesCredentials := func(entry T) bool {
+		cfgKey := strings.TrimSpace(entry.GetAPIKey())
+		cfgBase := strings.TrimSpace(entry.GetBaseURL())
 		if attrKey != "" && attrBase != "" {
-			if strings.EqualFold(cfgKey, attrKey) && strings.EqualFold(cfgBase, attrBase) {
-				return entry
-			}
-			continue
+			return strings.EqualFold(cfgKey, attrKey) && strings.EqualFold(cfgBase, attrBase)
 		}
-		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
-			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
-				return entry
-			}
+		if attrKey != "" {
+			return strings.EqualFold(cfgKey, attrKey) && (cfgBase == "" || strings.EqualFold(cfgBase, attrBase))
 		}
-		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
-			return entry
+		return attrBase != "" && strings.EqualFold(cfgBase, attrBase)
+	}
+	if auth.Attributes != nil {
+		index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes["config_index"]))
+		if errIndex == nil && index >= 0 && index < len(entries) && matchesCredentials(entries[index]) {
+			return &entries[index]
+		}
+	}
+	for i := range entries {
+		entry := entries[i]
+		if matchesCredentials(entry) && strings.EqualFold(strings.TrimSpace(entry.GetPrefix()), strings.TrimSpace(auth.Prefix)) && strings.EqualFold(strings.TrimSpace(entry.GetProxyURL()), strings.TrimSpace(auth.ProxyURL)) {
+			return &entries[i]
+		}
+	}
+	for i := range entries {
+		if matchesCredentials(entries[i]) {
+			return &entries[i]
 		}
 	}
 	if attrKey != "" {
 		for i := range entries {
-			entry := &entries[i]
-			if strings.EqualFold(strings.TrimSpace((*entry).GetAPIKey()), attrKey) {
-				return entry
+			if strings.EqualFold(strings.TrimSpace(entries[i].GetAPIKey()), attrKey) {
+				return &entries[i]
 			}
 		}
 	}
@@ -278,6 +291,14 @@ func resolveGeminiAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internal
 		return nil
 	}
 	return resolveAPIKeyConfig(cfg.GeminiKey, auth)
+}
+
+// resolveInteractionsAPIKeyConfig resolves a native Interactions api key config.
+func resolveInteractionsAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.GeminiKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveAPIKeyConfig(cfg.InteractionsKey, auth)
 }
 
 // resolveClaudeAPIKeyConfig resolves a claude api key config.
@@ -315,6 +336,15 @@ func resolveVertexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internal
 // resolveUpstreamModelForGeminiAPIKey resolves an upstream model for gemini api key.
 func resolveUpstreamModelForGeminiAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
 	entry := resolveGeminiAPIKeyConfig(cfg, auth)
+	if entry == nil {
+		return ""
+	}
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+// resolveUpstreamModelForInteractionsAPIKey resolves an upstream model for a native Interactions api key.
+func resolveUpstreamModelForInteractionsAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := resolveInteractionsAPIKeyConfig(cfg, auth)
 	if entry == nil {
 		return ""
 	}

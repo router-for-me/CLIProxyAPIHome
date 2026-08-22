@@ -13,6 +13,7 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	root := map[string]any{"debug": true}
 	auths := []*coreauth.Auth{
 		testConfigAPIKeyAuth("gemini-id", "gemini", "config:gemini[token]", "gemini-key"),
+		testConfigAPIKeyAuth("interactions-id", "gemini-interactions", "config:interactions[token]", "interactions-key"),
 		testConfigAPIKeyAuth("vertex-id", "vertex", "config:vertex-apikey[token]", "vertex-key"),
 		testConfigAPIKeyAuth("codex-id", "codex", "config:codex[token]", "codex-key"),
 		testConfigAPIKeyAuth("xai-id", "xai", "config:xai[token]", "xai-key"),
@@ -20,13 +21,22 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 		testConfigAPIKeyAuth("compat-id", "compat", "config:compat[token]", "compat-key"),
 		testConfigAPIKeyAuth("codex-file-id", "codex", "auth-file.json", "ignored-key"),
 	}
-	auths[3].Metadata = map[string]any{"disable_cooling": false, "request_retry": 0}
-	auths[5].Attributes["compat_name"] = "compat"
-	auths[5].Attributes["provider_key"] = "compat"
-	auths[5].Metadata = map[string]any{"request_retry": 2}
+	auths[1].Metadata = map[string]any{
+		"request_retry": 1,
+		"home_config_models": []any{map[string]any{
+			"id":                  "interactions-alias",
+			"name":                "interactions-upstream",
+			"config_display_name": "Interactions Catalog Name",
+			"force_mapping":       true,
+		}},
+	}
+	auths[4].Metadata = map[string]any{"disable_cooling": false, "request_retry": 0}
+	auths[6].Attributes["compat_name"] = "compat"
+	auths[6].Attributes["provider_key"] = "compat"
+	auths[6].Metadata = map[string]any{"request_retry": 2}
 
 	counts := ApplyCredentialConfigToRoot(root, auths)
-	if counts.GeminiKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.ClaudeKeys != 1 || counts.OpenAICompatibility != 1 {
+	if counts.GeminiKeys != 1 || counts.InteractionsKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.ClaudeKeys != 1 || counts.OpenAICompatibility != 1 {
 		t.Fatalf("unexpected credential counts: %#v", counts)
 	}
 	if got := root["debug"]; got != true {
@@ -39,6 +49,16 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	}
 	if geminiKeys[0].ID != "gemini-id" || geminiKeys[0].UUID != "" {
 		t.Fatalf("gemini credential identity = %#v, want exported id only", geminiKeys[0])
+	}
+	interactionsKeys, ok := root["interactions-api-key"].([]appconfig.GeminiKey)
+	if !ok || len(interactionsKeys) != 1 || interactionsKeys[0].APIKey != "interactions-key" {
+		t.Fatalf("unexpected interactions-api-key root value: %#v", root["interactions-api-key"])
+	}
+	if interactionsKeys[0].ID != "interactions-id" || interactionsKeys[0].RequestRetry == nil || *interactionsKeys[0].RequestRetry != 1 {
+		t.Fatalf("interactions credential = %#v, want exported id and request-retry", interactionsKeys[0])
+	}
+	if len(interactionsKeys[0].Models) != 1 || interactionsKeys[0].Models[0].DisplayName != "Interactions Catalog Name" || !interactionsKeys[0].Models[0].ForceMapping {
+		t.Fatalf("interactions models = %#v", interactionsKeys[0].Models)
 	}
 	vertexKeys, ok := root["vertex-api-key"].([]appconfig.VertexCompatKey)
 	if !ok || len(vertexKeys) != 1 || vertexKeys[0].APIKey != "vertex-key" {
