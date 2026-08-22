@@ -199,6 +199,10 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `PATCH` | `/gemini-api-key` |
 | `PUT` | `/gemini-api-key` |
 | `GET` | `/get-auth-status` |
+| `DELETE` | `/interactions-api-key` |
+| `GET` | `/interactions-api-key` |
+| `PATCH` | `/interactions-api-key` |
+| `PUT` | `/interactions-api-key` |
 | `GET` | `/kimi-auth-url` |
 | `GET` | `/latest-version` |
 | `GET` | `/logging-to-file` |
@@ -361,6 +365,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
   "antigravity-signature-cache-enabled": true,
   "antigravity-signature-bypass-strict": false,
   "gemini-api-key": [],
+  "interactions-api-key": [],
   "codex-api-key": [],
   "xai-api-key": [],
   "codex-header-defaults": {
@@ -439,6 +444,7 @@ Home 会把非 credential roots 持久化到 config snapshot。上传 YAML 中�
 ```text
 auth-dir
 gemini-api-key
+interactions-api-key
 vertex-api-key
 codex-api-key
 xai-api-key
@@ -2030,6 +2036,11 @@ PUT    /gemini-api-key
 PATCH  /gemini-api-key
 DELETE /gemini-api-key
 
+GET    /interactions-api-key
+PUT    /interactions-api-key
+PATCH  /interactions-api-key
+DELETE /interactions-api-key
+
 GET    /claude-api-key
 PUT    /claude-api-key
 PATCH  /claude-api-key
@@ -2064,7 +2075,7 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `api-key` | string | 上游 Gemini API key。 |
+| `api-key` | string | 上游 Gemini API key。若 `base-url` 非空，则可留空，例如由自定义 `headers` 提供上游认证时。 |
 | `priority` | integer | 凭证选择优先级，值越大越优先。 |
 | `prefix` | string | 可选模型命名空间前缀。 |
 | `base-url` | string | 可选 Gemini API base URL override。 |
@@ -2078,6 +2089,8 @@ Home 会从这些 config-like payload 合成 DB auth records。xAI API-key usage
 | `id` | string | 规范且不可变的 credential UUID。响应和导出使用此字段。 |
 | `uuid` | string | 仅用于兼容输入的旧字段，会被规范化为 `id`，不会在响应或导出中出现。 |
 | `disabled` | boolean | 只读 DB auth disabled flag；请使用 `PATCH /auth-files/status` 修改。 |
+
+`GeminiKey` 同时用于 `gemini-api-key` 和 `interactions-api-key`；后者会创建 `gemini-interactions` 凭证，用于原生 Interactions 执行。`api-key` 与 `base-url` 至少一个必须非空。API key 和 base URL 相同但 `prefix`、`proxy-url` 或规范化 `headers` 不同的条目会保留为不同凭证。
 
 `ClaudeKey`、`CodexKey`、`XAIKey` 和 `VertexCompatKey` 使用相同通用字段。`XAIKey` 使用原生 xAI executor，并要求提供 `base-url`（通常为 `https://api.x.ai/v1`）。额外字段如下：
 
@@ -3487,6 +3500,7 @@ Query 参数：
 ```text
 claude
 gemini
+gemini-interactions
 vertex
 codex
 codex-free
@@ -4073,6 +4087,7 @@ DELETE query：
 | `antigravity-signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `antigravity-signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
 | `gemini-api-key` | array of `GeminiKey` | Gemini API-key credentials；应使用 provider-key routes。 |
+| `interactions-api-key` | array of `GeminiKey` | 原生 Google Interactions API-key credentials；应使用 provider-key routes。 |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials；应使用 provider-key routes。 |
 | `xai-api-key` | array of `XAIKey` | 原生 xAI API-key credentials；应使用 provider-key routes。 |
 | `codex-header-defaults.user-agent` | string | 默认 Codex User-Agent。 |

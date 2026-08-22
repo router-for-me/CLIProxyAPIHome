@@ -57,6 +57,12 @@ func (k VertexCompatKey) GetAPIKey() string { return k.APIKey }
 // GetBaseURL returns a base url.
 func (k VertexCompatKey) GetBaseURL() string { return k.BaseURL }
 
+// GetPrefix returns a model prefix.
+func (k VertexCompatKey) GetPrefix() string { return k.Prefix }
+
+// GetProxyURL returns a proxy url.
+func (k VertexCompatKey) GetProxyURL() string { return k.ProxyURL }
+
 // VertexCompatModel represents a model configuration for Vertex compatibility,
 // including the actual model name and its alias for API routing.
 type VertexCompatModel struct {

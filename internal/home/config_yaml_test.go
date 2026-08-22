@@ -33,6 +33,8 @@ api-keys:
   - "k1"
 gemini-api-key:
   - api-key: "g1"
+interactions-api-key:
+  - api-key: "i1"
 codex-api-key:
   - api-key: "c1"
 xai-api-key:
@@ -99,6 +101,7 @@ plugins:
 	assertNotContains("auth-dir:")
 	assertNotContains("api-keys:")
 	assertNotContains("gemini-api-key:")
+	assertNotContains("interactions-api-key:")
 	assertNotContains("codex-api-key:")
 	assertNotContains("xai-api-key:")
 	assertNotContains("claude-api-key:")

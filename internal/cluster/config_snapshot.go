@@ -82,6 +82,11 @@ func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context,
 	if errSynthesize != nil {
 		return errSynthesize
 	}
+	existing, errExisting := NewRepository(tx).ListAuths(ctx)
+	if errExisting != nil {
+		return errExisting
+	}
+	ReuseGeneratedProviderCredentialIDs(existing, auths)
 	exported := make(map[string]any, len(explicitKeys))
 	ApplyCredentialConfigToRoot(exported, auths)
 	for key := range explicitKeys {
@@ -170,6 +175,7 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 		return nil, nil, errTrustedProxies
 	}
 	cfg.SanitizeGeminiKeys()
+	cfg.SanitizeInteractionsKeys()
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
@@ -258,7 +264,7 @@ func normalizeConfigRootSecrets(root map[string]any) (bool, error) {
 // isClusterCredentialConfigKey reports whether cluster credential config key.
 func isClusterCredentialConfigKey(key string) bool {
 	switch strings.TrimSpace(key) {
-	case "auth-dir", "credential-concurrency", "gemini-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
+	case "auth-dir", "credential-concurrency", "gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
 		return true
 	default:
 		return false

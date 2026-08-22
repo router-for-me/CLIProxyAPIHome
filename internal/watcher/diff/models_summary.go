@@ -41,7 +41,11 @@ func SummarizeGeminiModels(models []config.GeminiModel) GeminiModelsSummary {
 			if name == "" && alias == "" {
 				continue
 			}
-			out(strings.ToLower(name) + "|" + strings.ToLower(alias))
+			forceMapping := "false"
+			if model.ForceMapping {
+				forceMapping = "true"
+			}
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strings.TrimSpace(model.DisplayName) + "|force-mapping=" + forceMapping)
 		}
 	})
 	return GeminiModelsSummary{

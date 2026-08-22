@@ -145,10 +145,12 @@ func TestGetProviderKeyRoutesReturnConfiguredModels(t *testing.T) {
 	engine := gin.New()
 	engine.PUT("/config.yaml", handler.PutConfigYAML)
 	engine.GET("/gemini-api-key", handler.GetGeminiKeys)
+	engine.GET("/interactions-api-key", handler.GetInteractionsKeys)
 	engine.GET("/claude-api-key", handler.GetClaudeKeys)
 	engine.GET("/codex-api-key", handler.GetCodexKeys)
 	engine.GET("/xai-api-key", handler.GetXAIKeys)
 	engine.GET("/vertex-api-key", handler.GetVertexCompatKeys)
+	engine.GET("/config.yaml", handler.GetConfigYAML)
 
 	payload := `port: 8327
 gemini-api-key:
@@ -156,6 +158,17 @@ gemini-api-key:
     models:
       - name: "gemini-upstream"
         alias: "gemini-alias"
+        display-name: "Gemini Catalog Name"
+        force-mapping: true
+interactions-api-key:
+  - base-url: "https://header-auth.example.test"
+    headers:
+      Authorization: "Bearer token"
+    models:
+      - name: "interactions-upstream"
+        alias: "interactions-alias"
+        display-name: "Interactions Catalog Name"
+        force-mapping: true
 claude-api-key:
   - api-key: claude-key
     models:
@@ -190,12 +203,15 @@ vertex-api-key:
 	}
 
 	cases := []struct {
-		Path      string
-		Key       string
-		WantName  string
-		WantAlias string
+		Path             string
+		Key              string
+		WantName         string
+		WantAlias        string
+		WantDisplayName  string
+		WantForceMapping bool
 	}{
-		{Path: "/gemini-api-key", Key: "gemini-api-key", WantName: "gemini-upstream", WantAlias: "gemini-alias"},
+		{Path: "/gemini-api-key", Key: "gemini-api-key", WantName: "gemini-upstream", WantAlias: "gemini-alias", WantDisplayName: "Gemini Catalog Name", WantForceMapping: true},
+		{Path: "/interactions-api-key", Key: "interactions-api-key", WantName: "interactions-upstream", WantAlias: "interactions-alias", WantDisplayName: "Interactions Catalog Name", WantForceMapping: true},
 		{Path: "/claude-api-key", Key: "claude-api-key", WantName: "claude-upstream", WantAlias: "claude-alias"},
 		{Path: "/codex-api-key", Key: "codex-api-key", WantName: "codex-upstream", WantAlias: "codex-alias"},
 		{Path: "/xai-api-key", Key: "xai-api-key", WantName: "xai-upstream", WantAlias: "xai-alias"},
@@ -216,10 +232,25 @@ vertex-api-key:
 			if gotAlias := stringFromAny(model["alias"]); gotAlias != tc.WantAlias {
 				t.Fatalf("model alias = %q, want %q", gotAlias, tc.WantAlias)
 			}
+			if gotDisplayName := stringFromAny(model["display-name"]); gotDisplayName != tc.WantDisplayName {
+				t.Fatalf("model display-name = %q, want %q", gotDisplayName, tc.WantDisplayName)
+			}
+			if gotForceMapping, _ := model["force-mapping"].(bool); gotForceMapping != tc.WantForceMapping {
+				t.Fatalf("model force-mapping = %#v, want %t", model["force-mapping"], tc.WantForceMapping)
+			}
 			if _, exists := model["thinking"]; exists {
 				t.Fatalf("model contains unexpected thinking field: %+v", model)
 			}
 		})
+	}
+
+	configResp := httptest.NewRecorder()
+	engine.ServeHTTP(configResp, httptest.NewRequest(http.MethodGet, "/config.yaml", nil))
+	if configResp.Code != http.StatusOK {
+		t.Fatalf("config yaml status = %d, body = %s", configResp.Code, configResp.Body.String())
+	}
+	if !strings.Contains(configResp.Body.String(), "display-name: Gemini Catalog Name") || !strings.Contains(configResp.Body.String(), "display-name: Interactions Catalog Name") || !strings.Contains(configResp.Body.String(), "force-mapping: true") {
+		t.Fatalf("config yaml did not preserve Gemini model catalog fields: %s", configResp.Body.String())
 	}
 }
 

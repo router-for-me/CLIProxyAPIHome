@@ -32,6 +32,9 @@ gemini-api-key:
   - api-key: gemini-key
     models:
       - name: gemini-2.5-pro
+interactions-api-key:
+  - api-key: interactions-key
+    request-retry: 0
 xai-api-key:
   - api-key: xai-key
     base-url: https://api.x.ai/v1
@@ -66,7 +69,21 @@ xai-api-key:
 		t.Fatalf("cluster_events count after second import = %d, want %d", secondEventCount, firstEventCount)
 	}
 	assertTableCount(t, db, &APIKeyRecord{}, 1)
-	assertActiveAuthCount(t, db, 3)
+	assertActiveAuthCount(t, db, 4)
+	auths, errAuths := repo.ListAuths(context.Background())
+	if errAuths != nil {
+		t.Fatalf("ListAuths() error = %v", errAuths)
+	}
+	for _, auth := range auths {
+		if auth.Provider != "gemini-interactions" {
+			continue
+		}
+		if retry, ok := auth.RequestRetryOverride(); !ok || retry != 0 {
+			t.Fatalf("interactions request-retry = (%d, %t), want (0, true)", retry, ok)
+		}
+		return
+	}
+	t.Fatal("imported interactions credential is missing")
 }
 
 func TestImportLocalStatePreservesAPIKeyDisplayName(t *testing.T) {
@@ -191,6 +208,43 @@ func TestImportLocalStateCountsUnchangedGeneratedProviderCredential(t *testing.T
 	}
 	if second.Unchanged != 1 || second.Updated != 0 {
 		t.Fatalf("second import stats = %+v, want one unchanged generated provider credential", second)
+	}
+}
+
+func TestImportLocalStateReusesLegacyGeminiCredentialUUID(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeFile(t, configPath, "gemini-api-key:\n  - api-key: shared-key\n    base-url: https://gemini.example.test\n    proxy-url: http://proxy.example.test\n    prefix: team-a\n    headers:\n      X-Test: one\n")
+	repo := NewRepository(openImportTestSQLite(t))
+	id := "12121212-3434-4567-8787-909090909090"
+	legacy := &coreauth.Auth{
+		ID:       id,
+		Index:    id,
+		Provider: "gemini",
+		Prefix:   "team-a",
+		ProxyURL: "http://proxy.example.test",
+		Disabled: true,
+		Status:   coreauth.StatusDisabled,
+		Attributes: map[string]string{
+			"source":        legacyGeminiSourceForTest("shared-key", "https://gemini.example.test"),
+			"api_key":       "shared-key",
+			"base_url":      "https://gemini.example.test",
+			"header:X-Test": "one",
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(context.Background(), legacy, "create"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+
+	if _, errImport := ImportLocalState(context.Background(), ImportOptions{ConfigPath: configPath, Repository: repo}); errImport != nil {
+		t.Fatal(errImport)
+	}
+	auths, errAuths := repo.ListAuths(context.Background())
+	if errAuths != nil {
+		t.Fatal(errAuths)
+	}
+	if len(auths) != 1 || auths[0].ID != id || !auths[0].Disabled {
+		t.Fatalf("imported legacy Gemini auths = %#v", auths)
 	}
 }
 

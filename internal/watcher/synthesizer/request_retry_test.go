@@ -18,6 +18,10 @@ func TestConfigSynthesizerPreservesRequestRetryOverrides(t *testing.T) {
 			cfg:  &appconfig.Config{GeminiKey: []appconfig.GeminiKey{{APIKey: "gemini-key", RequestRetry: &requestRetry}}},
 		},
 		{
+			name: "interactions",
+			cfg:  &appconfig.Config{InteractionsKey: []appconfig.GeminiKey{{APIKey: "interactions-key", RequestRetry: &requestRetry}}},
+		},
+		{
 			name: "claude",
 			cfg:  &appconfig.Config{ClaudeKey: []appconfig.ClaudeKey{{APIKey: "claude-key", RequestRetry: &requestRetry}}},
 		},

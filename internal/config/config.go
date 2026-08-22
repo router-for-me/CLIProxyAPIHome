@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -132,6 +133,9 @@ type Config struct {
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
 
+	// InteractionsKey defines native Google Interactions API key configurations.
+	InteractionsKey []GeminiKey `yaml:"interactions-api-key" json:"interactions-api-key"`
+
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
@@ -164,7 +168,7 @@ type Config struct {
 	// vertex, antigravity, claude, codex, kimi, xai.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
-	// gemini-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
+	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
@@ -434,6 +438,12 @@ func (k ClaudeKey) GetAPIKey() string { return k.APIKey }
 // GetBaseURL returns a base url.
 func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
 
+// GetPrefix returns a model prefix.
+func (k ClaudeKey) GetPrefix() string { return k.Prefix }
+
+// GetProxyURL returns a proxy url.
+func (k ClaudeKey) GetProxyURL() string { return k.ProxyURL }
+
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
 	// Name is the upstream model identifier used when issuing requests.
@@ -502,6 +512,12 @@ func (k CodexKey) GetAPIKey() string { return k.APIKey }
 
 // GetBaseURL returns a base url.
 func (k CodexKey) GetBaseURL() string { return k.BaseURL }
+
+// GetPrefix returns a model prefix.
+func (k CodexKey) GetPrefix() string { return k.Prefix }
+
+// GetProxyURL returns a proxy url.
+func (k CodexKey) GetProxyURL() string { return k.ProxyURL }
 
 // CodexModel describes a mapping between an alias and the actual upstream model name.
 type CodexModel struct {
@@ -583,6 +599,12 @@ func (k GeminiKey) GetAPIKey() string { return k.APIKey }
 // GetBaseURL returns a base url.
 func (k GeminiKey) GetBaseURL() string { return k.BaseURL }
 
+// GetPrefix returns a model prefix.
+func (k GeminiKey) GetPrefix() string { return k.Prefix }
+
+// GetProxyURL returns a proxy url.
+func (k GeminiKey) GetProxyURL() string { return k.ProxyURL }
+
 // GeminiModel describes a mapping between an alias and the actual upstream model name.
 type GeminiModel struct {
 	// Name is the upstream model identifier used when issuing requests.
@@ -590,6 +612,12 @@ type GeminiModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// DisplayName is the optional human-readable name shown in model catalogs.
+	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
+
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
 // GetName returns a name.
@@ -597,6 +625,12 @@ func (m GeminiModel) GetName() string { return m.Name }
 
 // GetAlias returns an alias.
 func (m GeminiModel) GetAlias() string { return m.Alias }
+
+// GetDisplayName returns a display name.
+func (m GeminiModel) GetDisplayName() string { return m.DisplayName }
+
+// GetForceMapping returns whether response model fields should be rewritten.
+func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
 
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
@@ -778,6 +812,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
+	// Sanitize native Interactions API key configuration.
+	cfg.SanitizeInteractionsKeys()
+
 	// Sanitize Vertex-compatible API keys.
 	cfg.SanitizeVertexCompatKeys()
 
@@ -954,6 +991,13 @@ func (cfg *Config) NormalizeProviderCredentialIDs() error {
 		}
 		cfg.GeminiKey[i].ID, cfg.GeminiKey[i].UUID = id, ""
 	}
+	for i := range cfg.InteractionsKey {
+		id, errNormalize := normalizeProviderCredentialID(cfg.InteractionsKey[i].ID, cfg.InteractionsKey[i].UUID)
+		if errNormalize != nil {
+			return errNormalize
+		}
+		cfg.InteractionsKey[i].ID, cfg.InteractionsKey[i].UUID = id, ""
+	}
 	for i := range cfg.VertexCompatAPIKey {
 		id, errNormalize := normalizeProviderCredentialID(cfg.VertexCompatAPIKey[i].ID, cfg.VertexCompatAPIKey[i].UUID)
 		if errNormalize != nil {
@@ -1103,34 +1147,79 @@ func (cfg *Config) SanitizeClaudeKeys() {
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
-// It uses API key + base URL as the uniqueness key.
+// It uses API key, base URL, proxy URL, prefix, and custom headers as the uniqueness key.
 func (cfg *Config) SanitizeGeminiKeys() {
 	// Keep validation before state changes so failures leave existing data intact.
 	if cfg == nil {
 		return
 	}
+	cfg.GeminiKey = sanitizeGeminiKeyEntries(cfg.GeminiKey)
+}
 
-	seen := make(map[string]struct{}, len(cfg.GeminiKey))
-	out := cfg.GeminiKey[:0]
-	for i := range cfg.GeminiKey {
-		entry := cfg.GeminiKey[i]
+// SanitizeInteractionsKeys deduplicates and normalizes native Interactions credentials.
+func (cfg *Config) SanitizeInteractionsKeys() {
+	if cfg == nil {
+		return
+	}
+	cfg.InteractionsKey = sanitizeGeminiKeyEntries(cfg.InteractionsKey)
+}
+
+func sanitizeGeminiKeyEntries(entries []GeminiKey) []GeminiKey {
+	seen := make(map[string]struct{}, len(entries))
+	out := entries[:0]
+	for i := range entries {
+		entry := entries[i]
 		entry.APIKey = strings.TrimSpace(entry.APIKey)
-		if entry.APIKey == "" {
+		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+		if entry.APIKey == "" && entry.BaseURL == "" {
 			continue
 		}
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
-		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		uniqueKey := formatGeminiKeyDedupID(entry)
 		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}
 		seen[uniqueKey] = struct{}{}
 		out = append(out, entry)
 	}
-	cfg.GeminiKey = out
+	return out
+}
+
+func formatGeminiKeyDedupID(entry GeminiKey) string {
+	var b strings.Builder
+	b.WriteString(entry.APIKey)
+	b.WriteByte(0)
+	b.WriteString(entry.BaseURL)
+	b.WriteByte(0)
+	b.WriteString(entry.ProxyURL)
+	b.WriteByte(0)
+	b.WriteString(entry.Prefix)
+	b.WriteByte(0)
+	b.WriteString(FormatSortedHeaders(entry.Headers))
+	return b.String()
+}
+
+// FormatSortedHeaders serializes headers deterministically with null byte separators.
+func FormatSortedHeaders(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, key := range keys {
+		b.WriteString(key)
+		b.WriteByte(0)
+		b.WriteString(headers[key])
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // normalizeModelPrefix normalizes a model prefix.

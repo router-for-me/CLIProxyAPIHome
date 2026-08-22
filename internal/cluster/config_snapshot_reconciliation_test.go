@@ -25,6 +25,45 @@ func TestReplaceConfigSnapshotPreservesCredentialsWhenRootsAreOmitted(t *testing
 	assertProviderCredentialSecrets(t, repo, ctx, map[string]string{geminiID: "gemini-old", codexID: "codex-old"})
 }
 
+func TestReplaceConfigSnapshotReusesLegacyGeminiCredentialUUID(t *testing.T) {
+	ctx := context.Background()
+	repo := newCredentialFoundationTestRepository(t)
+	id := "11111111-2222-4333-8444-555555555555"
+	legacy := &coreauth.Auth{
+		ID:       id,
+		Index:    id,
+		Provider: "gemini",
+		Prefix:   "team-a",
+		ProxyURL: "http://proxy.example.test",
+		Disabled: true,
+		Status:   coreauth.StatusDisabled,
+		Attributes: map[string]string{
+			"source":        legacyGeminiSourceForTest("shared-key", "https://gemini.example.test"),
+			"api_key":       "shared-key",
+			"base_url":      "https://gemini.example.test",
+			"header:X-Test": "one",
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, legacy, "create"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+
+	if errReplace := repo.ReplaceConfigSnapshot(ctx, map[string]any{
+		"gemini-api-key": []any{map[string]any{
+			"api-key": "shared-key", "base-url": "https://gemini.example.test", "proxy-url": "http://proxy.example.test", "prefix": "team-a", "headers": map[string]any{"X-Test": "one"},
+		}},
+	}); errReplace != nil {
+		t.Fatal(errReplace)
+	}
+	auths, errAuths := repo.ListAuths(ctx)
+	if errAuths != nil {
+		t.Fatal(errAuths)
+	}
+	if len(auths) != 1 || auths[0].ID != id || !auths[0].Disabled {
+		t.Fatalf("reconciled legacy Gemini auths = %#v", auths)
+	}
+}
+
 func TestReplaceConfigSnapshotUpdatesOnlyExplicitProviderRoot(t *testing.T) {
 	ctx := context.Background()
 	repo := newCredentialFoundationTestRepository(t)

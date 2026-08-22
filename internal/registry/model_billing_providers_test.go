@@ -49,6 +49,7 @@ func TestStaticModelDefinitionsExposeCanonicalBillingProviders(t *testing.T) {
 	}{
 		{channel: "claude", provider: "claude"},
 		{channel: "gemini", provider: "gemini"},
+		{channel: "gemini-interactions", provider: "gemini-interactions"},
 		{channel: "vertex", provider: "vertex"},
 		{channel: "codex-free", provider: "codex"},
 		{channel: "codex-pro", provider: "codex"},
@@ -109,6 +110,21 @@ func TestAllStaticModelDefinitionsUseCanonicalCodexProvider(t *testing.T) {
 			if !reflect.DeepEqual(model.Providers, wantProviders) {
 				t.Fatalf("channel %q model %q providers = %#v, want %#v", channel, model.ID, model.Providers, wantProviders)
 			}
+		}
+	}
+}
+
+func TestAllStaticModelDefinitionsIncludesGeminiInteractions(t *testing.T) {
+	models := GetAllStaticModelDefinitions()["gemini-interactions"]
+	if len(models) == 0 {
+		t.Fatal("gemini-interactions static models are missing")
+	}
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if !reflect.DeepEqual(model.Providers, []string{"gemini-interactions"}) {
+			t.Fatalf("model %q providers = %#v, want gemini-interactions", model.ID, model.Providers)
 		}
 	}
 }

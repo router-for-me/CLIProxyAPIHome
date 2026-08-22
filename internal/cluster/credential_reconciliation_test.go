@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
 	"gorm.io/gorm"
 )
 
@@ -36,6 +37,102 @@ func newCredentialFoundationTestRepository(t *testing.T) *Repository {
 		}
 	})
 	return NewRepository(db)
+}
+
+func TestReuseGeneratedProviderCredentialIDs(t *testing.T) {
+	legacySource := legacyGeminiSourceForTest("shared-key", "https://gemini.example.test")
+	newSource := geminiSourceForTest("shared-key", "https://gemini.example.test", "http://proxy-a.example.test", "team-a")
+	existingID := "10101010-1010-4010-8010-101010101010"
+
+	tests := []struct {
+		name     string
+		existing []*coreauth.Auth
+		next     []*coreauth.Auth
+		wantIDs  []string
+	}{
+		{
+			name: "exact current source",
+			existing: []*coreauth.Auth{{
+				ID: existingID, Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test"},
+			}},
+			next: []*coreauth.Auth{{
+				ID: "20202020-2020-4020-8020-202020202020", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"},
+			}},
+			wantIDs: []string{existingID},
+		},
+		{
+			name: "legacy Gemini source",
+			existing: []*coreauth.Auth{{
+				ID: existingID, Provider: "gemini", Attributes: map[string]string{"source": legacySource, "api_key": "shared-key", "base_url": "https://gemini.example.test"},
+			}},
+			next: []*coreauth.Auth{{
+				ID: "30303030-3030-4030-8030-303030303030", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"},
+			}},
+			wantIDs: []string{existingID},
+		},
+		{
+			name: "legacy UUID is claimed once",
+			existing: []*coreauth.Auth{{
+				ID: existingID, Provider: "gemini", Attributes: map[string]string{"source": legacySource, "api_key": "shared-key", "base_url": "https://gemini.example.test"},
+			}},
+			next: []*coreauth.Auth{
+				{ID: "40404040-4040-4040-8040-404040404040", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
+				{ID: "50505050-5050-4050-8050-505050505050", Provider: "gemini", Attributes: map[string]string{"source": geminiSourceForTest("shared-key", "https://gemini.example.test", "http://proxy-b.example.test", "team-b"), "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
+			},
+			wantIDs: []string{existingID, "50505050-5050-4050-8050-505050505050"},
+		},
+		{
+			name: "stored routing identity wins legacy fallback order",
+			existing: []*coreauth.Auth{{
+				ID: existingID, Provider: "gemini", Prefix: "team-b", ProxyURL: "http://proxy-b.example.test", Attributes: map[string]string{"source": legacySource, "api_key": "shared-key", "base_url": "https://gemini.example.test"},
+			}},
+			next: []*coreauth.Auth{
+				{ID: "51515151-5151-4151-8151-515151515151", Provider: "gemini", Prefix: "team-a", ProxyURL: "http://proxy-a.example.test", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
+				{ID: "52525252-5252-4252-8252-525252525252", Provider: "gemini", Prefix: "team-b", ProxyURL: "http://proxy-b.example.test", Attributes: map[string]string{"source": geminiSourceForTest("shared-key", "https://gemini.example.test", "http://proxy-b.example.test", "team-b"), "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
+			},
+			wantIDs: []string{"51515151-5151-4151-8151-515151515151", existingID},
+		},
+		{
+			name: "explicit UUID reserves existing credential",
+			existing: []*coreauth.Auth{{
+				ID: existingID, Provider: "gemini", Attributes: map[string]string{"source": legacySource, "api_key": "shared-key", "base_url": "https://gemini.example.test"},
+			}},
+			next: []*coreauth.Auth{
+				{ID: existingID, Provider: "gemini", Attributes: map[string]string{"source": "config:gemini[explicit]", "api_key": "explicit"}},
+				{ID: "60606060-6060-4060-8060-606060606060", Provider: "gemini", Attributes: map[string]string{"source": newSource, "api_key": "shared-key", "base_url": "https://gemini.example.test", "provider_credential_id_generated": "true"}},
+			},
+			wantIDs: []string{existingID, "60606060-6060-4060-8060-606060606060"},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			for _, auth := range testCase.next {
+				if auth != nil && auth.Index == "" {
+					auth.Index = auth.ID
+				}
+			}
+			ReuseGeneratedProviderCredentialIDs(testCase.existing, testCase.next)
+			for i, wantID := range testCase.wantIDs {
+				if testCase.next[i].ID != wantID || testCase.next[i].Index != wantID {
+					t.Fatalf("next[%d] identity = (%q, %q), want %q", i, testCase.next[i].ID, testCase.next[i].Index, wantID)
+				}
+				if testCase.next[i].Attributes["cluster_uuid"] != "" && testCase.next[i].Attributes["cluster_uuid"] != wantID {
+					t.Fatalf("next[%d] cluster_uuid = %q, want %q", i, testCase.next[i].Attributes["cluster_uuid"], wantID)
+				}
+			}
+		})
+	}
+}
+
+func legacyGeminiSourceForTest(apiKey, baseURL string) string {
+	_, token := synthesizer.NewStableIDGenerator().Next("gemini:apikey", apiKey, baseURL)
+	return "config:gemini[" + token + "]"
+}
+
+func geminiSourceForTest(apiKey, baseURL, proxyURL, prefix string) string {
+	_, token := synthesizer.NewStableIDGenerator().Next("gemini:apikey", apiKey, baseURL, proxyURL, prefix, "")
+	return "config:gemini[" + token + "]"
 }
 
 func TestReconcileProviderAuthsPreservesExplicitUUIDAndRejectsReferencedOrphan(t *testing.T) {

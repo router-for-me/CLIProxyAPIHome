@@ -124,7 +124,7 @@ func respondConfigWriteError(c *gin.Context, err error) {
 }
 
 func hasCredentialConfigRoots(root map[string]any) bool {
-	for _, key := range []string{"gemini-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility"} {
+	for _, key := range []string{"gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility"} {
 		if _, exists := root[key]; exists {
 			return true
 		}
@@ -391,7 +391,7 @@ func mergeConfigPatch(current map[string]any, patch map[string]any) map[string]a
 // isCredentialConfigKey reports whether credential config key.
 func isCredentialConfigKey(key string) bool {
 	switch strings.TrimSpace(key) {
-	case "auth-dir", "gemini-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
+	case "auth-dir", "gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "claude-api-key", "openai-compatibility":
 		return true
 	default:
 		return false

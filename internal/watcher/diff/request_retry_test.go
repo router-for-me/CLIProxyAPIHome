@@ -11,7 +11,8 @@ func TestBuildConfigChangeDetailsIncludesCredentialRequestRetry(t *testing.T) {
 	zero := 0
 	two := 2
 	oldCfg := &config.Config{
-		GeminiKey: []config.GeminiKey{{APIKey: "secret", RequestRetry: &zero}},
+		GeminiKey:       []config.GeminiKey{{APIKey: "secret", RequestRetry: &zero}},
+		InteractionsKey: []config.GeminiKey{{APIKey: "interactions-secret", RequestRetry: &zero}},
 		OpenAICompatibility: []config.OpenAICompatibility{{
 			Name:          "compat",
 			BaseURL:       "https://compat.example.com",
@@ -20,7 +21,8 @@ func TestBuildConfigChangeDetailsIncludesCredentialRequestRetry(t *testing.T) {
 		}},
 	}
 	newCfg := &config.Config{
-		GeminiKey: []config.GeminiKey{{APIKey: "secret", RequestRetry: &two}},
+		GeminiKey:       []config.GeminiKey{{APIKey: "secret", RequestRetry: &two}},
+		InteractionsKey: []config.GeminiKey{{APIKey: "interactions-secret", RequestRetry: &two}},
 		OpenAICompatibility: []config.OpenAICompatibility{{
 			Name:          "compat",
 			BaseURL:       "https://compat.example.com",
@@ -32,6 +34,9 @@ func TestBuildConfigChangeDetailsIncludesCredentialRequestRetry(t *testing.T) {
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
 	if !slices.Contains(changes, "gemini[0].request-retry: 0 -> 2") {
 		t.Fatalf("changes = %v, want Gemini request-retry detail", changes)
+	}
+	if !slices.Contains(changes, "interactions[0].request-retry: 0 -> 2") {
+		t.Fatalf("changes = %v, want Interactions request-retry detail", changes)
 	}
 	if !slices.Contains(changes, "  provider updated: compat (request-retry 0 -> 2)") {
 		t.Fatalf("changes = %v, want OpenAI compatibility request-retry detail", changes)
