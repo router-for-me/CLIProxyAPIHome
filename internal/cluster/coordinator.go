@@ -125,7 +125,7 @@ func (c *Coordinator) Initialize(ctx context.Context) error {
 	c.mu.Lock()
 	c.node.StartedAt = incarnation.StartedAt
 	c.mu.Unlock()
-	if errBeat := c.heartbeatAndElect(ctx); errBeat != nil {
+	if errBeat := c.heartbeatAndElect(ctx, incarnation); errBeat != nil {
 		return c.retireFailedInitialization(ctx, incarnation, errBeat)
 	}
 	c.mu.Lock()
@@ -224,14 +224,15 @@ func (c *Coordinator) Start(ctx context.Context) error {
 				c.setMaster(false)
 				return nil
 			}
-			if errHeartbeat := c.heartbeatHomeIncarnation(ctx); errHeartbeat != nil {
+			incarnation, errHeartbeat := c.heartbeatHomeIncarnation(ctx)
+			if errHeartbeat != nil {
 				c.setMaster(false)
 				if ctx.Err() != nil {
 					return nil
 				}
 				return errHeartbeat
 			}
-			if errBeat := c.heartbeatAndElect(ctx); errBeat != nil {
+			if errBeat := c.heartbeatAndElect(ctx, incarnation); errBeat != nil {
 				c.setMaster(false)
 				if ctx.Err() != nil {
 					return nil
@@ -322,7 +323,11 @@ func (c *Coordinator) UpdateClientCount(ctx context.Context, clientCount int) er
 		Update("client_count", clientCount).Error; errUpdate != nil {
 		return errUpdate
 	}
-	return c.syncCPANodeSnapshot(ctx, now)
+	home, initialized := c.HomeIncarnation()
+	if !initialized {
+		return fmt.Errorf("cluster coordinator is not initialized")
+	}
+	return c.syncCPANodeSnapshot(ctx, home, now)
 }
 
 // SetOnMasterChanged sets an on master changed.
@@ -368,7 +373,7 @@ func (c *Coordinator) CurrentMaster(ctx context.Context) (*ClusterNodeRecord, er
 }
 
 // heartbeatAndElect handles a heartbeat and elect.
-func (c *Coordinator) heartbeatAndElect(ctx context.Context) error {
+func (c *Coordinator) heartbeatAndElect(ctx context.Context, home HomeIncarnationID) error {
 	// Keep validation before state changes so failures leave existing data intact.
 	db, errDB := c.repo.database()
 	if errDB != nil {
@@ -431,21 +436,24 @@ func (c *Coordinator) heartbeatAndElect(ctx context.Context) error {
 		return errTransaction
 	}
 	c.setMaster(clusterNodeMatches(elected, c.node.IP, c.node.Port))
-	if errSnapshot := c.syncCPANodeSnapshot(ctx, seenAt); errSnapshot != nil {
+	if errSnapshot := c.syncCPANodeSnapshot(ctx, home, seenAt); errSnapshot != nil {
 		log.Warnf("failed to sync CPA node snapshot: %v", errSnapshot)
 	}
 	return nil
 }
 
-func (c *Coordinator) heartbeatHomeIncarnation(ctx context.Context) error {
+func (c *Coordinator) heartbeatHomeIncarnation(ctx context.Context) (HomeIncarnationID, error) {
 	c.mu.RLock()
 	incarnation := c.homeIncarnation
 	initialized := c.initialized
 	c.mu.RUnlock()
 	if !initialized {
-		return fmt.Errorf("cluster coordinator is not initialized")
+		return HomeIncarnationID{}, fmt.Errorf("cluster coordinator is not initialized")
 	}
-	return c.repo.HeartbeatHomeIncarnation(ctx, incarnation)
+	if errHeartbeat := c.repo.HeartbeatHomeIncarnation(ctx, incarnation); errHeartbeat != nil {
+		return HomeIncarnationID{}, errHeartbeat
+	}
+	return incarnation, nil
 }
 
 func (c *Coordinator) validate() error {
@@ -464,13 +472,9 @@ func (c *Coordinator) validate() error {
 	return nil
 }
 
-func (c *Coordinator) syncCPANodeSnapshot(ctx context.Context, seenAt time.Time) error {
+func (c *Coordinator) syncCPANodeSnapshot(ctx context.Context, home HomeIncarnationID, seenAt time.Time) error {
 	if c == nil || c.repo == nil {
 		return nil
-	}
-	home, initialized := c.HomeIncarnation()
-	if !initialized {
-		return fmt.Errorf("cluster coordinator is not initialized")
 	}
 	return c.repo.ReplaceCPANodeSnapshotForIncarnation(ctx, home, node.GlobalRegistry().List(), seenAt)
 }
