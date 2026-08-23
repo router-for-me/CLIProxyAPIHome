@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -113,64 +114,162 @@ func ClientAddr(ctx context.Context, db *gorm.DB) (string, error) {
 
 // AutoMigrate handles an auto migrate.
 func AutoMigrate(db *gorm.DB) error {
+	return AutoMigrateContext(context.Background(), db)
+}
+
+// AutoMigrateContext migrates the database while honoring startup cancellation.
+func AutoMigrateContext(ctx context.Context, db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
-	if db.Dialector != nil && db.Dialector.Name() == "postgres" {
-		return db.Transaction(func(tx *gorm.DB) error {
-			if errLock := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationAdvisoryLockKey).Error; errLock != nil {
-				return errLock
-			}
-			return autoMigrate(tx)
-		})
+	if db.Dialector == nil {
+		return fmt.Errorf("database dialect is nil")
 	}
-	return autoMigrate(db)
+	ctx = contextOrBackground(ctx)
+	if db.Dialector.Name() == "postgres" {
+		return autoMigratePostgresContext(ctx, db, false, nil)
+	}
+
+	startedAt := time.Now()
+	errMigrate := autoMigrate(db.WithContext(ctx))
+	fields := log.Fields{
+		"database_backend":   db.Dialector.Name(),
+		"migration_skipped":  false,
+		"migration_executor": true,
+		"migration_total_ms": time.Since(startedAt).Milliseconds(),
+	}
+	if errMigrate != nil {
+		log.WithFields(fields).WithError(errMigrate).Error("database schema migration failed")
+		return errMigrate
+	}
+	log.WithFields(fields).Info("database schema migration completed")
+	return nil
+}
+
+func autoMigratePostgresContext(ctx context.Context, db *gorm.DB, runWhenCurrent bool, afterSchema func(context.Context, *gorm.DB) error) error {
+	ctx = contextOrBackground(ctx)
+	startedAt := time.Now()
+	result, errMigrate := coordinateSchemaMigration(
+		ctx,
+		currentDatabaseVersion,
+		schemaMigrationPollInterval,
+		schemaMigrationWaitTimeout,
+		runWhenCurrent,
+		postgresSchemaMigrationOperations(db, startedAt, ctx, func(lockedCtx context.Context, tx *gorm.DB, _ int64, requiredVersion int64) error {
+			lockedDB := tx.WithContext(lockedCtx)
+			if errSchema := autoMigrateSchema(lockedDB); errSchema != nil {
+				return errSchema
+			}
+			if afterSchema != nil {
+				if errAfterSchema := afterSchema(lockedCtx, lockedDB); errAfterSchema != nil {
+					return errAfterSchema
+				}
+			}
+			if errCustom := runCustomMigrations(lockedDB); errCustom != nil {
+				return errCustom
+			}
+			if errVersion := writePostgresSchemaMigrationVersion(lockedCtx, lockedDB, requiredVersion); errVersion != nil {
+				return fmt.Errorf("write database schema version: %w", errVersion)
+			}
+			return nil
+		}),
+	)
+	fields := log.Fields{
+		"database_backend":                "postgres",
+		"schema_initial_version":          result.InitialState.Version,
+		"schema_initial_version_recorded": result.InitialState.Initialized,
+		"schema_current_version":          result.CurrentState.Version,
+		"schema_required_version":         currentDatabaseVersion,
+		"migration_skipped":               !result.MigrationExecutor,
+		"migration_executor":              result.MigrationExecutor,
+		"migration_committed":             result.MigrationCommitted,
+		"migration_lock_acquired":         result.LockAcquired,
+		"migration_lock_attempts":         result.LockAttempts,
+		"migration_coordination_wait_ms":  result.WaitDuration.Milliseconds(),
+		"migration_total_ms":              time.Since(startedAt).Milliseconds(),
+	}
+	if errMigrate != nil {
+		log.WithFields(fields).WithError(errMigrate).Error("database schema migration failed")
+		return errMigrate
+	}
+	log.WithFields(fields).Info("database schema migration completed")
+	return nil
 }
 
 func autoMigrate(db *gorm.DB) error {
+	if errSchema := autoMigrateSchema(db); errSchema != nil {
+		return errSchema
+	}
+	return runCustomMigrations(db)
+}
+
+func autoMigrateSchema(db *gorm.DB) error {
+	startedAt := time.Now()
+	isPostgres := db.Dialector.Name() == "postgres"
 	if errMigrate := db.AutoMigrate(databaseMigrationModels()...); errMigrate != nil {
-		return errMigrate
+		log.WithFields(log.Fields{
+			"database_backend":            db.Dialector.Name(),
+			"migration_stage":             "gorm_auto_migrate",
+			"migration_stage_duration_ms": time.Since(startedAt).Milliseconds(),
+		}).WithError(errMigrate).Error("database migration stage failed")
+		return fmt.Errorf("gorm auto migrate: %w", errMigrate)
 	}
-	if errMigrate := migrateCPANodePrimaryKey(db); errMigrate != nil {
-		return errMigrate
+	gormLog := log.WithFields(log.Fields{
+		"database_backend":            db.Dialector.Name(),
+		"migration_stage":             "gorm_auto_migrate",
+		"migration_stage_duration_ms": time.Since(startedAt).Milliseconds(),
+	})
+	if isPostgres {
+		gormLog.Info("database migration stage completed")
+	} else {
+		gormLog.Debug("database migration stage completed")
 	}
-	if errMigrate := migrateBillingIndexes(db); errMigrate != nil {
-		return errMigrate
+	return nil
+}
+
+func runCustomMigrations(db *gorm.DB) error {
+	isPostgres := db.Dialector.Name() == "postgres"
+	migrations := []struct {
+		name string
+		run  func(*gorm.DB) error
+	}{
+		{name: "migrate_cpa_node_primary_key", run: migrateCPANodePrimaryKey},
+		{name: "migrate_billing_indexes", run: migrateBillingIndexes},
+		{name: "migrate_billing_import_indexes", run: migrateBillingImportIndexes},
+		{name: "migrate_certificate_fingerprints", run: migrateCertificateFingerprints},
+		{name: "migrate_api_key_channels", run: migrateAPIKeyChannels},
+		{name: "migrate_api_key_model_groups", run: migrateAPIKeyModelGroups},
+		{name: "migrate_model_group_detail_channels", run: migrateModelGroupDetailChannels},
+		{name: "migrate_user_unique_username", run: migrateUserUniqueUsername},
+		{name: "migrate_user_unique_email", run: migrateUserUniqueEmail},
+		{name: "migrate_auth_next_retry_after", run: migrateAuthNextRetryAfter},
+		{name: "migrate_usage_observability_indexes", run: migrateUsageObservabilityIndexes},
+		{name: "migrate_usage_provider_api_key_sources", run: migrateUsageProviderAPIKeySources},
+		{name: "migrate_usage_service_tiers", run: migrateUsageServiceTiers},
+		{name: "migrate_legacy_api_keys", run: migrateLegacyAPIKeys},
 	}
-	if errMigrate := migrateBillingImportIndexes(db); errMigrate != nil {
-		return errMigrate
+	for _, migration := range migrations {
+		stageStartedAt := time.Now()
+		if errMigrate := migration.run(db); errMigrate != nil {
+			log.WithFields(log.Fields{
+				"database_backend":            db.Dialector.Name(),
+				"migration_stage":             migration.name,
+				"migration_stage_duration_ms": time.Since(stageStartedAt).Milliseconds(),
+			}).WithError(errMigrate).Error("database migration stage failed")
+			return fmt.Errorf("%s: %w", migration.name, errMigrate)
+		}
+		stageLog := log.WithFields(log.Fields{
+			"database_backend":            db.Dialector.Name(),
+			"migration_stage":             migration.name,
+			"migration_stage_duration_ms": time.Since(stageStartedAt).Milliseconds(),
+		})
+		if isPostgres {
+			stageLog.Info("database migration stage completed")
+		} else {
+			stageLog.Debug("database migration stage completed")
+		}
 	}
-	if errMigrate := migrateCertificateFingerprints(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateAPIKeyChannels(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateAPIKeyModelGroups(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateModelGroupDetailChannels(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateUserUniqueUsername(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateUserUniqueEmail(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateAuthNextRetryAfter(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateUsageObservabilityIndexes(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateUsageProviderAPIKeySources(db); errMigrate != nil {
-		return errMigrate
-	}
-	if errMigrate := migrateUsageServiceTiers(db); errMigrate != nil {
-		return errMigrate
-	}
-	return migrateLegacyAPIKeys(db)
+	return nil
 }
 
 func migrateCPANodePrimaryKey(db *gorm.DB) error {

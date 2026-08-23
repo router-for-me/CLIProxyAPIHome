@@ -60,8 +60,8 @@ func TestDatabaseSnapshotRoundTripsCPANodeMetadata(t *testing.T) {
 	if errExport != nil {
 		t.Fatalf("ExportDatabaseSnapshot() error = %v", errExport)
 	}
-	if manifest.FormatVersion != databaseSnapshotFormatVersion {
-		t.Fatalf("snapshot format version = %d, want %d", manifest.FormatVersion, databaseSnapshotFormatVersion)
+	if manifest.FormatVersion != currentDatabaseVersion {
+		t.Fatalf("snapshot format version = %d, want %d", manifest.FormatVersion, currentDatabaseVersion)
 	}
 	snapshot, errOpenSnapshot := OpenDatabaseSnapshot(ctx, snapshotPath)
 	if errOpenSnapshot != nil {

@@ -208,7 +208,7 @@ func run() int {
 		log.Infof("database snapshot import completed target_backend=%s tables=%d", dbBackend, len(result.Tables))
 		return 0
 	}
-	if errMigrate := cluster.AutoMigrate(clusterDB); errMigrate != nil {
+	if errMigrate := cluster.AutoMigrateContext(runCtx, clusterDB); errMigrate != nil {
 		log.Errorf("failed to migrate database: %v", errMigrate)
 		return 1
 	}

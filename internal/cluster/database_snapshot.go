@@ -29,7 +29,6 @@ import (
 
 const (
 	databaseSnapshotFormat        = "cliproxyapihome-database-snapshot"
-	databaseSnapshotFormatVersion = 4
 	databaseSnapshotManifestName  = "manifest.json"
 	databaseSnapshotBatchSize     = 500
 	databaseSnapshotManifestLimit = 4 << 20
@@ -189,7 +188,7 @@ func ExportDatabaseSnapshot(ctx context.Context, db *gorm.DB, opts DatabaseSnaps
 	zipWriter := zip.NewWriter(tempFile)
 	manifest := DatabaseSnapshotManifest{
 		Format:        databaseSnapshotFormat,
-		FormatVersion: databaseSnapshotFormatVersion,
+		FormatVersion: currentDatabaseVersion,
 		CreatedAt:     time.Now().UTC(),
 		HomeVersion:   strings.TrimSpace(opts.HomeVersion),
 		HomeCommit:    strings.TrimSpace(opts.HomeCommit),
@@ -400,8 +399,8 @@ func OpenDatabaseSnapshot(ctx context.Context, path string) (*ValidatedDatabaseS
 	if errManifest != nil {
 		return nil, errManifest
 	}
-	if manifest.FormatVersion > databaseSnapshotFormatVersion {
-		return nil, fmt.Errorf("database snapshot format version %d is newer than supported version %d", manifest.FormatVersion, databaseSnapshotFormatVersion)
+	if manifest.FormatVersion > currentDatabaseVersion {
+		return nil, fmt.Errorf("database snapshot format version %d is newer than supported version %d", manifest.FormatVersion, currentDatabaseVersion)
 	}
 	models, okModels := databaseSnapshotModels(manifest.FormatVersion)
 	if !okModels {
@@ -501,8 +500,8 @@ func validateDatabaseSnapshotManifest(manifest DatabaseSnapshotManifest, entries
 	if manifest.Format != databaseSnapshotFormat {
 		return fmt.Errorf("unsupported database snapshot format %q", manifest.Format)
 	}
-	if manifest.FormatVersion > databaseSnapshotFormatVersion {
-		return fmt.Errorf("database snapshot format version %d is newer than supported version %d", manifest.FormatVersion, databaseSnapshotFormatVersion)
+	if manifest.FormatVersion > currentDatabaseVersion {
+		return fmt.Errorf("database snapshot format version %d is newer than supported version %d", manifest.FormatVersion, currentDatabaseVersion)
 	}
 	if manifest.FormatVersion < 1 {
 		return fmt.Errorf("unsupported database snapshot format version %d", manifest.FormatVersion)
@@ -1088,51 +1087,75 @@ func ImportDatabaseSnapshot(ctx context.Context, db *gorm.DB, snapshot *Validate
 	if errEmpty := ensureExistingDatabaseSnapshotTargetEmpty(ctx, db); errEmpty != nil {
 		return DatabaseSnapshotImportResult{}, errEmpty
 	}
-	if errMigrate := AutoMigrate(db); errMigrate != nil {
-		return DatabaseSnapshotImportResult{}, fmt.Errorf("migrate database before snapshot import: %w", errMigrate)
-	}
-
-	result := DatabaseSnapshotImportResult{Tables: make([]DatabaseSnapshotImportTableResult, 0, len(snapshot.models))}
-	now := time.Now().UTC()
-	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if errEmpty := ensureDatabaseSnapshotTargetEmpty(ctx, tx); errEmpty != nil {
-			return errEmpty
-		}
-		for index, model := range snapshot.models {
-			manifestTable := snapshot.manifest.Tables[index]
-			tableResult := DatabaseSnapshotImportTableResult{Name: model.name}
-			if !model.restore {
-				tableResult.Skipped = manifestTable.Rows
-				result.Tables = append(result.Tables, tableResult)
-				if progress != nil {
-					progress(DatabaseSnapshotProgress{Operation: "import", Table: model.name, Skipped: tableResult.Skipped})
-				}
-				continue
-			}
-			imported, skipped, errImport := importDatabaseSnapshotTable(ctx, tx, snapshot.entries[databaseSnapshotTableEntryName(model.name)], model, now)
+	var result DatabaseSnapshotImportResult
+	if backend == DatabaseBackendPostgres {
+		errMigrate := autoMigratePostgresContext(ctx, db, true, func(lockedCtx context.Context, tx *gorm.DB) error {
+			imported, errImport := importDatabaseSnapshotRecords(lockedCtx, tx, snapshot, progress, backend)
 			if errImport != nil {
 				return errImport
 			}
-			tableResult.Imported = imported
-			tableResult.Skipped = skipped
-			result.Tables = append(result.Tables, tableResult)
-			if progress != nil {
-				progress(DatabaseSnapshotProgress{Operation: "import", Table: model.name, Rows: imported, Skipped: skipped})
-			}
+			result = imported
+			return nil
+		})
+		if errMigrate != nil {
+			return DatabaseSnapshotImportResult{}, fmt.Errorf("import database snapshot: %w", errMigrate)
 		}
-		if errRelationships := validateImportedDatabaseSnapshotRelationships(tx); errRelationships != nil {
-			return errRelationships
+		return result, nil
+	}
+
+	if errSchema := autoMigrateSchema(db.WithContext(ctx)); errSchema != nil {
+		return DatabaseSnapshotImportResult{}, fmt.Errorf("migrate database schema before snapshot import: %w", errSchema)
+	}
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		imported, errImport := importDatabaseSnapshotRecords(ctx, tx, snapshot, progress, backend)
+		if errImport != nil {
+			return errImport
 		}
-		if errCounts := validateDatabaseSnapshotImportCounts(tx, result, snapshot.models); errCounts != nil {
-			return errCounts
-		}
-		if errSequences := resetDatabaseSnapshotSequences(tx, backend, snapshot.models); errSequences != nil {
-			return errSequences
-		}
-		return nil
+		result = imported
+		return runCustomMigrations(tx.WithContext(ctx))
 	})
 	if errTransaction != nil {
 		return DatabaseSnapshotImportResult{}, fmt.Errorf("import database snapshot: %w", errTransaction)
+	}
+	return result, nil
+}
+
+func importDatabaseSnapshotRecords(ctx context.Context, tx *gorm.DB, snapshot *ValidatedDatabaseSnapshot, progress func(DatabaseSnapshotProgress), backend DatabaseBackend) (DatabaseSnapshotImportResult, error) {
+	result := DatabaseSnapshotImportResult{Tables: make([]DatabaseSnapshotImportTableResult, 0, len(snapshot.models))}
+	now := time.Now().UTC()
+	if errEmpty := ensureDatabaseSnapshotTargetEmpty(ctx, tx); errEmpty != nil {
+		return DatabaseSnapshotImportResult{}, errEmpty
+	}
+	for index, model := range snapshot.models {
+		manifestTable := snapshot.manifest.Tables[index]
+		tableResult := DatabaseSnapshotImportTableResult{Name: model.name}
+		if !model.restore {
+			tableResult.Skipped = manifestTable.Rows
+			result.Tables = append(result.Tables, tableResult)
+			if progress != nil {
+				progress(DatabaseSnapshotProgress{Operation: "import", Table: model.name, Skipped: tableResult.Skipped})
+			}
+			continue
+		}
+		imported, skipped, errImport := importDatabaseSnapshotTable(ctx, tx, snapshot.entries[databaseSnapshotTableEntryName(model.name)], model, now)
+		if errImport != nil {
+			return DatabaseSnapshotImportResult{}, errImport
+		}
+		tableResult.Imported = imported
+		tableResult.Skipped = skipped
+		result.Tables = append(result.Tables, tableResult)
+		if progress != nil {
+			progress(DatabaseSnapshotProgress{Operation: "import", Table: model.name, Rows: imported, Skipped: skipped})
+		}
+	}
+	if errRelationships := validateImportedDatabaseSnapshotRelationships(tx); errRelationships != nil {
+		return DatabaseSnapshotImportResult{}, errRelationships
+	}
+	if errCounts := validateDatabaseSnapshotImportCounts(tx, result, snapshot.models); errCounts != nil {
+		return DatabaseSnapshotImportResult{}, errCounts
+	}
+	if errSequences := resetDatabaseSnapshotSequences(tx, backend, snapshot.models); errSequences != nil {
+		return DatabaseSnapshotImportResult{}, errSequences
 	}
 	return result, nil
 }
