@@ -51,7 +51,7 @@ func TestDatabaseNowAdvancesWithinPostgresTransaction(t *testing.T) {
 	if dsn == "" {
 		t.Skip("CLIPROXY_HOME_TEST_POSTGRES_DSN is not configured")
 	}
-	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(defaultDatabaseSlowQueryThreshold))
 	if errOpen != nil {
 		t.Fatalf("open postgres: %v", errOpen)
 	}

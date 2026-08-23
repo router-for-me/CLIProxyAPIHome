@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
@@ -36,7 +37,7 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 		return nil, errDSN
 	}
 
-	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(cfg.SlowQueryThreshold))
 	if errOpen != nil {
 		return nil, errOpen
 	}
@@ -56,15 +57,19 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 }
 
 // OpenSQLite opens a SQLite database.
-func OpenSQLite(ctx context.Context, path string) (*gorm.DB, error) {
+func OpenSQLite(ctx context.Context, path string, configuredSlowQueryThreshold ...time.Duration) (*gorm.DB, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	slowQueryThreshold := defaultDatabaseSlowQueryThreshold
+	if len(configuredSlowQueryThreshold) > 0 {
+		slowQueryThreshold = configuredSlowQueryThreshold[0]
 	}
 	path = strings.TrimSpace(path)
 	if path == "" {
 		path = "home.db"
 	}
-	db, errOpen := gorm.Open(sqlite.Open(path), databaseGORMConfig())
+	db, errOpen := gorm.Open(sqlite.Open(path), databaseGORMConfig(slowQueryThreshold))
 	if errOpen != nil {
 		return nil, errOpen
 	}
@@ -848,6 +853,12 @@ func migrateLegacyAPIKeys(db *gorm.DB) error {
 
 // DSN returns the PostgreSQL connection string.
 func (c PGSQLConfig) DSN() (string, error) {
+	if postgresURI := strings.TrimSpace(c.PostgresURI); postgresURI != "" {
+		if errValidate := c.Validate(); errValidate != nil {
+			return "", errValidate
+		}
+		return postgresURI, nil
+	}
 	if c.Password == "" && c.Passowrd != "" {
 		c.Password = c.Passowrd
 	}

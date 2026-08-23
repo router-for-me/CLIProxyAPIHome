@@ -16,7 +16,7 @@ import (
 )
 
 func TestDatabaseGORMConfigRedactsParameters(t *testing.T) {
-	config := databaseGORMConfig()
+	config := databaseGORMConfig(defaultDatabaseSlowQueryThreshold)
 	filter, ok := config.Logger.(gorm.ParamsFilter)
 	if !ok {
 		t.Fatal("database GORM logger does not filter parameters")
@@ -33,13 +33,15 @@ func TestDatabaseGORMConfigRedactsParameters(t *testing.T) {
 
 func TestHomeGORMLoggerUsesApplicationFormat(t *testing.T) {
 	tests := []struct {
-		name        string
-		elapsed     time.Duration
-		err         error
-		wantLevel   string
-		wantMessage string
+		name               string
+		slowQueryThreshold time.Duration
+		elapsed            time.Duration
+		err                error
+		wantLevel          string
+		wantMessage        string
 	}{
-		{name: "slow query", elapsed: time.Second, wantLevel: "[warn ]", wantMessage: "SLOW SQL >= 200ms"},
+		{name: "default slow query threshold", elapsed: time.Second, wantLevel: "[warn ]", wantMessage: "SLOW SQL >= 200ms"},
+		{name: "configured slow query threshold", slowQueryThreshold: 750 * time.Millisecond, elapsed: time.Second, wantLevel: "[warn ]", wantMessage: "SLOW SQL >= 750ms"},
 		{name: "query error", err: errors.New("database\nunavailable"), wantLevel: "[error]", wantMessage: "error=database unavailable"},
 	}
 
@@ -50,7 +52,7 @@ func TestHomeGORMLoggerUsesApplicationFormat(t *testing.T) {
 			baseLogger.SetOutput(&output)
 			baseLogger.SetFormatter(&homelogging.LogFormatter{})
 
-			logger := newParameterizedGORMLogger(newHomeGORMLogger(baseLogger))
+			logger := newParameterizedGORMLogger(newHomeGORMLogger(baseLogger, test.slowQueryThreshold))
 			logger.Trace(context.Background(), time.Now().Add(-test.elapsed), func() (string, int64) {
 				return "SELECT *\nFROM records", 0
 			}, test.err)

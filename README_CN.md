@@ -23,7 +23,9 @@ Home 是一个为 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) �
 
 Home 现在始终使用数据库驱动的运行时。没有 `cluster.yaml` 时，Home 使用本地 SQLite 数据库运行同一套调度、节点发现、选主、事件监听、Management 和 RESP 逻辑。默认 SQLite 路径是 `home.db`，可以通过 `-sqlite-path` 覆盖。
 
-存在 `cluster.yaml` 时，Home 启用集群模式，并使用该文件中声明的数据库后端。可以复制 `cluster.sqlite.example.yaml` 或 `cluster.pgsql.example.yaml` 为 `cluster.yaml` 后再修改。多节点部署推荐使用 PostgreSQL；SQLite 也可以作为集群后端，但必须配置 `node.external-ip`，否则其他 Home 节点和 CPA 客户端无法稳定发现这个节点。
+存在 `cluster.yaml` 时，Home 启用集群模式，并使用该文件中声明的数据库后端。可以复制 `cluster.sqlite.example.yaml` 或 `cluster.pgsql.example.yaml` 为 `cluster.yaml` 后再修改。PostgreSQL 既支持拆分连接字段，也支持在 `pgsql.postgres_uri` 中填写连接字符串。多节点部署推荐使用 PostgreSQL；SQLite 也可以作为集群后端，但必须配置 `node.external-ip`，否则其他 Home 节点和 CPA 客户端无法稳定发现这个节点。
+
+可以在所选的 `pgsql` 或 `sqlite` 后端下设置 `slow-query-threshold`，控制慢 SQL 日志阈值。该字段接受 `"500ms"`、`"1s"` 等 Go duration 字符串，默认为 `"200ms"`。
 
 `config.yaml` 和 `auth-dir` 不再是运行时存储，只作为导入/导出的交换格式。迁移已有本地配置时，先运行：
 

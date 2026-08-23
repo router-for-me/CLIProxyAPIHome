@@ -10,7 +10,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultConfigPath = "cluster.yaml"
+const (
+	DefaultConfigPath                 = "cluster.yaml"
+	defaultDatabaseSlowQueryThreshold = 200 * time.Millisecond
+)
 
 type Config struct {
 	PGSQL  PGSQLConfig  `yaml:"pgsql"`
@@ -19,17 +22,20 @@ type Config struct {
 }
 
 type PGSQLConfig struct {
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	Passowrd string `yaml:"passowrd"`
-	Database string `yaml:"database"`
-	SSLMode  string `yaml:"sslmode"`
+	PostgresURI        string        `yaml:"postgres_uri"`
+	Host               string        `yaml:"host"`
+	Port               int           `yaml:"port"`
+	User               string        `yaml:"user"`
+	Password           string        `yaml:"password"`
+	Passowrd           string        `yaml:"passowrd"`
+	Database           string        `yaml:"database"`
+	SSLMode            string        `yaml:"sslmode"`
+	SlowQueryThreshold time.Duration `yaml:"slow-query-threshold"`
 }
 
 type SQLiteConfig struct {
-	Path string `yaml:"path"`
+	Path               string        `yaml:"path"`
+	SlowQueryThreshold time.Duration `yaml:"slow-query-threshold"`
 }
 
 type DatabaseBackend string
@@ -111,7 +117,8 @@ func LoadConfigOptional(path string) (*Config, bool, error) {
 	cfg := &Config{
 		PGSQL: raw.PGSQL,
 		SQLite: SQLiteConfig{
-			Path: strings.TrimSpace(raw.SQLite.Path),
+			Path:               strings.TrimSpace(raw.SQLite.Path),
+			SlowQueryThreshold: raw.SQLite.SlowQueryThreshold,
 		},
 		Node: NodeConfig{
 			ExternalIP:        strings.TrimSpace(raw.Node.ExternalIP),
@@ -132,14 +139,23 @@ func LoadConfigOptional(path string) (*Config, bool, error) {
 
 // applyDefaults applies a defaults.
 func (c *Config) applyDefaults() {
-	if c.PGSQL.Port == 0 {
-		c.PGSQL.Port = 5432
+	c.PGSQL.PostgresURI = strings.TrimSpace(c.PGSQL.PostgresURI)
+	if c.PGSQL.SlowQueryThreshold == 0 {
+		c.PGSQL.SlowQueryThreshold = defaultDatabaseSlowQueryThreshold
 	}
-	if c.PGSQL.SSLMode == "" {
-		c.PGSQL.SSLMode = "disable"
+	if c.PGSQL.PostgresURI == "" {
+		if c.PGSQL.Port == 0 {
+			c.PGSQL.Port = 5432
+		}
+		if c.PGSQL.SSLMode == "" {
+			c.PGSQL.SSLMode = "disable"
+		}
+		if c.PGSQL.Password == "" && c.PGSQL.Passowrd != "" {
+			c.PGSQL.Password = c.PGSQL.Passowrd
+		}
 	}
-	if c.PGSQL.Password == "" && c.PGSQL.Passowrd != "" {
-		c.PGSQL.Password = c.PGSQL.Passowrd
+	if c.SQLite.SlowQueryThreshold == 0 {
+		c.SQLite.SlowQueryThreshold = defaultDatabaseSlowQueryThreshold
 	}
 	if c.Node.HeartbeatInterval == 0 {
 		c.Node.HeartbeatInterval = 5 * time.Second
@@ -163,9 +179,15 @@ func (c *Config) Validate() error {
 		return c.PGSQL.Validate()
 	}
 	if pgsqlConfigured {
+		if c.PGSQL.SlowQueryThreshold < 0 {
+			return fmt.Errorf("pgsql.slow-query-threshold must not be negative")
+		}
 		if errValidatePGSQL := c.PGSQL.Validate(); errValidatePGSQL != nil {
 			return errValidatePGSQL
 		}
+	}
+	if sqliteConfigured && c.SQLite.SlowQueryThreshold < 0 {
+		return fmt.Errorf("sqlite.slow-query-threshold must not be negative")
 	}
 	if c.Node.Port <= 0 {
 		return fmt.Errorf("node.port must be greater than 0")
@@ -195,7 +217,8 @@ func (c *Config) DatabaseBackend() DatabaseBackend {
 
 // Configured reports whether PostgreSQL has cluster database settings.
 func (c PGSQLConfig) Configured() bool {
-	return strings.TrimSpace(c.Host) != "" ||
+	return strings.TrimSpace(c.PostgresURI) != "" ||
+		strings.TrimSpace(c.Host) != "" ||
 		strings.TrimSpace(c.User) != "" ||
 		c.Password != "" ||
 		c.Passowrd != "" ||
@@ -204,6 +227,18 @@ func (c PGSQLConfig) Configured() bool {
 
 // Validate validates validate.
 func (c PGSQLConfig) Validate() error {
+	if strings.TrimSpace(c.PostgresURI) != "" {
+		if strings.TrimSpace(c.Host) != "" ||
+			c.Port != 0 ||
+			strings.TrimSpace(c.User) != "" ||
+			c.Password != "" ||
+			c.Passowrd != "" ||
+			strings.TrimSpace(c.Database) != "" ||
+			strings.TrimSpace(c.SSLMode) != "" {
+			return fmt.Errorf("pgsql.postgres_uri cannot be combined with individual connection fields")
+		}
+		return nil
+	}
 	if strings.TrimSpace(c.Host) == "" {
 		return fmt.Errorf("pgsql.host is required")
 	}

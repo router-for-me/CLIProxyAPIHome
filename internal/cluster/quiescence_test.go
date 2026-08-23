@@ -95,7 +95,7 @@ func newPostgresQuiescenceRepository(t *testing.T) *Repository {
 	if dsn == "" {
 		t.Skip("HOME_TEST_POSTGRES_DSN is not configured")
 	}
-	adminDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	adminDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(defaultDatabaseSlowQueryThreshold))
 	if errOpen != nil {
 		t.Fatalf("open postgres admin database: %v", errOpen)
 	}
@@ -108,7 +108,7 @@ func newPostgresQuiescenceRepository(t *testing.T) *Repository {
 		t.Fatalf("create postgres schema: %v", errCreate)
 	}
 
-	db, errSchemaOpen := gorm.Open(postgres.Open(postgresDSNWithSearchPath(dsn, schema)), databaseGORMConfig())
+	db, errSchemaOpen := gorm.Open(postgres.Open(postgresDSNWithSearchPath(dsn, schema)), databaseGORMConfig(defaultDatabaseSlowQueryThreshold))
 	if errSchemaOpen != nil {
 		if errDrop := adminDB.Exec("DROP SCHEMA " + schema + " CASCADE").Error; errDrop != nil {
 			t.Errorf("drop postgres schema after open failure: %v", errDrop)

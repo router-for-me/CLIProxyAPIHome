@@ -13,8 +13,6 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
-const databaseSlowQueryThreshold = 200 * time.Millisecond
-
 type homeGORMLogger struct {
 	logger        *log.Logger
 	level         gormlogger.LogLevel
@@ -25,18 +23,21 @@ type parameterizedGORMLogger struct {
 	inner gormlogger.Interface
 }
 
-func databaseGORMConfig() *gorm.Config {
-	return &gorm.Config{Logger: newParameterizedGORMLogger(newHomeGORMLogger(log.StandardLogger()))}
+func databaseGORMConfig(slowQueryThreshold time.Duration) *gorm.Config {
+	return &gorm.Config{Logger: newParameterizedGORMLogger(newHomeGORMLogger(log.StandardLogger(), slowQueryThreshold))}
 }
 
-func newHomeGORMLogger(baseLogger *log.Logger) gormlogger.Interface {
+func newHomeGORMLogger(baseLogger *log.Logger, slowQueryThreshold time.Duration) gormlogger.Interface {
 	if baseLogger == nil {
 		baseLogger = log.StandardLogger()
+	}
+	if slowQueryThreshold <= 0 {
+		slowQueryThreshold = defaultDatabaseSlowQueryThreshold
 	}
 	return homeGORMLogger{
 		logger:        baseLogger,
 		level:         gormlogger.Warn,
-		slowThreshold: databaseSlowQueryThreshold,
+		slowThreshold: slowQueryThreshold,
 	}
 }
 

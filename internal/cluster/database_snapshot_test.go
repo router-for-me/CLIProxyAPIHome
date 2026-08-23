@@ -1281,7 +1281,7 @@ func TestDatabaseSnapshotPostgresCrossBackendRoundTrips(t *testing.T) {
 		t.Skip("CLIPROXY_HOME_TEST_POSTGRES_DSN is not set")
 	}
 	ctx := context.Background()
-	postgresDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	postgresDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(defaultDatabaseSlowQueryThreshold))
 	if errOpen != nil {
 		t.Fatalf("open postgres: %v", errOpen)
 	}

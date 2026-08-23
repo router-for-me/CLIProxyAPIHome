@@ -695,7 +695,7 @@ func openRuntimeDatabase(ctx context.Context, clusterCfg *cluster.Config, cluste
 		}
 		switch clusterCfg.DatabaseBackend() {
 		case cluster.DatabaseBackendSQLite:
-			db, errOpenSQLite := cluster.OpenSQLite(ctx, resolveSQLitePath(sqlitePath, clusterCfg.SQLite.Path))
+			db, errOpenSQLite := cluster.OpenSQLite(ctx, resolveSQLitePath(sqlitePath, clusterCfg.SQLite.Path), clusterCfg.SQLite.SlowQueryThreshold)
 			return db, cluster.DatabaseBackendSQLite, errOpenSQLite
 		case cluster.DatabaseBackendPostgres:
 			db, errOpenPostgres := cluster.Open(ctx, clusterCfg.PGSQL)
