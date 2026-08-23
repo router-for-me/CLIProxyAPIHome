@@ -1,14 +1,34 @@
 # CLIProxyAPIHome PostgreSQL cluster mode configuration.
 # Copy this file to cluster.yaml to enable cluster behavior.
+
+# Database configuration: PostgreSQL
+#
+# Configure exactly one database backend; do not add a sqlite section.
+# PostgreSQL accepts either postgres_uri or individual connection fields.
+# Choose exactly one format: postgres_uri cannot be combined with host, port,
+# user, password, database, or sslmode.
+#
+# Active example: postgres_uri connection string.
+# Paste the actual value supplied by the provider. Home does not expand
+# environment placeholders inside this file.
+# Percent-encode reserved characters in the username or password.
 pgsql:
-  host: "127.0.0.1"
-  # When running PostgreSQL in Docker Compose, use the service/container name instead of 127.0.0.1.
+  postgres_uri: "postgresql://cliproxy:secret@127.0.0.1:5432/cliproxy_home?sslmode=disable"
+
+  # Alternative: individual connection fields.
+  # Remove postgres_uri above, then uncomment the fields below.
+  # host: "127.0.0.1"
+  # For Docker Compose, use the PostgreSQL service name instead.
   # host: "postgres"
-  port: 5432
-  user: "cliproxy"
-  password: "secret"
-  database: "cliproxy_home"
-  sslmode: "disable"
+  # port: 5432
+  # user: "cliproxy"
+  # password: "secret"
+  # database: "cliproxy_home"
+  # sslmode: "disable"
+
+  # Queries taking longer than this threshold are logged as slow SQL.
+  # Optional; defaults to "200ms". Uses Go duration syntax such as "1s".
+  slow-query-threshold: "200ms"
 
 node:
   # Optional public address advertised to other Home nodes and CPA clients.

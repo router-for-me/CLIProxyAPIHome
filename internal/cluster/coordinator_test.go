@@ -5,19 +5,28 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 )
 
 func TestHeartbeatElectionPersistsExactlyOneLiveMaster(t *testing.T) {
 	ctx := context.Background()
 	repo := newCredentialFoundationTestRepository(t)
-	now := time.Now().UTC()
-	older := NewCoordinator(repo, NodeIdentity{IP: "10.0.0.1", Port: 8317, StartedAt: now.Add(-time.Minute)}, CoordinatorOptions{HeartbeatTimeout: 20 * time.Second})
-	newer := NewCoordinator(repo, NodeIdentity{IP: "10.0.0.2", Port: 8317, StartedAt: now}, CoordinatorOptions{HeartbeatTimeout: 20 * time.Second})
+	olderHome, errOlderHome := repo.RegisterHomeIncarnation(ctx, "10.0.0.1", 8317, nil)
+	if errOlderHome != nil {
+		t.Fatal(errOlderHome)
+	}
+	newerHome, errNewerHome := repo.RegisterHomeIncarnation(ctx, "10.0.0.2", 8317, nil)
+	if errNewerHome != nil {
+		t.Fatal(errNewerHome)
+	}
+	older := NewCoordinator(repo, NodeIdentity{IP: olderHome.IP, Port: olderHome.Port, StartedAt: olderHome.StartedAt}, CoordinatorOptions{HeartbeatTimeout: 20 * time.Second})
+	newer := NewCoordinator(repo, NodeIdentity{IP: newerHome.IP, Port: newerHome.Port, StartedAt: newerHome.StartedAt}, CoordinatorOptions{HeartbeatTimeout: 20 * time.Second})
 
-	if errBeat := older.heartbeatAndElect(ctx); errBeat != nil {
+	if errBeat := older.heartbeatAndElect(ctx, olderHome); errBeat != nil {
 		t.Fatal(errBeat)
 	}
-	if errBeat := newer.heartbeatAndElect(ctx); errBeat != nil {
+	if errBeat := newer.heartbeatAndElect(ctx, newerHome); errBeat != nil {
 		t.Fatal(errBeat)
 	}
 
@@ -37,6 +46,36 @@ func TestHeartbeatElectionPersistsExactlyOneLiveMaster(t *testing.T) {
 	}
 	if !older.IsMaster() || newer.IsMaster() {
 		t.Fatalf("local master state older=%t newer=%t", older.IsMaster(), newer.IsMaster())
+	}
+}
+
+func TestCoordinatorInitializeSyncsCPANodeSnapshot(t *testing.T) {
+	ctx := context.Background()
+	repo := newCredentialFoundationTestRepository(t)
+	registry := node.GlobalRegistry()
+	const (
+		clientIP = "192.0.2.10"
+		nodeID   = "cpa-initialize-snapshot"
+	)
+	registry.AddWithNodeID(clientIP, nodeID, time.Now().UTC())
+	defer registry.RemoveWithNodeID(clientIP, nodeID)
+
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "10.0.0.1", Port: 8317}, CoordinatorOptions{HeartbeatTimeout: 20 * time.Second})
+	if errInitialize := coordinator.Initialize(ctx); errInitialize != nil {
+		t.Fatal(errInitialize)
+	}
+	defer coordinator.setMaster(false)
+
+	home, initialized := coordinator.HomeIncarnation()
+	if !initialized {
+		t.Fatal("coordinator is not initialized")
+	}
+	var snapshot CPANodeRecord
+	if errFind := repo.db.First(&snapshot, "home_ip = ? AND home_port = ? AND home_started_at = ? AND node_key = ?", home.IP, home.Port, home.StartedAt, "node:"+nodeID).Error; errFind != nil {
+		t.Fatal(errFind)
+	}
+	if snapshot.NodeID != nodeID || snapshot.ClientIP != clientIP || snapshot.ClientCount != 1 {
+		t.Fatalf("snapshot = %#v", snapshot)
 	}
 }
 

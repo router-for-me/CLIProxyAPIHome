@@ -6,6 +6,11 @@ import (
 	"gorm.io/gorm"
 )
 
+// currentDatabaseVersion is shared by the live schema migration gate and the
+// portable snapshot format. Increment it for every required startup migration
+// or snapshot format change, and retain mappings for prior snapshot formats.
+const currentDatabaseVersion = 4
+
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
 	name          string
@@ -107,6 +112,7 @@ var databaseSnapshotV3Models = append(append([]databaseModel(nil), databaseSnaps
 var homeDatabaseModels = currentDatabaseModels()
 
 var databaseMigrationOnlyModels = []databaseModel{
+	newDatabaseModel[schemaMigrationRecord]("home_schema_migration", []string{"id"}, false, false),
 	newDatabaseModel[ClusterMasterGateRecord]("cluster_master_gate", []string{"id"}, false, false),
 	newDatabaseModel[ManagementInFlightSnapshotCursorRecord]("management_in_flight_snapshot_cursors", []string{"cursor"}, false, false),
 	newDatabaseModel[ManagementInFlightSnapshotCursorItemRecord]("management_in_flight_snapshot_cursor_items", []string{"cursor", "ordinal"}, false, false),
@@ -159,7 +165,7 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 		return databaseSnapshotV2Models, true
 	case 3:
 		return databaseSnapshotV3Models, true
-	case databaseSnapshotFormatVersion:
+	case currentDatabaseVersion:
 		return homeDatabaseModels, true
 	default:
 		return nil, false

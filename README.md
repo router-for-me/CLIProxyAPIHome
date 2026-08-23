@@ -23,7 +23,9 @@ It serves as a centralized hub for managing and scheduling API credentials in la
 
 Home now always runs from a database-backed runtime. When `cluster.yaml` is absent, Home runs the same scheduler, node discovery, leader election, event watcher, management, and RESP logic on a local SQLite database. The default SQLite path is `home.db`; use `-sqlite-path` to override it.
 
-When `cluster.yaml` exists, Home enables cluster mode and uses the database backend declared in that file. Copy `cluster.sqlite.example.yaml` or `cluster.pgsql.example.yaml` to `cluster.yaml` as a starting point. PostgreSQL is recommended for multi-node deployments. SQLite is also supported, but cluster SQLite requires `node.external-ip` so other nodes and CPA clients can reach this node.
+When `cluster.yaml` exists, Home enables cluster mode and uses the database backend declared in that file. Copy `cluster.sqlite.example.yaml` or `cluster.pgsql.example.yaml` to `cluster.yaml` as a starting point. PostgreSQL accepts either individual connection fields or a connection string in `pgsql.postgres_uri`. PostgreSQL is recommended for multi-node deployments. SQLite is also supported, but cluster SQLite requires `node.external-ip` so other nodes and CPA clients can reach this node.
+
+Set `slow-query-threshold` under the selected `pgsql` or `sqlite` backend to control slow SQL logging. It accepts Go duration strings such as `"500ms"` or `"1s"` and defaults to `"200ms"`.
 
 `config.yaml` and `auth-dir` are no longer runtime storage. They are import/export exchange formats only. To migrate an existing local setup into the database, run:
 

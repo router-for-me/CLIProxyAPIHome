@@ -1,10 +1,32 @@
 # CLIProxyAPIHome SQLite cluster mode configuration.
 # Copy this file to cluster.yaml to enable cluster behavior.
+
+# Database configuration: SQLite
+#
+# Configure exactly one database backend; do not add a pgsql section.
+# Without cluster.yaml, Home already uses ./home.db. Use this file when SQLite
+# needs an explicit cluster configuration or a custom database path.
+# SQLite is best suited to a single Home process. PostgreSQL is recommended
+# when multiple Home processes need to share runtime state.
+#
+# Active example: relative database path.
+# Home creates the database file when it does not exist. Its parent directory
+# must already exist and be writable by the Home process. Relative paths are
+# resolved from the Home process working directory. The -sqlite-path flag
+# overrides this value. Environment placeholders are not expanded.
 sqlite:
-  # Relative paths are resolved from the Home process working directory.
   path: "home.db"
-  # When running SQLite in Docker Compose, use the persisted Home data volume.
+
+  # Alternative: absolute database paths.
+  # Replace path above with the appropriate value for the deployment.
+  # On Windows, use forward slashes to avoid YAML backslash escaping.
+  # path: "E:/CLIProxyAPIHome/data/home.db"
+  # With docker-compose.sqlite.yml, use the persisted Home data volume.
   # path: "/CLIProxyAPIHome/data/home.db"
+
+  # Queries taking longer than this threshold are logged as slow SQL.
+  # Optional; defaults to "200ms". Uses Go duration syntax such as "1s".
+  slow-query-threshold: "200ms"
 
 node:
   # Public address advertised to other Home nodes and CPA clients. Required for multi-node SQLite deployments.

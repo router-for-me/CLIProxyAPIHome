@@ -66,6 +66,7 @@ func TestDatabaseSnapshotModelRegistryMatchesMigrationModels(t *testing.T) {
 		}
 	}
 	for _, required := range []any{
+		&schemaMigrationRecord{},
 		&UserSecurityTokenRecord{},
 		&UserMailJobRecord{},
 		&UserSecurityThrottleRecord{},
@@ -127,7 +128,7 @@ func TestDatabaseSnapshotV4FreezesLegacyAPIKeyShape(t *testing.T) {
 	if !okLegacy {
 		t.Fatal("database snapshot v3 registry is unsupported")
 	}
-	currentModels, okCurrent := databaseSnapshotModels(databaseSnapshotFormatVersion)
+	currentModels, okCurrent := databaseSnapshotModels(currentDatabaseVersion)
 	if !okCurrent {
 		t.Fatal("current database snapshot registry is unsupported")
 	}
@@ -312,7 +313,7 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	if errExport != nil {
 		t.Fatalf("ExportDatabaseSnapshot() error = %v", errExport)
 	}
-	if manifest.FormatVersion != databaseSnapshotFormatVersion || manifest.SourceBackend != DatabaseBackendSQLite || manifest.HomeVersion != "test-version" || manifest.HomeCommit != "test-commit" {
+	if manifest.FormatVersion != currentDatabaseVersion || manifest.SourceBackend != DatabaseBackendSQLite || manifest.HomeVersion != "test-version" || manifest.HomeCommit != "test-commit" {
 		t.Fatalf("export manifest = %#v", manifest)
 	}
 	if len(manifest.Tables) != len(homeDatabaseModels) {
@@ -415,6 +416,16 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	resetCredit := resetCredits.Credits[0]
 	if resetCredit.ID != "snapshot-reset-credit" || resetCredit.Status != "available" || !resetCredit.GrantedAt.Equal(want.resetCreditGrantedAt) || resetCredit.ExpiresAt == nil || !resetCredit.ExpiresAt.Equal(want.resetCreditExpiresAt) {
 		t.Fatalf("imported quota reset credit = %+v", resetCredit)
+	}
+	var usage UsageRecord
+	if errFirst := target.First(&usage, want.usageID).Error; errFirst != nil {
+		t.Fatalf("load imported usage: %v", errFirst)
+	}
+	if usage.Source != "auth-index" || strings.Contains(string(usage.PayloadJSON), "historical-provider-secret") {
+		t.Fatalf("imported provider usage was not sanitized: source=%q payload=%s", usage.Source, string(usage.PayloadJSON))
+	}
+	if usage.ServiceTier != defaultUsageServiceTier {
+		t.Fatalf("imported usage service tier = %q, want %q", usage.ServiceTier, defaultUsageServiceTier)
 	}
 	assertDatabaseSnapshotRuntimeTablesEmpty(t, target)
 
@@ -723,7 +734,7 @@ func TestDatabaseSnapshotValidationRejectsCorruption(t *testing.T) {
 					if errDecode := json.Unmarshal(raw, &manifest); errDecode != nil {
 						t.Fatalf("decode manifest: %v", errDecode)
 					}
-					manifest.FormatVersion = databaseSnapshotFormatVersion + 1
+					manifest.FormatVersion = currentDatabaseVersion + 1
 					updated, errMarshal := json.Marshal(manifest)
 					if errMarshal != nil {
 						t.Fatalf("encode future manifest: %v", errMarshal)
@@ -1281,7 +1292,7 @@ func TestDatabaseSnapshotPostgresCrossBackendRoundTrips(t *testing.T) {
 		t.Skip("CLIPROXY_HOME_TEST_POSTGRES_DSN is not set")
 	}
 	ctx := context.Background()
-	postgresDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig())
+	postgresDB, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(defaultDatabaseSlowQueryThreshold))
 	if errOpen != nil {
 		t.Fatalf("open postgres: %v", errOpen)
 	}
@@ -1310,6 +1321,14 @@ func TestDatabaseSnapshotPostgresCrossBackendRoundTrips(t *testing.T) {
 	defer func() { _ = sqliteSnapshot.Close() }()
 	if _, errImport := ImportDatabaseSnapshot(ctx, postgresDB, sqliteSnapshot, nil); errImport != nil {
 		t.Fatalf("import sqlite snapshot into postgres: %v", errImport)
+	}
+	assertPostgresSchemaMigrationVersion(t, postgresDB, currentDatabaseVersion)
+	var migratedUsage UsageRecord
+	if errFirst := postgresDB.First(&migratedUsage, want.usageID).Error; errFirst != nil {
+		t.Fatalf("load migrated postgres usage: %v", errFirst)
+	}
+	if migratedUsage.Source != "auth-index" || migratedUsage.ServiceTier != defaultUsageServiceTier || strings.Contains(string(migratedUsage.PayloadJSON), "historical-provider-secret") {
+		t.Fatalf("postgres snapshot usage migration = source %q tier %q payload %s", migratedUsage.Source, migratedUsage.ServiceTier, string(migratedUsage.PayloadJSON))
 	}
 	createdUser := UserRecord{Username: "postgres-sequence-user"}
 	if errCreate := postgresDB.Create(&createdUser).Error; errCreate != nil {
@@ -1355,6 +1374,7 @@ func TestDatabaseSnapshotPostgresCrossBackendRoundTrips(t *testing.T) {
 type databaseSnapshotTestData struct {
 	authUUID              string
 	pluginAuthID          uint
+	usageID               uint
 	maximumUserID         uint
 	maximumLogID          uint
 	resetCreditObservedAt time.Time
@@ -1425,7 +1445,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 		&APIKeyRecord{ID: apiKeyID, APIKey: "snapshot-api-key", DisplayName: &apiKeyDisplayName, UserID: &userID, Channels: JSONB(`[201]`), ModelGroups: JSONB(`[301]`), CreatedAt: now, UpdatedAt: now},
 		&ChannelGroupDetailRecord{ID: 211, ChannelGroupID: channelGroupID, AuthID: "auth-logical-id", CreatedAt: now, UpdatedAt: now},
 		&ModelGroupDetailRecord{ID: 311, ModelGroupID: modelGroupID, ModelID: "gpt-test", CreatedAt: now, UpdatedAt: now},
-		&UsageRecord{ID: usageID, Timestamp: now, Source: "snapshot", AuthIndex: "auth-index", InputTokens: 1, OutputTokens: 2, TotalTokens: 3, Provider: "codex", Model: "gpt-test", TokensJSON: JSONB(`{"input":1}`), FailJSON: JSONB(`null`), PayloadJSON: JSONB(`{"model":"gpt-test"}`), CreatedAt: now},
+		&UsageRecord{ID: usageID, Timestamp: now, Source: "historical-provider-secret", AuthIndex: "auth-index", InputTokens: 1, OutputTokens: 2, TotalTokens: 3, Provider: "codex", Model: "gpt-test", AuthType: "provider_api_key", TokensJSON: JSONB(`{"input":1}`), FailJSON: JSONB(`null`), PayloadJSON: JSONB(`{"source":"historical-provider-secret","auth_index":"auth-index","auth_type":"provider_api_key","model":"gpt-test"}`), CreatedAt: now},
 		&QuotaSnapshotRecord{CredentialID: authUUID, QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe", ObservedAt: &now, ExpiresAt: &expiresAt, ResetCredits: resetCredits, ProbeLeaseOwner: "old-home", ProbeLeaseExpiresAt: &expiresAt, ParserVersion: 1, CollectorVersion: 1, CreatedAt: now, UpdatedAt: now},
 		&QuotaWindowRecord{CredentialID: authUUID, WindowID: "primary", Label: "Primary", Scope: "credential", Mode: "rolling", Status: "available", Unit: "requests", Used: float64Pointer(2), Remaining: float64Pointer(8), Limit: float64Pointer(10), PeriodUnit: "hour", Source: "active_probe", ObservedAt: now, ExpiresAt: &expiresAt, CreatedAt: now, UpdatedAt: now},
 		&BillingModelPriceRecord{ID: "price-1", Provider: "codex", Model: "gpt-test", ServiceTier: "*", InputPricePerMillion: 1.25, OutputPricePerMillion: 2.5, Source: "manual", Enabled: true, CreatedAt: now, UpdatedAt: now, Revision: 1},
@@ -1435,7 +1455,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 		&BillingChargeRecord{ID: "charge-1", UsageID: usageID, PayloadHash: "payload-hash", UserID: &userID, APIKeyID: &apiKeyID, Provider: "codex", Model: "gpt-test", InputTokens: 1, OutputTokens: 2, Amount: 0.01, BalanceBefore: 42.5, BalanceAfter: 42.49, PriceSnapshot: JSONB(`{"input":1.25}`), CreatedAt: now},
 		&ProxyPoolRecord{ID: "proxy-1", Name: "Proxy", ProxyURL: "http://127.0.0.1:8080", Enabled: true, Scope: "global", LastTestResult: "untested", CreatedAt: now, UpdatedAt: now},
 		&AppLogRecord{ID: 701, Timestamp: now, ClientIP: "127.0.0.1", RequestID: "request-1", HomeIP: "127.0.0.1", Level: "info", Line: "snapshot log", CreatedAt: now},
-		&CertificateRecord{ID: "certificate-1", ClusterID: "cluster-1", CertificatePEM: "certificate", PrivateKeyPEM: "private-key", IsCA: true, SerialNumber: "1", NotBefore: now, NotAfter: expiresAt, CreatedAt: now, UpdatedAt: now},
+		&CertificateRecord{ID: "certificate-1", ClusterID: "cluster-1", CertificatePEM: "certificate", CertificateFingerprint: "snapshot-fingerprint", PrivateKeyPEM: "private-key", IsCA: true, SerialNumber: "1", NotBefore: now, NotAfter: expiresAt, CreatedAt: now, UpdatedAt: now},
 		&PluginStatusRecord{NodeType: "cpa", NodeID: "node-1", PluginID: "plugin-1", ReportedAt: now, CreatedAt: now, UpdatedAt: now},
 		&PluginTaskRecord{ID: 901, Operation: "install", PluginID: "plugin-1", CreatedAt: now, UpdatedAt: now},
 		&ClusterNodeRecord{IP: "127.0.0.1", Port: 18327, StartedAt: now, LastSeenAt: now},
@@ -1462,6 +1482,7 @@ func seedDatabaseSnapshotTestData(t *testing.T, db *gorm.DB) databaseSnapshotTes
 	return databaseSnapshotTestData{
 		authUUID:              authUUID,
 		pluginAuthID:          pluginAuthID,
+		usageID:               usageID,
 		maximumUserID:         userID,
 		maximumLogID:          701,
 		resetCreditObservedAt: now.UTC(),
