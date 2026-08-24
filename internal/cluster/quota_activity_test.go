@@ -550,6 +550,68 @@ func TestQuotaSnapshotWritesPreserveActivityWatermarks(t *testing.T) {
 	}
 }
 
+func TestPassiveQuotaSnapshotsPreservePendingProbeScheduleAcrossRepeatedWrites(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	credentialID := "preserve-probe-schedule"
+	seedQuotaSnapshotAuth(t, repo, credentialID, "codex", "Preserve Probe Schedule", map[string]any{"type": "codex"})
+	now := time.Date(2026, 8, 23, 14, 0, 0, 0, time.UTC)
+	recordQuotaUsageActivityAt(t, repo, credentialID, "codex", "oauth", now)
+	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, credentialID, "home-a", now, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("ClaimEligibleQuotaProbe() = %v, %v", claimed, errClaim)
+	}
+
+	activeObservedAt := now.Add(time.Second)
+	nextProbeAt := now.Add(30 * time.Minute)
+	windowSeconds := int64(5 * time.Hour / time.Second)
+	period := float64(5)
+	updated, errActive := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
+		CredentialID: credentialID, QuotaStatus: "healthy", CollectionStatus: "success", Source: "active_probe",
+		ObservedAt: &activeObservedAt, ExpiresAt: &nextProbeAt, NextProbeAt: &nextProbeAt,
+		ParserVersion: codexQuotaSnapshotVersion, CollectorVersion: codexQuotaSnapshotVersion,
+		ExpectedProbeOwner: "home-a", ClearProbeLease: true, ReplaceWindows: true,
+		Windows: []QuotaWindow{{
+			ID: "codex-5-hour", Scope: "account", Mode: "rolling", Status: "healthy", Unit: "percentage",
+			WindowSeconds: &windowSeconds, PeriodUnit: "hour", PeriodValue: &period, Source: "active_probe", ObservedAt: activeObservedAt,
+		}},
+	})
+	if errActive != nil || !updated {
+		t.Fatalf("active snapshot write = %v, %v", updated, errActive)
+	}
+
+	for index, passiveAt := range []time.Time{now.Add(time.Minute), now.Add(2 * time.Minute)} {
+		payload := fmt.Sprintf(`{"timestamp":%q,"provider":"codex","auth_type":"oauth","auth_index":%q,"response_headers":{"X-Codex-Active-Limit":["premium"],"X-Codex-Primary-Used-Percent":["10"],"X-Codex-Primary-Window-Minutes":["300"],"X-Codex-Primary-Reset-After-Seconds":["600"]}}`, passiveAt.Format(time.RFC3339Nano), credentialID)
+		if _, errAppend := repo.AppendUsageWithRuntime(ctx, payload, UsageRuntimeMetadata{ReceivedAt: passiveAt}); errAppend != nil {
+			t.Fatalf("AppendUsageWithRuntime(passive %d) error = %v", index+1, errAppend)
+		}
+	}
+
+	earlyClaimAt := now.Add(3 * time.Minute)
+	claimed, errClaim = repo.ClaimEligibleQuotaProbe(ctx, credentialID, "home-b", earlyClaimAt, time.Minute)
+	if errClaim != nil || claimed {
+		t.Fatalf("early claim after repeated passive writes = %v, %v, want false, nil", claimed, errClaim)
+	}
+
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	var snapshot QuotaSnapshotRecord
+	if errFirst := db.First(&snapshot, "credential_id = ?", credentialID).Error; errFirst != nil {
+		t.Fatalf("load preserved schedule: %v", errFirst)
+	}
+	if snapshot.NextProbeAt == nil || !snapshot.NextProbeAt.Equal(nextProbeAt) {
+		t.Fatalf("next probe after repeated passive writes = %v, want %v", snapshot.NextProbeAt, nextProbeAt)
+	}
+
+	claimed, errClaim = repo.ClaimEligibleQuotaProbe(ctx, credentialID, "home-b", nextProbeAt, time.Minute)
+	if errClaim != nil || !claimed {
+		t.Fatalf("scheduled claim = %v, %v, want true, nil", claimed, errClaim)
+	}
+}
+
 func TestQuotaActivityWatermarksAreExcludedFromPortableSnapshots(t *testing.T) {
 	now := time.Date(2026, 8, 23, 15, 0, 0, 0, time.UTC)
 	encoded, errMarshal := json.Marshal(QuotaSnapshotRecord{

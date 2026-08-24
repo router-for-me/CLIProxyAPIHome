@@ -367,7 +367,7 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 				if existing.CollectorVersion > record.CollectorVersion {
 					record.CollectorVersion = existing.CollectorVersion
 				}
-				preserveQuotaProbeSchedule(&record, existing, input.ObservedAt, input.ReceivedAt)
+				preserveQuotaProbeSchedule(&record, existing, input.ObservedAt, input.ReceivedAt, existingObservationInvalid)
 			}
 			if input.ClearProbeLease {
 				if strings.TrimSpace(input.ExpectedProbeOwner) != "" && existing.ProbeActivityAt != nil {
@@ -495,7 +495,7 @@ func createQuotaSnapshotRecord(tx *gorm.DB, record *QuotaSnapshotRecord, input Q
 	return resultSave.RowsAffected > 0, nil
 }
 
-func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnapshotRecord, observedAt *time.Time, receivedAt *time.Time) {
+func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnapshotRecord, observedAt *time.Time, receivedAt *time.Time, existingObservationInvalid bool) {
 	if record == nil {
 		return
 	}
@@ -504,8 +504,12 @@ func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnaps
 		leaseReferenceAt = receivedAt
 	}
 	leaseActive := existing.ProbeLeaseOwner != "" && existing.ProbeLeaseExpiresAt != nil && leaseReferenceAt != nil && existing.ProbeLeaseExpiresAt.After(leaseReferenceAt.UTC())
+	pendingSchedule := !existingObservationInvalid && existing.NextProbeAt != nil && leaseReferenceAt != nil && existing.NextProbeAt.After(leaseReferenceAt.UTC())
 	authoritativeSource := quotaAllowed(strings.TrimSpace(existing.Source), "active_probe", "mixed")
-	if existing.NextProbeAt != nil && (leaseActive || authoritativeSource || existing.CollectionStatus == "failed") {
+	// Repeated passive observations can replace all active windows and change the
+	// aggregate source to response_header. Keep a valid future probe schedule
+	// independent of source so later headers cannot make the probe immediately due.
+	if existing.NextProbeAt != nil && (pendingSchedule || leaseActive || authoritativeSource || existing.CollectionStatus == "failed") {
 		record.NextProbeAt = quotaUTC(existing.NextProbeAt)
 	}
 	if authoritativeSource || leaseActive || existing.CollectionStatus == "failed" {

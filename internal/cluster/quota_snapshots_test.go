@@ -1660,7 +1660,7 @@ func TestAppendUsageRecoversFromExistingFutureQuotaSnapshot(t *testing.T) {
 	period := float64(5)
 	remainingFuture := 0.01
 	_, errFuture := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
-		CredentialID: "future-recovery", QuotaStatus: "exhausted", CollectionStatus: "success", Source: "response_header", ObservedAt: &future, ReplaceWindows: true,
+		CredentialID: "future-recovery", QuotaStatus: "exhausted", CollectionStatus: "success", Source: "response_header", ObservedAt: &future, NextProbeAt: &future, ReplaceWindows: true,
 		Windows: []QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "exhausted", Unit: "percentage", RemainingRatio: &remainingFuture, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: future}},
 	})
 	if errFuture != nil {
