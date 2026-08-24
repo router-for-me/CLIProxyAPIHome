@@ -612,6 +612,15 @@ func newCollectorTestRepositoryAndDB(t *testing.T) (*cluster.Repository, *gorm.D
 	if errMigrate := cluster.AutoMigrate(db); errMigrate != nil {
 		t.Fatalf("AutoMigrate: %v", errMigrate)
 	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("database handle: %v", errDB)
+	}
+	t.Cleanup(func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close collector test database: %v", errClose)
+		}
+	})
 	return cluster.NewRepository(db), db
 }
 
@@ -625,5 +634,10 @@ func seedCollectorProviderAuth(t *testing.T, repo *cluster.Repository, id string
 	auth := &coreauth.Auth{ID: id, Index: id, Provider: provider, Label: id, Status: coreauth.StatusActive, Metadata: metadata, CreatedAt: now, UpdatedAt: now}
 	if _, errUpsert := repo.UpsertAuth(context.Background(), auth, "test"); errUpsert != nil {
 		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+	usageAt := time.Now().UTC()
+	payload := fmt.Sprintf(`{"timestamp":%q,"provider":%q,"auth_type":"oauth","auth_index":%q}`, usageAt.Format(time.RFC3339Nano), provider, id)
+	if _, errAppend := repo.AppendUsageWithRuntime(context.Background(), payload, cluster.UsageRuntimeMetadata{}); errAppend != nil {
+		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
 	}
 }

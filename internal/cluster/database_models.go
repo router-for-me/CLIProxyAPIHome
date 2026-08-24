@@ -3,13 +3,14 @@ package cluster
 import (
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"gorm.io/gorm"
 )
 
 // currentDatabaseVersion is shared by the live schema migration gate and the
 // portable snapshot format. Increment it for every required startup migration
 // or snapshot format change, and retain mappings for prior snapshot formats.
-const currentDatabaseVersion = 4
+const currentDatabaseVersion = 5
 
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
@@ -66,8 +67,102 @@ func (databaseSnapshotV3APIKeyRecord) TableName() string {
 	return "api_key"
 }
 
+// databaseSnapshotV4AuthRecord freezes the auth shape used by snapshot
+// formats v1 through v4, before quota activity identity generations were added.
+type databaseSnapshotV4AuthRecord struct {
+	UUID             string          `gorm:"column:uuid;primaryKey"`
+	AuthJSON         JSONB           `gorm:"column:auth_json;not null"`
+	Version          int64           `gorm:"column:version;not null;default:1"`
+	ID               string          `gorm:"column:id;index:idx_auth_active_order,priority:2"`
+	Index            string          `gorm:"column:index;index:idx_auth_index_active,priority:1"`
+	Provider         string          `gorm:"column:provider"`
+	Label            string          `gorm:"column:label"`
+	Prefix           string          `gorm:"column:prefix"`
+	Status           coreauth.Status `gorm:"column:status"`
+	Disabled         bool            `gorm:"column:disabled"`
+	Unavailable      bool            `gorm:"column:unavailable"`
+	BaseURL          string          `gorm:"column:base_url"`
+	APIKeyHash       string          `gorm:"column:api_key_hash"`
+	CompatName       string          `gorm:"column:compat_name"`
+	ProviderKey      string          `gorm:"column:provider_key"`
+	ModelsHash       string          `gorm:"column:models_hash"`
+	CreatedAt        time.Time       `gorm:"column:created_at"`
+	UpdatedAt        time.Time       `gorm:"column:updated_at"`
+	LastRefreshedAt  *time.Time      `gorm:"column:last_refreshed_at"`
+	NextRefreshAfter *time.Time      `gorm:"column:next_refresh_after"`
+	NextRetryAfter   *time.Time      `gorm:"column:next_retry_after"`
+	DeletedAt        gorm.DeletedAt  `gorm:"column:deleted_at;index;index:idx_auth_active_order,priority:1;index:idx_auth_index_active,priority:2"`
+}
+
+func (databaseSnapshotV4AuthRecord) TableName() string {
+	return "auth"
+}
+
+// databaseSnapshotV4UsageRecord freezes the usage shape used by snapshot
+// formats v1 through v4, before quota activity identity fields were added.
+type databaseSnapshotV4UsageRecord struct {
+	ID              uint      `gorm:"column:id;primaryKey;autoIncrement;index:idx_usage_time_order,priority:2"`
+	Timestamp       time.Time `gorm:"column:timestamp;not null;index:idx_usage_timestamp;index:idx_usage_time_order,priority:1,sort:desc;index:idx_usage_source_time,priority:2,sort:desc;index:idx_usage_auth_time,priority:2,sort:desc;index:idx_usage_failed_time,priority:2,sort:desc;index:idx_usage_failed_status_time,priority:3,sort:desc;index:idx_usage_provider_model_time,priority:3,sort:desc;index:idx_usage_provider_time,priority:2,sort:desc;index:idx_usage_endpoint_time,priority:2,sort:desc;index:idx_usage_home_time,priority:2,sort:desc;index:idx_usage_auth_type_time,priority:2,sort:desc"`
+	LatencyMS       int64     `gorm:"column:latency_ms;not null;default:0"`
+	TTFTMS          int64     `gorm:"column:ttft_ms;not null;default:0"`
+	Source          string    `gorm:"column:source;index:idx_usage_source;index:idx_usage_source_time,priority:1"`
+	AuthIndex       string    `gorm:"column:auth_index;index:idx_usage_auth_index;index:idx_usage_auth_time,priority:1"`
+	InputTokens     int64     `gorm:"column:input_tokens;not null;default:0"`
+	OutputTokens    int64     `gorm:"column:output_tokens;not null;default:0"`
+	ReasoningTokens int64     `gorm:"column:reasoning_tokens;not null;default:0"`
+	CachedTokens    int64     `gorm:"column:cached_tokens;not null;default:0"`
+	CacheReadTokens int64     `gorm:"column:cache_read_tokens;not null;default:0"`
+	// CacheReadTokensPresent distinguishes a canonical zero from a legacy CPA
+	// payload that did not know the cache_read_tokens field.
+	CacheReadTokensPresent     bool      `gorm:"column:cache_read_tokens_present;not null;default:false"`
+	CacheCreationTokens        int64     `gorm:"column:cache_creation_tokens;not null;default:0"`
+	TotalTokens                int64     `gorm:"column:total_tokens;not null;default:0"`
+	TokenAccountingVersion     int       `gorm:"column:token_accounting_version;not null;default:0;index:idx_usage_token_accounting_version"`
+	TokenAccountingQuality     string    `gorm:"column:token_accounting_quality;not null;default:'unclassified'"`
+	AccountingTotalTokens      int64     `gorm:"column:accounting_total_tokens;not null;default:0"`
+	AccountingInputTokens      int64     `gorm:"column:accounting_input_tokens;not null;default:0"`
+	UncachedInputTokens        int64     `gorm:"column:uncached_input_tokens;not null;default:0"`
+	AccountingCacheReadTokens  int64     `gorm:"column:accounting_cache_read_tokens;not null;default:0"`
+	AccountingCacheWriteTokens int64     `gorm:"column:accounting_cache_write_tokens;not null;default:0"`
+	AccountingOutputTokens     int64     `gorm:"column:accounting_output_tokens;not null;default:0"`
+	NonReasoningOutputTokens   int64     `gorm:"column:non_reasoning_output_tokens;not null;default:0"`
+	AccountingReasoningTokens  int64     `gorm:"column:accounting_reasoning_tokens;not null;default:0"`
+	UnclassifiedTokens         int64     `gorm:"column:unclassified_tokens;not null;default:0"`
+	Failed                     bool      `gorm:"column:failed;not null;default:false;index:idx_usage_failed;index:idx_usage_failed_time,priority:1;index:idx_usage_failed_status_time,priority:1"`
+	FailStatusCode             int       `gorm:"column:fail_status_code;not null;default:0;index:idx_usage_failed_status_time,priority:2"`
+	FailBody                   string    `gorm:"column:fail_body;type:text"`
+	Provider                   string    `gorm:"column:provider;index:idx_usage_provider_model,priority:1;index:idx_usage_provider_model_time,priority:1;index:idx_usage_provider_time,priority:1"`
+	ExecutorType               string    `gorm:"column:executor_type"`
+	Model                      string    `gorm:"column:model;index:idx_usage_provider_model,priority:2;index:idx_usage_provider_model_time,priority:2"`
+	Alias                      string    `gorm:"column:alias"`
+	Effort                     string    `gorm:"column:effort"`
+	ServiceTier                string    `gorm:"column:service_tier"`
+	ResponseServiceTier        string    `gorm:"column:response_service_tier"`
+	Endpoint                   string    `gorm:"column:endpoint;index:idx_usage_endpoint;index:idx_usage_endpoint_time,priority:1"`
+	AuthType                   string    `gorm:"column:auth_type;index:idx_usage_auth_type_time,priority:1"`
+	APIKey                     string    `gorm:"column:api_key;index:idx_usage_api_key"`
+	RequestID                  string    `gorm:"column:request_id;index:idx_usage_request_id"`
+	UpstreamRequestID          string    `gorm:"column:upstream_request_id;index:idx_usage_upstream_request_id"`
+	EventType                  string    `gorm:"column:event_type;index:idx_usage_event_type;index:idx_usage_event_time,priority:1"`
+	UpstreamStatusCode         int       `gorm:"column:upstream_status_code;not null;default:0;index:idx_usage_upstream_status_code"`
+	HomeIP                     string    `gorm:"column:home_ip;index:idx_usage_home_ip;index:idx_usage_home_time,priority:1;index:idx_usage_home_port_time,priority:1"`
+	HomePort                   int       `gorm:"column:home_port;not null;default:0;index:idx_usage_home_port_time,priority:2"`
+	CPANodeID                  string    `gorm:"column:cpa_node_id;index:idx_usage_cpa_node_id;index:idx_usage_cpa_node_time,priority:1"`
+	CPAIP                      string    `gorm:"column:cpa_ip;index:idx_usage_cpa_ip"`
+	CPAPort                    int       `gorm:"column:cpa_port;not null;default:0"`
+	CPALabel                   string    `gorm:"column:cpa_label;index:idx_usage_cpa_label"`
+	TokensJSON                 JSONB     `gorm:"column:tokens"`
+	FailJSON                   JSONB     `gorm:"column:fail"`
+	PayloadJSON                JSONB     `gorm:"column:payload;not null"`
+	CreatedAt                  time.Time `gorm:"column:created_at;not null"`
+}
+
+func (databaseSnapshotV4UsageRecord) TableName() string {
+	return "usage"
+}
+
 var databaseSnapshotV1Models = []databaseModel{
-	newDatabaseModel[AuthRecord]("auth", []string{"uuid"}, false, true),
+	newDatabaseModel[databaseSnapshotV4AuthRecord]("auth", []string{"uuid"}, false, true),
 	newDatabaseModel[ConfigRecord]("config", []string{"key"}, false, true),
 	newDatabaseModel[KVRecord]("kv_store", []string{"key"}, false, true),
 	newDatabaseModel[PluginStatusRecord]("plugin_status", []string{"node_type", "node_id", "plugin_id"}, false, false),
@@ -86,7 +181,7 @@ var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[ClusterNodeRecord]("cluster", []string{"ip", "port"}, false, false),
 	newDatabaseModel[databaseSnapshotV1CPANodeRecord]("cpa_node", []string{"home_ip", "home_port", "node_key"}, false, false),
 	newDatabaseModel[ClusterEventRecord]("cluster_events", []string{"id"}, true, false),
-	newDatabaseModel[UsageRecord]("usage", []string{"id"}, true, true),
+	newDatabaseModel[databaseSnapshotV4UsageRecord]("usage", []string{"id"}, true, true),
 	newDatabaseModel[QuotaSnapshotRecord]("quota_snapshot", []string{"credential_id"}, false, true),
 	newDatabaseModel[QuotaWindowRecord]("quota_window", []string{"credential_id", "window_id"}, false, true),
 	newDatabaseModel[BillingModelPriceRecord]("billing_model_price", []string{"id"}, false, true),
@@ -107,6 +202,9 @@ var databaseSnapshotV2Models = databaseSnapshotV2ModelRegistry()
 var databaseSnapshotV3Models = append(append([]databaseModel(nil), databaseSnapshotV2Models...),
 	newDatabaseModel[CPANodeMetadataRecord]("cpa_node_metadata", []string{"node_id"}, false, true),
 )
+
+// databaseSnapshotV4Models is the frozen database snapshot format v4 registry.
+var databaseSnapshotV4Models = databaseSnapshotV4ModelRegistry()
 
 // homeDatabaseModels is the current database snapshot registry.
 var homeDatabaseModels = currentDatabaseModels()
@@ -146,12 +244,25 @@ func databaseSnapshotV2ModelRegistry() []databaseModel {
 	)
 }
 
-func currentDatabaseModels() []databaseModel {
+func databaseSnapshotV4ModelRegistry() []databaseModel {
 	models := append([]databaseModel(nil), databaseSnapshotV3Models...)
 	for index := range models {
 		if models[index].name == "api_key" {
 			models[index] = newDatabaseModel[APIKeyRecord]("api_key", []string{"id"}, true, true)
 			break
+		}
+	}
+	return models
+}
+
+func currentDatabaseModels() []databaseModel {
+	models := append([]databaseModel(nil), databaseSnapshotV4Models...)
+	for index := range models {
+		switch models[index].name {
+		case "auth":
+			models[index] = newDatabaseModel[AuthRecord]("auth", []string{"uuid"}, false, true)
+		case "usage":
+			models[index] = newDatabaseModel[UsageRecord]("usage", []string{"id"}, true, true)
 		}
 	}
 	return models
@@ -165,6 +276,8 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 		return databaseSnapshotV2Models, true
 	case 3:
 		return databaseSnapshotV3Models, true
+	case 4:
+		return databaseSnapshotV4Models, true
 	case currentDatabaseVersion:
 		return homeDatabaseModels, true
 	default:

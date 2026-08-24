@@ -166,7 +166,11 @@ func TestCollectorClearsStaleXAIPlan(t *testing.T) {
 	}
 
 	now = now.Add(31 * time.Minute)
-	collector.collect(context.Background())
+	accepted, errTrigger := collector.TriggerCollection(context.Background(), map[string]struct{}{"xai-plan-clear": {}}, nil)
+	if errTrigger != nil || accepted != 1 {
+		t.Fatalf("TriggerCollection() = %d, %v, want 1, nil", accepted, errTrigger)
+	}
+	collector.Wait()
 	second, errSecond := repo.GetQuotaCredential(context.Background(), "xai-plan-clear", now)
 	if errSecond != nil {
 		t.Fatalf("GetQuotaCredential() after plan change error = %v", errSecond)

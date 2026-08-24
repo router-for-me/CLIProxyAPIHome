@@ -122,43 +122,89 @@ func quotaResponseHeaderRequestID(headers gjson.Result) string {
 	return ""
 }
 
-func upsertQuotaFromUsagePayloadTx(ctx context.Context, tx *gorm.DB, payload string, metadata UsageRuntimeMetadata, receivedAt time.Time) error {
-	input, ok := quotaSnapshotWriteFromUsagePayload(payload, metadata, receivedAt)
+func upsertQuotaFromUsageRecord(ctx context.Context, db *gorm.DB, usage *UsageRecord, metadata UsageRuntimeMetadata) error {
+	if db == nil || usage == nil || strings.TrimSpace(usage.QuotaCredentialID) == "" || usage.QuotaIdentityVersion <= 0 || strings.TrimSpace(usage.QuotaIdentityKey) == "" {
+		return nil
+	}
+	input, ok := quotaSnapshotWriteFromUsagePayload(string(usage.PayloadJSON), metadata, usage.CreatedAt)
 	if !ok {
 		return nil
 	}
-	record, found, errResolve := resolveQuotaObservationCredential(ctx, tx, input.CredentialID)
-	if errResolve != nil {
-		return errResolve
+	reportedProvider := normalizeQuotaProviderID(usage.Provider)
+	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		var record AuthRecord
+		query := tx.Where("uuid = ?", usage.QuotaCredentialID)
+		if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "SHARE"})
+		}
+		errFind := query.First(&record).Error
+		if errors.Is(errFind, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if errFind != nil {
+			return errFind
+		}
+		if quotaCredentialIdentityVersion(record) != usage.QuotaIdentityVersion {
+			return nil
+		}
+		credentialProvider := normalizeQuotaProviderID(record.Provider)
+		if reportedProvider != credentialProvider {
+			return nil
+		}
+		auth, errAuth := quotaAuthFromRecord(&record)
+		if errAuth != nil {
+			return errAuth
+		}
+		credentialType := quotaCredentialType(auth)
+		if usage.QuotaIdentityKey != quotaUsageIdentityKey(credentialProvider, credentialType) {
+			return nil
+		}
+		reportedType := normalizeUsageObservabilityCredentialType(usage.AuthType)
+		if reportedType != "unknown" && reportedType != credentialType {
+			return nil
+		}
+		if !quotaCredentialCollectorPlanned(credentialProvider, credentialType) {
+			return nil
+		}
+		input.CredentialID = record.UUID
+		_, errUpsert := upsertQuotaSnapshotDB(ctx, tx, input)
+		return errUpsert
+	})
+}
+
+func resolveQuotaUsageCredential(ctx context.Context, tx *gorm.DB, authIndex string, reportedAuthType string) (AuthRecord, string, bool, error) {
+	record, found, errResolve := resolveQuotaCredentialByAuthIndex(ctx, tx, authIndex)
+	if errResolve != nil || !found {
+		return AuthRecord{}, "", false, errResolve
 	}
-	if !found || normalizeQuotaProviderID(record.Provider) != "codex" {
-		return nil
+	provider := normalizeQuotaProviderID(record.Provider)
+	if !quotaProviderPlanned(provider) {
+		return AuthRecord{}, "", false, nil
 	}
 	auth, errAuth := quotaAuthFromRecord(&record)
 	if errAuth != nil {
-		return errAuth
+		return AuthRecord{}, "", false, errAuth
 	}
 	credentialType := quotaCredentialType(auth)
-	if credentialType != "oauth" && credentialType != "file_auth" {
-		return nil
+	if !quotaCredentialCollectorPlanned(provider, credentialType) {
+		return AuthRecord{}, "", false, nil
 	}
-	reportedType := normalizeUsageObservabilityCredentialType(gjson.Get(payload, "auth_type").String())
+	reportedType := normalizeUsageObservabilityCredentialType(reportedAuthType)
 	if reportedType != "unknown" && reportedType != credentialType {
-		return nil
+		return AuthRecord{}, "", false, nil
 	}
-	input.CredentialID = record.UUID
-	_, errUpsert := upsertQuotaSnapshotDB(ctx, tx, input)
-	return errUpsert
+	return record, quotaUsageIdentityKey(provider, credentialType), true, nil
 }
 
-func resolveQuotaObservationCredential(ctx context.Context, tx *gorm.DB, authIndex string) (AuthRecord, bool, error) {
+func resolveQuotaCredentialByAuthIndex(ctx context.Context, tx *gorm.DB, authIndex string) (AuthRecord, bool, error) {
 	if tx == nil || strings.TrimSpace(authIndex) == "" {
 		return AuthRecord{}, false, nil
 	}
+	authIndex = strings.TrimSpace(authIndex)
 	for _, column := range []string{"uuid", "index", "id"} {
 		var record AuthRecord
-		errFind := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where(map[string]any{column: strings.TrimSpace(authIndex)}).Order("uuid ASC").First(&record).Error
+		query := tx.WithContext(contextOrBackground(ctx)).Where(map[string]any{column: authIndex}).Order("uuid ASC")
+		errFind := query.First(&record).Error
 		if errFind == nil {
 			return record, true, nil
 		}
@@ -167,6 +213,23 @@ func resolveQuotaObservationCredential(ctx context.Context, tx *gorm.DB, authInd
 		}
 	}
 	return AuthRecord{}, false, nil
+}
+
+func quotaCredentialIdentityVersion(record AuthRecord) int64 {
+	if record.QuotaIdentityVersion > 0 {
+		return record.QuotaIdentityVersion
+	}
+	return 1
+}
+
+func quotaUsageIdentityKey(provider string, credentialType string) string {
+	provider = normalizeQuotaProviderID(provider)
+	credentialType = strings.ToLower(strings.TrimSpace(credentialType))
+	credentialType = strings.ReplaceAll(credentialType, "-", "_")
+	if provider == "" || credentialType == "" {
+		return ""
+	}
+	return provider + "/" + credentialType
 }
 
 func quotaSnapshotWriteFromUsagePayload(payload string, metadata UsageRuntimeMetadata, receivedAt time.Time) (QuotaSnapshotWrite, bool) {

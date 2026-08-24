@@ -167,7 +167,7 @@ type ClusterAdapter interface {
 }
 
 type clusterUsageStore interface {
-	StoreUsagePayload(ctx context.Context, payload string) error
+	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
 }
 
 type appLogStore interface {
@@ -487,8 +487,8 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 	return refresher.RefreshAuthIndex(ctx, uuid)
 }
 
-// PersistClusterUsagePayload stores persist cluster usage payload.
-func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string) (bool, error) {
+// PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
+func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
 		return false, nil
 	}
@@ -496,7 +496,7 @@ func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string
 	if queue == nil {
 		return true, nil
 	}
-	if ok := queue.Push(payload); !ok {
+	if ok := queue.Push(payload, receivedAt); !ok {
 		log.Warnf("cluster usage queue is stopped; accepting usage without persistence")
 	}
 	return true, nil

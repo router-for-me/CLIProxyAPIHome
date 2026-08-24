@@ -89,28 +89,30 @@ func (j *JSONB) UnmarshalJSON(data []byte) error {
 }
 
 type AuthRecord struct {
-	UUID             string          `gorm:"column:uuid;primaryKey"`
-	AuthJSON         JSONB           `gorm:"column:auth_json;not null"`
-	Version          int64           `gorm:"column:version;not null;default:1"`
-	ID               string          `gorm:"column:id;index:idx_auth_active_order,priority:2"`
-	Index            string          `gorm:"column:index;index:idx_auth_index_active,priority:1"`
-	Provider         string          `gorm:"column:provider"`
-	Label            string          `gorm:"column:label"`
-	Prefix           string          `gorm:"column:prefix"`
-	Status           coreauth.Status `gorm:"column:status"`
-	Disabled         bool            `gorm:"column:disabled"`
-	Unavailable      bool            `gorm:"column:unavailable"`
-	BaseURL          string          `gorm:"column:base_url"`
-	APIKeyHash       string          `gorm:"column:api_key_hash"`
-	CompatName       string          `gorm:"column:compat_name"`
-	ProviderKey      string          `gorm:"column:provider_key"`
-	ModelsHash       string          `gorm:"column:models_hash"`
-	CreatedAt        time.Time       `gorm:"column:created_at"`
-	UpdatedAt        time.Time       `gorm:"column:updated_at"`
-	LastRefreshedAt  *time.Time      `gorm:"column:last_refreshed_at"`
-	NextRefreshAfter *time.Time      `gorm:"column:next_refresh_after"`
-	NextRetryAfter   *time.Time      `gorm:"column:next_retry_after"`
-	DeletedAt        gorm.DeletedAt  `gorm:"column:deleted_at;index;index:idx_auth_active_order,priority:1;index:idx_auth_index_active,priority:2"`
+	UUID     string `gorm:"column:uuid;primaryKey"`
+	AuthJSON JSONB  `gorm:"column:auth_json;not null"`
+	Version  int64  `gorm:"column:version;not null;default:1"`
+	// QuotaIdentityVersion advances when provider/type identity changes or a deleted identity is restored.
+	QuotaIdentityVersion int64           `gorm:"column:quota_identity_version;not null;default:1"`
+	ID                   string          `gorm:"column:id;index:idx_auth_active_order,priority:2"`
+	Index                string          `gorm:"column:index;index:idx_auth_index_active,priority:1"`
+	Provider             string          `gorm:"column:provider"`
+	Label                string          `gorm:"column:label"`
+	Prefix               string          `gorm:"column:prefix"`
+	Status               coreauth.Status `gorm:"column:status"`
+	Disabled             bool            `gorm:"column:disabled"`
+	Unavailable          bool            `gorm:"column:unavailable"`
+	BaseURL              string          `gorm:"column:base_url"`
+	APIKeyHash           string          `gorm:"column:api_key_hash"`
+	CompatName           string          `gorm:"column:compat_name"`
+	ProviderKey          string          `gorm:"column:provider_key"`
+	ModelsHash           string          `gorm:"column:models_hash"`
+	CreatedAt            time.Time       `gorm:"column:created_at"`
+	UpdatedAt            time.Time       `gorm:"column:updated_at"`
+	LastRefreshedAt      *time.Time      `gorm:"column:last_refreshed_at"`
+	NextRefreshAfter     *time.Time      `gorm:"column:next_refresh_after"`
+	NextRetryAfter       *time.Time      `gorm:"column:next_retry_after"`
+	DeletedAt            gorm.DeletedAt  `gorm:"column:deleted_at;index;index:idx_auth_active_order,priority:1;index:idx_auth_index_active,priority:2"`
 }
 
 // TableName returns the database table name.
