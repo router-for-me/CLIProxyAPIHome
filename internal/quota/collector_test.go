@@ -312,8 +312,8 @@ func TestQuotaHTTPProbeErrorClassification(t *testing.T) {
 		code      string
 		retryable bool
 	}{
-		{status: http.StatusUnauthorized, code: "UPSTREAM_AUTH_REJECTED", retryable: false},
-		{status: http.StatusForbidden, code: "UPSTREAM_AUTH_REJECTED", retryable: false},
+		{status: http.StatusUnauthorized, code: "UPSTREAM_AUTH_REJECTED", retryable: true},
+		{status: http.StatusForbidden, code: "UPSTREAM_AUTH_REJECTED", retryable: true},
 		{status: http.StatusTooManyRequests, code: "UPSTREAM_RATE_LIMITED", retryable: true},
 		{status: http.StatusInternalServerError, code: "UPSTREAM_UNAVAILABLE", retryable: true},
 		{status: http.StatusBadRequest, code: "UPSTREAM_UNAVAILABLE", retryable: false},
@@ -342,30 +342,122 @@ func TestQuotaRetryAfterSupportsSecondsAndHTTPDate(t *testing.T) {
 	}
 }
 
-func TestCollectorResolvesFreshAuthBeforeProbe(t *testing.T) {
+func TestCollectorReadsLatestDBAuthBeforeProbe(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 16, 9, 30, 0, 0, time.UTC)
 	seedCollectorAuth(t, repo, "codex-refresh", map[string]any{"type": "codex", "access_token": "stale-token"})
-	var resolved atomic.Int32
+	candidate, _, errCandidate := repo.GetAuth(context.Background(), "codex-refresh")
+	if errCandidate != nil {
+		t.Fatalf("GetAuth(candidate) error = %v", errCandidate)
+	}
+	latest := candidate.Clone()
+	latest.Metadata["access_token"] = "latest-token"
+	latest.Metadata["refresh_token"] = "unused-refresh-token"
+	latest.Metadata["expired"] = now.Add(48 * time.Hour).Format(time.RFC3339)
+	if _, errUpsert := repo.UpsertAuth(context.Background(), latest, "test"); errUpsert != nil {
+		t.Fatalf("UpsertAuth(latest) error = %v", errUpsert)
+	}
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Authorization") != "Bearer fresh-token" {
-			t.Errorf("Authorization = %q, want refreshed token", request.Header.Get("Authorization"))
+		requests.Add(1)
+		if request.Header.Get("Authorization") != "Bearer latest-token" {
+			t.Errorf("Authorization = %q, want latest DB token", request.Header.Get("Authorization"))
 		}
-		_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":600}}}`))
+		switch request.URL.Path {
+		case "/usage":
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":600}}}`))
+		case "/resets":
+			_, _ = w.Write([]byte(`{"available_count":0,"credits":[]}`))
+		default:
+			http.NotFound(w, request)
+		}
 	}))
 	defer server.Close()
 	collector := NewCollector(repo, Options{
-		Owner: "home-a", CodexUsageURL: server.URL, Now: func() time.Time { return now },
-		ResolveAuth: func(_ context.Context, candidate *coreauth.Auth) (*coreauth.Auth, error) {
-			resolved.Add(1)
-			fresh := candidate.Clone()
-			fresh.Metadata["access_token"] = "fresh-token"
-			return fresh, nil
-		},
+		Owner: "home-a", CodexUsageURL: server.URL + "/usage", CodexResetCreditsURL: server.URL + "/resets",
+		Now: func() time.Time { return now },
 	})
-	collector.collect(context.Background())
-	if resolved.Load() != 1 {
-		t.Fatalf("ResolveAuth calls = %d, want 1", resolved.Load())
+	collector.collectCredential(context.Background(), candidate, false)
+	if requests.Load() != 2 {
+		t.Fatalf("upstream requests = %d, want usage and reset-credit requests", requests.Load())
+	}
+}
+
+func TestCollectorAuthRejectionBacksOffAndRecoversAfterTokenUpdate(t *testing.T) {
+	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 7, 16, 9, 40, 0, 0, time.UTC)
+	seedCollectorAuth(t, repo, "codex-auth-recovery", map[string]any{"type": "codex", "access_token": "stale-token"})
+	candidate, _, errCandidate := repo.GetAuth(context.Background(), "codex-auth-recovery")
+	if errCandidate != nil {
+		t.Fatalf("GetAuth(candidate) error = %v", errCandidate)
+	}
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		switch request.Header.Get("Authorization") {
+		case "Bearer stale-token":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "Bearer fresh-token":
+			switch request.URL.Path {
+			case "/usage":
+				_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":600}}}`))
+			case "/resets":
+				_, _ = w.Write([]byte(`{"available_count":0,"credits":[]}`))
+			default:
+				http.NotFound(w, request)
+			}
+		default:
+			t.Errorf("Authorization = %q, want stale or fresh DB token", request.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner: "home-a", CodexUsageURL: server.URL + "/usage", CodexResetCreditsURL: server.URL + "/resets",
+		Now: func() time.Time { return now },
+	})
+	for attempt := 0; attempt < 2; attempt++ {
+		attemptedAt := now
+		collector.collectCredential(context.Background(), candidate, false)
+		item, errGet := repo.GetQuotaCredential(context.Background(), candidate.ID, now)
+		if errGet != nil {
+			t.Fatalf("GetQuotaCredential(attempt %d) error = %v", attempt+1, errGet)
+		}
+		if item.Error == nil || item.Error.Code != "UPSTREAM_AUTH_REJECTED" || !item.Error.Retryable {
+			t.Fatalf("auth rejection(attempt %d) = %+v, want retryable", attempt+1, item.Error)
+		}
+		if item.NextProbeAt == nil {
+			t.Fatalf("next probe(attempt %d) is nil", attempt+1)
+		}
+		delay := item.NextProbeAt.Sub(attemptedAt)
+		wantDelay := quotaBackoffWithJitter(defaultFailureBackoff*time.Duration(1<<attempt), candidate.ID)
+		if delay != wantDelay {
+			t.Fatalf("auth retry delay(attempt %d) = %v, want %v", attempt+1, delay, wantDelay)
+		}
+		now = item.NextProbeAt.Add(time.Second)
+	}
+
+	latest, _, errLatest := repo.GetAuth(context.Background(), candidate.ID)
+	if errLatest != nil {
+		t.Fatalf("GetAuth(latest) error = %v", errLatest)
+	}
+	latest.Metadata["access_token"] = "fresh-token"
+	if _, errUpsert := repo.UpsertAuth(context.Background(), latest, "refresh"); errUpsert != nil {
+		t.Fatalf("UpsertAuth(fresh token) error = %v", errUpsert)
+	}
+
+	collector.collectCredential(context.Background(), candidate, false)
+	item, errGet := repo.GetQuotaCredential(context.Background(), candidate.ID, now)
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential(recovered) error = %v", errGet)
+	}
+	if item.CollectionStatus != "success" || item.ConsecutiveFailure != 0 || item.Error != nil {
+		t.Fatalf("recovered quota state = %+v", item)
+	}
+	if requests.Load() != 4 {
+		t.Fatalf("upstream requests = %d, want two rejected usage probes plus recovered usage and reset probes", requests.Load())
 	}
 }
 
@@ -384,19 +476,8 @@ func TestCollectorSkipsStaleCandidateWhenDBCredentialBecameAPIKey(t *testing.T) 
 	if _, errUpsert := repo.UpsertAuth(context.Background(), apiKeyAuth, "test"); errUpsert != nil {
 		t.Fatalf("UpsertAuth(API key) error = %v", errUpsert)
 	}
-	var resolved atomic.Int32
-	collector := NewCollector(repo, Options{
-		Owner: "home-a", Now: func() time.Time { return now },
-		ResolveAuth: func(ctx context.Context, _ *coreauth.Auth) (*coreauth.Auth, error) {
-			resolved.Add(1)
-			current, _, errGet := repo.GetAuth(ctx, apiKeyAuth.ID)
-			return current, errGet
-		},
-	})
+	collector := NewCollector(repo, Options{Owner: "home-a", Now: func() time.Time { return now }})
 	collector.collectCredential(context.Background(), candidate, false)
-	if resolved.Load() != 0 {
-		t.Fatalf("ResolveAuth calls = %d, want 0", resolved.Load())
-	}
 	item, errGet := repo.GetQuotaCredential(context.Background(), apiKeyAuth.ID, now)
 	if errGet != nil {
 		t.Fatalf("GetQuotaCredential() error = %v", errGet)
