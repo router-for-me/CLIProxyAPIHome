@@ -109,7 +109,11 @@ func TestBackgroundRefreshUsesConfiguredHandler(t *testing.T) {
 		Index:    "auth-auto-handler",
 		Provider: "codex",
 		Status:   StatusActive,
-		Metadata: map[string]any{"access_token": "access", "refresh_token": "refresh"},
+		Metadata: map[string]any{
+			"access_token":  "access",
+			"refresh_token": "refresh",
+			"expires_at":    time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano),
+		},
 	}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)

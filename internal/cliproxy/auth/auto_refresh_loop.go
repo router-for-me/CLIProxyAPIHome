@@ -88,8 +88,8 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 			if authID == "" {
 				continue
 			}
-			l.manager.refreshAuth(ctx, authID)
-			l.queueReschedule(authID)
+			resolved := l.manager.refreshAuth(ctx, authID)
+			l.rescheduleAfterRefresh(time.Now().UTC(), authID, resolved)
 		}
 	}
 }
@@ -273,10 +273,50 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		return
 	}
 
+	manager.mu.RLock()
+	auth = manager.auths[authID]
+	next, shouldSchedule = nextRefreshCheckAt(now, auth, l.interval)
+	manager.mu.RUnlock()
+	if shouldSchedule {
+		l.upsert(authID, next)
+	} else {
+		l.remove(authID)
+	}
+
 	select {
 	case <-ctx.Done():
 		return
 	case l.jobs <- authID:
+	}
+}
+
+// rescheduleAfterRefresh commits a resolved schedule only while the current
+// index still matches the resolved storage revision.
+func (l *authAutoRefreshLoop) rescheduleAfterRefresh(now time.Time, authID string, resolved *Auth) {
+	if l == nil || l.manager == nil || authID == "" {
+		return
+	}
+
+	l.manager.mu.RLock()
+	current := l.manager.auths[authID]
+	scheduled := current
+	if current != nil && resolved != nil && current.StateVersion == resolved.StateVersion {
+		scheduled = resolved
+	}
+	stateVersion := int64(0)
+	if current != nil {
+		stateVersion = current.StateVersion
+	}
+	next, ok := nextRefreshCheckAt(now, scheduled, l.interval)
+	if ok {
+		l.upsertAfterRefresh(authID, next, stateVersion)
+	} else {
+		l.remove(authID)
+	}
+	l.manager.mu.RUnlock()
+	select {
+	case l.wakeCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -291,13 +331,17 @@ func (l *authAutoRefreshLoop) applyDirty(now time.Time) {
 		l.manager.mu.RLock()
 		auth := l.manager.auths[authID]
 		next, ok := nextRefreshCheckAt(now, auth, l.interval)
+		stateVersion := int64(0)
+		if auth != nil {
+			stateVersion = auth.StateVersion
+		}
 		l.manager.mu.RUnlock()
 
 		if !ok {
 			l.remove(authID)
 			continue
 		}
-		l.upsert(authID, next)
+		l.upsertDirty(authID, next, stateVersion)
 	}
 }
 
@@ -323,12 +367,42 @@ func (l *authAutoRefreshLoop) upsert(authID string, next time.Time) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.upsertLocked(authID, next, 0)
+}
+
+// upsertAfterRefresh records the state revision used by a completed worker.
+func (l *authAutoRefreshLoop) upsertAfterRefresh(authID string, next time.Time, stateVersion int64) {
+	if authID == "" || next.IsZero() {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.upsertLocked(authID, next, stateVersion)
+}
+
+// upsertDirty keeps an already committed schedule for the same or newer state revision.
+func (l *authAutoRefreshLoop) upsertDirty(authID string, next time.Time, stateVersion int64) {
+	if authID == "" || next.IsZero() {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if stateVersion > 0 {
+		if item := l.index[authID]; item != nil && item.stateVersion >= stateVersion {
+			return
+		}
+	}
+	l.upsertLocked(authID, next, 0)
+}
+
+func (l *authAutoRefreshLoop) upsertLocked(authID string, next time.Time, stateVersion int64) {
 	if item, ok := l.index[authID]; ok && item != nil {
 		item.next = next
+		item.stateVersion = stateVersion
 		heap.Fix(&l.queue, item.index)
 		return
 	}
-	item := &refreshHeapItem{id: authID, next: next}
+	item := &refreshHeapItem{id: authID, next: next, stateVersion: stateVersion}
 	heap.Push(&l.queue, item)
 	l.index[authID] = item
 }
@@ -369,6 +443,11 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 			interval = refreshCheckInterval
 		}
 		return now.Add(interval), true
+	}
+
+	builtInRefresh := authSupportsBuiltInRefresh(auth)
+	if builtInRefresh && accessTokenForFingerprint(auth) == "" {
+		return now, true
 	}
 
 	lastRefresh := auth.LastRefreshedAt
@@ -416,6 +495,14 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		}
 		return dueAt, true
 	}
+	if builtInRefresh {
+		// A refresh lead is not a token lifetime. Recheck unknown expiry later
+		// without calling the provider until the credential becomes explicitly due.
+		if interval <= 0 {
+			interval = refreshCheckInterval
+		}
+		return now.Add(interval), true
+	}
 	if !lastRefresh.IsZero() {
 		dueAt := lastRefresh.Add(*lead)
 		if !dueAt.After(now) {
@@ -427,9 +514,10 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 }
 
 type refreshHeapItem struct {
-	id    string
-	next  time.Time
-	index int
+	id           string
+	next         time.Time
+	index        int
+	stateVersion int64
 }
 
 type refreshMinHeap []*refreshHeapItem
