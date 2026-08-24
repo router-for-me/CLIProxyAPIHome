@@ -121,12 +121,16 @@ func TestDatabaseSnapshotV2RegistryExcludesMigrationOnlyModels(t *testing.T) {
 	}
 }
 
-func TestDatabaseSnapshotV4FreezesLegacyAPIKeyShape(t *testing.T) {
+func TestDatabaseSnapshotRegistriesFreezeChangedShapes(t *testing.T) {
 	t.Parallel()
 
 	legacyModels, okLegacy := databaseSnapshotModels(3)
 	if !okLegacy {
 		t.Fatal("database snapshot v3 registry is unsupported")
+	}
+	v4Models, okV4 := databaseSnapshotModels(4)
+	if !okV4 {
+		t.Fatal("database snapshot v4 registry is unsupported")
 	}
 	currentModels, okCurrent := databaseSnapshotModels(currentDatabaseVersion)
 	if !okCurrent {
@@ -137,9 +141,20 @@ func TestDatabaseSnapshotV4FreezesLegacyAPIKeyShape(t *testing.T) {
 	if legacyType != reflect.TypeOf(&databaseSnapshotV3APIKeyRecord{}) {
 		t.Fatalf("v3 API key snapshot type = %v, want frozen legacy type", legacyType)
 	}
-	currentType := databaseSnapshotModelType(t, currentModels, "api_key")
-	if currentType != reflect.TypeOf(&APIKeyRecord{}) {
-		t.Fatalf("v4 API key snapshot type = %v, want current APIKeyRecord", currentType)
+	if currentType := databaseSnapshotModelType(t, v4Models, "api_key"); currentType != reflect.TypeOf(&APIKeyRecord{}) {
+		t.Fatalf("v4 API key snapshot type = %v, want APIKeyRecord", currentType)
+	}
+	if authType := databaseSnapshotModelType(t, v4Models, "auth"); authType != reflect.TypeOf(&databaseSnapshotV4AuthRecord{}) {
+		t.Fatalf("v4 auth snapshot type = %v, want frozen v4 auth record", authType)
+	}
+	if usageType := databaseSnapshotModelType(t, v4Models, "usage"); usageType != reflect.TypeOf(&databaseSnapshotV4UsageRecord{}) {
+		t.Fatalf("v4 usage snapshot type = %v, want frozen v4 usage record", usageType)
+	}
+	if authType := databaseSnapshotModelType(t, currentModels, "auth"); authType != reflect.TypeOf(&AuthRecord{}) {
+		t.Fatalf("current auth snapshot type = %v, want AuthRecord", authType)
+	}
+	if usageType := databaseSnapshotModelType(t, currentModels, "usage"); usageType != reflect.TypeOf(&UsageRecord{}) {
+		t.Fatalf("current usage snapshot type = %v, want UsageRecord", usageType)
 	}
 }
 
@@ -220,6 +235,65 @@ func TestDatabaseSnapshotV3APIKeyRecordRemainsImportable(t *testing.T) {
 	}
 	if imported.DisplayName != nil {
 		t.Fatalf("imported v3 display name = %q, want null", *imported.DisplayName)
+	}
+}
+
+func TestLegacyDatabaseSnapshotsDefaultQuotaActivityFields(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Date(2026, 8, 24, 1, 0, 0, 0, time.UTC)
+	source := openDatabaseSnapshotSQLiteTestDB(t, filepath.Join(t.TempDir(), "source.db"))
+	if errCreate := source.Create(&AuthRecord{
+		UUID: "legacy-quota-activity", AuthJSON: JSONB(`{"id":"legacy-quota-activity","index":"legacy-quota-activity","provider":"codex"}`),
+		Version: 1, QuotaIdentityVersion: 7, ID: "legacy-quota-activity", Index: "legacy-quota-activity", Provider: "codex",
+		CreatedAt: now, UpdatedAt: now,
+	}).Error; errCreate != nil {
+		t.Fatalf("create source auth: %v", errCreate)
+	}
+	if errCreate := source.Create(&UsageRecord{
+		Timestamp: now, AuthIndex: "legacy-quota-activity", QuotaCredentialID: "legacy-quota-activity", QuotaIdentityVersion: 7, QuotaIdentityKey: "codex/oauth",
+		Provider: "codex", AuthType: "oauth", PayloadJSON: JSONB(`{"timestamp":"2026-08-24T01:00:00Z","provider":"codex","auth_type":"oauth","auth_index":"legacy-quota-activity"}`), CreatedAt: now,
+	}).Error; errCreate != nil {
+		t.Fatalf("create source usage: %v", errCreate)
+	}
+
+	for version := 1; version <= 4; version++ {
+		snapshotVersion := version
+		t.Run(fmt.Sprintf("v%d", snapshotVersion), func(t *testing.T) {
+			snapshotPath := filepath.Join(t.TempDir(), fmt.Sprintf("legacy-v%d.snapshot.zip", snapshotVersion))
+			if _, errExport := exportDatabaseSnapshotVersion(ctx, source, snapshotPath, snapshotVersion); errExport != nil {
+				t.Fatalf("exportDatabaseSnapshotVersion(v%d) error = %v", snapshotVersion, errExport)
+			}
+			snapshot, errOpen := OpenDatabaseSnapshot(ctx, snapshotPath)
+			if errOpen != nil {
+				t.Fatalf("OpenDatabaseSnapshot(v%d) error = %v", snapshotVersion, errOpen)
+			}
+			defer func() {
+				if errClose := snapshot.Close(); errClose != nil {
+					t.Errorf("close v%d snapshot: %v", snapshotVersion, errClose)
+				}
+			}()
+
+			target := openDatabaseSnapshotSQLiteRawTestDB(t, filepath.Join(t.TempDir(), "target.db"))
+			if _, errImport := ImportDatabaseSnapshot(ctx, target, snapshot, nil); errImport != nil {
+				t.Fatalf("ImportDatabaseSnapshot(v%d) error = %v", snapshotVersion, errImport)
+			}
+			var importedAuth AuthRecord
+			if errFirst := target.First(&importedAuth, "uuid = ?", "legacy-quota-activity").Error; errFirst != nil {
+				t.Fatalf("load imported v%d auth: %v", snapshotVersion, errFirst)
+			}
+			if importedAuth.QuotaIdentityVersion != 1 {
+				t.Fatalf("imported v%d quota identity version = %d, want default 1", snapshotVersion, importedAuth.QuotaIdentityVersion)
+			}
+			var importedUsage UsageRecord
+			if errFirst := target.First(&importedUsage, "auth_index = ?", "legacy-quota-activity").Error; errFirst != nil {
+				t.Fatalf("load imported v%d usage: %v", snapshotVersion, errFirst)
+			}
+			if importedUsage.QuotaCredentialID != "" || importedUsage.QuotaIdentityVersion != 0 || importedUsage.QuotaIdentityKey != "" {
+				t.Fatalf("imported v%d quota activity identity = %q/%d/%q, want empty/0/empty", snapshotVersion, importedUsage.QuotaCredentialID, importedUsage.QuotaIdentityVersion, importedUsage.QuotaIdentityKey)
+			}
+		})
 	}
 }
 

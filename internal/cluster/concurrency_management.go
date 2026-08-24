@@ -77,10 +77,23 @@ func (r *Repository) patchAuthTx(ctx context.Context, tx *gorm.DB, credentialID 
 	if sameJSON {
 		return nil
 	}
+	identityChanged := quotaCredentialIdentityChanged(existing, *record)
+	record.QuotaIdentityVersion = quotaCredentialIdentityVersion(existing)
+	if identityChanged {
+		record.QuotaIdentityVersion++
+	}
 	record.Version = existing.Version + 1
 	record.CreatedAt = existing.CreatedAt
 	if errUpdate := tx.WithContext(contextOrBackground(ctx)).Select("*").Where("uuid = ?", credentialID).Updates(record).Error; errUpdate != nil {
 		return errUpdate
+	}
+	if identityChanged {
+		if errDeleteSnapshot := tx.WithContext(contextOrBackground(ctx)).Where("credential_id = ?", credentialID).Delete(&QuotaSnapshotRecord{}).Error; errDeleteSnapshot != nil {
+			return errDeleteSnapshot
+		}
+		if errDeleteWindows := tx.WithContext(contextOrBackground(ctx)).Where("credential_id = ?", credentialID).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
+			return errDeleteWindows
+		}
 	}
 	return appendEvent(tx, "auth", "update", credentialID, record.Version)
 }

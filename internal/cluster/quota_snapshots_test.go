@@ -29,8 +29,18 @@ func TestQuotaAutoMigrateCreatesSnapshotTables(t *testing.T) {
 			t.Fatalf("table %s was not migrated", table)
 		}
 	}
-	if !db.Migrator().HasColumn(&QuotaSnapshotRecord{}, "reset_credits") {
-		t.Fatal("quota_snapshot.reset_credits was not migrated")
+	for _, column := range []string{"reset_credits", "last_active_probe_at", "probe_activity_at"} {
+		if !db.Migrator().HasColumn(&QuotaSnapshotRecord{}, column) {
+			t.Fatalf("quota_snapshot.%s was not migrated", column)
+		}
+	}
+	for _, column := range []string{"quota_credential_id", "quota_identity_version", "quota_identity_key"} {
+		if !db.Migrator().HasColumn(&UsageRecord{}, column) {
+			t.Fatalf("usage.%s was not migrated", column)
+		}
+	}
+	if !db.Migrator().HasIndex(&UsageRecord{}, "idx_usage_quota_activity") {
+		t.Fatal("usage quota activity index was not migrated")
 	}
 }
 
@@ -684,6 +694,7 @@ func TestForceClaimEligibleQuotaProbeBypassesFreshnessButNotLease(t *testing.T) 
 	}); errSeed != nil {
 		t.Fatalf("UpsertQuotaSnapshot() error = %v", errSeed)
 	}
+	recordQuotaUsageActivityAt(t, repo, "force-fresh-auth", "codex", "oauth", now)
 	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "force-fresh-auth", "home-a", now, time.Minute)
 	if errClaim != nil || claimed {
 		t.Fatalf("normal fresh claim = %v, %v, want false, nil", claimed, errClaim)
@@ -722,6 +733,7 @@ func TestCodexLegacySnapshotUpgradeForcesOneProbeAndHonorsBackoff(t *testing.T) 
 	if errSeed != nil {
 		t.Fatalf("seed legacy snapshot: %v", errSeed)
 	}
+	recordQuotaUsageActivityAt(t, repo, "codex-legacy-upgrade", "codex", "oauth", now)
 
 	legacy, errLegacy := repo.GetQuotaCredential(ctx, "codex-legacy-upgrade", now)
 	if errLegacy != nil {
@@ -754,6 +766,7 @@ func TestCodexLegacySnapshotUpgradeForcesOneProbeAndHonorsBackoff(t *testing.T) 
 	}, retryAt, now); errFail != nil {
 		t.Fatalf("FailQuotaProbeAt() error = %v", errFail)
 	}
+	recordQuotaUsageActivityAt(t, repo, "codex-legacy-upgrade", "codex", "oauth", now.Add(time.Minute))
 	failed, errFailed := repo.GetQuotaCredential(ctx, "codex-legacy-upgrade", now.Add(time.Minute))
 	if errFailed != nil {
 		t.Fatalf("GetQuotaCredential(failed) error = %v", errFailed)
@@ -789,6 +802,7 @@ func TestCodexSnapshotUpgradeSuccessReplacesLegacyWindowsAndKeepsVersion(t *test
 	if errSeed != nil {
 		t.Fatalf("seed legacy snapshot: %v", errSeed)
 	}
+	recordQuotaUsageActivityAt(t, repo, "codex-upgrade-success", "codex", "oauth", now)
 	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "codex-upgrade-success", "home-a", now, time.Minute)
 	if errClaim != nil || !claimed {
 		t.Fatalf("upgrade claim = %v, %v", claimed, errClaim)
@@ -875,6 +889,7 @@ func TestAntigravityLegacySnapshotUpgradeForcesOneProbeAndHonorsBackoff(t *testi
 	if errSeed != nil {
 		t.Fatalf("seed legacy snapshot: %v", errSeed)
 	}
+	recordQuotaUsageActivityAt(t, repo, "antigravity-legacy-upgrade", "antigravity", "oauth", now)
 
 	legacy, errLegacy := repo.GetQuotaCredential(ctx, "antigravity-legacy-upgrade", now)
 	if errLegacy != nil {
@@ -907,6 +922,7 @@ func TestAntigravityLegacySnapshotUpgradeForcesOneProbeAndHonorsBackoff(t *testi
 	}, retryAt, now); errFail != nil {
 		t.Fatalf("FailQuotaProbeAt() error = %v", errFail)
 	}
+	recordQuotaUsageActivityAt(t, repo, "antigravity-legacy-upgrade", "antigravity", "oauth", now.Add(time.Minute))
 	failed, errFailed := repo.GetQuotaCredential(ctx, "antigravity-legacy-upgrade", now.Add(time.Minute))
 	if errFailed != nil {
 		t.Fatalf("GetQuotaCredential(failed) error = %v", errFailed)
@@ -947,6 +963,7 @@ func TestAntigravitySnapshotUpgradeSuccessReplacesLegacyWindows(t *testing.T) {
 	if errSeed != nil {
 		t.Fatalf("seed legacy snapshot: %v", errSeed)
 	}
+	recordQuotaUsageActivityAt(t, repo, "antigravity-upgrade-success", "antigravity", "oauth", now)
 	claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, "antigravity-upgrade-success", "home-a", now, time.Minute)
 	if errClaim != nil || !claimed {
 		t.Fatalf("upgrade claim = %v, %v", claimed, errClaim)
@@ -1643,7 +1660,7 @@ func TestAppendUsageRecoversFromExistingFutureQuotaSnapshot(t *testing.T) {
 	period := float64(5)
 	remainingFuture := 0.01
 	_, errFuture := repo.UpsertQuotaSnapshot(ctx, QuotaSnapshotWrite{
-		CredentialID: "future-recovery", QuotaStatus: "exhausted", CollectionStatus: "success", Source: "response_header", ObservedAt: &future, ReplaceWindows: true,
+		CredentialID: "future-recovery", QuotaStatus: "exhausted", CollectionStatus: "success", Source: "response_header", ObservedAt: &future, NextProbeAt: &future, ReplaceWindows: true,
 		Windows: []QuotaWindow{{ID: "codex-primary", Scope: "account", Mode: "rolling", Status: "exhausted", Unit: "percentage", RemainingRatio: &remainingFuture, PeriodUnit: "hour", PeriodValue: &period, Source: "response_header", ObservedAt: future}},
 	})
 	if errFuture != nil {

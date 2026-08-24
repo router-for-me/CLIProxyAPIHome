@@ -23,7 +23,10 @@ const (
 	codexQuotaSnapshotVersion       = 2
 )
 
-const quotaSnapshotFallbackFreshness = 30 * time.Minute
+const (
+	quotaSnapshotFallbackFreshness = 30 * time.Minute
+	quotaProbeActivityWindow       = 30 * time.Minute
+)
 
 const (
 	quotaCredentialIDMaxLength  = 128
@@ -67,6 +70,8 @@ type QuotaSnapshotRecord struct {
 	LastAttemptAt       *time.Time `gorm:"column:last_attempt_at"`
 	LastSuccessAt       *time.Time `gorm:"column:last_success_at"`
 	NextProbeAt         *time.Time `gorm:"column:next_probe_at;index"`
+	LastActiveProbeAt   *time.Time `gorm:"column:last_active_probe_at" json:"-"`
+	ProbeActivityAt     *time.Time `gorm:"column:probe_activity_at" json:"-"`
 	ConsecutiveFailure  int        `gorm:"column:consecutive_failures;not null;default:0"`
 	ErrorCode           string     `gorm:"column:error_code;size:128"`
 	ErrorMessage        string     `gorm:"column:error_message;size:500"`
@@ -331,6 +336,8 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 		}
 		if errExisting == nil {
 			record.CreatedAt = existing.CreatedAt
+			record.LastActiveProbeAt = quotaUTC(existing.LastActiveProbeAt)
+			record.ProbeActivityAt = quotaUTC(existing.ProbeActivityAt)
 			if record.HomeID == "" {
 				record.HomeID = existing.HomeID
 			}
@@ -360,9 +367,14 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 				if existing.CollectorVersion > record.CollectorVersion {
 					record.CollectorVersion = existing.CollectorVersion
 				}
-				preserveQuotaProbeSchedule(&record, existing, input.ObservedAt, input.ReceivedAt)
+				preserveQuotaProbeSchedule(&record, existing, input.ObservedAt, input.ReceivedAt, existingObservationInvalid)
 			}
-			if !input.ClearProbeLease {
+			if input.ClearProbeLease {
+				if strings.TrimSpace(input.ExpectedProbeOwner) != "" && existing.ProbeActivityAt != nil {
+					record.LastActiveProbeAt = quotaUTC(existing.ProbeActivityAt)
+				}
+				record.ProbeActivityAt = nil
+			} else {
 				record.ProbeLeaseOwner = existing.ProbeLeaseOwner
 				record.ProbeLeaseExpiresAt = quotaUTC(existing.ProbeLeaseExpiresAt)
 			}
@@ -483,7 +495,7 @@ func createQuotaSnapshotRecord(tx *gorm.DB, record *QuotaSnapshotRecord, input Q
 	return resultSave.RowsAffected > 0, nil
 }
 
-func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnapshotRecord, observedAt *time.Time, receivedAt *time.Time) {
+func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnapshotRecord, observedAt *time.Time, receivedAt *time.Time, existingObservationInvalid bool) {
 	if record == nil {
 		return
 	}
@@ -492,8 +504,12 @@ func preserveQuotaProbeSchedule(record *QuotaSnapshotRecord, existing QuotaSnaps
 		leaseReferenceAt = receivedAt
 	}
 	leaseActive := existing.ProbeLeaseOwner != "" && existing.ProbeLeaseExpiresAt != nil && leaseReferenceAt != nil && existing.ProbeLeaseExpiresAt.After(leaseReferenceAt.UTC())
+	pendingSchedule := !existingObservationInvalid && existing.NextProbeAt != nil && leaseReferenceAt != nil && existing.NextProbeAt.After(leaseReferenceAt.UTC())
 	authoritativeSource := quotaAllowed(strings.TrimSpace(existing.Source), "active_probe", "mixed")
-	if existing.NextProbeAt != nil && (leaseActive || authoritativeSource || existing.CollectionStatus == "failed") {
+	// Repeated passive observations can replace all active windows and change the
+	// aggregate source to response_header. Keep a valid future probe schedule
+	// independent of source so later headers cannot make the probe immediately due.
+	if existing.NextProbeAt != nil && (pendingSchedule || leaseActive || authoritativeSource || existing.CollectionStatus == "failed") {
 		record.NextProbeAt = quotaUTC(existing.NextProbeAt)
 	}
 	if authoritativeSource || leaseActive || existing.CollectionStatus == "failed" {
@@ -615,8 +631,9 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 	claimed := false
 	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
 		targetCollectorVersion := quotaSnapshotSchemaVersion
+		var authRecord AuthRecord
+		identityKey := ""
 		if requireEligible {
-			var authRecord AuthRecord
 			errAuth := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&authRecord, "uuid = ?", credentialID).Error
 			if errors.Is(errAuth, gorm.ErrRecordNotFound) {
 				return nil
@@ -634,6 +651,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 				return nil
 			}
 			targetCollectorVersion = QuotaSnapshotVersion(provider)
+			identityKey = quotaUsageIdentityKey(provider, credentialType)
 		}
 		var record QuotaSnapshotRecord
 		errFind := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "credential_id = ?", credentialID).Error
@@ -642,10 +660,48 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 		}
 		observationInFuture := false
 		upgradeClaim := false
+		recoverAbandonedProbe := false
 		if errFind == nil {
 			if record.ProbeLeaseExpiresAt != nil && record.ProbeLeaseExpiresAt.After(now) {
 				return nil
 			}
+			recoverAbandonedProbe = record.CollectionStatus == "collecting" && record.ProbeActivityAt != nil && record.LastAttemptAt != nil &&
+				record.ProbeActivityAt.After(record.LastAttemptAt.UTC().Add(-quotaProbeActivityWindow)) &&
+				(record.LastActiveProbeAt == nil || record.ProbeActivityAt.After(record.LastActiveProbeAt.UTC()))
+		}
+		var claimActivityAt *time.Time
+		if requireEligible && !force {
+			activityAfter := now.Add(-quotaProbeActivityWindow)
+			if errFind == nil && record.LastActiveProbeAt != nil && record.LastActiveProbeAt.After(activityAfter) {
+				activityAfter = record.LastActiveProbeAt.UTC()
+			}
+			latestActivityAt, errActivity := latestQuotaUsageActivityAt(ctx, tx, authRecord.UUID, quotaCredentialIdentityVersion(authRecord), identityKey, activityAfter)
+			if errActivity != nil {
+				return errActivity
+			}
+			claimActivityAt = latestActivityAt
+			if claimActivityAt == nil && recoverAbandonedProbe {
+				claimActivityAt = quotaUTC(record.ProbeActivityAt)
+			}
+			if claimActivityAt == nil {
+				// Forced claims may have no recoverable activity watermark. Clear an
+				// expired orphan instead of exposing collecting indefinitely.
+				if errFind == nil && record.CollectionStatus == "collecting" {
+					updates := map[string]any{
+						"collection_status":      "idle",
+						"probe_lease_owner":      "",
+						"probe_lease_expires_at": nil,
+						"probe_activity_at":      nil,
+						"updated_at":             now,
+					}
+					if errUpdate := tx.Model(&QuotaSnapshotRecord{}).Where("credential_id = ?", credentialID).Updates(updates).Error; errUpdate != nil {
+						return errUpdate
+					}
+				}
+				return nil
+			}
+		}
+		if errFind == nil {
 			upgradeClaim = record.CollectorVersion < targetCollectorVersion
 			observationInFuture = record.ObservedAt != nil && record.ObservedAt.After(now.Add(quotaMaxFutureObservationSkew))
 			if !force && !observationInFuture && !upgradeClaim {
@@ -661,7 +717,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 		if errors.Is(errFind, gorm.ErrRecordNotFound) {
 			record = QuotaSnapshotRecord{
 				CredentialID: credentialID, QuotaStatus: "unknown", CollectionStatus: "collecting",
-				LastAttemptAt: &now, ProbeLeaseOwner: owner, ProbeLeaseExpiresAt: &leaseExpiresAt,
+				LastAttemptAt: &now, ProbeLeaseOwner: owner, ProbeLeaseExpiresAt: &leaseExpiresAt, ProbeActivityAt: quotaUTC(claimActivityAt),
 				ParserVersion: quotaSnapshotSchemaVersion, CollectorVersion: targetCollectorVersion,
 				CreatedAt: now, UpdatedAt: now,
 			}
@@ -671,7 +727,11 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 		} else {
 			updates := map[string]any{
 				"collection_status": "collecting", "last_attempt_at": now, "probe_lease_owner": owner,
-				"probe_lease_expires_at": leaseExpiresAt, "updated_at": now,
+				"probe_lease_expires_at": leaseExpiresAt, "probe_activity_at": nil, "updated_at": now,
+			}
+			if claimActivityAt != nil {
+				// Capture the claimed watermark without completing it so an expired lease can be recovered.
+				updates["probe_activity_at"] = claimActivityAt.UTC()
 			}
 			if observationInFuture {
 				if errDeleteWindows := tx.Where("credential_id = ?", credentialID).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
@@ -708,6 +768,27 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 	return claimed, errTransaction
 }
 
+func latestQuotaUsageActivityAt(ctx context.Context, db *gorm.DB, credentialID string, identityVersion int64, identityKey string, after time.Time) (*time.Time, error) {
+	if db == nil || strings.TrimSpace(credentialID) == "" || identityVersion <= 0 || strings.TrimSpace(identityKey) == "" {
+		return nil, nil
+	}
+	var activity struct {
+		CreatedAt time.Time
+	}
+	result := db.WithContext(contextOrBackground(ctx)).Model(&UsageRecord{}).
+		Select("created_at").
+		Where("quota_credential_id = ? AND quota_identity_version = ? AND quota_identity_key = ? AND quota_credential_id <> '' AND quota_identity_version > 0 AND quota_identity_key <> '' AND created_at > ?", strings.TrimSpace(credentialID), identityVersion, strings.TrimSpace(identityKey), after.UTC()).
+		Order("created_at DESC").Limit(1).Find(&activity)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 || activity.CreatedAt.IsZero() {
+		return nil, nil
+	}
+	activityAt := activity.CreatedAt.UTC()
+	return &activityAt, nil
+}
+
 func (r *Repository) FailQuotaProbe(ctx context.Context, credentialID string, owner string, failure QuotaCollectionError, nextProbeAt time.Time) error {
 	return r.FailQuotaProbeAt(ctx, credentialID, owner, failure, nextProbeAt, time.Now().UTC())
 }
@@ -733,7 +814,8 @@ func (r *Repository) FailQuotaProbeAt(ctx context.Context, credentialID string, 
 		"consecutive_failures": gorm.Expr("consecutive_failures + 1"), "error_code": strings.TrimSpace(failure.Code),
 		"error_message": quotaSafeErrorMessage(failure.Message), "error_retryable": failure.Retryable,
 		"error_occurred_at": quotaUTC(failure.OccurredAt), "error_status_code": 0, "error_request_id": "",
-		"probe_lease_owner": "", "probe_lease_expires_at": nil, "updated_at": now,
+		"last_active_probe_at": gorm.Expr("COALESCE(probe_activity_at, last_active_probe_at)"),
+		"probe_lease_owner":    "", "probe_lease_expires_at": nil, "probe_activity_at": nil, "updated_at": now,
 	}
 	updates["quota_status"] = gorm.Expr("CASE WHEN observed_at IS NULL THEN ? ELSE quota_status END", "error")
 	if failure.UpstreamStatusCode != nil {

@@ -92,19 +92,20 @@ func AuthToRecord(auth *coreauth.Auth) (*AuthRecord, error) {
 	}
 
 	record := &AuthRecord{
-		UUID:        auth.ID,
-		AuthJSON:    JSONB(rawJSON),
-		Version:     1,
-		ID:          auth.ID,
-		Index:       auth.Index,
-		Provider:    auth.Provider,
-		Label:       auth.Label,
-		Prefix:      auth.Prefix,
-		Status:      auth.Status,
-		Disabled:    auth.Disabled,
-		Unavailable: auth.Unavailable,
-		CreatedAt:   auth.CreatedAt,
-		UpdatedAt:   auth.UpdatedAt,
+		UUID:                 auth.ID,
+		AuthJSON:             JSONB(rawJSON),
+		Version:              1,
+		QuotaIdentityVersion: 1,
+		ID:                   auth.ID,
+		Index:                auth.Index,
+		Provider:             auth.Provider,
+		Label:                auth.Label,
+		Prefix:               auth.Prefix,
+		Status:               auth.Status,
+		Disabled:             auth.Disabled,
+		Unavailable:          auth.Unavailable,
+		CreatedAt:            auth.CreatedAt,
+		UpdatedAt:            auth.UpdatedAt,
 	}
 
 	if auth.Attributes != nil {
@@ -194,6 +195,7 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 		switch {
 		case errors.Is(errFirst, gorm.ErrRecordNotFound):
 			record.Version = 1
+			record.QuotaIdentityVersion = 1
 			if errCreate := tx.Create(record).Error; errCreate != nil {
 				return errCreate
 			}
@@ -236,17 +238,26 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 				out = &existing
 				return nil
 			}
+			identityChanged := existing.DeletedAt.Valid || quotaCredentialIdentityChanged(existing, *record)
+			identityVersion := existing.QuotaIdentityVersion
+			if identityVersion <= 0 {
+				identityVersion = 1
+			}
+			if identityChanged {
+				identityVersion++
+			}
 			record.Version = existing.Version + 1
+			record.QuotaIdentityVersion = identityVersion
 			record.DeletedAt = gorm.DeletedAt{}
 			if errUpdate := tx.Unscoped().Select("*").Where("uuid = ?", record.UUID).Updates(record).Error; errUpdate != nil {
 				return errUpdate
 			}
-			if existing.DeletedAt.Valid || quotaCredentialIdentityChanged(existing, *record) {
-				if errDeleteWindows := tx.Where("credential_id = ?", record.UUID).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
-					return errDeleteWindows
-				}
+			if identityChanged {
 				if errDeleteSnapshot := tx.Where("credential_id = ?", record.UUID).Delete(&QuotaSnapshotRecord{}).Error; errDeleteSnapshot != nil {
 					return errDeleteSnapshot
+				}
+				if errDeleteWindows := tx.Where("credential_id = ?", record.UUID).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
+					return errDeleteWindows
 				}
 			}
 			if existing.DeletedAt.Valid {
@@ -385,11 +396,24 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		if errRecord != nil {
 			return errRecord
 		}
+		identityChanged := quotaCredentialIdentityChanged(*existing, *record)
+		record.QuotaIdentityVersion = quotaCredentialIdentityVersion(*existing)
+		if identityChanged {
+			record.QuotaIdentityVersion++
+		}
 		record.Version = existing.Version + 1
 		auth.StateVersion = record.Version
 		record.CreatedAt = existing.CreatedAt
 		if errUpdate := txDB.Select("*").Where("uuid = ?", uuid).Updates(record).Error; errUpdate != nil {
 			return errUpdate
+		}
+		if identityChanged {
+			if errDeleteSnapshot := txDB.Where("credential_id = ?", uuid).Delete(&QuotaSnapshotRecord{}).Error; errDeleteSnapshot != nil {
+				return errDeleteSnapshot
+			}
+			if errDeleteWindows := txDB.Where("credential_id = ?", uuid).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
+				return errDeleteWindows
+			}
 		}
 		outAuth = auth
 		outRecord = record
@@ -761,11 +785,11 @@ func (r *Repository) SoftDeleteAuthWithVersion(ctx context.Context, uuid string)
 		if errDelete := tx.Delete(&record).Error; errDelete != nil {
 			return errDelete
 		}
-		if errDeleteWindows := tx.Where("credential_id = ?", uuid).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
-			return errDeleteWindows
-		}
 		if errDeleteSnapshot := tx.Where("credential_id = ?", uuid).Delete(&QuotaSnapshotRecord{}).Error; errDeleteSnapshot != nil {
 			return errDeleteSnapshot
+		}
+		if errDeleteWindows := tx.Where("credential_id = ?", uuid).Delete(&QuotaWindowRecord{}).Error; errDeleteWindows != nil {
+			return errDeleteWindows
 		}
 		if errEvent := appendEvent(tx, "auth", "delete", record.UUID, record.Version); errEvent != nil {
 			return errEvent

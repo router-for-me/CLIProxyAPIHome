@@ -69,7 +69,6 @@ type Options struct {
 	AntigravityURLs        []string
 	Now                    func() time.Time
 	HTTPClient             func(*coreauth.Auth, time.Duration) (*http.Client, error)
-	ResolveAuth            func(context.Context, *coreauth.Auth) (*coreauth.Auth, error)
 }
 
 type Collector struct {
@@ -314,16 +313,14 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 	if !claimed {
 		return
 	}
-	if c.options.ResolveAuth != nil {
-		resolveCtx, cancelResolve := context.WithTimeout(ctx, c.options.ProbeTimeout)
-		resolved, errResolve := c.options.ResolveAuth(resolveCtx, auth)
-		cancelResolve()
-		if errResolve != nil || resolved == nil {
-			c.failProbe(ctx, auth.ID, &probeError{code: "AUTH_REFRESH_FAILED", message: "Credential could not be refreshed for quota collection.", retryable: true})
-			return
-		}
-		auth = resolved
+	resolveCtx, cancelResolve := context.WithTimeout(ctx, c.options.ProbeTimeout)
+	resolved, _, errResolve := c.repo.GetAuth(resolveCtx, auth.ID)
+	cancelResolve()
+	if errResolve != nil || resolved == nil {
+		c.failProbe(ctx, auth.ID, &probeError{code: "AUTH_RESOLVE_FAILED", message: "Credential could not be resolved for quota collection.", retryable: true})
+		return
 	}
+	auth = resolved
 	result, errProbe := c.probeCredential(ctx, auth)
 	if errProbe != nil {
 		c.failProbe(ctx, auth.ID, errProbe)
@@ -521,12 +518,14 @@ func (c *Collector) failProbe(ctx context.Context, credentialID string, failure 
 	delay := defaultFailureBackoff
 	if !failure.retryable {
 		delay = maxFailureBackoff
-	} else if item, errGet := c.repo.GetQuotaCredential(ctx, credentialID, now); errGet == nil && item.ConsecutiveFailure > 0 {
-		for index := 0; index < item.ConsecutiveFailure && delay < maxFailureBackoff; index++ {
-			delay *= 2
-		}
-		if delay > maxFailureBackoff {
-			delay = maxFailureBackoff
+	} else {
+		if item, errGet := c.repo.GetQuotaCredential(ctx, credentialID, now); errGet == nil && item.ConsecutiveFailure > 0 {
+			for index := 0; index < item.ConsecutiveFailure && delay < maxFailureBackoff; index++ {
+				delay *= 2
+			}
+			if delay > maxFailureBackoff {
+				delay = maxFailureBackoff
+			}
 		}
 	}
 	if failure.retryAfter > delay {
@@ -734,7 +733,7 @@ func quotaRetryAfter(headers http.Header, now time.Time) time.Duration {
 func quotaHTTPProbeError(status int, requestID string) *probeError {
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return &probeError{code: "UPSTREAM_AUTH_REJECTED", message: "Upstream rejected the credential.", retryable: false, statusCode: status, requestID: requestID}
+		return &probeError{code: "UPSTREAM_AUTH_REJECTED", message: "Upstream rejected the credential.", retryable: true, statusCode: status, requestID: requestID}
 	case http.StatusTooManyRequests:
 		return &probeError{code: "UPSTREAM_RATE_LIMITED", message: "Upstream quota endpoint rate limited the probe.", retryable: true, statusCode: status, requestID: requestID}
 	default:

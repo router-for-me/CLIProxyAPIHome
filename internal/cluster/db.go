@@ -422,6 +422,7 @@ func migrateUsageObservabilityIndexes(db *gorm.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_event_type_time ON "usage" ("event_type", "timestamp" DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_cpa_node_time ON "usage" ("cpa_node_id", "timestamp" DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_home_port_time ON "usage" ("home_ip", "home_port", "timestamp" DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_quota_activity ON "usage" ("quota_credential_id", "quota_identity_version", "quota_identity_key", "created_at" DESC) WHERE "quota_credential_id" <> '' AND "quota_identity_version" > 0 AND "quota_identity_key" <> ''`,
 	}
 	for _, statement := range statements {
 		if errExec := db.Exec(statement).Error; errExec != nil {

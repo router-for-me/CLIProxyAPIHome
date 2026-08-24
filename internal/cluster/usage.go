@@ -17,17 +17,22 @@ import (
 const defaultUsageServiceTier = "auto"
 
 type UsageRecord struct {
-	ID              uint      `gorm:"column:id;primaryKey;autoIncrement;index:idx_usage_time_order,priority:2"`
-	Timestamp       time.Time `gorm:"column:timestamp;not null;index:idx_usage_timestamp;index:idx_usage_time_order,priority:1,sort:desc;index:idx_usage_source_time,priority:2,sort:desc;index:idx_usage_auth_time,priority:2,sort:desc;index:idx_usage_failed_time,priority:2,sort:desc;index:idx_usage_failed_status_time,priority:3,sort:desc;index:idx_usage_provider_model_time,priority:3,sort:desc;index:idx_usage_provider_time,priority:2,sort:desc;index:idx_usage_endpoint_time,priority:2,sort:desc;index:idx_usage_home_time,priority:2,sort:desc;index:idx_usage_auth_type_time,priority:2,sort:desc"`
-	LatencyMS       int64     `gorm:"column:latency_ms;not null;default:0"`
-	TTFTMS          int64     `gorm:"column:ttft_ms;not null;default:0"`
-	Source          string    `gorm:"column:source;index:idx_usage_source;index:idx_usage_source_time,priority:1"`
-	AuthIndex       string    `gorm:"column:auth_index;index:idx_usage_auth_index;index:idx_usage_auth_time,priority:1"`
-	InputTokens     int64     `gorm:"column:input_tokens;not null;default:0"`
-	OutputTokens    int64     `gorm:"column:output_tokens;not null;default:0"`
-	ReasoningTokens int64     `gorm:"column:reasoning_tokens;not null;default:0"`
-	CachedTokens    int64     `gorm:"column:cached_tokens;not null;default:0"`
-	CacheReadTokens int64     `gorm:"column:cache_read_tokens;not null;default:0"`
+	ID        uint      `gorm:"column:id;primaryKey;autoIncrement;index:idx_usage_time_order,priority:2"`
+	Timestamp time.Time `gorm:"column:timestamp;not null;index:idx_usage_timestamp;index:idx_usage_time_order,priority:1,sort:desc;index:idx_usage_source_time,priority:2,sort:desc;index:idx_usage_auth_time,priority:2,sort:desc;index:idx_usage_failed_time,priority:2,sort:desc;index:idx_usage_failed_status_time,priority:3,sort:desc;index:idx_usage_provider_model_time,priority:3,sort:desc;index:idx_usage_provider_time,priority:2,sort:desc;index:idx_usage_endpoint_time,priority:2,sort:desc;index:idx_usage_home_time,priority:2,sort:desc;index:idx_usage_auth_type_time,priority:2,sort:desc"`
+	LatencyMS int64     `gorm:"column:latency_ms;not null;default:0"`
+	TTFTMS    int64     `gorm:"column:ttft_ms;not null;default:0"`
+	Source    string    `gorm:"column:source;index:idx_usage_source;index:idx_usage_source_time,priority:1"`
+	AuthIndex string    `gorm:"column:auth_index;index:idx_usage_auth_index;index:idx_usage_auth_time,priority:1"`
+	// Quota identity fields fence activity from concurrent credential replacement;
+	// the key also protects rolling upgrades where an older Home cannot advance the generation.
+	QuotaCredentialID    string `gorm:"column:quota_credential_id;not null;default:''"`
+	QuotaIdentityVersion int64  `gorm:"column:quota_identity_version;not null;default:0"`
+	QuotaIdentityKey     string `gorm:"column:quota_identity_key;not null;default:'';size:128"`
+	InputTokens          int64  `gorm:"column:input_tokens;not null;default:0"`
+	OutputTokens         int64  `gorm:"column:output_tokens;not null;default:0"`
+	ReasoningTokens      int64  `gorm:"column:reasoning_tokens;not null;default:0"`
+	CachedTokens         int64  `gorm:"column:cached_tokens;not null;default:0"`
+	CacheReadTokens      int64  `gorm:"column:cache_read_tokens;not null;default:0"`
 	// CacheReadTokensPresent distinguishes a canonical zero from a legacy CPA
 	// payload that did not know the cache_read_tokens field.
 	CacheReadTokensPresent     bool      `gorm:"column:cache_read_tokens_present;not null;default:false"`
@@ -74,12 +79,13 @@ type UsageRecord struct {
 }
 
 type UsageRuntimeMetadata struct {
-	HomeIP    string
-	HomePort  int
-	CPANodeID string
-	CPAIP     string
-	CPAPort   int
-	CPALabel  string
+	HomeIP     string
+	HomePort   int
+	CPANodeID  string
+	CPAIP      string
+	CPAPort    int
+	CPALabel   string
+	ReceivedAt time.Time
 }
 
 // TableName returns the database table name.
@@ -148,6 +154,12 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 	if errBreakdown != nil {
 		return nil, errBreakdown
 	}
+	receivedAt := metadata.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = time.Now().UTC()
+	} else {
+		receivedAt = receivedAt.UTC()
+	}
 
 	record := &UsageRecord{
 		Timestamp:                  timestamp.UTC(),
@@ -199,7 +211,7 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 		TokensJSON:                 jsonbFromPayloadField(payload, "tokens"),
 		FailJSON:                   jsonbFromPayloadField(payload, "fail"),
 		PayloadJSON:                JSONB(payload),
-		CreatedAt:                  time.Now().UTC(),
+		CreatedAt:                  receivedAt,
 	}
 	record.EventType = usageEventTypeFromPayload(payload, record.Endpoint)
 	if strings.TrimSpace(record.CPALabel) == "" {
@@ -306,6 +318,17 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 	}
 
 	ctx = contextOrBackground(ctx)
+	record.QuotaCredentialID = ""
+	record.QuotaIdentityVersion = 0
+	record.QuotaIdentityKey = ""
+	resolved, identityKey, found, errResolve := resolveQuotaUsageCredential(ctx, db, record.AuthIndex, record.AuthType)
+	if errResolve != nil {
+		log.WithError(errResolve).Warn("usage quota credential resolution ignored")
+	} else if found {
+		record.QuotaCredentialID = resolved.UUID
+		record.QuotaIdentityVersion = quotaCredentialIdentityVersion(resolved)
+		record.QuotaIdentityKey = identityKey
+	}
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if errCreate := tx.WithContext(ctx).Create(record).Error; errCreate != nil {
 			return errCreate
@@ -313,16 +336,13 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 		if errBilling := r.createBillingChargeForUsageTx(ctx, tx, record, payload); errBilling != nil {
 			return errBilling
 		}
-		errQuota := tx.WithContext(ctx).Transaction(func(quotaTx *gorm.DB) error {
-			return upsertQuotaFromUsagePayloadTx(ctx, quotaTx, string(record.PayloadJSON), metadata, record.CreatedAt)
-		})
-		if errQuota != nil {
-			log.WithError(errQuota).Warn("usage quota observation ignored")
-		}
 		return nil
 	})
 	if errTransaction != nil {
 		return nil, errTransaction
+	}
+	if errQuota := upsertQuotaFromUsageRecord(ctx, db, record, metadata); errQuota != nil {
+		log.WithError(errQuota).Warn("usage quota observation ignored")
 	}
 	return record, nil
 }

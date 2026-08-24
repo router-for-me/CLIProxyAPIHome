@@ -37,6 +37,7 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	if !strings.EqualFold(strings.TrimSpace(args[1]), "usage") {
 		return dispatch.Err("unsupported key")
 	}
+	receivedAt := time.Now().UTC()
 
 	payload := strings.TrimSpace(args[2])
 	if payload == "" || !gjson.Valid(payload) {
@@ -56,7 +57,7 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	// Always update scheduler state before queuing persistence so cooldowns are applied even if log persistence fails.
 	if env.Runtime != nil {
 		env.Runtime.RecordUsagePayload(ctx, payload)
-		persisted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload)
+		persisted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
 		if errPersist != nil {
 			log.Errorf("usage database write error: %v", errPersist)
 		}

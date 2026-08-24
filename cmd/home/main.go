@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/buildinfo"
-	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
@@ -416,26 +415,6 @@ func run() int {
 				return ""
 			}
 			return currentConfig.ProxyURL
-		},
-		ResolveAuth: func(ctx context.Context, candidate *coreauth.Auth) (*coreauth.Auth, error) {
-			if candidate == nil {
-				return nil, fmt.Errorf("quota collector credential is nil")
-			}
-			current, _, errAuth := repo.GetAuth(ctx, candidate.ID)
-			if errAuth != nil {
-				return nil, errAuth
-			}
-			manager := rt.CoreManager()
-			if manager != nil && manager.ShouldRefreshCredential(current, time.Now().UTC()) {
-				if _, errRefresh := rt.RefreshNow(ctx, current.ID); errRefresh != nil {
-					return nil, errRefresh
-				}
-				current, _, errAuth = repo.GetAuth(ctx, candidate.ID)
-				if errAuth != nil {
-					return nil, errAuth
-				}
-			}
-			return current, nil
 		},
 	})
 	quotaCollector.Start(runCtx)

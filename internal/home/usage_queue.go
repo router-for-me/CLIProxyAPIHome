@@ -4,14 +4,20 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
+type usagePayloadItem struct {
+	payload    string
+	receivedAt time.Time
+}
+
 type usagePayloadQueue struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
-	items  []string
+	items  []usagePayloadItem
 	head   int
 	closed bool
 }
@@ -22,9 +28,14 @@ func newUsagePayloadQueue() *usagePayloadQueue {
 	return q
 }
 
-func (q *usagePayloadQueue) Push(payload string) bool {
+func (q *usagePayloadQueue) Push(payload string, receivedAt time.Time) bool {
 	if q == nil {
 		return false
+	}
+	if receivedAt.IsZero() {
+		receivedAt = time.Now().UTC()
+	} else {
+		receivedAt = receivedAt.UTC()
 	}
 
 	q.mu.Lock()
@@ -32,14 +43,14 @@ func (q *usagePayloadQueue) Push(payload string) bool {
 	if q.closed {
 		return false
 	}
-	q.items = append(q.items, payload)
+	q.items = append(q.items, usagePayloadItem{payload: payload, receivedAt: receivedAt})
 	q.cond.Signal()
 	return true
 }
 
-func (q *usagePayloadQueue) Pop() (string, bool) {
+func (q *usagePayloadQueue) Pop() (usagePayloadItem, bool) {
 	if q == nil {
-		return "", false
+		return usagePayloadItem{}, false
 	}
 
 	q.mu.Lock()
@@ -48,14 +59,14 @@ func (q *usagePayloadQueue) Pop() (string, bool) {
 		q.cond.Wait()
 	}
 	if q.closed {
-		return "", false
+		return usagePayloadItem{}, false
 	}
 
-	payload := q.items[q.head]
-	q.items[q.head] = ""
+	item := q.items[q.head]
+	q.items[q.head] = usagePayloadItem{}
 	q.head++
 	q.compactLocked()
-	return payload, true
+	return item, true
 }
 
 func (q *usagePayloadQueue) Close() {
@@ -75,7 +86,7 @@ func (q *usagePayloadQueue) compactLocked() {
 	if q.head < 1024 || q.head*2 < len(q.items) {
 		return
 	}
-	next := append([]string(nil), q.items[q.head:]...)
+	next := append([]usagePayloadItem(nil), q.items[q.head:]...)
 	q.items = next
 	q.head = 0
 }
@@ -139,14 +150,14 @@ func (r *Runtime) runClusterUsageWriter(ctx context.Context, store clusterUsageS
 	}
 
 	for {
-		payload, ok := queue.Pop()
+		item, ok := queue.Pop()
 		if !ok {
 			return
 		}
-		if strings.TrimSpace(payload) == "" {
+		if strings.TrimSpace(item.payload) == "" {
 			continue
 		}
-		if errStoreUsagePayload := store.StoreUsagePayload(ctx, payload); errStoreUsagePayload != nil {
+		if errStoreUsagePayload := store.StoreUsagePayload(ctx, item.payload, item.receivedAt); errStoreUsagePayload != nil {
 			log.Errorf("usage database async write error: %v", errStoreUsagePayload)
 		}
 	}

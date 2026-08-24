@@ -130,15 +130,16 @@ func (a *RuntimeAdapter) LoadConfigYAML(ctx context.Context) ([]byte, error) {
 	return payload, nil
 }
 
-// StoreUsagePayload stores an usage payload.
-func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string) error {
+// StoreUsagePayload stores an usage payload with its trusted Home receive time.
+func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error {
 	if !a.Enabled() {
 		return fmt.Errorf("cluster runtime adapter is disabled")
 	}
 	a.mu.RLock()
 	metadata := UsageRuntimeMetadata{
-		HomeIP:   a.homeIP,
-		HomePort: a.homePort,
+		HomeIP:     a.homeIP,
+		HomePort:   a.homePort,
+		ReceivedAt: receivedAt,
 	}
 	a.mu.RUnlock()
 	_, errAppend := a.repo.AppendUsageWithRuntime(ctx, payload, metadata)
