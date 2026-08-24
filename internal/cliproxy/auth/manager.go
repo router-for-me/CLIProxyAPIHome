@@ -1281,6 +1281,10 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return evaluator.ShouldRefresh(now, a)
 	}
+	builtInRefresh := authSupportsBuiltInRefresh(a)
+	if builtInRefresh && accessTokenForFingerprint(a) == "" {
+		return true
+	}
 
 	lastRefresh := a.LastRefreshedAt
 	if lastRefresh.IsZero() {
@@ -1319,6 +1323,10 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	}
 	if hasExpiry && !expiry.IsZero() {
 		return expiry.Sub(now) <= *lead
+	}
+	if builtInRefresh {
+		// Unknown expiry alone does not make a usable access token refresh-due.
+		return false
 	}
 	if !lastRefresh.IsZero() {
 		return now.Sub(lastRefresh) >= *lead
@@ -1520,8 +1528,6 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	ApplyRefreshPendingState(auth, now)
 	m.auths[id] = auth
 	m.mu.Unlock()
-
-	m.queueRefreshReschedule(id)
 	return true
 }
 
@@ -1927,17 +1933,18 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	return updated, nil
 }
 
-// refreshAuth refreshes an auth.
-func (m *Manager) refreshAuth(ctx context.Context, authID string) {
+// refreshAuth refreshes an auth and returns a resolved snapshot when no
+// provider refresh is needed.
+func (m *Manager) refreshAuth(ctx context.Context, authID string) *Auth {
 	if m == nil {
-		return
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
-		return
+		return nil
 	}
 
 	m.mu.RLock()
@@ -1945,20 +1952,20 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 	autoRefreshHandler := m.autoRefreshHandler
 	m.mu.RUnlock()
 	if current == nil {
-		return
+		return nil
 	}
 	fullCurrent, okFull, errFull := m.resolveFullRefreshAuth(ctx, current)
 	if errFull != nil {
 		logEntryWithRequestID(ctx).Warnf("auth refresh full auth lookup failed | auth=%s err=%v", authID, errFull)
-		return
+		return nil
 	}
 	if !okFull {
-		return
+		return nil
 	}
 	current = fullCurrent
 	now := time.Now().UTC()
 	if !m.shouldRefresh(current, now) {
-		return
+		return current.Clone()
 	}
 
 	if autoRefreshHandler != nil {
@@ -1972,7 +1979,7 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 				logEntryWithRequestID(ctx).Warnf("auth refresh failed | auth=%s provider=%s err=%s", authID, current.Provider, refreshTransientErrorMsg)
 			}
 		}
-		return
+		return nil
 	}
 
 	beforeRefresh := current.Clone()
@@ -1983,14 +1990,15 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) {
 				logEntryWithRequestID(ctx).Warnf("auth refresh failure state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
 			}
 		}
-		return
+		return nil
 	}
 	modelsToResume := refreshedUnauthorizedModels(beforeRefresh, updated)
 	if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
 		logEntryWithRequestID(ctx).Warnf("auth refresh state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
-		return
+		return nil
 	}
 	resumeRefreshedModels(updated.ID, modelsToResume)
+	return nil
 }
 
 // ApplyRefreshSuccessState clears refresh errors and unauthorized execution state.
