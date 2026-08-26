@@ -410,8 +410,8 @@ type usageObservabilityRecordRow struct {
 	AuthStatus                 string          `gorm:"column:auth_status"`
 	AuthDisabled               bool            `gorm:"column:auth_disabled"`
 	AuthUnavailable            bool            `gorm:"column:auth_unavailable"`
-	AuthNextRefreshAfter       sql.NullTime    `gorm:"column:auth_next_refresh_after"`
-	AuthNextRetryAfter         sql.NullTime    `gorm:"column:auth_next_retry_after"`
+	AuthNextRefreshAfter       sql.NullString  `gorm:"column:auth_next_refresh_after"`
+	AuthNextRetryAfter         sql.NullString  `gorm:"column:auth_next_retry_after"`
 }
 
 type usageObservabilityAggregateRow struct {
@@ -3622,9 +3622,10 @@ func usageObservabilityAuthNextRetryAt(row *usageObservabilityRecordRow) *time.T
 	if row == nil {
 		return nil
 	}
-	if row.AuthNextRetryAfter.Valid {
-		nextRetryAt := row.AuthNextRetryAfter.Time.UTC()
-		return &nextRetryAt
+	if row.AuthNextRetryAfter.Valid && strings.TrimSpace(row.AuthNextRetryAfter.String) != "" {
+		if nextRetryAt := usageObservabilityOptionalAggregateTime(row.AuthNextRetryAfter.String); nextRetryAt != nil {
+			return nextRetryAt
+		}
 	}
 	return usageObservabilityAuthJSONNextRetryAt(string(row.AuthJSON))
 }

@@ -1305,6 +1305,58 @@ func TestGetUsageObservabilityRecordReturnsRecord(t *testing.T) {
 	}
 }
 
+func TestGetUsageObservabilityRecordWithAuthNextRetryAndRefreshAfter(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	seedUsageObservabilityRecord(t, ctx, repo)
+
+	nextRetry := time.Date(2026, time.August, 25, 11, 59, 41, 0, time.UTC)
+	nextRefresh := time.Date(2026, time.August, 25, 12, 30, 0, 0, time.UTC)
+	auth := &coreauth.Auth{
+		ID:               "auth-observability",
+		Index:            "auth-observability",
+		Provider:         "codex",
+		Label:            "Primary OAuth",
+		Status:           coreauth.StatusActive,
+		NextRetryAfter:   nextRetry,
+		NextRefreshAfter: nextRefresh,
+		CreatedAt:        time.Date(2026, time.June, 10, 1, 0, 0, 0, time.UTC),
+		UpdatedAt:        time.Date(2026, time.June, 10, 1, 0, 0, 0, time.UTC),
+	}
+	if _, errAuth := repo.UpsertAuth(ctx, auth, "test"); errAuth != nil {
+		t.Fatalf("UpsertAuth() error = %v", errAuth)
+	}
+
+	record, errRecord := repo.GetUsageObservabilityRecord(ctx, "1")
+	if errRecord != nil {
+		t.Fatalf("GetUsageObservabilityRecord() error = %v", errRecord)
+	}
+	if record.UsageID != 1 {
+		t.Fatalf("usage id = %d, want 1", record.UsageID)
+	}
+	if record.Credential.NextRetryAt == nil {
+		t.Fatalf("NextRetryAt is nil, want %v", nextRetry)
+	}
+	if !record.Credential.NextRetryAt.UTC().Equal(nextRetry) {
+		t.Fatalf("NextRetryAt = %v, want %v", record.Credential.NextRetryAt.UTC(), nextRetry)
+	}
+
+	listResult, errList := repo.ListUsageObservabilityRecords(ctx, UsageObservabilityRecordQuery{})
+	if errList != nil {
+		t.Fatalf("ListUsageObservabilityRecords() error = %v", errList)
+	}
+	if len(listResult.Records) == 0 {
+		t.Fatalf("ListUsageObservabilityRecords() returned 0 records")
+	}
+	if listResult.Records[0].Credential.NextRetryAt == nil || !listResult.Records[0].Credential.NextRetryAt.UTC().Equal(nextRetry) {
+		t.Fatalf("list record NextRetryAt = %v, want %v", listResult.Records[0].Credential.NextRetryAt, nextRetry)
+	}
+}
+
 func TestUsageObservabilityOverviewBuildsTrendWithSQLBuckets(t *testing.T) {
 	t.Parallel()
 
