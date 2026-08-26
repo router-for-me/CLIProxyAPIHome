@@ -1007,6 +1007,43 @@ func TestGetUsageRecordReturnsDetail(t *testing.T) {
 	}
 }
 
+func TestGetUsageRecordWithAuthNextRetryAfter(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	seedUsageObservabilityManagementRecordWithRetry(t, handler)
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.GET("/usage/records/:id", handler.GetUsageRecord)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/usage/records/1", nil)
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusOK)
+	}
+
+	var payload map[string]any
+	if errDecode := json.Unmarshal(resp.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	record, ok := payload["record"].(map[string]any)
+	if !ok {
+		t.Fatalf("record = %T, want object", payload["record"])
+	}
+	credential, ok := record["credential"].(map[string]any)
+	if !ok {
+		t.Fatalf("credential = %T, want object", record["credential"])
+	}
+	if credential["auth_index"] != "auth-observability" {
+		t.Fatalf("credential.auth_index = %v, want auth-observability", credential["auth_index"])
+	}
+	if credential["status"] != "unavailable" {
+		t.Fatalf("credential.status = %v, want unavailable", credential["status"])
+	}
+}
+
 func TestGetUsageRecordReturnsLogExcerptWhenRequested(t *testing.T) {
 	handler, closeRepo := newUsageObservabilityTestHandler(t)
 	defer closeRepo()
