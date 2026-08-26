@@ -2513,7 +2513,7 @@ Selector 字段：
 | `websockets` | boolean or string bool | 支持的 auth 的 runtime websocket flag。 |
 | `disabled` | boolean or string bool | 更新 auth disabled state 和 status。 |
 | `disable-cooling` | boolean 或 `null` | 凭证级 cooling 覆盖。`true` 禁用冷却，`false` 启用冷却，`null` 清除覆盖并继承全局设置。该 hyphenated response 字段可直接用于此 PATCH 接口。 |
-| `request-retry` | integer 或 `null` | 凭证级额外重试轮次覆盖。`0` 禁用额外轮次；`null` 或负值继承全局设置。接受 `request-retry` 和 `request_retry`，但两者不能同时出现。 |
+| `request-retry` | integer 或 `null` | 凭证级额外重试轮次覆盖。`0` 禁用额外轮次；`null` 或负值继承全局设置。接受 `request-retry` 和 `request_retry`；两者同时提供时以 `request_retry` 优先。 |
 | 任意 nested path | any valid JSON | 可以设置任意 metadata path，例如 `token.access_token`。 |
 
 输出示例：

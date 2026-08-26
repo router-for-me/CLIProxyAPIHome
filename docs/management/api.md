@@ -2515,7 +2515,7 @@ Editable fields:
 | `websockets` | boolean or string bool | Runtime websocket flag for supported auths. |
 | `disabled` | boolean or string bool | Updates auth disabled state and status. |
 | `disable-cooling` | boolean or `null` | Credential cooling override. `true` disables cooling, `false` enables it, and `null` clears the override so the credential inherits the global setting. The hyphenated response field is accepted directly by this PATCH route. |
-| `request-retry` | integer or `null` | Additional credential retry-round override. `0` disables additional rounds; `null` or a negative value inherits the global setting. Both `request-retry` and `request_retry` are accepted, but they cannot appear together. |
+| `request-retry` | integer or `null` | Additional credential retry-round override. `0` disables additional rounds; `null` or a negative value inherits the global setting. Both `request-retry` and `request_retry` are accepted; when both appear together, `request_retry` takes precedence. |
 | any nested path | any valid JSON | Sets arbitrary metadata paths such as `token.access_token`. |
 
 Example response:

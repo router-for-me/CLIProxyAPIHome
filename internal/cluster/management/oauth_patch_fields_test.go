@@ -54,11 +54,63 @@ func TestApplyOAuthFieldPatchArbitraryFields(t *testing.T) {
 	}
 }
 
-func TestApplyOAuthFieldPatchRejectsConflictingRequestRetryAliases(t *testing.T) {
+func TestApplyOAuthFieldPatchCanonicalPrecedenceOverLegacyAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		patch     string
+		wantRetry int
+		wantProxy string
+	}{
+		{
+			name:      "canonical request_retry wins over legacy alias",
+			patch:     `{"request-retry":2,"request_retry":3,"proxy_url":"http://127.0.0.1:8080","proxy-url":"http://127.0.0.1:8080"}`,
+			wantRetry: 3,
+			wantProxy: "http://127.0.0.1:8080",
+		},
+		{
+			name:      "canonical request_retry wins when alias has whitespace",
+			patch:     `{" request-retry ":2,"request_retry":4,"proxy-url":"http://127.0.0.1:8080","proxy_url":"http://127.0.0.1:8080"}`,
+			wantRetry: 4,
+			wantProxy: "http://127.0.0.1:8080",
+		},
+		{
+			name:      "canonical request_retry wins regardless of map iteration order",
+			patch:     `{"request_retry":5,"request-retry":1}`,
+			wantRetry: 5,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &coreauth.Auth{
+				ID:         "codex-auth",
+				Provider:   "codex",
+				Attributes: map[string]string{"priority": "10"},
+				Metadata:   map[string]any{"type": "codex", "request_retry": 1},
+			}
+			changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, tc.patch))
+			if errPatch != nil || !changed {
+				t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want successful patch", tc.patch, changed, errPatch)
+			}
+			if got, ok := auth.RequestRetryOverride(); !ok || got != tc.wantRetry {
+				t.Fatalf("request retry override = (%d, %t), want (%d, true)", got, ok, tc.wantRetry)
+			}
+			if tc.wantProxy != "" {
+				if auth.ProxyURL != tc.wantProxy {
+					t.Fatalf("auth.ProxyURL = %q, want %q", auth.ProxyURL, tc.wantProxy)
+				}
+				if _, exists := auth.Metadata["proxy-url"]; exists {
+					t.Fatalf("legacy proxy-url remains in metadata: %#v", auth.Metadata)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyOAuthFieldPatchRejectsConflictingOrOverlappingPaths(t *testing.T) {
 	patches := []string{
-		`{"request-retry":2,"request_retry":3}`,
-		`{" request-retry ":2,"request_retry":3}`,
+		`{"request-retry":2," request-retry ":3}`,
+		`{"request_retry":2," request_retry ":3}`,
 		`{"request_retry":2,"request-retry.child":3}`,
+		`{"proxy_url":"http://proxy","proxy_url.child":"value"}`,
 	}
 	for _, patch := range patches {
 		auth := &coreauth.Auth{
@@ -69,7 +121,7 @@ func TestApplyOAuthFieldPatchRejectsConflictingRequestRetryAliases(t *testing.T)
 		}
 		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch))
 		if errPatch == nil || changed {
-			t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want unchanged conflict error", patch, changed, errPatch)
+			t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want unchanged conflict/overlap error", patch, changed, errPatch)
 		}
 		if got, ok := auth.RequestRetryOverride(); !ok || got != 1 {
 			t.Fatalf("request retry override after rejected patch %s = (%d, %t), want (1, true)", patch, got, ok)
@@ -257,6 +309,39 @@ func TestPatchAuthFileFieldsRoundTripsEditableMetadata(t *testing.T) {
 	}
 	if persisted.Attributes["priority"] != "10" || persisted.Attributes["note"] != "primary" || persisted.Attributes["websockets"] != "true" {
 		t.Fatalf("persisted attributes = %#v, want editable metadata attributes", persisted.Attributes)
+	}
+}
+
+func TestPatchAuthFileFieldsWithBothProxyUrlAliases(t *testing.T) {
+	handler, engine, _, closeRepo := newConcurrencyManagementTestServer(t)
+	defer closeRepo()
+	seedOAuthAuth(t, handler.repo, "oauth-proxy-both")
+	engine.GET("/auth-files", handler.ListAuthFiles)
+
+	patchResponse := httptest.NewRecorder()
+	patchRequest := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{
+		"id":"oauth-proxy-both",
+		"prefix":"team-b",
+		"proxy_url":"socks5://127.0.0.1:1080",
+		"proxy-url":"socks5://127.0.0.1:1080",
+		"priority":5,
+		"note":"secondary"
+	}`))
+	patchRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(patchResponse, patchRequest)
+	if patchResponse.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d body=%s", patchResponse.Code, patchResponse.Body.String())
+	}
+
+	persisted, _, errAuth := handler.repo.GetAuth(t.Context(), "oauth-proxy-both")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.Prefix != "team-b" || persisted.ProxyURL != "socks5://127.0.0.1:1080" {
+		t.Fatalf("persisted auth = %#v, want canonical prefix and proxy URL", persisted)
+	}
+	if _, exists := persisted.Metadata["proxy-url"]; exists {
+		t.Fatalf("legacy proxy-url remains in metadata: %#v", persisted.Metadata)
 	}
 }
 

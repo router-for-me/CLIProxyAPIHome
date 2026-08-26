@@ -610,25 +610,42 @@ func authFileDisplayName(auth *coreauth.Auth) string {
 // applyOAuthFieldPatch applies an o auth field patch.
 func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage) (bool, error) {
 	// Resolve credential context before calling upstream OAuth services.
-	normalizedPaths := make(map[string]string, len(fields))
+	normalizedFields := make(map[string]json.RawMessage, len(fields))
 	pathOwners := make(map[string]string, len(fields))
+	canonicalOwners := make(map[string]bool, len(fields))
 	orderedPaths := make([]string, 0, len(fields))
-	for key := range fields {
+	for key, rawValue := range fields {
 		fieldPath := strings.TrimSpace(key)
 		if fieldPath == "" {
 			return false, fmt.Errorf("field name is required")
 		}
-		metadataPath := oauthMetadataFieldPath(fieldPath)
-		for _, part := range strings.Split(metadataPath, ".") {
-			if part == "" {
+		parts := strings.Split(fieldPath, ".")
+		for index := range parts {
+			parts[index] = strings.TrimSpace(parts[index])
+			if parts[index] == "" {
 				return false, fmt.Errorf("invalid field path: %s", fieldPath)
 			}
 		}
+		originalRoot := parts[0]
+		parts[0] = canonicalOAuthMetadataKey(originalRoot)
+		metadataPath := strings.Join(parts, ".")
+		isCanonical := originalRoot == parts[0]
+
 		if previousKey, exists := pathOwners[metadataPath]; exists {
+			previousCanonical := canonicalOwners[metadataPath]
+			if previousCanonical != isCanonical {
+				if isCanonical {
+					normalizedFields[metadataPath] = rawValue
+					pathOwners[metadataPath] = key
+					canonicalOwners[metadataPath] = true
+				}
+				continue
+			}
 			return false, fmt.Errorf("fields %s and %s resolve to the same metadata path", previousKey, key)
 		}
-		normalizedPaths[key] = metadataPath
+		normalizedFields[metadataPath] = rawValue
 		pathOwners[metadataPath] = key
+		canonicalOwners[metadataPath] = isCanonical
 		orderedPaths = append(orderedPaths, metadataPath)
 	}
 	sort.Strings(orderedPaths)
@@ -640,10 +657,10 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 			}
 		}
 	}
-	decodedValues := make(map[string]any, len(fields))
-	for key, rawValue := range fields {
-		fieldPath := strings.TrimSpace(key)
-		metadataPath := normalizedPaths[key]
+	decodedValues := make(map[string]any, len(normalizedFields))
+	for _, metadataPath := range orderedPaths {
+		rawValue := normalizedFields[metadataPath]
+		fieldPath := pathOwners[metadataPath]
 		value, errDecode := decodeOAuthFieldPatchValue(rawValue)
 		if errDecode != nil {
 			return false, fmt.Errorf("invalid field %s", fieldPath)
@@ -672,7 +689,7 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 				}
 			}
 		}
-		decodedValues[key] = value
+		decodedValues[metadataPath] = value
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -681,17 +698,15 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 		auth.Attributes = make(map[string]string)
 	}
 	changed := false
-	touchedRoots := make(map[string]struct{}, len(fields))
-	for key := range fields {
-		value := decodedValues[key]
-		metadataPath := normalizedPaths[key]
-		if metadataPath == "disable_cooling" {
-			// Keep one canonical key so a PATCH using the public hyphenated alias
-			// cannot be shadowed by a previously stored legacy value.
-			delete(auth.Metadata, "disable-cooling")
+	touchedRoots := make(map[string]struct{}, len(normalizedFields))
+	for _, metadataPath := range orderedPaths {
+		value := decodedValues[metadataPath]
+		if root := rootOAuthField(metadataPath); root != "" {
+			if legacy := legacyOAuthMetadataKey(root); legacy != "" {
+				delete(auth.Metadata, legacy)
+			}
 		}
 		if metadataPath == "request_retry" {
-			delete(auth.Metadata, "request-retry")
 			if value == nil {
 				delete(auth.Metadata, "request_retry")
 				if root := rootOAuthField(metadataPath); root != "" {
@@ -740,31 +755,75 @@ func decodeOAuthFieldPatchValue(raw json.RawMessage) (any, error) {
 }
 
 func removeOAuthFieldPatchIdentifierFields(fields map[string]json.RawMessage) {
-	for _, key := range []string{"id", "uuid", "auth_index", "index", "name", "file", "filename"} {
-		delete(fields, key)
+	for key := range fields {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "id", "uuid", "auth_index", "authindex", "index", "name", "file", "filename":
+			delete(fields, key)
+		}
 	}
 }
 
 func removeOAuthFieldPatchConcurrencyFields(fields map[string]json.RawMessage) {
-	for _, key := range []string{"version", "max_in_flight", "max_in_flight_by_model"} {
-		delete(fields, key)
+	for key := range fields {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "version", "max_in_flight", "max_in_flight_by_model":
+			delete(fields, key)
+		}
 	}
 }
 
-func oauthMetadataFieldPath(path string) string {
-	parts := strings.Split(strings.TrimSpace(path), ".")
-	for index := range parts {
-		parts[index] = strings.TrimSpace(parts[index])
-	}
-	switch parts[0] {
-	case "proxy-url":
-		parts[0] = "proxy_url"
+func canonicalOAuthMetadataKey(key string) string {
+	switch key {
+	case "api-key":
+		return "api_key"
+	case "base-url":
+		return "base_url"
 	case "disable-cooling":
-		parts[0] = "disable_cooling"
+		return "disable_cooling"
+	case "excluded-models":
+		return "excluded_models"
+	case "fingerprint-profile":
+		return "fingerprint_profile"
+	case "model-aliases":
+		return "model_aliases"
+	case "proxy-url":
+		return "proxy_url"
 	case "request-retry":
-		parts[0] = "request_retry"
+		return "request_retry"
+	case "request-scoped-errors":
+		return "request_scoped_errors"
+	case "tool-prefix-disabled":
+		return "tool_prefix_disabled"
+	default:
+		return key
 	}
-	return strings.Join(parts, ".")
+}
+
+func legacyOAuthMetadataKey(canonicalKey string) string {
+	switch canonicalKey {
+	case "api_key":
+		return "api-key"
+	case "base_url":
+		return "base-url"
+	case "disable_cooling":
+		return "disable-cooling"
+	case "excluded_models":
+		return "excluded-models"
+	case "fingerprint_profile":
+		return "fingerprint-profile"
+	case "model_aliases":
+		return "model-aliases"
+	case "proxy_url":
+		return "proxy-url"
+	case "request_retry":
+		return "request-retry"
+	case "request_scoped_errors":
+		return "request-scoped-errors"
+	case "tool_prefix_disabled":
+		return "tool-prefix-disabled"
+	default:
+		return ""
+	}
 }
 
 func rootOAuthField(path string) string {
@@ -867,14 +926,10 @@ func syncOAuthMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct
 		return
 	}
 	if _, ok := touchedRoots["prefix"]; ok {
-		if prefix, okString := auth.Metadata["prefix"].(string); okString {
-			auth.Prefix = strings.TrimSpace(prefix)
-		}
+		auth.Prefix = stringFromAny(auth.Metadata["prefix"])
 	}
 	if _, ok := touchedRoots["proxy_url"]; ok {
-		if proxyURL, okString := auth.Metadata["proxy_url"].(string); okString {
-			auth.ProxyURL = strings.TrimSpace(proxyURL)
-		}
+		auth.ProxyURL = stringFromAny(auth.Metadata["proxy_url"])
 	}
 	if _, ok := touchedRoots["headers"]; ok {
 		syncOAuthHeaderAttributes(auth)
