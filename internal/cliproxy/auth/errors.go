@@ -1,5 +1,11 @@
 package auth
 
+// UpstreamResponse contains the exact HTTP response returned by a provider.
+type UpstreamResponse struct {
+	Status int    `json:"status"`
+	Body   []byte `json:"body"`
+}
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.
@@ -10,12 +16,18 @@ type Error struct {
 	Retryable bool `json:"retryable"`
 	// HTTPStatus optionally records an HTTP-like status code for the error.
 	HTTPStatus int `json:"http_status,omitempty"`
+	// Upstream preserves the provider response independently from internal
+	// scheduling classification.
+	Upstream *UpstreamResponse `json:"upstream,omitempty"`
 }
 
 // Error returns the error message.
 func (e *Error) Error() string {
 	if e == nil {
 		return ""
+	}
+	if e.Upstream != nil {
+		return string(e.Upstream.Body)
 	}
 	if e.Code == "" {
 		return e.Message

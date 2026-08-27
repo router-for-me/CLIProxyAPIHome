@@ -733,6 +733,7 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 		item.Status = auth.Status
 		item.Disabled = auth.Disabled
 		item.Unavailable = auth.Unavailable
+		item.RefreshBlocked = coreauth.RefreshBlocksDispatch(auth)
 		item.NextRetryAfter = auth.NextRetryAfter
 		item.Quota = auth.Quota
 		item.ModelStates = auth.ModelStates
@@ -778,6 +779,7 @@ func authFromIndex(item AuthIndex) *coreauth.Auth {
 		Status:                item.Status,
 		Disabled:              item.Disabled,
 		Unavailable:           item.Unavailable,
+		RuntimeRefreshBlocked: item.RefreshBlocked,
 		NextRetryAfter:        item.NextRetryAfter,
 		Quota:                 item.Quota,
 		ModelStates:           cloneModelStateMap(item.ModelStates),

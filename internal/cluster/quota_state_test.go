@@ -316,6 +316,9 @@ func TestClusterAuthIndexCarriesCooldownState(t *testing.T) {
 		t.Fatalf("expected one minimal auth, got %d", len(minimals))
 	}
 	minimal := minimals[0]
+	if minimal.RuntimeRefreshBlocked {
+		t.Fatal("quota cooldown was projected as a credential refresh block")
+	}
 	if minimal.RuntimeDisableCooling == nil || !*minimal.RuntimeDisableCooling {
 		t.Fatal("expected minimal auth to preserve disable-cooling override")
 	}
@@ -331,6 +334,102 @@ func TestClusterAuthIndexCarriesCooldownState(t *testing.T) {
 	}
 	if !state.Quota.NextRecoverAt.Equal(recover) {
 		t.Fatalf("expected minimal model window %v, got %v", recover, state.Quota.NextRecoverAt)
+	}
+}
+
+func TestClusterAuthIndexCarriesRefreshBlockWithoutProviderDiagnostic(t *testing.T) {
+	const authID = "auth-cluster-refresh-block"
+	repo := newQuotaTestRepository(t)
+	ctx := context.Background()
+	retryAt := time.Now().UTC().Add(5 * time.Minute).Round(0)
+	seed := &coreauth.Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "antigravity",
+		Status:         coreauth.StatusError,
+		StatusMessage:  `antigravity refresh: upstream response contains provider-secret`,
+		Unavailable:    true,
+		NextRetryAfter: retryAt,
+		LastError: &coreauth.Error{
+			Code:       "refresh_temporarily_unavailable",
+			Message:    `antigravity refresh: upstream response contains provider-secret`,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		Metadata: map[string]any{
+			"access_token":  "access-secret",
+			"refresh_token": "refresh-secret",
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, seed, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	peerAdapter := NewRuntimeAdapter(repo, "127.0.0.2")
+	if errLoad := peerAdapter.LoadIndex(ctx); errLoad != nil {
+		t.Fatalf("LoadIndex() error = %v", errLoad)
+	}
+	minimals := peerAdapter.ListMinimalAuths()
+	if len(minimals) != 1 || minimals[0] == nil {
+		t.Fatalf("ListMinimalAuths() = %#v, want one auth", minimals)
+	}
+	minimal := minimals[0]
+	if !minimal.Unavailable || !minimal.RuntimeRefreshBlocked || !minimal.NextRetryAfter.Equal(retryAt) {
+		t.Fatalf("minimal refresh block = %#v, want unavailable until %v", minimal, retryAt)
+	}
+	if minimal.LastError != nil || minimal.StatusMessage != "" {
+		t.Fatalf("minimal projection copied provider diagnostic: status=%q error=%#v", minimal.StatusMessage, minimal.LastError)
+	}
+	if _, ok := minimal.Metadata["access_token"]; ok {
+		t.Fatalf("minimal projection copied provider metadata: %#v", minimal.Metadata)
+	}
+}
+
+func TestClusterAuthIndexDoesNotProjectUnsupportedRefreshBackoffAsRefreshBlock(t *testing.T) {
+	const authID = "auth-cluster-refresh-unsupported"
+	const model = "blocked-model"
+	repo := newQuotaTestRepository(t)
+	ctx := context.Background()
+	retryAt := time.Now().UTC().Add(5 * time.Minute).Round(0)
+	seed := &coreauth.Auth{
+		ID:               authID,
+		Index:            authID,
+		Provider:         "custom",
+		Status:           coreauth.StatusError,
+		Unavailable:      true,
+		NextRefreshAfter: retryAt,
+		NextRetryAfter:   retryAt,
+		LastError: &coreauth.Error{
+			Code:       "refresh_unsupported",
+			Message:    "credential does not support refresh",
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			model: {
+				Status:         coreauth.StatusError,
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+			},
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, seed, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	peerAdapter := NewRuntimeAdapter(repo, "127.0.0.2")
+	if errLoad := peerAdapter.LoadIndex(ctx); errLoad != nil {
+		t.Fatalf("LoadIndex() error = %v", errLoad)
+	}
+	minimals := peerAdapter.ListMinimalAuths()
+	if len(minimals) != 1 || minimals[0] == nil {
+		t.Fatalf("ListMinimalAuths() = %#v, want one auth", minimals)
+	}
+	minimal := minimals[0]
+	if minimal.RuntimeRefreshBlocked || coreauth.RefreshBlocksDispatch(minimal) {
+		t.Fatalf("unsupported refresh backoff was projected as a credential-level block: %#v", minimal)
+	}
+	if state := minimal.ModelStates[model]; state == nil || !state.Unavailable {
+		t.Fatalf("model cooldown was lost from minimal projection: %#v", minimal.ModelStates)
 	}
 }
 

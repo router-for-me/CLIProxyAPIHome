@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
@@ -35,11 +36,25 @@ type refreshHTTPError struct {
 	status    int
 	message   string
 	retryable bool
+	upstream  *oautherror.ResponseError
 }
 
 // Error returns the error message.
 func (e *refreshHTTPError) Error() string {
+	if e != nil && e.upstream != nil {
+		return e.upstream.Error()
+	}
+	if e == nil {
+		return "token refresh failed"
+	}
 	return fmt.Sprintf("token refresh failed with status %d: %s", e.status, e.message)
+}
+
+func (e *refreshHTTPError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.upstream
 }
 
 // Retryable reports whether the error can be retried.
@@ -226,16 +241,16 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		message := string(body)
+		upstream := oautherror.NewResponseError(resp.StatusCode, body)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := parseClaudeRetryAfter(resp)
 			setClaudeRefreshBlockedUntil(refreshToken, time.Now().Add(retryAfter))
-			return nil, &refreshHTTPError{status: resp.StatusCode, message: message, retryable: false}
+			return nil, &refreshHTTPError{status: resp.StatusCode, retryable: false, upstream: upstream}
 		}
 		return nil, &refreshHTTPError{
 			status:    resp.StatusCode,
-			message:   message,
 			retryable: resp.StatusCode >= http.StatusInternalServerError,
+			upstream:  upstream,
 		}
 	}
 

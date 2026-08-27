@@ -182,12 +182,25 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if isTokenVersionFencedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
 		return transition
 	}
+	preserveRefreshAcquisition := RefreshBlocksDispatch(auth)
+	refreshStatus := auth.Status
+	refreshStatusMessage := auth.StatusMessage
+	refreshLastError := cloneError(auth.LastError)
+	refreshNextRetryAfter := auth.NextRetryAfter
+	refreshRuntimeBlocked := auth.RuntimeRefreshBlocked
 
 	if result.Success {
 		state := ensureModelState(auth, resultModel)
 		resetModelState(state, now)
 		updateAggregatedAvailability(auth, now)
-		if !hasModelError(auth, now) {
+		if preserveRefreshAcquisition {
+			auth.Status = refreshStatus
+			auth.StatusMessage = refreshStatusMessage
+			auth.LastError = refreshLastError
+			auth.Unavailable = true
+			auth.NextRetryAfter = refreshNextRetryAfter
+			auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
+		} else if !hasModelError(auth, now) {
 			auth.LastError = nil
 			auth.StatusMessage = ""
 			auth.Status = StatusActive
@@ -277,6 +290,14 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
+	if preserveRefreshAcquisition {
+		auth.Status = refreshStatus
+		auth.StatusMessage = refreshStatusMessage
+		auth.LastError = refreshLastError
+		auth.Unavailable = true
+		auth.NextRetryAfter = refreshNextRetryAfter
+		auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
+	}
 	return transition
 }
 
@@ -500,6 +521,8 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	local.Disabled = persisted.Disabled
 	local.UpdatedAt = persisted.UpdatedAt
 	local.StateVersion = persisted.StateVersion
+	localRefreshBlocked := local.RuntimeRefreshBlocked ||
+		(local.LastError != nil && strings.EqualFold(strings.TrimSpace(local.LastError.Code), refreshTransientErrorCode))
 	if state := persisted.ModelStates[resultModel]; state != nil {
 		if local.ModelStates == nil {
 			local.ModelStates = make(map[string]*ModelState)
@@ -509,6 +532,34 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 		delete(local.ModelStates, resultModel)
 	}
 	updateAggregatedAvailability(local, now)
+	persistedRefreshBlocked := RefreshBlocksDispatch(persisted)
+	local.RuntimeRefreshBlocked = persistedRefreshBlocked
+	if localRefreshBlocked && !persistedRefreshBlocked {
+		local.StatusMessage = ""
+		local.LastError = nil
+		var latestModelError *ModelState
+		for _, state := range local.ModelStates {
+			if state == nil {
+				continue
+			}
+			activeError := state.LastError != nil ||
+				(state.Status == StatusError && state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)))
+			if !activeError {
+				continue
+			}
+			if latestModelError == nil || state.UpdatedAt.After(latestModelError.UpdatedAt) {
+				latestModelError = state
+			}
+		}
+		if latestModelError != nil {
+			local.Status = StatusError
+			local.StatusMessage = latestModelError.StatusMessage
+			local.LastError = cloneError(latestModelError.LastError)
+			if local.StatusMessage == "" && local.LastError != nil {
+				local.StatusMessage = local.LastError.Message
+			}
+		}
+	}
 	// The persisted copy can report a clean active state even though this
 	// node still tracks a model error that was never persisted (for example a
 	// transient 5xx). Keep the local error view in that case.
@@ -516,6 +567,10 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 		local.Status = persisted.Status
 		local.StatusMessage = persisted.StatusMessage
 		local.LastError = cloneError(persisted.LastError)
+	}
+	if persistedRefreshBlocked {
+		local.Unavailable = true
+		local.NextRetryAfter = persisted.NextRetryAfter
 	}
 	return local.Clone(), true
 }
@@ -704,12 +759,19 @@ func cloneError(err *Error) *Error {
 	if err == nil {
 		return nil
 	}
-	return &Error{
+	cloned := &Error{
 		Code:       err.Code,
 		Message:    err.Message,
 		Retryable:  err.Retryable,
 		HTTPStatus: err.HTTPStatus,
 	}
+	if err.Upstream != nil {
+		cloned.Upstream = &UpstreamResponse{
+			Status: err.Upstream.Status,
+			Body:   append([]byte(nil), err.Upstream.Body...),
+		}
+	}
+	return cloned
 }
 
 // statusCodeFromResult derives status code from result.
@@ -785,6 +847,7 @@ func disableAuthAfterUnauthorized(auth *Auth, state *ModelState, resultErr *Erro
 	}
 	auth.Disabled = true
 	auth.Unavailable = true
+	auth.RuntimeRefreshBlocked = false
 	auth.Status = StatusDisabled
 	auth.StatusMessage = "unauthorized"
 	auth.NextRetryAfter = time.Time{}

@@ -551,7 +551,7 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 				}
 				payload, errCluster := s.cluster.Handle(connectionCtx, args, clientIP)
 				if errCluster != nil {
-					_ = writer.WriteRedisError("ERR " + errCluster.Error())
+					_ = writer.WriteRedisError(cluster.FormatRESPError(errCluster))
 					return
 				}
 				_ = writer.WriteRedisBulkString(payload)

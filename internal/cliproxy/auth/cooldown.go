@@ -333,6 +333,9 @@ func hasDisabledCooldownState(auth *Auth) bool {
 	if auth.Disabled || auth.Status == StatusDisabled || len(auth.ModelStates) > 0 {
 		return false
 	}
+	if RefreshBlocksDispatch(auth) {
+		return false
+	}
 	authStatus := statusCodeFromResult(auth.LastError)
 	legacyRequestError := authStatus == 0 && !auth.Quota.Exceeded
 	quotaOwnsRetry := auth.Quota.Exceeded && auth.NextRetryAfter.Equal(auth.Quota.NextRecoverAt)
@@ -343,6 +346,13 @@ func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
 	if auth == nil {
 		return false
 	}
+	preserveRefreshAcquisition := !auth.Disabled && auth.Status != StatusDisabled && RefreshBlocksDispatch(auth)
+	refreshStatus := auth.Status
+	refreshStatusMessage := auth.StatusMessage
+	refreshLastError := cloneError(auth.LastError)
+	refreshUnavailable := auth.Unavailable
+	refreshNextRetryAfter := auth.NextRetryAfter
+	refreshRuntimeBlocked := auth.RuntimeRefreshBlocked
 	quotaTransition := clearQuotaCooldownState(auth, nil, now, true)
 
 	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
@@ -384,7 +394,7 @@ func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
 
 	legacyAuthRequestError := authStatus == 0 && !auth.Quota.Exceeded
 	quotaOwnsAuthRetry := auth.Quota.Exceeded && auth.NextRetryAfter.Equal(auth.Quota.NextRecoverAt)
-	clearAuthRetry := !wasDisabled && len(auth.ModelStates) == 0 && !auth.NextRetryAfter.IsZero() &&
+	clearAuthRetry := !wasDisabled && !preserveRefreshAcquisition && len(auth.ModelStates) == 0 && !auth.NextRetryAfter.IsZero() &&
 		!quotaOwnsAuthRetry && (legacyAuthRequestError || isRequestErrorCooldownStatus(authStatus))
 	if clearAuthRetry {
 		if auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now) {
@@ -415,6 +425,14 @@ func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
 	} else if preserveAuthState {
 		auth.Unavailable = preservedUnavailable
 		auth.NextRetryAfter = preservedRetryAfter
+	}
+	if preserveRefreshAcquisition {
+		auth.Status = refreshStatus
+		auth.StatusMessage = refreshStatusMessage
+		auth.LastError = refreshLastError
+		auth.Unavailable = refreshUnavailable
+		auth.NextRetryAfter = refreshNextRetryAfter
+		auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
 	}
 	auth.UpdatedAt = now
 	return true
@@ -746,6 +764,7 @@ func (m *Manager) adoptPersistedCooldownState(persisted *Auth, now time.Time) (*
 	local.StatusMessage = persistedClone.StatusMessage
 	local.LastError = cloneError(persistedClone.LastError)
 	local.Unavailable = persistedClone.Unavailable
+	local.RuntimeRefreshBlocked = RefreshBlocksDispatch(persistedClone)
 	local.NextRetryAfter = persistedClone.NextRetryAfter
 	local.Quota = persistedClone.Quota
 	local.ModelStates = mergePersistedCooldownModelStates(persistedClone.ModelStates, local.ModelStates)

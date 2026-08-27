@@ -2,26 +2,27 @@ package codex
 
 import (
 	"net/http"
-	"strings"
 	"testing"
 )
 
-func TestCodexRefreshResponseErrorClassifiesAndRedactsTerminalSignals(t *testing.T) {
+func TestCodexRefreshResponseErrorClassifiesAndPreservesUpstreamBody(t *testing.T) {
 	t.Parallel()
 
-	terminal := newCodexRefreshResponseError(http.StatusBadRequest, []byte(`{"error":"invalid_grant","error_description":"refresh token revoked","refresh_token":"provider-secret"}`))
+	terminalBody := `{"error":"invalid_grant","error_description":"refresh token revoked"}`
+	terminal := newCodexRefreshResponseError(http.StatusBadRequest, []byte(terminalBody))
 	if !isNonRetryableRefreshErr(terminal) {
 		t.Fatalf("invalid_grant error was retryable: %v", terminal)
 	}
-	if strings.Contains(terminal.Error(), "provider-secret") {
-		t.Fatalf("terminal refresh error leaked provider body: %v", terminal)
+	if got := terminal.Error(); got != terminalBody {
+		t.Fatalf("terminal refresh error = %q, want exact body %q", got, terminalBody)
 	}
 
-	generic := newCodexRefreshResponseError(http.StatusUnauthorized, []byte(`{"error":"unauthorized","message":"proxy authentication required","access_token":"provider-secret"}`))
+	genericBody := `{"error":"unauthorized","message":"proxy authentication required"}`
+	generic := newCodexRefreshResponseError(http.StatusUnauthorized, []byte(genericBody))
 	if isNonRetryableRefreshErr(generic) {
 		t.Fatalf("generic HTTP 401 was classified as terminal: %v", generic)
 	}
-	if strings.Contains(generic.Error(), "provider-secret") {
-		t.Fatalf("generic refresh error leaked provider body: %v", generic)
+	if got := generic.Error(); got != genericBody {
+		t.Fatalf("generic refresh error = %q, want exact body %q", got, genericBody)
 	}
 }

@@ -493,6 +493,125 @@ func TestAdoptPersistedStateKeepsLocalModelError(t *testing.T) {
 	}
 }
 
+func TestAdoptPersistedStateClearsRefreshErrorAndRebuildsLocalModelError(t *testing.T) {
+	const authID = "auth-clear-refresh-block"
+	now := time.Now().UTC()
+	retryAt := now.Add(5 * time.Minute)
+	manager := NewManager(nil, nil, nil)
+	local := &Auth{
+		ID:                    authID,
+		Index:                 authID,
+		Provider:              "codex",
+		Status:                StatusError,
+		StatusMessage:         refreshTransientErrorMsg,
+		Unavailable:           true,
+		RuntimeRefreshBlocked: true,
+		NextRetryAfter:        retryAt,
+		LastError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    refreshTransientErrorMsg,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		ModelStates: map[string]*ModelState{
+			"model-a": {
+				Status:         StatusError,
+				StatusMessage:  "model-a failed",
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+				LastError:      &Error{Message: "local upstream failure", HTTPStatus: http.StatusBadGateway},
+				UpdatedAt:      now,
+			},
+			"model-b": {
+				Status:    StatusError,
+				LastError: &Error{Message: "stale model-b error", HTTPStatus: http.StatusBadGateway},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), local); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	persisted := &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+	}
+
+	adopted, current := manager.adoptPersistedResultState(Result{AuthID: authID, Model: "model-b"}, "model-b", persisted, now)
+	if !current || adopted == nil {
+		t.Fatalf("adoptPersistedResultState() = %#v/%v, want current auth", adopted, current)
+	}
+	if !adopted.Unavailable || adopted.RuntimeRefreshBlocked || RefreshBlocksDispatch(adopted) {
+		t.Fatalf("cleared persisted refresh block remained active: %#v", adopted)
+	}
+	if adopted.Status != StatusError || adopted.StatusMessage != "model-a failed" || adopted.LastError == nil || adopted.LastError.Message != "local upstream failure" {
+		t.Fatalf("auth-level model error was not rebuilt from model-a: %#v", adopted)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(adopted, "model-a", now); !blocked {
+		t.Fatal("surviving model-a error was cleared with the credential refresh block")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(adopted, "model-c", now); blocked {
+		t.Fatal("cleared credential refresh block still blocked an unrelated model")
+	}
+	if state := adopted.ModelStates["model-b"]; state != nil {
+		t.Fatalf("cleared persisted model-b state remained local: %#v", state)
+	}
+}
+
+func TestMarkResultAdoptsPersistedRefreshBlock(t *testing.T) {
+	const authID = "auth-adopt-refresh-block"
+	const model = "gpt-5"
+	now := time.Now().UTC()
+	retryAt := now.Add(5 * time.Minute)
+	const providerMessage = `codex refresh: Post "https://auth.openai.com/oauth/token": proxyconnect tcp: connection refused`
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  providerMessage,
+		Unavailable:    true,
+		NextRetryAfter: retryAt,
+		LastError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    providerMessage,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		Metadata: map[string]any{"access_token": "persisted-access-token"},
+	}}
+	manager := NewManager(store, nil, nil)
+	minimal := &Auth{
+		ID:                    authID,
+		Index:                 authID,
+		Provider:              "codex",
+		Status:                StatusError,
+		Unavailable:           true,
+		RuntimeRefreshBlocked: true,
+		NextRetryAfter:        retryAt,
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), minimal); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), Result{AuthID: authID, Provider: "codex", Model: model, Success: true})
+
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil {
+		t.Fatal("GetByID() missing auth")
+	}
+	if local.Status != StatusError || !local.Unavailable || !local.RuntimeRefreshBlocked || !local.NextRetryAfter.Equal(retryAt) {
+		t.Fatalf("local refresh block = %#v, want persisted credential-level block", local)
+	}
+	if local.LastError == nil || local.LastError.Code != refreshTransientErrorCode || local.LastError.Message != providerMessage {
+		t.Fatalf("local refresh error = %#v, want persisted provider diagnostic", local.LastError)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(local, model, retryAt.Add(time.Hour)); !blocked {
+		t.Fatal("late execution success made refresh-failed auth dispatchable")
+	}
+}
+
 // blockingMutatorStore blocks inside MutateAuthState so tests can assert the
 // manager lock is not held during persisted state mutations.
 type blockingMutatorStore struct {

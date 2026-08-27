@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -30,6 +31,24 @@ const (
 
 // ErrRefreshTokenRejected marks an explicit terminal OAuth refresh response.
 var ErrRefreshTokenRejected = errors.New("kimi refresh token rejected")
+
+type refreshTokenRejectedError struct {
+	upstream *oautherror.ResponseError
+}
+
+func (e *refreshTokenRejectedError) Error() string {
+	if e == nil || e.upstream == nil {
+		return ErrRefreshTokenRejected.Error()
+	}
+	return e.upstream.Error()
+}
+
+func (e *refreshTokenRejectedError) Unwrap() []error {
+	if e == nil || e.upstream == nil {
+		return []error{ErrRefreshTokenRejected}
+	}
+	return []error{ErrRefreshTokenRejected, e.upstream}
+}
 
 // DeviceFlowClient is a minimal Kimi OAuth client used for refresh-token exchange.
 type DeviceFlowClient struct {
@@ -190,27 +209,20 @@ func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string
 }
 
 func kimiRefreshResponseError(statusCode int, body []byte) error {
-	var oauthErr struct {
-		Error            string `json:"error"`
-		Code             string `json:"code"`
-		ErrorDescription string `json:"error_description"`
-		Message          string `json:"message"`
-		Detail           string `json:"detail"`
-	}
-	_ = json.Unmarshal(body, &oauthErr)
-	code := strings.ToLower(strings.TrimSpace(oauthErr.Error))
+	upstream := oautherror.NewResponseError(statusCode, body)
+	code := strings.ToLower(strings.TrimSpace(upstream.OAuthError()))
 	if code == "" {
-		code = strings.ToLower(strings.TrimSpace(oauthErr.Code))
+		code = strings.ToLower(strings.TrimSpace(upstream.Code()))
 	}
 	switch code {
 	case "invalid_grant", "refresh_token_expired", "refresh_token_revoked", "refresh_token_reused":
-		return fmt.Errorf("%w (status %d)", ErrRefreshTokenRejected, statusCode)
+		return &refreshTokenRejectedError{upstream: upstream}
 	}
-	description := strings.ToLower(strings.Join([]string{oauthErr.ErrorDescription, oauthErr.Message, oauthErr.Detail}, " "))
+	description := strings.ToLower(strings.Join([]string{upstream.ErrorDescription(), upstream.Message(), upstream.Detail()}, " "))
 	if strings.Contains(description, "refresh token") || strings.Contains(description, "refresh_token") {
 		if strings.Contains(description, "expired") || strings.Contains(description, "revoked") || strings.Contains(description, "reused") {
-			return fmt.Errorf("%w (status %d)", ErrRefreshTokenRejected, statusCode)
+			return &refreshTokenRejectedError{upstream: upstream}
 		}
 	}
-	return fmt.Errorf("kimi: refresh failed with status %d", statusCode)
+	return upstream
 }

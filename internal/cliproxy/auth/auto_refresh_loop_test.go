@@ -80,12 +80,12 @@ func TestNextRefreshCheckAtUsesProviderExpiryLead(t *testing.T) {
 		want     time.Time
 		wantDue  bool
 	}{
-		{name: "Codex", provider: "codex", lead: codexRefreshLead, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(5 * 24 * time.Hour)},
-		{name: "Claude", provider: "claude", lead: claudeRefreshLead, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - claudeRefreshLead)},
-		{name: "Antigravity", provider: "antigravity", lead: antigravityRefreshLead, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - antigravityRefreshLead)},
-		{name: "Kimi", provider: "kimi", lead: kimiRefreshLead, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - kimiRefreshLead)},
-		{name: "xAI", provider: "xai", lead: xaiRefreshLead, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - xaiRefreshLead)},
-		{name: "boundary is due", provider: "xai", lead: xaiRefreshLead, expiry: now.Add(xaiRefreshLead), want: now, wantDue: true},
+		{name: "Codex", provider: "codex", lead: 5 * 24 * time.Hour, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(5 * 24 * time.Hour)},
+		{name: "Claude", provider: "claude", lead: 4 * time.Hour, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 4*time.Hour)},
+		{name: "Antigravity", provider: "antigravity", lead: 50 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 50*time.Minute)},
+		{name: "Kimi", provider: "kimi", lead: 5 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 5*time.Minute)},
+		{name: "xAI", provider: "xai", lead: 5 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 5*time.Minute)},
+		{name: "boundary is due", provider: "xai", lead: 5 * time.Minute, expiry: now.Add(5 * time.Minute), want: now, wantDue: true},
 	}
 	manager := NewManager(nil, nil, nil)
 

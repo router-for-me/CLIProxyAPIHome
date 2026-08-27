@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,7 +21,10 @@ import (
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 )
 
-const clusterRESPTimeout = 35 * time.Second
+const (
+	clusterRESPTimeout               = 35 * time.Second
+	clusterRESPStructuredErrorMarker = " home-error-v1:"
+)
 
 type RESPHandler struct {
 	coordinator *Coordinator
@@ -482,12 +487,52 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 	}
 }
 
+// FormatRESPError encodes structured auth errors into a single-line RESP
+// error while retaining a legacy type/message prefix for older Home nodes.
+func FormatRESPError(err error) string {
+	if err == nil {
+		return "ERR cluster error"
+	}
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return "ERR " + singleLineRESPError(err.Error())
+	}
+	raw, errMarshal := json.Marshal(authErr)
+	if errMarshal != nil {
+		return "ERR " + singleLineRESPError(authErr.Error())
+	}
+	errorType := strings.TrimSpace(authErr.Code)
+	if errorType == "" {
+		errorType = homeerrors.TypeError
+	}
+	message := strings.TrimSpace(authErr.Message)
+	if message == "" {
+		message = "credential refresh failed"
+	}
+	legacy := singleLineRESPError(errorType + ": " + message)
+	return "ERR " + legacy + clusterRESPStructuredErrorMarker + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func singleLineRESPError(message string) string {
+	message = strings.NewReplacer("\r", " ", "\n", " ").Replace(message)
+	return strings.Join(strings.Fields(message), " ")
+}
+
 // parseClusterRESPError restores structured application errors sent by another
 // Home node while leaving transport and protocol failures as ordinary errors.
 func parseClusterRESPError(line string) error {
 	message := strings.TrimSpace(line)
 	if len(message) > 4 && strings.EqualFold(message[:4], "ERR ") {
 		message = strings.TrimSpace(message[4:])
+	}
+	if marker := strings.LastIndex(message, clusterRESPStructuredErrorMarker); marker >= 0 {
+		encoded := strings.TrimSpace(message[marker+len(clusterRESPStructuredErrorMarker):])
+		if raw, errDecode := base64.RawURLEncoding.DecodeString(encoded); errDecode == nil {
+			var authErr coreauth.Error
+			if errUnmarshal := json.Unmarshal(raw, &authErr); errUnmarshal == nil {
+				return &authErr
+			}
+		}
 	}
 	errorType, errorMessage := homeerrors.SplitRedisErrorMessage(message)
 	if errorType == homeerrors.TypeError {

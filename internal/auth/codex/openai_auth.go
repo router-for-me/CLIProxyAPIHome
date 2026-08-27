@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -34,16 +35,24 @@ type CodexAuth struct {
 type codexRefreshResponseError struct {
 	statusCode   int
 	terminalCode string
+	upstream     *oautherror.ResponseError
 }
 
 func (e *codexRefreshResponseError) Error() string {
-	if e != nil && e.terminalCode != "" {
-		return "token refresh failed: " + e.terminalCode
-	}
 	if e == nil {
 		return "token refresh failed"
 	}
+	if e.upstream != nil {
+		return e.upstream.Error()
+	}
 	return fmt.Sprintf("token refresh failed with status %d", e.statusCode)
+}
+
+func (e *codexRefreshResponseError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.upstream
 }
 
 // NewCodexAuthWithProxyURL creates a new CodexAuth service instance.
@@ -173,19 +182,13 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 }
 
 func newCodexRefreshResponseError(statusCode int, body []byte) error {
-	var oauthErr struct {
-		Error            string `json:"error"`
-		Code             string `json:"code"`
-		ErrorDescription string `json:"error_description"`
-		Message          string `json:"message"`
-	}
-	_ = json.Unmarshal(body, &oauthErr)
-	code := strings.ToLower(strings.TrimSpace(oauthErr.Error))
+	upstream := oautherror.NewResponseError(statusCode, body)
+	code := strings.ToLower(strings.TrimSpace(upstream.OAuthError()))
 	if code == "" {
-		code = strings.ToLower(strings.TrimSpace(oauthErr.Code))
+		code = strings.ToLower(strings.TrimSpace(upstream.Code()))
 	}
-	terminalCode := codexTerminalRefreshCode(code, strings.Join([]string{oauthErr.ErrorDescription, oauthErr.Message}, " "))
-	return &codexRefreshResponseError{statusCode: statusCode, terminalCode: terminalCode}
+	terminalCode := codexTerminalRefreshCode(code, strings.Join([]string{upstream.ErrorDescription(), upstream.Message(), upstream.Detail()}, " "))
+	return &codexRefreshResponseError{statusCode: statusCode, terminalCode: terminalCode, upstream: upstream}
 }
 
 func codexTerminalRefreshCode(code, description string) string {

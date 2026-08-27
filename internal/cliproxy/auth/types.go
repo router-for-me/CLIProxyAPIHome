@@ -52,6 +52,9 @@ type Auth struct {
 	// RuntimeDisableCooling carries the auth-scoped cooling override in minimal
 	// projections without serializing provider metadata or secrets.
 	RuntimeDisableCooling *bool `json:"-"`
+	// RuntimeRefreshBlocked preserves a credential-level refresh block in
+	// minimal projections without copying provider response diagnostics.
+	RuntimeRefreshBlocked bool `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
@@ -214,6 +217,7 @@ func (a *Auth) Clone() *Auth {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.LastError = cloneError(a.LastError)
 	if a.RuntimeDisableCooling != nil {
 		disableCooling := *a.RuntimeDisableCooling
 		copyAuth.RuntimeDisableCooling = &disableCooling
@@ -357,14 +361,7 @@ func (m *ModelState) Clone() *ModelState {
 		return nil
 	}
 	copyState := *m
-	if m.LastError != nil {
-		copyState.LastError = &Error{
-			Code:       m.LastError.Code,
-			Message:    m.LastError.Message,
-			Retryable:  m.LastError.Retryable,
-			HTTPStatus: m.LastError.HTTPStatus,
-		}
-	}
+	copyState.LastError = cloneError(m.LastError)
 	return &copyState
 }
 

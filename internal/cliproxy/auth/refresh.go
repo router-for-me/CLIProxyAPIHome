@@ -15,6 +15,7 @@ import (
 	claudeauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/claude"
 	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	kimiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/kimi"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	xaiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	log "github.com/sirupsen/logrus"
@@ -58,7 +59,7 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
-		return nil, err
+		return nil, builtInRefreshError("codex", err)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -88,7 +89,7 @@ func refreshClaude(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, 
 	svc := claudeauth.NewClaudeAuthWithProxyURL(cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
-		return nil, err
+		return nil, builtInRefreshError("claude", err)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -114,10 +115,7 @@ func refreshKimi(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, er
 	client := kimiauth.NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg, resolveKimiDeviceID(auth), auth.ProxyURL)
 	td, err := client.RefreshToken(ctx, refreshToken)
 	if err != nil {
-		if errors.Is(err, kimiauth.ErrRefreshTokenRejected) {
-			return nil, newUnauthorizedRefreshError()
-		}
-		return nil, err
+		return nil, builtInRefreshError("kimi", err)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -145,20 +143,74 @@ func resolveKimiDeviceID(auth *Auth) string {
 	return ""
 }
 
-type oauthRefreshErrorResponse struct {
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
+// providerRefreshError carries diagnostics returned by a built-in provider.
+type providerRefreshError struct {
+	message string
+	cause   error
 }
 
-// antigravityOAuthRefreshError classifies terminal OAuth failures without retaining
-// the upstream response body, which may contain credential material.
-func antigravityOAuthRefreshError(statusCode int, body []byte) error {
-	var oauthErr oauthRefreshErrorResponse
-	if errUnmarshal := json.Unmarshal(body, &oauthErr); errUnmarshal == nil &&
-		(strings.EqualFold(strings.TrimSpace(oauthErr.Error), "invalid_grant") || isTerminalOAuthRefreshDescription(oauthErr.ErrorDescription)) {
-		return newUnauthorizedRefreshError()
+func (e *providerRefreshError) Error() string {
+	if e == nil {
+		return ""
 	}
-	return fmt.Errorf("antigravity refresh: oauth refresh failed with status %d", statusCode)
+	type upstreamResponseError interface {
+		ResponseBody() []byte
+	}
+	var upstream upstreamResponseError
+	if errors.As(e.cause, &upstream) && upstream != nil {
+		return string(upstream.ResponseBody())
+	}
+	return e.message
+}
+
+func (e *providerRefreshError) StatusCode() int {
+	return http.StatusServiceUnavailable
+}
+
+func (e *providerRefreshError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// builtInRefreshError preserves diagnostics emitted by built-in provider
+// clients, including transport and response-read failures.
+func builtInRefreshError(provider string, errRefresh error) error {
+	if errRefresh == nil {
+		return nil
+	}
+	if errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+		return errRefresh
+	}
+	var existing *providerRefreshError
+	if errors.As(errRefresh, &existing) && existing != nil {
+		return errRefresh
+	}
+	diagnostic := errRefresh.Error()
+	var upstream *oautherror.ResponseError
+	if errors.As(errRefresh, &upstream) && upstream != nil {
+		diagnostic = upstream.Error()
+	}
+	return &providerRefreshError{
+		message: fmt.Sprintf("%s refresh: %s", provider, diagnostic),
+		cause:   errRefresh,
+	}
+}
+
+// antigravityOAuthRefreshError classifies terminal OAuth failures while
+// preserving the upstream response diagnostics.
+func antigravityOAuthRefreshError(statusCode int, body []byte) error {
+	upstream := oautherror.NewResponseError(statusCode, body)
+	code := strings.TrimSpace(upstream.OAuthError())
+	if code == "" {
+		code = strings.TrimSpace(upstream.Code())
+	}
+	cause := error(upstream)
+	if strings.EqualFold(code, "invalid_grant") || isTerminalOAuthRefreshDescription(strings.Join([]string{upstream.ErrorDescription(), upstream.Message(), upstream.Detail()}, " ")) {
+		cause = fmt.Errorf("%w: %w", newUnauthorizedRefreshError(), upstream)
+	}
+	return builtInRefreshError("antigravity", cause)
 }
 
 // isTerminalOAuthRefreshDescription recognizes explicit expired or revoked
@@ -178,6 +230,9 @@ func isTerminalOAuthRefreshDescription(description string) bool {
 		"refresh token has been revoked",
 		"refresh token is revoked",
 		"refresh token revoked",
+		"refresh token has been reused",
+		"refresh token is reused",
+		"refresh token reused",
 	} {
 		if strings.Contains(normalized, signal) {
 			return true
@@ -203,7 +258,7 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
 	if errReq != nil {
-		return nil, errReq
+		return nil, builtInRefreshError("antigravity", errReq)
 	}
 	req.Header.Set("Host", "oauth2.googleapis.com")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -215,7 +270,7 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 	}
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return nil, errDo
+		return nil, builtInRefreshError("antigravity", errDo)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -224,7 +279,7 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 	}()
 	body, errRead := io.ReadAll(resp.Body)
 	if errRead != nil {
-		return nil, errRead
+		return nil, builtInRefreshError("antigravity", errRead)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, antigravityOAuthRefreshError(resp.StatusCode, body)
@@ -237,7 +292,7 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 		TokenType    string `json:"token_type"`
 	}
 	if errUnmarshal := json.Unmarshal(body, &tokenResp); errUnmarshal != nil {
-		return nil, errUnmarshal
+		return nil, builtInRefreshError("antigravity", errUnmarshal)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -267,13 +322,13 @@ func refreshXAI(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, err
 	if tokenEndpoint == "" {
 		discovery, errDiscover := svc.Discover(ctx)
 		if errDiscover != nil {
-			return nil, errDiscover
+			return nil, builtInRefreshError("xai", errDiscover)
 		}
 		tokenEndpoint = discovery.TokenEndpoint
 	}
 	td, errRefresh := svc.RefreshTokens(ctx, refreshToken, tokenEndpoint)
 	if errRefresh != nil {
-		return nil, errRefresh
+		return nil, builtInRefreshError("xai", errRefresh)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
