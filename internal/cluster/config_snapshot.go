@@ -142,6 +142,14 @@ func ConfigRootFromSnapshot(snapshot map[string]json.RawMessage) (map[string]any
 // RuntimeConfigFromRoot derives runtime config from root.
 func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, error) {
 	// Normalize source data before building the derived payload.
+	if _, exists := root["port"]; !exists {
+		rootWithDefaultPort := make(map[string]any, len(root)+1)
+		for key, value := range root {
+			rootWithDefaultPort[key] = value
+		}
+		rootWithDefaultPort["port"] = appconfig.DefaultCPAPort
+		root = rootWithDefaultPort
+	}
 	if _, errSecret := normalizeConfigRootSecrets(root); errSecret != nil {
 		return nil, nil, errSecret
 	}
@@ -149,7 +157,7 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	if errMarshal != nil {
 		return nil, nil, errMarshal
 	}
-	cfg := &appconfig.Config{}
+	cfg := &appconfig.Config{Port: appconfig.DefaultCPAPort}
 	cfg.CredentialConcurrency = appconfig.DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = appconfig.DefaultCredentialInFlightConfig()
 	cfg.Pprof.Addr = appconfig.DefaultPprofAddr

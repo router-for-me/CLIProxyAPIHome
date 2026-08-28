@@ -8,7 +8,7 @@
 http://<host>:<port>/user
 ```
 
-Home 示例端口通常为 `8327`。实际监听地址来自 runtime config、`cluster.yaml` 或 `-addr` 的最终值。
+Home 示例端口通常为 `8327`。显式 `-addr` 优先；未指定时，Home 使用 `cluster.yaml` 中的 `node.port`。runtime config 的 `port` 仅下发给 CPA 节点，不参与 Home 监听端口配置。
 
 ## Runtime 模型
 

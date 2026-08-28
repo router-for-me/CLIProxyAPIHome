@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -691,5 +692,88 @@ func TestPutUsageStatisticsEnabledRejectsDisable(t *testing.T) {
 
 	if resp.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestPortRoutesReadAndPersistCPAPort(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	repo := cluster.NewRepository(db)
+	if errReplace := repo.ReplaceConfigSnapshot(context.Background(), map[string]any{"debug": false}); errReplace != nil {
+		t.Fatalf("ReplaceConfigSnapshot() error = %v", errReplace)
+	}
+	handler := NewHandler(repo, nil, "127.0.0.1", 8327)
+	engine := gin.New()
+	engine.GET("/port", handler.GetPort)
+	engine.PUT("/port", handler.PutPort)
+	engine.PATCH("/port", handler.PutPort)
+
+	getResp := httptest.NewRecorder()
+	engine.ServeHTTP(getResp, httptest.NewRequest(http.MethodGet, "/port", nil))
+	if getResp.Code != http.StatusOK || strings.TrimSpace(getResp.Body.String()) != `{"port":8317}` {
+		t.Fatalf("GET /port status = %d, body = %s", getResp.Code, getResp.Body.String())
+	}
+
+	for _, request := range []struct {
+		method string
+		port   int
+	}{
+		{method: http.MethodPut, port: 8317},
+		{method: http.MethodPatch, port: 8318},
+	} {
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(request.method, "/port", strings.NewReader(fmt.Sprintf(`{"value":%d}`, request.port)))
+		req.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("%s /port status = %d, body = %s", request.method, resp.Code, resp.Body.String())
+		}
+	}
+
+	cfg, payload, errConfig := repo.LoadConfigAsRuntimeConfig(context.Background())
+	if errConfig != nil {
+		t.Fatalf("LoadConfigAsRuntimeConfig() error = %v", errConfig)
+	}
+	if cfg.Port != 8318 || !strings.Contains(string(payload), "port: 8318") {
+		t.Fatalf("runtime port = %d, payload = %s", cfg.Port, payload)
+	}
+	snapshot, errSnapshot := repo.LoadConfigSnapshot(context.Background())
+	if errSnapshot != nil {
+		t.Fatalf("LoadConfigSnapshot() error = %v", errSnapshot)
+	}
+	if string(snapshot["port"]) != "8318" || string(snapshot["debug"]) != "false" {
+		t.Fatalf("snapshot port = %s, debug = %s", snapshot["port"], snapshot["debug"])
+	}
+}
+
+func TestPutPortRejectsOutOfRangeValues(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	repo := cluster.NewRepository(db)
+	if errReplace := repo.ReplaceConfigSnapshot(context.Background(), map[string]any{"port": 8317}); errReplace != nil {
+		t.Fatalf("ReplaceConfigSnapshot() error = %v", errReplace)
+	}
+	handler := NewHandler(repo, nil, "127.0.0.1", 8327)
+	engine := gin.New()
+	engine.PUT("/port", handler.PutPort)
+
+	for _, port := range []int{0, -1, 65536} {
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/port", strings.NewReader(fmt.Sprintf(`{"value":%d}`, port)))
+		req.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(resp, req)
+		if resp.Code != http.StatusUnprocessableEntity || !strings.Contains(resp.Body.String(), `"error":"invalid_port"`) {
+			t.Fatalf("port %d status = %d, body = %s", port, resp.Code, resp.Body.String())
+		}
+	}
+
+	snapshot, errSnapshot := repo.LoadConfigSnapshot(context.Background())
+	if errSnapshot != nil {
+		t.Fatalf("LoadConfigSnapshot() error = %v", errSnapshot)
+	}
+	if string(snapshot["port"]) != "8317" {
+		t.Fatalf("snapshot port = %s, want 8317", snapshot["port"])
 	}
 }

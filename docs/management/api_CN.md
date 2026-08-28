@@ -20,7 +20,7 @@ GET /assets/*
 
 Panel assets 会在构建时内嵌到二进制中。
 
-Home 示例端口通常为 `8327`。实际监听地址来自 runtime config、`cluster.yaml` 或 `-addr` 的最终值。
+Home 示例端口通常为 `8327`。显式 `-addr` 优先；未指定时，Home 使用 `cluster.yaml` 中的 `node.port`。runtime config 的 `port` 仅下发给 CPA 节点，不参与 Home 监听端口配置。
 
 ## Runtime 模型
 
@@ -261,6 +261,9 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/plugin-store-auth/:id` |
 | `PATCH` | `/plugin-store-auth/:id` |
 | `DELETE` | `/plugin-store-auth/:id` |
+| `GET` | `/port` |
+| `PATCH` | `/port` |
+| `PUT` | `/port` |
 | `DELETE` | `/proxy-url` |
 | `GET` | `/proxy-url` |
 | `PATCH` | `/proxy-url` |
@@ -466,8 +469,12 @@ openai-compatibility
 
 这些接口会写入 cluster repository 中对应 config root，并 reload Home runtime。
 
+端口变更需要重启 CPA：`PUT/PATCH /port` 会立即持久化并下发新值，但已运行的 CPA 不会重新绑定监听端口，必须重启对应的 CPA 进程后才会生效。
+
 | Method | Path | 输入 | 输出 |
 | --- | --- | --- | --- |
+| `GET` | `/port` | 无 | `{ "port": number }` |
+| `PUT/PATCH` | `/port` | `{ "value": number }`；必须是 `1` 到 `65535` 之间的整数。 | `{ "status": "ok" }` |
 | `GET` | `/debug` | 无 | `{ "debug": boolean }` |
 | `PUT/PATCH` | `/debug` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/logging-to-file` | 无 | `{ "logging-to-file": boolean }` |
@@ -4034,7 +4041,7 @@ DELETE query：
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `host` | string | 服务绑定 host/interface。 |
-| `port` | integer | 服务监听端口。 |
+| `port` | integer | Home 下发的 CPA 服务监听端口；省略时默认为 `8317`。 |
 | `allow-host` | array of string | RESP client IP allowlist；空列表表示允许所有 host。 |
 | `tls.enable` | boolean | 启用 HTTPS。 |
 | `tls.cert` | string | TLS certificate 路径。 |

@@ -39,6 +39,8 @@ var (
 	BuildDate = "unknown"
 )
 
+const defaultHomeListenPort = 8327
+
 // init copies main package build metadata into shared build info.
 func init() {
 	buildinfo.Version = Version
@@ -728,10 +730,9 @@ func resolveListenAddress(addr string, cfg *config.Config, clusterCfg *cluster.C
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		host := ""
-		port := 0
+		port := defaultHomeListenPort
 		if cfg != nil {
 			host = strings.TrimSpace(cfg.Host)
-			port = cfg.Port
 		}
 		if clusterEnabled {
 			if clusterCfg == nil {

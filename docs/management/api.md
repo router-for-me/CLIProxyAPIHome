@@ -20,7 +20,7 @@ GET /assets/*
 
 The panel assets are embedded into the binary at build time.
 
-Home examples usually use port `8327`. The effective listen address comes from runtime config, `cluster.yaml`, or the final `-addr` value.
+Home examples usually use port `8327`. An explicit `-addr` takes precedence; otherwise Home uses `node.port` from `cluster.yaml`. The runtime config `port` is distributed to CPA nodes and does not configure the Home listener.
 
 ## Runtime Model
 
@@ -261,6 +261,9 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/plugin-store-auth/:id` |
 | `PATCH` | `/plugin-store-auth/:id` |
 | `DELETE` | `/plugin-store-auth/:id` |
+| `GET` | `/port` |
+| `PATCH` | `/port` |
+| `PUT` | `/port` |
 | `DELETE` | `/proxy-url` |
 | `GET` | `/proxy-url` |
 | `PATCH` | `/proxy-url` |
@@ -466,8 +469,12 @@ Example response:
 
 These routes write the corresponding config root into the cluster repository and reload the Home runtime.
 
+Port changes require a CPA restart: `PUT/PATCH /port` persists and distributes the new value immediately, but an already running CPA does not rebind its listener until that CPA process is restarted.
+
 | Method | Path | Input | Output |
 | --- | --- | --- | --- |
+| `GET` | `/port` | none | `{ "port": number }` |
+| `PUT/PATCH` | `/port` | `{ "value": number }`; must be an integer from `1` to `65535`. | `{ "status": "ok" }` |
 | `GET` | `/debug` | none | `{ "debug": boolean }` |
 | `PUT/PATCH` | `/debug` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/logging-to-file` | none | `{ "logging-to-file": boolean }` |
@@ -4066,7 +4073,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | Field | Type | Description |
 | --- | --- | --- |
 | `host` | string | Service bind host/interface. |
-| `port` | integer | Service listen port. |
+| `port` | integer | CPA service listen port distributed by Home; defaults to `8317` when omitted. |
 | `allow-host` | array of string | RESP client IP allowlist. Empty list allows all hosts. |
 | `tls.enable` | boolean | Enable HTTPS. |
 | `tls.cert` | string | TLS certificate path. |

@@ -8,14 +8,21 @@ import (
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"gopkg.in/yaml.v3"
 )
 
 func TestRuntimeConfigFromRootAppliesConcurrencyDefaults(t *testing.T) {
-	cfg, _, errConfig := RuntimeConfigFromRoot(map[string]any{})
+	cfg, payload, errConfig := RuntimeConfigFromRoot(map[string]any{})
 	if errConfig != nil {
 		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
+	}
+	if cfg.Port != appconfig.DefaultCPAPort {
+		t.Fatalf("Port = %d, want %d", cfg.Port, appconfig.DefaultCPAPort)
+	}
+	if !strings.Contains(string(payload), "port: 8317") {
+		t.Fatalf("runtime payload = %s, want default CPA port", payload)
 	}
 	if cfg.CredentialConcurrency.ReleaseFlushInterval != "250ms" {
 		t.Fatalf("ReleaseFlushInterval = %q", cfg.CredentialConcurrency.ReleaseFlushInterval)

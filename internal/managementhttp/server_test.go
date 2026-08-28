@@ -127,6 +127,22 @@ func TestClusterManagementAPIKeyUsageRouteRegistered(t *testing.T) {
 	}
 }
 
+func TestClusterManagementPortRoutesRegistered(t *testing.T) {
+	reg := newRouteRegistry()
+	handler := clustermanagement.NewHandler(nil, nil, "", 0)
+	registerClusterManagementRoutes(reg, handler)
+
+	for _, route := range []RouteKey{
+		{Method: http.MethodGet, Path: "/port"},
+		{Method: http.MethodPut, Path: "/port"},
+		{Method: http.MethodPatch, Path: "/port"},
+	} {
+		if reg.routes[route] == nil {
+			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
+		}
+	}
+}
+
 func TestClusterManagementLogRoutesRegistered(t *testing.T) {
 	reg := newRouteRegistry()
 	legacyDeleteCalled := false

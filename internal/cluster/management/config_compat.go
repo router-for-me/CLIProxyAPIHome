@@ -135,6 +135,38 @@ func (h *Handler) updateStringConfigField(c *gin.Context, rootKey string, set fu
 	h.persistConfigRootKey(c, ctx, cfg, rootKey)
 }
 
+// GetPort returns the CPA server port distributed by Home.
+func (h *Handler) GetPort(c *gin.Context) {
+	_, cancel, cfg, ok := h.loadRuntimeConfig(c)
+	if !ok {
+		return
+	}
+	defer cancel()
+	c.JSON(http.StatusOK, gin.H{"port": cfg.Port})
+}
+
+// PutPort replaces the CPA server port distributed by Home.
+func (h *Handler) PutPort(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if *body.Value < 1 || *body.Value > 65535 {
+		respondError(c, http.StatusUnprocessableEntity, "invalid_port", errors.New("port must be between 1 and 65535"))
+		return
+	}
+	ctx, cancel, cfg, ok := h.loadRuntimeConfig(c)
+	if !ok {
+		return
+	}
+	defer cancel()
+	cfg.Port = *body.Value
+	h.persistConfigRootKey(c, ctx, cfg, "port")
+}
+
 // GetDebug returns a debug.
 func (h *Handler) GetDebug(c *gin.Context) {
 	_, cancel, cfg, ok := h.loadRuntimeConfig(c)
