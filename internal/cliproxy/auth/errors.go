@@ -12,6 +12,8 @@ type Error struct {
 	Code string `json:"code,omitempty"`
 	// Message is a human readable description of the failure.
 	Message string `json:"message"`
+	// Diagnostic is a redacted internal summary for trusted transports and logs.
+	Diagnostic string `json:"diagnostic,omitempty"`
 	// Retryable indicates whether a retry might fix the issue automatically.
 	Retryable bool `json:"retryable"`
 	// HTTPStatus optionally records an HTTP-like status code for the error.

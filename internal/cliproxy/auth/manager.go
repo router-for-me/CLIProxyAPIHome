@@ -1367,6 +1367,9 @@ func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
 	auth.RuntimeRefreshBlocked = true
 	auth.Status = StatusError
 	auth.LastError = newTransientRefreshErrorFrom(errRefresh)
+	if auth.LastError.Diagnostic != "" {
+		auth.LastError.Diagnostic = logging.SafeDiagnosticForLog(auth.LastError.Diagnostic + " retry_at=" + retryAt.UTC().Format(time.RFC3339Nano))
+	}
 	auth.StatusMessage = auth.LastError.Message
 	auth.UpdatedAt = now
 }
@@ -1428,14 +1431,9 @@ func newTransientRefreshError() *Error {
 // provider refresh implementation.
 func newTransientRefreshErrorFrom(errRefresh error) *Error {
 	result := newTransientRefreshError()
+	result.Diagnostic = refreshErrorDiagnostic(errRefresh)
 	if copyUpstreamResponse(result, errRefresh) {
 		return result
-	}
-	var providerErr *providerRefreshError
-	if errors.As(errRefresh, &providerErr) && providerErr != nil {
-		if message := strings.TrimSpace(providerErr.Error()); message != "" {
-			result.Message = message
-		}
 	}
 	return result
 }
@@ -1457,16 +1455,48 @@ func newUnauthorizedRefreshError() *Error {
 // newUnauthorizedRefreshErrorFrom preserves a built-in provider response.
 func newUnauthorizedRefreshErrorFrom(errRefresh error) *Error {
 	result := newUnauthorizedRefreshError()
+	result.Diagnostic = refreshErrorDiagnostic(errRefresh)
 	if copyUpstreamResponse(result, errRefresh) {
 		return result
 	}
-	var providerErr *providerRefreshError
-	if errors.As(errRefresh, &providerErr) && providerErr != nil {
-		if message := strings.TrimSpace(providerErr.Error()); message != "" {
-			result.Message = message
+	return result
+}
+
+func refreshErrorDiagnostic(errRefresh error) string {
+	if errRefresh == nil {
+		return ""
+	}
+	var authErr *Error
+	if errors.As(errRefresh, &authErr) && authErr != nil {
+		if diagnostic := logging.SafeDiagnosticForLog(authErr.Diagnostic); diagnostic != "" {
+			return diagnostic
+		}
+		if authErr.Upstream != nil {
+			return fmt.Sprintf("credential refresh upstream response: status=%d", authErr.Upstream.Status)
 		}
 	}
-	return result
+	var providerErr *providerRefreshError
+	if errors.As(errRefresh, &providerErr) && providerErr != nil {
+		return logging.SafeDiagnosticForLog(providerErr.Diagnostic())
+	}
+	return logging.SafeErrorDiagnostic(errRefresh)
+}
+
+func logCredentialRefreshFailure(ctx context.Context, auth *Auth) {
+	if auth == nil || auth.LastError == nil {
+		return
+	}
+	fields := log.Fields{
+		"auth":       auth.ID,
+		"code":       auth.LastError.Code,
+		"diagnostic": logging.SafeDiagnosticForLog(auth.LastError.Diagnostic),
+		"provider":   auth.Provider,
+		"stage":      "credential_refresh",
+	}
+	if !auth.NextRefreshAfter.IsZero() {
+		fields["retry_at"] = auth.NextRefreshAfter.UTC().Format(time.RFC3339Nano)
+	}
+	logEntryWithRequestID(ctx).WithFields(fields).Warn("credential refresh failed")
 }
 
 func copyUpstreamResponse(target *Error, errRefresh error) bool {
@@ -1942,6 +1972,7 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 		}
 		snapshot := target.Clone()
 		applyRefreshFailureState(snapshot, errRefresh, now)
+		logCredentialRefreshFailure(ctx, snapshot)
 		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
 			return nil, errUpdate
 		}
@@ -2014,6 +2045,7 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 		}
 		snapshot := target.Clone()
 		applyRefreshFailureState(snapshot, errRefresh, now)
+		logCredentialRefreshFailure(ctx, snapshot)
 		return snapshot, cloneError(snapshot.LastError)
 	}
 	if !refreshAttempted {
@@ -2077,7 +2109,11 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) *Auth {
 			case errors.Is(errRefresh, ErrRefreshUnsupported):
 				log.Debugf("auth refresh unsupported | auth=%s provider=%s", authID, current.Provider)
 			default:
-				logEntryWithRequestID(ctx).Warnf("auth refresh failed | auth=%s provider=%s err=%v", authID, current.Provider, errRefresh)
+				logEntryWithRequestID(ctx).WithFields(log.Fields{
+					"auth":       authID,
+					"diagnostic": refreshErrorDiagnostic(errRefresh),
+					"provider":   current.Provider,
+				}).Warn("auth refresh failed")
 			}
 		}
 		return nil

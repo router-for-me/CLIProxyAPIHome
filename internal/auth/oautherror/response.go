@@ -3,6 +3,9 @@ package oautherror
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
 )
 
 // ResponseError preserves an upstream OAuth error response while exposing
@@ -137,6 +140,67 @@ func (e *ResponseError) Detail() string {
 		return ""
 	}
 	return e.detail
+}
+
+// Diagnostic returns a summary assembled only from known OAuth response fields.
+// Callers must still redact and bound field values before logging it.
+func (e *ResponseError) Diagnostic() string {
+	if e == nil {
+		return "upstream OAuth request failed"
+	}
+	parts := []string{fmt.Sprintf("upstream OAuth request failed with status %d", e.statusCode)}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "error", value: e.oauthError},
+		{name: "code", value: e.code},
+		{name: "request_id", value: e.requestID},
+	} {
+		if value := diagnosticIdentifier(field.value); value != "" {
+			parts = append(parts, field.name+"="+strconv.Quote(value))
+		}
+	}
+	if reason := diagnosticReason(strings.Join([]string{e.errorDescription, e.message, e.detail}, " ")); reason != "" {
+		parts = append(parts, "reason="+reason)
+	}
+	return strings.Join(parts, " ")
+}
+
+func diagnosticIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for i := 0; i < len(value); i++ {
+		char := value[i]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		switch char {
+		case '.', '_', '-', ':':
+			continue
+		default:
+			return ""
+		}
+	}
+	return value
+}
+
+func diagnosticReason(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.NewReplacer("_", " ", "-", " ").Replace(normalized)
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	switch {
+	case strings.Contains(normalized, "revoked") && strings.Contains(normalized, "token"):
+		return "token_revoked"
+	case strings.Contains(normalized, "reused") && strings.Contains(normalized, "token"):
+		return "token_reused"
+	case strings.Contains(normalized, "expired") && strings.Contains(normalized, "token"):
+		return "token_expired"
+	default:
+		return ""
+	}
 }
 
 func firstDiagnosticString(values ...json.RawMessage) string {

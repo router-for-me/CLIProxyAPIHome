@@ -762,6 +762,7 @@ func cloneError(err *Error) *Error {
 	cloned := &Error{
 		Code:       err.Code,
 		Message:    err.Message,
+		Diagnostic: err.Diagnostic,
 		Retryable:  err.Retryable,
 		HTTPStatus: err.HTTPStatus,
 	}

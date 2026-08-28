@@ -86,20 +86,31 @@ func TestRefreshAntigravityPreservesTransportAndReadErrors(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name      string
-		cause     error
-		transport refreshTestRoundTripper
+		name        string
+		stage       string
+		wantSignals []string
+		transport   refreshTestRoundTripper
 	}{
 		{
-			name:  "socks transport",
-			cause: errors.New("socks connect tcp 10.0.0.8:1080: connection refused"),
+			name:        "socks transport",
+			stage:       "transport",
+			wantSignals: []string{"proxy=socks", "connection_refused"},
 			transport: func(_ *http.Request) (*http.Response, error) {
 				return nil, errors.New("socks connect tcp 10.0.0.8:1080: connection refused")
 			},
 		},
 		{
-			name:  "response read",
-			cause: errors.New("oauth response stream reset"),
+			name:        "transport EOF",
+			stage:       "transport",
+			wantSignals: []string{"EOF"},
+			transport: func(_ *http.Request) (*http.Response, error) {
+				return nil, io.EOF
+			},
+		},
+		{
+			name:        "response read",
+			stage:       "response_read",
+			wantSignals: []string{"stream_reset"},
 			transport: func(_ *http.Request) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
@@ -115,8 +126,8 @@ func TestRefreshAntigravityPreservesTransportAndReadErrors(t *testing.T) {
 			if errRefresh == nil {
 				t.Fatal("refreshAntigravity() error = nil")
 			}
-			if !strings.HasPrefix(errRefresh.Error(), "antigravity refresh: ") || !strings.Contains(errRefresh.Error(), tc.cause.Error()) {
-				t.Fatalf("refreshAntigravity() error = %q, want provider prefix and %q", errRefresh, tc.cause)
+			if !strings.HasPrefix(errRefresh.Error(), "antigravity refresh failed: stage="+tc.stage) {
+				t.Fatalf("refreshAntigravity() error = %q, want stage %q", errRefresh, tc.stage)
 			}
 			var providerErr *providerRefreshError
 			if !errors.As(errRefresh, &providerErr) || providerErr.StatusCode() != http.StatusServiceUnavailable {
@@ -124,23 +135,79 @@ func TestRefreshAntigravityPreservesTransportAndReadErrors(t *testing.T) {
 			}
 
 			applyRefreshFailureState(auth, errRefresh, time.Now().UTC())
-			if auth.LastError == nil || !strings.Contains(auth.LastError.Message, tc.cause.Error()) {
-				t.Fatalf("persisted refresh error = %#v, want original cause", auth.LastError)
+			if auth.LastError == nil || auth.LastError.Message != refreshTransientErrorMsg || !strings.Contains(auth.LastError.Diagnostic, "stage="+tc.stage) || !strings.Contains(auth.LastError.Diagnostic, "retry_at=") {
+				t.Fatalf("persisted refresh error = %#v, want generic message and safe stage diagnostic", auth.LastError)
+			}
+			for _, signal := range tc.wantSignals {
+				if !strings.Contains(errRefresh.Error(), signal) || !strings.Contains(auth.LastError.Diagnostic, signal) {
+					t.Fatalf("refresh diagnostics = error %q persisted %q, want %q", errRefresh, auth.LastError.Diagnostic, signal)
+				}
 			}
 		})
+	}
+}
+
+func TestApplyRefreshFailureStateRedactsPersistedTransportDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	errRefresh := builtInRefreshError(
+		"antigravity",
+		"transport",
+		errors.New(`Post "https://proxy-user:proxy-password@oauth.example/token?access_token=query-secret": access token: access-secret connection refused`),
+	)
+	auth := &Auth{ID: "auth-1", Provider: "antigravity", Status: StatusActive}
+	applyRefreshFailureState(auth, errRefresh, time.Now().UTC())
+
+	if auth.LastError == nil || !strings.Contains(auth.LastError.Diagnostic, "stage=transport") || !strings.Contains(auth.LastError.Diagnostic, "connection_refused") {
+		t.Fatalf("persisted diagnostic = %#v, want transport failure detail", auth.LastError)
+	}
+	for _, secret := range []string{"proxy-user", "proxy-password", "query-secret", "access-secret"} {
+		if strings.Contains(auth.LastError.Diagnostic, secret) {
+			t.Fatalf("persisted diagnostic leaked %q: %q", secret, auth.LastError.Diagnostic)
+		}
+	}
+	if auth.LastError.Message != refreshTransientErrorMsg || strings.Contains(auth.LastError.Error(), "connection_refused") {
+		t.Fatalf("client-facing refresh error = %q, want generic message", auth.LastError.Error())
+	}
+}
+
+func TestApplyRefreshFailureStateDoesNotPersistUnknownErrorText(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{ID: "auth-1", Provider: "antigravity", Status: StatusActive}
+	applyRefreshFailureState(auth, errors.New("provider failed with unlabeled-secret"), time.Now().UTC())
+
+	if auth.LastError == nil || !strings.Contains(auth.LastError.Diagnostic, "error_type=") {
+		t.Fatalf("persisted diagnostic = %#v, want safe error type", auth.LastError)
+	}
+	if strings.Contains(auth.LastError.Diagnostic, "unlabeled-secret") || strings.Contains(auth.LastError.Diagnostic, "provider failed") {
+		t.Fatalf("persisted diagnostic retained arbitrary error text: %q", auth.LastError.Diagnostic)
 	}
 }
 
 func TestBuiltInRefreshErrorLeavesContextCancellationUnchanged(t *testing.T) {
 	t.Parallel()
 
-	errRefresh := builtInRefreshError("codex", context.Canceled)
+	errRefresh := builtInRefreshError("codex", "provider_refresh", context.Canceled)
 	if !errors.Is(errRefresh, context.Canceled) {
 		t.Fatalf("builtInRefreshError() = %v, want context cancellation", errRefresh)
 	}
 	var providerErr *providerRefreshError
 	if errors.As(errRefresh, &providerErr) {
 		t.Fatalf("context cancellation was exposed as provider failure: %v", errRefresh)
+	}
+}
+
+func TestBuiltInRefreshErrorKeepsInternalDeadlineDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	errRefresh := builtInRefreshError("antigravity", "transport", context.DeadlineExceeded)
+	if !errors.Is(errRefresh, context.DeadlineExceeded) {
+		t.Fatalf("builtInRefreshError() = %v, want wrapped context deadline", errRefresh)
+	}
+	var providerErr *providerRefreshError
+	if !errors.As(errRefresh, &providerErr) || !strings.Contains(providerErr.Diagnostic(), "stage=transport") || !strings.Contains(providerErr.Diagnostic(), "timeout") {
+		t.Fatalf("deadline diagnostic = %T/%v, want provider transport stage", errRefresh, errRefresh)
 	}
 }
 
@@ -165,6 +232,9 @@ func TestApplyRefreshFailureStateUsesGenericTerminalErrorForUnstructuredFailure(
 	}
 	if strings.Contains(auth.LastError.Error(), "provider-secret") || strings.Contains(auth.LastError.Error(), "invalid_grant") {
 		t.Fatalf("LastError included unstructured provider detail: %v", auth.LastError)
+	}
+	if !strings.Contains(auth.LastError.Diagnostic, "invalid_grant") || strings.Contains(auth.LastError.Diagnostic, "provider-secret") {
+		t.Fatalf("LastError diagnostic = %q, want redacted terminal signal", auth.LastError.Diagnostic)
 	}
 	if !auth.NextRefreshAfter.IsZero() {
 		t.Fatalf("NextRefreshAfter = %v, want zero", auth.NextRefreshAfter)
@@ -192,6 +262,9 @@ func TestApplyRefreshFailureStatePreservesTerminalUpstreamResponse(t *testing.T)
 	}
 	if got := auth.LastError.Error(); got != string(body) {
 		t.Fatalf("terminal refresh error = %q, want exact upstream body %q", got, body)
+	}
+	if !strings.Contains(auth.LastError.Diagnostic, "stage=upstream_response") || !strings.Contains(auth.LastError.Diagnostic, `error="invalid_grant"`) {
+		t.Fatalf("terminal refresh diagnostic = %q, want response stage and OAuth code", auth.LastError.Diagnostic)
 	}
 }
 
@@ -228,6 +301,38 @@ func TestRefreshNowObservedReturnsStoredTerminalUpstreamResponse(t *testing.T) {
 	}
 	if authErr.Upstream.Status != http.StatusBadRequest || errRefresh.Error() != responseBody {
 		t.Fatalf("stored upstream response = %#v, error=%q", authErr.Upstream, errRefresh.Error())
+	}
+}
+
+func TestRefreshNowObservedReturnsStoredDiagnosticDuringBackoff(t *testing.T) {
+	t.Parallel()
+
+	const diagnostic = "antigravity refresh failed: stage=transport err=EOF"
+	auth := &Auth{
+		ID:                    "auth-transient-backoff",
+		Index:                 "auth-transient-backoff",
+		Provider:              "antigravity",
+		Status:                StatusError,
+		Unavailable:           true,
+		RuntimeRefreshBlocked: true,
+		NextRefreshAfter:      time.Now().UTC().Add(time.Minute),
+		LastError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    refreshTransientErrorMsg,
+			Diagnostic: diagnostic,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	_, errRefresh := manager.RefreshNowObserved(context.Background(), auth.ID, "")
+	var authErr *Error
+	if !errors.As(errRefresh, &authErr) || authErr.Diagnostic != diagnostic || authErr.Message != refreshTransientErrorMsg {
+		t.Fatalf("RefreshNowObserved() error = %#v, want stored safe diagnostic", errRefresh)
 	}
 }
 
@@ -277,7 +382,7 @@ func TestBackgroundRefreshUsesConfiguredHandler(t *testing.T) {
 	}
 }
 
-func TestBackgroundRefreshLogsProviderError(t *testing.T) {
+func TestBackgroundRefreshLogsSafeProviderError(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-auto-provider-error",
@@ -310,11 +415,49 @@ func TestBackgroundRefreshLogsProviderError(t *testing.T) {
 	manager.refreshAuth(context.Background(), auth.ID)
 
 	for _, entry := range hook.AllEntries() {
-		if entry.Level == log.WarnLevel && strings.Contains(entry.Message, providerMessage) {
+		if entry.Level == log.WarnLevel && entry.Message == "auth refresh failed" && entry.Data["diagnostic"] == "status=400" {
 			return
 		}
 	}
 	t.Fatalf("provider refresh error was not logged: %#v", hook.AllEntries())
+}
+
+func TestLogCredentialRefreshFailureIncludesSafeDiagnosticFields(t *testing.T) {
+	savedHooks := make(log.LevelHooks)
+	for level, hooks := range log.StandardLogger().Hooks {
+		savedHooks[level] = append([]log.Hook(nil), hooks...)
+	}
+	hook := logtest.NewGlobal()
+	t.Cleanup(func() {
+		log.StandardLogger().ReplaceHooks(savedHooks)
+	})
+
+	retryAt := time.Now().UTC().Add(refreshFailureBackoff)
+	auth := &Auth{
+		ID:               "auth-diagnostic",
+		Provider:         "antigravity",
+		NextRefreshAfter: retryAt,
+		LastError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    refreshTransientErrorMsg,
+			Diagnostic: "antigravity refresh failed: stage=transport err=EOF",
+		},
+	}
+	logCredentialRefreshFailure(context.Background(), auth)
+
+	for _, entry := range hook.AllEntries() {
+		if entry.Level != log.WarnLevel || entry.Message != "credential refresh failed" {
+			continue
+		}
+		if entry.Data["auth"] != auth.ID || entry.Data["provider"] != auth.Provider || entry.Data["stage"] != "credential_refresh" || entry.Data["code"] != refreshTransientErrorCode {
+			t.Fatalf("refresh log fields = %#v", entry.Data)
+		}
+		if entry.Data["diagnostic"] != auth.LastError.Diagnostic || entry.Data["retry_at"] != retryAt.Format(time.RFC3339Nano) {
+			t.Fatalf("refresh diagnostic log fields = %#v", entry.Data)
+		}
+		return
+	}
+	t.Fatalf("credential refresh failure was not logged: %#v", hook.AllEntries())
 }
 
 func TestApplyRefreshPendingStateDoesNotBlockDispatch(t *testing.T) {
@@ -437,6 +580,9 @@ func TestApplyRefreshFailureStatePreservesTransientUpstreamResponse(t *testing.T
 	}
 	if got := auth.LastError.Error(); got != string(body) {
 		t.Fatalf("refresh error = %q, want exact upstream body %q", got, body)
+	}
+	if !strings.Contains(auth.LastError.Diagnostic, "stage=upstream_response") || !strings.Contains(auth.LastError.Diagnostic, "status 400") {
+		t.Fatalf("refresh diagnostic = %q, want upstream response stage and status", auth.LastError.Diagnostic)
 	}
 }
 

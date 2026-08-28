@@ -2,6 +2,7 @@ package oautherror
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,14 @@ func TestNewResponseErrorParsesClassificationFieldsWithoutChangingBody(t *testin
 	}
 	if errResponse.OAuthError() != "invalid_grant" || errResponse.Code() != "42901" || errResponse.Message() != "Refresh token expired" || errResponse.Detail() != "sign in again" {
 		t.Fatalf("classification fields = error %q code %q message %q detail %q", errResponse.OAuthError(), errResponse.Code(), errResponse.Message(), errResponse.Detail())
+	}
+	diagnostic := errResponse.Diagnostic()
+	for _, want := range []string{"status 400", `error="invalid_grant"`, `code="42901"`, `request_id="req-nested"`, "reason=token_expired"} {
+		if !strings.Contains(diagnostic, want) {
+			t.Fatalf("Diagnostic() = %q, want %q", diagnostic, want)
+		}
+	}
+	if strings.Contains(diagnostic, "sign in again") || strings.Contains(diagnostic, "Refresh token expired") {
+		t.Fatalf("Diagnostic() retained free-form provider detail: %q", diagnostic)
 	}
 }

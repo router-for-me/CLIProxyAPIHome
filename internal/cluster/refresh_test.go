@@ -241,6 +241,7 @@ func TestRESPErrorRoundTripPreservesUpstreamResponseExactly(t *testing.T) {
 			wireError := &coreauth.Error{
 				Code:       "refresh_temporarily_unavailable",
 				Message:    "credential refresh temporarily unavailable",
+				Diagnostic: "antigravity refresh failed: stage=upstream_response status=400",
 				Retryable:  true,
 				HTTPStatus: http.StatusServiceUnavailable,
 				Upstream: &coreauth.UpstreamResponse{
@@ -254,7 +255,7 @@ func TestRESPErrorRoundTripPreservesUpstreamResponseExactly(t *testing.T) {
 			if !errors.As(errRead, &authErr) || authErr.Upstream == nil {
 				t.Fatalf("readRESPBulk() error = %#v, want structured upstream response", errRead)
 			}
-			if authErr.Code != wireError.Code || authErr.HTTPStatus != wireError.HTTPStatus || authErr.Upstream.Status != http.StatusBadRequest || !bytes.Equal(authErr.Upstream.Body, tt.body) {
+			if authErr.Code != wireError.Code || authErr.Diagnostic != wireError.Diagnostic || authErr.HTTPStatus != wireError.HTTPStatus || authErr.Upstream.Status != http.StatusBadRequest || !bytes.Equal(authErr.Upstream.Body, tt.body) {
 				t.Fatalf("round-trip auth error = %#v, want %#v", authErr, wireError)
 			}
 			if got := authErr.Error(); !bytes.Equal([]byte(got), tt.body) {
@@ -930,6 +931,9 @@ func TestRefreshControllerStandbyTransientMasterErrorFailsClosedWhenSyncFails(t 
 	if authErr.Upstream == nil || authErr.Upstream.Status != http.StatusBadRequest || string(authErr.Upstream.Body) != responseBody || errRefresh.Error() != responseBody {
 		t.Fatalf("standby upstream response = %#v, error=%q", authErr.Upstream, errRefresh.Error())
 	}
+	if !strings.Contains(authErr.Diagnostic, "stage=upstream_response") || !strings.Contains(authErr.Diagnostic, "status 400") {
+		t.Fatalf("standby refresh diagnostic = %q, want forwarded response stage and status", authErr.Diagnostic)
+	}
 	if masterTransport.calls != 1 || standbyTransport.calls != 0 {
 		t.Fatalf("provider refresh calls = master %d standby %d, want 1/0", masterTransport.calls, standbyTransport.calls)
 	}
@@ -941,6 +945,9 @@ func TestRefreshControllerStandbyTransientMasterErrorFailsClosedWhenSyncFails(t 
 	if !coreauth.RefreshBlocksDispatch(persisted) {
 		t.Fatalf("persisted auth was not refresh-blocked: %#v", persisted)
 	}
+	if persisted.LastError == nil || persisted.LastError.Diagnostic != authErr.Diagnostic {
+		t.Fatalf("persisted diagnostic = %#v, want %q", persisted.LastError, authErr.Diagnostic)
+	}
 	standbyAuth, ok := standbyRuntime.CoreManager().GetByID(authID)
 	if !ok || standbyAuth == nil {
 		t.Fatal("standby GetByID() did not find auth")
@@ -948,7 +955,7 @@ func TestRefreshControllerStandbyTransientMasterErrorFailsClosedWhenSyncFails(t 
 	if standbyAuth.Disabled || !standbyAuth.Unavailable || !standbyAuth.RuntimeRefreshBlocked || standbyAuth.Status != coreauth.StatusError || !coreauth.RefreshBlocksDispatch(standbyAuth) {
 		t.Fatalf("standby fail-closed state = %#v, want transient credential block", standbyAuth)
 	}
-	if standbyAuth.LastError == nil || standbyAuth.LastError.Code != "refresh_temporarily_unavailable" || standbyAuth.LastError.Upstream == nil || string(standbyAuth.LastError.Upstream.Body) != responseBody {
+	if standbyAuth.LastError == nil || standbyAuth.LastError.Code != "refresh_temporarily_unavailable" || standbyAuth.LastError.Diagnostic != authErr.Diagnostic || standbyAuth.LastError.Upstream == nil || string(standbyAuth.LastError.Upstream.Body) != responseBody {
 		t.Fatalf("standby LastError = %#v, want forwarded transient upstream response", standbyAuth.LastError)
 	}
 }
