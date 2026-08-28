@@ -37,6 +37,11 @@ func (e *Error) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+// Is preserves sentinel matching for structured unsupported-refresh errors.
+func (e *Error) Is(target error) bool {
+	return e != nil && target == ErrRefreshUnsupported && e.Code == refreshUnsupportedCode
+}
+
 // StatusCode returns the HTTP status code.
 func (e *Error) StatusCode() int {
 	if e == nil {

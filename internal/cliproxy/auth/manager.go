@@ -1386,6 +1386,7 @@ func ApplyUnsupportedRefreshBackoff(auth *Auth, now time.Time) {
 	auth.Unavailable = false
 	auth.RuntimeRefreshBlocked = false
 	auth.LastError = cloneError(ErrRefreshUnsupported)
+	auth.LastError.Diagnostic = unsupportedRefreshDiagnostic(auth)
 	auth.StatusMessage = ""
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
@@ -1397,6 +1398,23 @@ func ApplyUnsupportedRefreshBackoff(auth *Auth, now time.Time) {
 	} else {
 		auth.Status = StatusActive
 	}
+}
+
+func unsupportedRefreshDiagnostic(auth *Auth) string {
+	provider := "unknown"
+	if auth != nil {
+		if value := strings.ToLower(strings.TrimSpace(auth.Provider)); value != "" {
+			provider = value
+		}
+	}
+	reason := "no_refresh_handler"
+	switch provider {
+	case "codex", "claude", "kimi", "antigravity", "xai":
+		if auth == nil || strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token")) == "" {
+			reason = "missing_refresh_token"
+		}
+	}
+	return logging.SafeDiagnosticForLog(fmt.Sprintf("credential refresh unsupported: provider=%s reason=%s", provider, reason))
 }
 
 // RefreshRetryBackoffOpen reports whether provider refresh calls are currently
@@ -1984,7 +2002,7 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
 			return nil, errUpdate
 		}
-		return nil, ErrRefreshUnsupported
+		return nil, cloneError(snapshot.LastError)
 	}
 	if updated == nil {
 		updated = target.Clone()
@@ -2051,7 +2069,7 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	if !refreshAttempted {
 		snapshot := target.Clone()
 		ApplyUnsupportedRefreshBackoff(snapshot, now)
-		return snapshot, ErrRefreshUnsupported
+		return snapshot, cloneError(snapshot.LastError)
 	}
 	if updated == nil {
 		updated = target.Clone()

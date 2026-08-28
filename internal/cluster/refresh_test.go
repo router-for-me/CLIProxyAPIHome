@@ -453,6 +453,50 @@ func TestRefreshControllerTransientFailureBlocksCredentialDispatch(t *testing.T)
 	}
 }
 
+func TestRefreshControllerUnsupportedFailurePreservesCapabilityDiagnostic(t *testing.T) {
+	const authID = "antigravity-refresh-unsupported"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "expired-access-token"},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := &refreshTestRoundTripper{}
+	runtime := newRefreshTestRuntime(t, repo, auth, transport)
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9306, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	_, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	var authErr *coreauth.Error
+	if !errors.As(errRefresh, &authErr) || authErr == nil || authErr.Code != "refresh_unsupported" {
+		t.Fatalf("RefreshNowObserved() error = %#v, want structured unsupported refresh error", errRefresh)
+	}
+	for _, signal := range []string{"provider=antigravity", "reason=missing_refresh_token"} {
+		if !strings.Contains(authErr.Diagnostic, signal) {
+			t.Fatalf("RefreshNowObserved() diagnostic = %q, want %q", authErr.Diagnostic, signal)
+		}
+	}
+	if transport.calls != 0 {
+		t.Fatalf("provider refresh calls = %d, want 0 without a refresh token", transport.calls)
+	}
+
+	persisted, _, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if persisted.LastError == nil || persisted.LastError.Diagnostic != authErr.Diagnostic || coreauth.RefreshBlocksDispatch(persisted) {
+		t.Fatalf("persisted unsupported refresh state = %#v, want diagnostic without dispatch block", persisted)
+	}
+}
+
 func TestMergeClusterRefreshOutcomeKeepsConcurrentDetailsAndBlocksDispatch(t *testing.T) {
 	now := time.Now().UTC()
 	base := &coreauth.Auth{ID: "auth-1", Provider: "antigravity", Status: coreauth.StatusActive}

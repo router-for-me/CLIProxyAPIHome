@@ -511,6 +511,9 @@ func TestUnsupportedRefreshBackoffDoesNotBlockDispatch(t *testing.T) {
 	if auth.LastError == nil || auth.LastError.Code != refreshUnsupportedCode || auth.StatusMessage != "" {
 		t.Fatalf("unsupported refresh state = last error %#v status message %q", auth.LastError, auth.StatusMessage)
 	}
+	if !strings.Contains(auth.LastError.Diagnostic, "provider=custom") || !strings.Contains(auth.LastError.Diagnostic, "reason=no_refresh_handler") {
+		t.Fatalf("unsupported refresh diagnostic = %q, want provider and capability reason", auth.LastError.Diagnostic)
+	}
 	if blocked, _, _ := isAuthBlockedForModel(auth, "blocked-model", now); !blocked {
 		t.Fatal("existing model cooldown was cleared unexpectedly")
 	}
@@ -521,6 +524,32 @@ func TestUnsupportedRefreshBackoffDoesNotBlockDispatch(t *testing.T) {
 	NewManager(nil, nil, nil).applyResultTransition(auth, Result{AuthID: auth.ID, Model: "new-model", Success: true}, "new-model", now, false)
 	if auth.Unavailable || auth.RuntimeRefreshBlocked || RefreshBlocksDispatch(auth) {
 		t.Fatalf("successful result preserved an unsupported refresh as a dispatch block: %#v", auth)
+	}
+}
+
+func TestRefreshAuthCredentialReturnsUnsupportedDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		ID:       "antigravity-missing-refresh-token",
+		Provider: "antigravity",
+		Metadata: map[string]any{"access_token": "expired-access-token"},
+	}
+	refreshed, errRefresh := NewManager(nil, nil, nil).RefreshAuthCredential(context.Background(), auth)
+	var authErr *Error
+	if !errors.As(errRefresh, &authErr) || authErr == nil || authErr.Code != refreshUnsupportedCode {
+		t.Fatalf("RefreshAuthCredential() error = %#v, want structured unsupported refresh error", errRefresh)
+	}
+	for _, signal := range []string{"provider=antigravity", "reason=missing_refresh_token"} {
+		if !strings.Contains(authErr.Diagnostic, signal) {
+			t.Fatalf("RefreshAuthCredential() diagnostic = %q, want %q", authErr.Diagnostic, signal)
+		}
+	}
+	if refreshed == nil || refreshed.LastError == nil || refreshed.LastError.Diagnostic != authErr.Diagnostic {
+		t.Fatalf("RefreshAuthCredential() state = %#v, want returned diagnostic %q", refreshed, authErr.Diagnostic)
+	}
+	if !errors.Is(errRefresh, ErrRefreshUnsupported) {
+		t.Fatalf("RefreshAuthCredential() error = %#v, want ErrRefreshUnsupported compatibility", errRefresh)
 	}
 }
 
