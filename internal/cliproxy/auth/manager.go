@@ -36,7 +36,10 @@ const (
 	// successfully but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
-	refreshIneffectiveBackoff = 30 * time.Second
+	refreshIneffectiveBackoff        = 30 * time.Second
+	defaultResultPersistWorkers      = 16
+	defaultResultPersistTimeout      = 10 * time.Second
+	defaultResultPersistRetryBackoff = 5 * time.Second
 )
 
 // RefreshEvaluator allows runtime state to override refresh decisions.
@@ -57,6 +60,44 @@ var (
 	}
 )
 
+type authUpdateLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// authUpdateLocks serializes publication and persistence for one auth ID while
+// allowing unrelated credentials to proceed independently.
+type authUpdateLocks struct {
+	mu      sync.Mutex
+	entries map[string]*authUpdateLock
+}
+
+func (l *authUpdateLocks) lock(authID string) func() {
+	authID = strings.TrimSpace(authID)
+	l.mu.Lock()
+	if l.entries == nil {
+		l.entries = make(map[string]*authUpdateLock)
+	}
+	entry := l.entries[authID]
+	if entry == nil {
+		entry = &authUpdateLock{}
+		l.entries[authID] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && l.entries[authID] == entry {
+			delete(l.entries, authID)
+		}
+		l.mu.Unlock()
+	}
+}
+
 // Manager orchestrates auth lifecycle, selection, and persistence for CLIProxyAPIHome.
 //
 // This is intentionally narrower than CPA's full execution manager: it only supports
@@ -65,10 +106,11 @@ type Manager struct {
 	store    Store
 	selector Selector
 
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	indexAuth map[string]*Auth
-	scheduler *authScheduler
+	mu          sync.RWMutex
+	updateLocks authUpdateLocks
+	auths       map[string]*Auth
+	indexAuth   map[string]*Auth
+	scheduler   *authScheduler
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -82,12 +124,16 @@ type Manager struct {
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
 
-	resultPersistOnce    sync.Once
-	resultPersistMu      sync.Mutex
-	resultPersistWake    chan struct{}
-	resultPersistPending map[string]*Auth
-	resultPersistActive  map[string]struct{}
-	cooldownFencePending map[string]struct{}
+	resultPersistMu           sync.Mutex
+	resultPersistOnce         sync.Once
+	resultPersistCond         *sync.Cond
+	resultPersistPending      map[string]*Auth
+	resultPersistActive       map[string]struct{}
+	resultPersistQueue        []string
+	resultPersistWorkers      int
+	resultPersistTimeout      time.Duration
+	resultPersistRetryBackoff time.Duration
+	cooldownFencePending      map[string]struct{}
 }
 
 // NewManager creates a new manager.
@@ -96,15 +142,18 @@ func NewManager(store Store, selector Selector, _ any) *Manager {
 		selector = &RoundRobinSelector{}
 	}
 	mgr := &Manager{
-		store:                store,
-		selector:             selector,
-		auths:                make(map[string]*Auth),
-		indexAuth:            make(map[string]*Auth),
-		resultPersistWake:    make(chan struct{}, 1),
-		resultPersistPending: make(map[string]*Auth),
-		resultPersistActive:  make(map[string]struct{}),
-		cooldownFencePending: make(map[string]struct{}),
+		store:                     store,
+		selector:                  selector,
+		auths:                     make(map[string]*Auth),
+		indexAuth:                 make(map[string]*Auth),
+		resultPersistPending:      make(map[string]*Auth),
+		resultPersistActive:       make(map[string]struct{}),
+		resultPersistWorkers:      defaultResultPersistWorkers,
+		resultPersistTimeout:      defaultResultPersistTimeout,
+		resultPersistRetryBackoff: defaultResultPersistRetryBackoff,
+		cooldownFencePending:      make(map[string]struct{}),
 	}
+	mgr.resultPersistCond = sync.NewCond(&mgr.resultPersistMu)
 	mgr.runtimeConfig.Store(&internalconfig.Config{})
 	// atomic.Value requires non-nil initial value.
 	mgr.oauthModelAlias.Store(&oauthModelAliasTable{})
@@ -227,6 +276,8 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	next.UpdatedAt = now
 	next.EnsureIndex()
 
+	unlockUpdate := m.updateLocks.lock(next.ID)
+	defer unlockUpdate()
 	m.mu.Lock()
 	if m.auths == nil {
 		m.auths = make(map[string]*Auth)
@@ -238,6 +289,17 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("auth manager: auth already exists")
 	}
+	m.mu.Unlock()
+
+	accepted, errPersist := m.persistLocked(ctx, next, false)
+	if errPersist != nil || !accepted {
+		if errPersist != nil {
+			return nil, errPersist
+		}
+		return m.adoptAuthoritativeAuthLocked(ctx, next.ID)
+	}
+
+	m.mu.Lock()
 	m.auths[next.ID] = next
 	if idx := strings.TrimSpace(next.Index); idx != "" {
 		m.indexAuth[idx] = next
@@ -245,9 +307,6 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Unlock()
 
 	m.scheduler.upsertAuth(next)
-	if errPersist := m.persist(ctx, next); errPersist != nil {
-		return nil, errPersist
-	}
 	m.queueRefreshReschedule(next.ID)
 	return next.Clone(), nil
 }
@@ -266,12 +325,23 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 		ctx = context.Background()
 	}
 
-	m.mu.Lock()
+	unlockUpdate := m.updateLocks.lock(id)
+	defer unlockUpdate()
+	m.mu.RLock()
 	auth, ok := m.auths[id]
 	if !ok {
-		m.mu.Unlock()
+		m.mu.RUnlock()
 		return fmt.Errorf("auth manager: auth not found")
 	}
+	m.mu.RUnlock()
+
+	if !shouldSkipPersist(ctx) && m.store != nil {
+		if errDelete := m.store.Delete(ctx, id); errDelete != nil {
+			return errDelete
+		}
+	}
+
+	m.mu.Lock()
 	if auth != nil {
 		idx := strings.TrimSpace(auth.Index)
 		if idx != "" {
@@ -293,27 +363,28 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok {
 		invalidator.InvalidateAuth(id)
 	}
-	if shouldSkipPersist(ctx) {
-		return nil
-	}
-	if m.store == nil {
-		return nil
-	}
-	return m.store.Delete(ctx, id)
+	return nil
 }
 
 // Update updates the value.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
+	updated, _, errUpdate := m.updateWithAcceptance(ctx, auth)
+	return updated, errUpdate
+}
+
+func (m *Manager) updateWithAcceptance(ctx context.Context, auth *Auth) (*Auth, bool, error) {
 	// Keep validation before state changes so failures leave existing data intact.
 	if m == nil {
-		return nil, fmt.Errorf("auth manager: nil manager")
+		return nil, false, fmt.Errorf("auth manager: nil manager")
 	}
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
-		return nil, fmt.Errorf("auth manager: missing auth id")
+		return nil, false, fmt.Errorf("auth manager: missing auth id")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	unlockUpdate := m.updateLocks.lock(auth.ID)
+	defer unlockUpdate()
 
 	now := time.Now().UTC()
 
@@ -321,23 +392,63 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	current, ok := m.auths[auth.ID]
 	if !ok || current == nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("auth manager: auth not found")
+		return nil, false, fmt.Errorf("auth manager: auth not found")
+	}
+	if auth.StateVersion > 0 && current.StateVersion > 0 && auth.StateVersion < current.StateVersion {
+		currentSnapshot := current.Clone()
+		m.mu.Unlock()
+		return currentSnapshot, false, nil
 	}
 	next := auth.Clone()
+	if strings.TrimSpace(next.FileName) == "" {
+		next.FileName = current.FileName
+	}
+	if next.Storage == nil {
+		next.Storage = current.Storage
+	}
+	if next.Runtime == nil {
+		next.Runtime = current.Runtime
+	}
+	next.Success = current.Success
+	next.Failed = current.Failed
+	next.recentRequests = current.recentRequests
+	next.indexAssigned = current.indexAssigned
 	if next.CreatedAt.IsZero() {
 		next.CreatedAt = current.CreatedAt
 	}
 	next.UpdatedAt = now
 	next.EnsureIndex()
-	prevIndex := ""
-	if current != nil {
-		prevIndex = strings.TrimSpace(current.Index)
+	m.mu.Unlock()
+
+	accepted, errPersist := m.persistLocked(ctx, next, false)
+	if errPersist != nil || !accepted {
+		if errPersist != nil {
+			return nil, false, errPersist
+		}
+		authoritative, errAuthoritative := m.adoptAuthoritativeAuthLocked(ctx, next.ID)
+		if errAuthoritative != nil {
+			return nil, false, errAuthoritative
+		}
+		return authoritative, false, nil
 	}
+
+	m.mu.Lock()
+	latest := m.auths[next.ID]
+	if latest == nil {
+		m.mu.Unlock()
+		return nil, false, fmt.Errorf("auth manager: auth not found")
+	}
+	if next.StateVersion > 0 && latest.StateVersion > next.StateVersion {
+		latestSnapshot := latest.Clone()
+		m.mu.Unlock()
+		return latestSnapshot, false, nil
+	}
+	prevIndex := strings.TrimSpace(latest.Index)
 	newIndex := strings.TrimSpace(next.Index)
 	m.auths[next.ID] = next
 	if m.indexAuth != nil {
 		if prevIndex != "" && prevIndex != newIndex {
-			if cur, ok := m.indexAuth[prevIndex]; ok && cur != nil && cur.ID == next.ID {
+			if indexed := m.indexAuth[prevIndex]; indexed != nil && indexed.ID == next.ID {
 				delete(m.indexAuth, prevIndex)
 			}
 		}
@@ -346,142 +457,393 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 	}
 	m.mu.Unlock()
-
 	m.scheduler.upsertAuth(next)
-	if errPersist := m.persist(ctx, next); errPersist != nil {
-		return nil, errPersist
-	}
 	m.queueRefreshReschedule(next.ID)
-	return next.Clone(), nil
+	return next.Clone(), true, nil
 }
 
 // persist persists the value.
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
-	if m == nil || m.store == nil || auth == nil {
+	if m == nil || auth == nil {
 		return nil
 	}
-	if shouldSkipPersist(ctx) {
+	unlockUpdate := m.updateLocks.lock(auth.ID)
+	defer unlockUpdate()
+	persisted := auth
+	m.mu.RLock()
+	if current := m.auths[auth.ID]; current != nil {
+		persisted = current.Clone()
+	} else {
+		persisted = nil
+	}
+	m.mu.RUnlock()
+	accepted, errPersist := m.persistLocked(ctx, persisted, true)
+	if errPersist != nil || accepted {
+		return errPersist
+	}
+	_, errAuthoritative := m.adoptAuthoritativeAuthLocked(ctx, auth.ID)
+	return errAuthoritative
+}
+
+func (m *Manager) persistLocked(ctx context.Context, auth *Auth, synchronizeCurrent bool) (bool, error) {
+	if m == nil {
+		return true, nil
+	}
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	return m.persistWithStore(ctx, store, auth, synchronizeCurrent)
+}
+
+func (m *Manager) persistQueued(ctx context.Context, auth *Auth) error {
+	if m == nil || auth == nil {
 		return nil
+	}
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if _, versioned := store.(StateVersionSaver); !versioned {
+		return m.persist(ctx, auth)
+	}
+
+	unlockUpdate := m.updateLocks.lock(auth.ID)
+	persisted := auth
+	m.mu.RLock()
+	if current := m.auths[auth.ID]; current != nil {
+		persisted = current.Clone()
+	} else {
+		persisted = nil
+	}
+	m.mu.RUnlock()
+	unlockUpdate()
+
+	accepted, errPersist := m.persistWithStore(ctx, store, persisted, true)
+	if errPersist != nil || accepted {
+		return errPersist
+	}
+	_, errAuthoritative := m.adoptAuthoritativeAuth(ctx, auth.ID)
+	return errAuthoritative
+}
+
+func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth, synchronizeCurrent bool) (bool, error) {
+	if m == nil || store == nil || auth == nil {
+		return true, nil
+	}
+	if shouldSkipPersist(ctx) {
+		return true, nil
 	}
 	if auth.Attributes != nil {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(auth.Attributes["source"])), "config:") {
-			return nil
+			return true, nil
 		}
 		if strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
-			return nil
+			return true, nil
 		}
 	}
 	if auth.Disabled {
 		// Keep disabled auth entries persisted to disk too, consistent with CPA.
 	}
 	if auth.Metadata == nil && auth.Storage == nil {
-		return nil
+		return true, nil
 	}
-	if versionedStore, ok := m.store.(StateVersionSaver); ok {
+	if versionedStore, ok := store.(StateVersionSaver); ok {
+		previousVersion := auth.StateVersion
 		persisted := auth.Clone()
 		_, stateVersion, errSave := versionedStore.SaveWithStateVersion(ctx, persisted)
 		if errSave != nil {
-			return errSave
+			return false, errSave
 		}
-		if stateVersion > 0 {
-			m.mu.Lock()
-			if current := m.auths[auth.ID]; current == auth {
+		if stateVersion <= 0 {
+			return false, nil
+		}
+		auth.StateVersion = stateVersion
+		if !synchronizeCurrent {
+			return true, nil
+		}
+		m.mu.Lock()
+		if current := m.auths[auth.ID]; current != nil {
+			if current == auth || current.StateVersion == previousVersion {
 				current.StateVersion = stateVersion
 			}
-			m.mu.Unlock()
 		}
-		return nil
+		m.mu.Unlock()
+		return true, nil
 	}
-	_, errSave := m.store.Save(ctx, auth)
-	return errSave
+	_, errSave := store.Save(ctx, auth)
+	return errSave == nil, errSave
+}
+
+func (m *Manager) adoptAuthoritativeAuth(ctx context.Context, authID string) (*Auth, error) {
+	if m == nil {
+		return nil, fmt.Errorf("auth manager: nil manager")
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil, fmt.Errorf("auth manager: missing auth id")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	unlockUpdate := m.updateLocks.lock(authID)
+	defer unlockUpdate()
+	return m.adoptAuthoritativeAuthLocked(ctx, authID)
+}
+
+func (m *Manager) adoptAuthoritativeAuthLocked(ctx context.Context, authID string) (*Auth, error) {
+	m.mu.RLock()
+	resolver := m.fullResolver
+	m.mu.RUnlock()
+	if resolver == nil {
+		return nil, fmt.Errorf("auth manager: authoritative resolver is unavailable after rejecting stale auth %s", authID)
+	}
+
+	authoritative, errResolve := resolver.GetFullAuth(ctx, authID)
+	if errResolve != nil {
+		if errors.Is(errResolve, ErrFullAuthNotFound) {
+			m.removeAuthLocked(authID)
+			m.reconcileRegistryModelStatesLocked(authID)
+			return nil, fmt.Errorf("auth manager: authoritative auth %s no longer exists", authID)
+		}
+		return nil, fmt.Errorf("auth manager: load authoritative auth %s: %w", authID, errResolve)
+	}
+	if authoritative == nil {
+		m.removeAuthLocked(authID)
+		m.reconcileRegistryModelStatesLocked(authID)
+		return nil, fmt.Errorf("auth manager: authoritative auth %s is unavailable", authID)
+	}
+	authoritative.ID = authID
+	authoritative.EnsureIndex()
+
+	m.mu.Lock()
+	current := m.auths[authID]
+	if current != nil && authoritative.StateVersion > 0 && current.StateVersion > authoritative.StateVersion {
+		currentSnapshot := current.Clone()
+		m.mu.Unlock()
+		return currentSnapshot, nil
+	}
+	if authoritative.CreatedAt.IsZero() && current != nil {
+		authoritative.CreatedAt = current.CreatedAt
+	}
+	previousIndex := ""
+	if current != nil {
+		previousIndex = strings.TrimSpace(current.Index)
+		m.adoptPersistedCredentialLocked(current, authoritative)
+		current.ModelStates = mergePersistedCooldownModelStates(authoritative.ModelStates, current.ModelStates)
+		authoritative = current
+	}
+	newIndex := strings.TrimSpace(authoritative.Index)
+	if m.auths == nil {
+		m.auths = make(map[string]*Auth)
+	}
+	if m.indexAuth == nil {
+		m.indexAuth = make(map[string]*Auth)
+	}
+	m.auths[authID] = authoritative
+	if previousIndex != "" && previousIndex != newIndex {
+		if indexed := m.indexAuth[previousIndex]; indexed != nil && indexed.ID == authID {
+			delete(m.indexAuth, previousIndex)
+		}
+	}
+	if newIndex != "" {
+		m.indexAuth[newIndex] = authoritative
+	}
+	m.mu.Unlock()
+	m.scheduler.upsertAuth(authoritative)
+	m.reconcileRegistryModelStatesLocked(authID)
+	m.queueRefreshReschedule(authID)
+	return authoritative.Clone(), nil
+}
+
+func (m *Manager) removeAuthLocked(authID string) {
+	m.mu.Lock()
+	auth := m.auths[authID]
+	if auth != nil {
+		if index := strings.TrimSpace(auth.Index); index != "" {
+			if indexed := m.indexAuth[index]; indexed != nil && indexed.ID == authID {
+				delete(m.indexAuth, index)
+			}
+		}
+	}
+	delete(m.auths, authID)
+	loop := m.refreshLoop
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(authID)
+	}
+	if loop != nil {
+		loop.remove(authID)
+	}
+	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok {
+		invalidator.InvalidateAuth(authID)
+	}
 }
 
 // enqueueResultPersist queues runtime result state for background persistence.
 func (m *Manager) enqueueResultPersist(ctx context.Context, auth *Auth) {
+	authID, schedule := m.stageResultPersist(ctx, auth)
+	if schedule {
+		m.scheduleResultPersist(authID)
+	}
+}
+
+// stageResultPersist publishes the latest snapshot before scheduling database
+// work so configuration fencing can observe it without racing the worker.
+func (m *Manager) stageResultPersist(ctx context.Context, auth *Auth) (string, bool) {
 	if m == nil || m.store == nil || auth == nil {
-		return
+		return "", false
 	}
 	if shouldSkipPersist(ctx) {
-		return
+		return "", false
 	}
 	authID := strings.TrimSpace(auth.ID)
 	if authID == "" {
-		return
+		return "", false
 	}
-
-	m.resultPersistOnce.Do(func() {
-		m.resultPersistMu.Lock()
-		if m.resultPersistWake == nil {
-			m.resultPersistWake = make(chan struct{}, 1)
-		}
-		if m.resultPersistPending == nil {
-			m.resultPersistPending = make(map[string]*Auth)
-		}
-		if m.resultPersistActive == nil {
-			m.resultPersistActive = make(map[string]struct{})
-		}
-		if m.cooldownFencePending == nil {
-			m.cooldownFencePending = make(map[string]struct{})
-		}
-		m.resultPersistMu.Unlock()
-		go m.runResultPersistWorker()
-	})
 
 	m.resultPersistMu.Lock()
 	if m.resultPersistPending == nil {
 		m.resultPersistPending = make(map[string]*Auth)
 	}
+	if m.resultPersistActive == nil {
+		m.resultPersistActive = make(map[string]struct{})
+	}
+	if m.cooldownFencePending == nil {
+		m.cooldownFencePending = make(map[string]struct{})
+	}
 	m.resultPersistPending[authID] = auth.Clone()
-	wake := m.resultPersistWake
+	_, active := m.resultPersistActive[authID]
+	if !active {
+		m.resultPersistActive[authID] = struct{}{}
+	}
 	m.resultPersistMu.Unlock()
-
-	if wake == nil {
-		return
-	}
-	select {
-	case wake <- struct{}{}:
-	default:
-	}
+	return authID, !active
 }
 
-// runResultPersistWorker persists queued result state snapshots.
-func (m *Manager) runResultPersistWorker() {
+func (m *Manager) scheduleResultPersist(authID string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	m.startResultPersistWorkers()
+	m.resultPersistMu.Lock()
+	if _, active := m.resultPersistActive[authID]; active && m.resultPersistPending[authID] != nil {
+		m.resultPersistQueue = append(m.resultPersistQueue, authID)
+		m.resultPersistCond.Signal()
+	}
+	m.resultPersistMu.Unlock()
+}
+
+func (m *Manager) startResultPersistWorkers() {
 	if m == nil {
 		return
 	}
-	for range m.resultPersistWake {
-		m.flushResultPersistQueue()
+	m.resultPersistOnce.Do(func() {
+		m.resultPersistMu.Lock()
+		if m.resultPersistCond == nil {
+			m.resultPersistCond = sync.NewCond(&m.resultPersistMu)
+		}
+		workerCount := m.resultPersistWorkers
+		if workerCount <= 0 {
+			workerCount = defaultResultPersistWorkers
+		}
+		m.resultPersistMu.Unlock()
+
+		for worker := 0; worker < workerCount; worker++ {
+			go m.runResultPersistWorker()
+		}
+	})
+}
+
+// runResultPersistWorker persists queued snapshots while bounding database
+// concurrency across auth IDs.
+func (m *Manager) runResultPersistWorker() {
+	for {
+		m.resultPersistMu.Lock()
+		for len(m.resultPersistQueue) == 0 {
+			m.resultPersistCond.Wait()
+		}
+		authID := m.resultPersistQueue[0]
+		m.resultPersistQueue[0] = ""
+		m.resultPersistQueue = m.resultPersistQueue[1:]
+		auth := m.resultPersistPending[authID]
+		if auth == nil {
+			delete(m.resultPersistActive, authID)
+			m.resultPersistMu.Unlock()
+			continue
+		}
+		delete(m.resultPersistPending, authID)
+		persistTimeout := m.resultPersistTimeout
+		if persistTimeout <= 0 {
+			persistTimeout = defaultResultPersistTimeout
+		}
+		retryBackoff := m.resultPersistRetryBackoff
+		if retryBackoff <= 0 {
+			retryBackoff = defaultResultPersistRetryBackoff
+		}
+		m.resultPersistMu.Unlock()
+
+		persistCtx, cancelPersist := context.WithTimeout(context.Background(), persistTimeout)
+		errPersist := m.persistQueued(persistCtx, auth)
+		cancelPersist()
+		if errPersist == nil {
+			m.resultPersistMu.Lock()
+			if m.resultPersistPending[authID] != nil {
+				m.resultPersistQueue = append(m.resultPersistQueue, authID)
+				m.resultPersistCond.Signal()
+			} else {
+				delete(m.resultPersistActive, authID)
+			}
+			m.resultPersistMu.Unlock()
+			continue
+		}
+
+		log.WithFields(log.Fields{
+			"auth":        authID,
+			"retry_after": retryBackoff,
+		}).WithError(errPersist).Warn("auth manager: background result persistence failed")
+
+		m.resultPersistMu.Lock()
+		if m.resultPersistPending[authID] == nil {
+			m.resultPersistPending[authID] = auth
+		}
+		m.resultPersistMu.Unlock()
+
+		retryAuthID := authID
+		time.AfterFunc(retryBackoff, func() {
+			m.resultPersistMu.Lock()
+			defer m.resultPersistMu.Unlock()
+			if _, active := m.resultPersistActive[retryAuthID]; !active {
+				return
+			}
+			if m.resultPersistPending[retryAuthID] == nil {
+				delete(m.resultPersistActive, retryAuthID)
+				return
+			}
+			m.resultPersistQueue = append(m.resultPersistQueue, retryAuthID)
+			m.resultPersistCond.Signal()
+		})
 	}
 }
 
-// flushResultPersistQueue drains queued result state snapshots.
+// flushResultPersistQueue schedules queued auth IDs that have no active work.
+// It is kept as a recovery hook for callers that restore queue state directly.
 func (m *Manager) flushResultPersistQueue() {
 	if m == nil {
 		return
 	}
-	for {
-		m.resultPersistMu.Lock()
-		if len(m.resultPersistPending) == 0 {
-			m.resultPersistMu.Unlock()
-			return
-		}
-		pending := m.resultPersistPending
-		m.resultPersistPending = make(map[string]*Auth, len(pending))
-		if m.resultPersistActive == nil {
-			m.resultPersistActive = make(map[string]struct{}, len(pending))
-		}
-		for authID := range pending {
-			m.resultPersistActive[authID] = struct{}{}
-		}
-		m.resultPersistMu.Unlock()
-
-		for authID, auth := range pending {
-			_ = m.persist(context.Background(), auth)
-			m.resultPersistMu.Lock()
-			delete(m.resultPersistActive, authID)
-			m.resultPersistMu.Unlock()
-		}
+	m.startResultPersistWorkers()
+	m.resultPersistMu.Lock()
+	if m.resultPersistActive == nil {
+		m.resultPersistActive = make(map[string]struct{})
 	}
+	for authID := range m.resultPersistPending {
+		if _, active := m.resultPersistActive[authID]; active {
+			continue
+		}
+		m.resultPersistActive[authID] = struct{}{}
+		m.resultPersistQueue = append(m.resultPersistQueue, authID)
+		m.resultPersistCond.Signal()
+	}
+	m.resultPersistMu.Unlock()
 }
 
 // List returns the available entries.
@@ -539,14 +901,31 @@ func (m *Manager) GetByIndex(index string) (*Auth, bool) {
 
 // RefreshSchedulerEntry refreshes refresh scheduler entry.
 func (m *Manager) RefreshSchedulerEntry(authID string) {
-	if m == nil || m.scheduler == nil {
+	if m == nil {
 		return
 	}
-	auth, ok := m.GetByID(authID)
-	if !ok || auth == nil {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
 		return
 	}
-	m.scheduler.upsertAuth(auth)
+
+	unlockUpdate := m.updateLocks.lock(authID)
+	defer unlockUpdate()
+	m.mu.RLock()
+	scheduler := m.scheduler
+	auth := m.auths[authID]
+	if auth != nil {
+		auth = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if scheduler == nil {
+		return
+	}
+	if auth == nil {
+		scheduler.removeAuth(authID)
+		return
+	}
+	scheduler.upsertAuth(auth)
 }
 
 // ReconcileRegistryModelStates aligns the derived model registry with the
@@ -555,8 +934,28 @@ func (m *Manager) ReconcileRegistryModelStates(_ context.Context, authID string)
 	if m == nil {
 		return
 	}
-	auth, ok := m.GetByID(authID)
-	if !ok || auth == nil {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+
+	// Keep registry effects ordered with publication for this auth. A result or
+	// cooldown mutation may finish after a newer Update or Delete, so derive the
+	// registry state from the current manager snapshot.
+	unlockUpdate := m.updateLocks.lock(authID)
+	defer unlockUpdate()
+	m.reconcileRegistryModelStatesLocked(authID)
+}
+
+func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
+	m.mu.RLock()
+	auth := m.auths[authID]
+	if auth != nil {
+		auth = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if auth == nil {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
 		return
 	}
 
@@ -1350,28 +1749,172 @@ func authRefreshDisabled(auth *Auth) bool {
 	return auth == nil || auth.Disabled || auth.Status == StatusDisabled
 }
 
-// applyRefreshFailureState prevents dispatch until credential acquisition
-// succeeds after a transient refresh failure.
-func applyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) {
+// ApplyRefreshFailureState backs off credential acquisition after a transient
+// refresh failure. A known-valid Antigravity access token remains dispatchable
+// outside the request safety window while Home retries the refresh.
+func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Error {
 	if auth == nil || errRefresh == nil {
-		return
+		return nil
 	}
 	if isTerminalRefreshAuthError(errRefresh) {
-		disableAuthAfterUnauthorized(auth, nil, newUnauthorizedRefreshErrorFrom(errRefresh), now)
-		return
+		refreshFailure := newUnauthorizedRefreshErrorFrom(errRefresh)
+		disableAuthAfterUnauthorized(auth, nil, refreshFailure, now)
+		return refreshFailure
 	}
+
+	wasRefreshBlocked := RefreshBlocksDispatch(auth) && isRefreshAcquisitionState(auth)
 	retryAt := now.Add(refreshFailureBackoff)
+	safeAntigravityToken := antigravityTokenSafeForDispatch(auth, now)
+	if safeAntigravityToken {
+		expiresAt, _ := auth.ExpirationTime()
+		if safetyDeadline := expiresAt.Add(-refreshFailureBackoff); safetyDeadline.Before(retryAt) {
+			retryAt = safetyDeadline
+		}
+	}
+	refreshFailure := newTransientRefreshErrorFrom(errRefresh)
+	if refreshFailure.Diagnostic != "" && !strings.Contains(refreshFailure.Diagnostic, "retry_at=") {
+		refreshFailure.Diagnostic = logging.SafeDiagnosticForLog(refreshFailure.Diagnostic + " retry_at=" + retryAt.UTC().Format(time.RFC3339Nano))
+	}
+	auth.LastRefreshError = cloneError(refreshFailure)
 	auth.NextRefreshAfter = retryAt
+	if safeAntigravityToken {
+		if wasRefreshBlocked {
+			clearRefreshDispatchBlock(auth, now)
+		}
+		if !hasHigherPriorityExecutionError(auth, now) {
+			auth.LastError = cloneError(refreshFailure)
+			auth.StatusMessage = ""
+			if !auth.Disabled && auth.Status != StatusDisabled {
+				auth.Status = StatusActive
+			}
+		}
+		auth.UpdatedAt = now
+		return refreshFailure
+	}
+
+	auth.LastError = cloneError(refreshFailure)
 	auth.NextRetryAfter = retryAt
 	auth.Unavailable = true
 	auth.RuntimeRefreshBlocked = true
 	auth.Status = StatusError
-	auth.LastError = newTransientRefreshErrorFrom(errRefresh)
-	if auth.LastError.Diagnostic != "" {
-		auth.LastError.Diagnostic = logging.SafeDiagnosticForLog(auth.LastError.Diagnostic + " retry_at=" + retryAt.UTC().Format(time.RFC3339Nano))
-	}
-	auth.StatusMessage = auth.LastError.Message
+	auth.StatusMessage = refreshFailure.Message
 	auth.UpdatedAt = now
+	return refreshFailure
+}
+
+func antigravityTokenSafeForDispatch(auth *Auth, now time.Time) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") || accessTokenForFingerprint(auth) == "" {
+		return false
+	}
+	if isUnauthorizedAuthState(auth) {
+		return false
+	}
+	for _, state := range auth.ModelStates {
+		if isUnauthorizedModelState(state) {
+			return false
+		}
+	}
+	expiresAt, okExpiry := auth.ExpirationTime()
+	return okExpiry && expiresAt.After(now.Add(refreshFailureBackoff))
+}
+
+func hasHigherPriorityExecutionError(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Unavailable || hasModelError(auth, now) {
+		return true
+	}
+	return auth.LastError != nil && !isRefreshAcquisitionState(auth)
+}
+
+func clearRefreshDispatchBlock(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	preserveCredentialQuota := hasLegacyCredentialQuota(auth)
+	preservedQuota := auth.Quota
+	preserveNonRefreshError := auth.LastError != nil && !isRefreshAcquisitionError(auth.LastError) && !authErrorMirroredByModel(auth)
+	preservedStatus := auth.Status
+	preservedStatusMessage := auth.StatusMessage
+	preservedLastError := cloneError(auth.LastError)
+	preservedUnavailable := auth.Unavailable
+	preservedRetryAfter := auth.NextRetryAfter
+
+	auth.RuntimeRefreshBlocked = false
+	if isRefreshAcquisitionError(auth.LastError) {
+		auth.LastError = nil
+		auth.StatusMessage = ""
+	}
+	updateAggregatedAvailability(auth, now)
+	if preserveCredentialQuota {
+		auth.Quota = preservedQuota
+	}
+	modelError := latestModelErrorState(auth, now)
+	switch {
+	case auth.Disabled || auth.Status == StatusDisabled:
+		auth.Status = StatusDisabled
+		auth.Unavailable = true
+	case preserveCredentialQuota:
+		auth.Status = StatusError
+		if preserveNonRefreshError {
+			auth.StatusMessage = preservedStatusMessage
+			auth.LastError = preservedLastError
+			if auth.StatusMessage == "" {
+				auth.StatusMessage = preservedLastError.Message
+			}
+		} else {
+			quotaMessage := strings.TrimSpace(preservedQuota.Reason)
+			if quotaMessage == "" {
+				quotaMessage = "quota exceeded"
+			}
+			auth.StatusMessage = quotaMessage
+			auth.LastError = &Error{
+				Message:    quotaMessage,
+				Retryable:  true,
+				HTTPStatus: http.StatusTooManyRequests,
+			}
+		}
+		auth.Unavailable = true
+		auth.NextRetryAfter = preservedQuota.NextRecoverAt
+	case preserveNonRefreshError:
+		auth.Status = preservedStatus
+		auth.StatusMessage = preservedStatusMessage
+		auth.LastError = preservedLastError
+		auth.Unavailable = preservedUnavailable
+		auth.NextRetryAfter = preservedRetryAfter
+	case modelError != nil:
+		auth.Status = StatusError
+		auth.StatusMessage = modelError.StatusMessage
+		auth.LastError = cloneError(modelError.LastError)
+		if auth.StatusMessage == "" && auth.LastError != nil {
+			auth.StatusMessage = auth.LastError.Message
+		}
+	default:
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+	}
+}
+
+func latestModelErrorState(auth *Auth, now time.Time) *ModelState {
+	if auth == nil {
+		return nil
+	}
+	var latest *ModelState
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		activeError := state.LastError != nil ||
+			(state.Status == StatusError && state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)))
+		if !activeError {
+			continue
+		}
+		if latest == nil || state.UpdatedAt.After(latest.UpdatedAt) {
+			latest = state
+		}
+	}
+	return latest
 }
 
 // ApplyUnsupportedRefreshBackoff clears credential-level refresh blocking while
@@ -1387,6 +1930,7 @@ func ApplyUnsupportedRefreshBackoff(auth *Auth, now time.Time) {
 	auth.RuntimeRefreshBlocked = false
 	auth.LastError = cloneError(ErrRefreshUnsupported)
 	auth.LastError.Diagnostic = unsupportedRefreshDiagnostic(auth)
+	auth.LastRefreshError = cloneError(auth.LastError)
 	auth.StatusMessage = ""
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
@@ -1450,9 +1994,15 @@ func newTransientRefreshError() *Error {
 func newTransientRefreshErrorFrom(errRefresh error) *Error {
 	result := newTransientRefreshError()
 	result.Diagnostic = refreshErrorDiagnostic(errRefresh)
-	if copyUpstreamResponse(result, errRefresh) {
+	var authErr *Error
+	if errors.As(errRefresh, &authErr) && authErr != nil && authErr.Upstream != nil {
+		result.Upstream = &UpstreamResponse{
+			Status: authErr.Upstream.Status,
+			Body:   append([]byte(nil), authErr.Upstream.Body...),
+		}
 		return result
 	}
+	copyUpstreamResponse(result, errRefresh)
 	return result
 }
 
@@ -1474,9 +2024,15 @@ func newUnauthorizedRefreshError() *Error {
 func newUnauthorizedRefreshErrorFrom(errRefresh error) *Error {
 	result := newUnauthorizedRefreshError()
 	result.Diagnostic = refreshErrorDiagnostic(errRefresh)
-	if copyUpstreamResponse(result, errRefresh) {
+	var authErr *Error
+	if errors.As(errRefresh, &authErr) && authErr != nil && authErr.Upstream != nil {
+		result.Upstream = &UpstreamResponse{
+			Status: authErr.Upstream.Status,
+			Body:   append([]byte(nil), authErr.Upstream.Body...),
+		}
 		return result
 	}
+	copyUpstreamResponse(result, errRefresh)
 	return result
 }
 
@@ -1500,20 +2056,35 @@ func refreshErrorDiagnostic(errRefresh error) string {
 	return logging.SafeErrorDiagnostic(errRefresh)
 }
 
-func logCredentialRefreshFailure(ctx context.Context, auth *Auth) {
-	if auth == nil || auth.LastError == nil {
+func logCredentialRefreshFailure(ctx context.Context, auth *Auth, refreshFailures ...error) {
+	if auth == nil {
+		return
+	}
+	failure := auth.LastError
+	if len(refreshFailures) > 0 && refreshFailures[0] != nil {
+		var structured *Error
+		if errors.As(refreshFailures[0], &structured) && structured != nil {
+			failure = structured
+		}
+	}
+	if failure == nil {
 		return
 	}
 	fields := log.Fields{
-		"auth":       auth.ID,
-		"code":       auth.LastError.Code,
-		"diagnostic": logging.SafeDiagnosticForLog(auth.LastError.Diagnostic),
-		"provider":   auth.Provider,
-		"stage":      "credential_refresh",
+		"auth":             auth.ID,
+		"code":             failure.Code,
+		"diagnostic":       logging.SafeDiagnosticForLog(failure.Diagnostic),
+		"provider":         auth.Provider,
+		"proxy_configured": strings.TrimSpace(auth.ProxyURL) != "",
+		"stage":            "credential_refresh",
 	}
 	if !auth.NextRefreshAfter.IsZero() {
 		fields["retry_at"] = auth.NextRefreshAfter.UTC().Format(time.RFC3339Nano)
 	}
+	if expiresAt, okExpiry := auth.ExpirationTime(); okExpiry {
+		fields["token_expires_at"] = expiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	fields["dispatch_blocked"] = RefreshBlocksDispatch(auth)
 	logEntryWithRequestID(ctx).WithFields(fields).Warn("credential refresh failed")
 }
 
@@ -1606,6 +2177,22 @@ func AuthIsNewerThanObserved(auth *Auth, observedAccessTokenSHA256 string) bool 
 	return okObserved && okCurrent && currentHash != observedHash
 }
 
+// CanUseObservedTokenAfterRefreshFailure reports whether a downstream caller
+// can safely keep using the exact Antigravity token it observed when refresh
+// fails. This compatibility path never accepts terminal or canceled refreshes.
+func CanUseObservedTokenAfterRefreshFailure(auth *Auth, observedAccessTokenSHA256 string, errRefresh error, now time.Time) bool {
+	if authRefreshDisabled(auth) || errRefresh == nil ||
+		errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) ||
+		isTerminalRefreshAuthError(errRefresh) ||
+		(auth.LastError != nil && isTerminalRefreshAuthError(auth.LastError)) ||
+		!antigravityTokenSafeForDispatch(auth, now) {
+		return false
+	}
+	observedHash, okObserved := normalizeSHA256Hex(observedAccessTokenSHA256)
+	currentHash, okCurrent := normalizeSHA256Hex(AccessTokenSHA256(auth))
+	return okObserved && okCurrent && observedHash == currentHash
+}
+
 func normalizeSHA256Hex(value string) (string, bool) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if len(value) != sha256.Size*2 {
@@ -1666,13 +2253,15 @@ func ApplyRefreshPendingState(auth *Auth, now time.Time) {
 
 // markRefreshPending handles a mark refresh pending.
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
+	unlockUpdate := m.updateLocks.lock(id)
+	defer unlockUpdate()
 	m.mu.Lock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil {
 		m.mu.Unlock()
 		return false
 	}
-	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+	if !m.shouldRefresh(auth, now) {
 		m.mu.Unlock()
 		return false
 	}
@@ -1965,11 +2554,18 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	if AuthIsNewerThanObserved(target, observedAccessTokenSHA256) {
 		return target.Clone(), nil
 	}
-	if RefreshRetryBackoffOpen(target, time.Now().UTC()) {
-		if isRefreshAcquisitionState(target) {
-			return nil, cloneError(target.LastError)
+	now := time.Now().UTC()
+	if RefreshRetryBackoffOpen(target, now) {
+		errRefresh := NewTransientRefreshError()
+		if target.LastRefreshError != nil {
+			errRefresh = cloneError(target.LastRefreshError)
+		} else if isRefreshAcquisitionState(target) && target.LastError != nil {
+			errRefresh = cloneError(target.LastError)
 		}
-		return nil, NewTransientRefreshError()
+		if CanUseObservedTokenAfterRefreshFailure(target, observedAccessTokenSHA256, errRefresh, now) {
+			return target.Clone(), nil
+		}
+		return nil, errRefresh
 	}
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
@@ -1983,26 +2579,60 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
-	now := time.Now().UTC()
+	now = time.Now().UTC()
 	if errRefresh != nil {
 		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
 			return nil, errRefresh
 		}
 		snapshot := target.Clone()
-		applyRefreshFailureState(snapshot, errRefresh, now)
-		logCredentialRefreshFailure(ctx, snapshot)
-		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
+		refreshFailure := ApplyRefreshFailureState(snapshot, errRefresh, now)
+		logCredentialRefreshFailure(ctx, snapshot, refreshFailure)
+		updatedPersisted, errUpdate := m.Update(ctx, snapshot)
+		if errUpdate != nil {
 			return nil, errUpdate
 		}
-		return nil, cloneError(snapshot.LastError)
+		if authRefreshDisabled(updatedPersisted) {
+			if updatedPersisted.LastError != nil && strings.EqualFold(strings.TrimSpace(updatedPersisted.LastError.Code), refreshAuthErrorCode) {
+				return nil, cloneError(updatedPersisted.LastError)
+			}
+			return nil, newUnauthorizedRefreshError()
+		}
+		if !authRefreshDisabled(updatedPersisted) && AuthIsNewerThanObserved(updatedPersisted, observedAccessTokenSHA256) {
+			return updatedPersisted, nil
+		}
+		persistedFailure := refreshFailure
+		if updatedPersisted.LastRefreshError != nil {
+			persistedFailure = cloneError(updatedPersisted.LastRefreshError)
+		}
+		if CanUseObservedTokenAfterRefreshFailure(updatedPersisted, observedAccessTokenSHA256, persistedFailure, now) {
+			return updatedPersisted, nil
+		}
+		return nil, cloneError(persistedFailure)
 	}
 	if !refreshAttempted {
 		snapshot := target.Clone()
 		ApplyUnsupportedRefreshBackoff(snapshot, now)
-		if _, errUpdate := m.Update(ctx, snapshot); errUpdate != nil {
+		updatedPersisted, errUpdate := m.Update(ctx, snapshot)
+		if errUpdate != nil {
 			return nil, errUpdate
 		}
-		return nil, cloneError(snapshot.LastError)
+		if authRefreshDisabled(updatedPersisted) {
+			if updatedPersisted.LastError != nil && strings.EqualFold(strings.TrimSpace(updatedPersisted.LastError.Code), refreshAuthErrorCode) {
+				return nil, cloneError(updatedPersisted.LastError)
+			}
+			return nil, newUnauthorizedRefreshError()
+		}
+		if !authRefreshDisabled(updatedPersisted) && AuthIsNewerThanObserved(updatedPersisted, observedAccessTokenSHA256) {
+			return updatedPersisted, nil
+		}
+		persistedFailure := snapshot.LastError
+		if updatedPersisted.LastRefreshError != nil {
+			persistedFailure = cloneError(updatedPersisted.LastRefreshError)
+		}
+		if CanUseObservedTokenAfterRefreshFailure(updatedPersisted, observedAccessTokenSHA256, persistedFailure, now) {
+			return updatedPersisted, nil
+		}
+		return nil, cloneError(persistedFailure)
 	}
 	if updated == nil {
 		updated = target.Clone()
@@ -2010,14 +2640,24 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	if updated.Runtime == nil {
 		updated.Runtime = target.Runtime
 	}
-	modelsToResume := applyRefreshSuccessState(updated, now)
+	applyRefreshSuccessState(updated, now)
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	updatedPersisted, errUpdate := m.Update(ctx, updated)
+	updatedPersisted, refreshAccepted, errUpdate := m.updateWithAcceptance(ctx, updated)
 	if errUpdate != nil {
 		return nil, errUpdate
 	}
+	if authRefreshDisabled(updatedPersisted) {
+		if updatedPersisted.LastError != nil && strings.EqualFold(strings.TrimSpace(updatedPersisted.LastError.Code), refreshAuthErrorCode) {
+			return nil, cloneError(updatedPersisted.LastError)
+		}
+		return nil, newUnauthorizedRefreshError()
+	}
+	if !refreshAccepted && !AuthIsNewerThanObserved(updatedPersisted, AccessTokenSHA256(target)) {
+		return nil, NewTransientRefreshError()
+	}
+	modelsToResume := refreshedUnauthorizedModels(target, updatedPersisted)
 	resumeRefreshedModels(updated.ID, modelsToResume)
 	if targetIndex != authIndex {
 		refreshed, ok := m.GetByIndex(authIndex)
@@ -2062,9 +2702,9 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 			return target.Clone(), errRefresh
 		}
 		snapshot := target.Clone()
-		applyRefreshFailureState(snapshot, errRefresh, now)
-		logCredentialRefreshFailure(ctx, snapshot)
-		return snapshot, cloneError(snapshot.LastError)
+		refreshFailure := ApplyRefreshFailureState(snapshot, errRefresh, now)
+		logCredentialRefreshFailure(ctx, snapshot, refreshFailure)
+		return snapshot, cloneError(refreshFailure)
 	}
 	if !refreshAttempted {
 		snapshot := target.Clone()
@@ -2147,12 +2787,12 @@ func (m *Manager) refreshAuth(ctx context.Context, authID string) *Auth {
 		}
 		return nil
 	}
-	modelsToResume := refreshedUnauthorizedModels(beforeRefresh, updated)
-	if _, errUpdate := m.Update(ctx, updated); errUpdate != nil {
+	updatedPersisted, errUpdate := m.Update(ctx, updated)
+	if errUpdate != nil {
 		logEntryWithRequestID(ctx).Warnf("auth refresh state update failed | auth=%s provider=%s err=%v", authID, current.Provider, errUpdate)
 		return nil
 	}
-	resumeRefreshedModels(updated.ID, modelsToResume)
+	resumeRefreshedModels(updatedPersisted.ID, refreshedUnauthorizedModels(beforeRefresh, updatedPersisted))
 	return nil
 }
 
@@ -2172,6 +2812,7 @@ func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
 
 	auth.LastRefreshedAt = now
 	auth.NextRefreshAfter = time.Time{}
+	auth.LastRefreshError = nil
 	auth.UpdatedAt = now
 	if clearRefreshAcquisition {
 		auth.NextRetryAfter = time.Time{}
@@ -2231,13 +2872,14 @@ func isRefreshAcquisitionState(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	if auth.RuntimeRefreshBlocked {
-		return true
-	}
-	if auth.LastError == nil {
+	return auth.RuntimeRefreshBlocked || isRefreshAcquisitionError(auth.LastError)
+}
+
+func isRefreshAcquisitionError(authErr *Error) bool {
+	if authErr == nil {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(auth.LastError.Code)) {
+	switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
 	case refreshTransientErrorCode, refreshUnsupportedCode:
 		return true
 	default:

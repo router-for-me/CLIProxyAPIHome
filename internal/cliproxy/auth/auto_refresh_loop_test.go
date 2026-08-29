@@ -82,7 +82,7 @@ func TestNextRefreshCheckAtUsesProviderExpiryLead(t *testing.T) {
 	}{
 		{name: "Codex", provider: "codex", lead: 5 * 24 * time.Hour, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(5 * 24 * time.Hour)},
 		{name: "Claude", provider: "claude", lead: 4 * time.Hour, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 4*time.Hour)},
-		{name: "Antigravity", provider: "antigravity", lead: 50 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 50*time.Minute)},
+		{name: "Antigravity", provider: "antigravity", lead: 30 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 30*time.Minute)},
 		{name: "Kimi", provider: "kimi", lead: 5 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 5*time.Minute)},
 		{name: "xAI", provider: "xai", lead: 5 * time.Minute, expiry: now.Add(10 * 24 * time.Hour), want: now.Add(10*24*time.Hour - 5*time.Minute)},
 		{name: "boundary is due", provider: "xai", lead: 5 * time.Minute, expiry: now.Add(5 * time.Minute), want: now, wantDue: true},
@@ -111,6 +111,32 @@ func TestNextRefreshCheckAtUsesProviderExpiryLead(t *testing.T) {
 				t.Fatalf("ProviderRefreshLead() = %v, want %v", gotLead, test.lead)
 			}
 		})
+	}
+}
+
+func TestNextRefreshCheckAtUsesRelativeAntigravityExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
+	issuedAt := now.Add(-15 * time.Minute)
+	auth := &Auth{
+		Provider: "antigravity",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":  "test-access",
+			"refresh_token": "test-refresh",
+			"expires_in":    3600,
+			"timestamp":     int(issuedAt.UnixMilli()),
+		},
+	}
+
+	next, ok := nextRefreshCheckAt(now, auth, 15*time.Minute)
+	want := issuedAt.Add(time.Hour - antigravityRefreshLead)
+	if !ok || !next.Equal(want) {
+		t.Fatalf("nextRefreshCheckAt() = (%v, %t), want %v, true", next, ok, want)
+	}
+	if manager := NewManager(nil, nil, nil); manager.ShouldRefreshCredential(auth, now) {
+		t.Fatal("ShouldRefreshCredential() = true before the relative expiry refresh lead")
 	}
 }
 

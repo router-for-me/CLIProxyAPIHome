@@ -1209,19 +1209,22 @@ func TestClearQuotaCooldownClearsOnlyRequestedModel(t *testing.T) {
 func TestAdoptPersistedCooldownStateClearsStaleRuntimeRefreshBlock(t *testing.T) {
 	now := time.Now().UTC()
 	const authID = "auth-stale-runtime-refresh-block"
+	refreshAt := now.Add(3 * time.Minute)
 	quotaState := quotaCooldownModelState(now, 10*time.Minute)
 	quotaState.Quota.Scope = quotaScopeModel
 	persisted := &Auth{
-		ID:             authID,
-		Index:          authID,
-		Provider:       "codex",
-		Status:         StatusError,
-		StatusMessage:  quotaState.StatusMessage,
-		LastError:      cloneError(quotaState.LastError),
-		Unavailable:    true,
-		NextRetryAfter: quotaState.NextRetryAfter,
-		Quota:          quotaState.Quota,
-		ModelStates:    map[string]*ModelState{"model-a": quotaState},
+		ID:               authID,
+		Index:            authID,
+		Provider:         "codex",
+		Status:           StatusError,
+		StatusMessage:    quotaState.StatusMessage,
+		LastError:        cloneError(quotaState.LastError),
+		LastRefreshError: &Error{Code: refreshUnsupportedCode, Diagnostic: "refresh unsupported"},
+		Unavailable:      true,
+		NextRefreshAfter: refreshAt,
+		NextRetryAfter:   quotaState.NextRetryAfter,
+		Quota:            quotaState.Quota,
+		ModelStates:      map[string]*ModelState{"model-a": quotaState},
 	}
 	store := &fakeMutatorStore{persisted: persisted}
 	manager := NewManager(store, nil, nil)
@@ -1235,6 +1238,8 @@ func TestAdoptPersistedCooldownStateClearsStaleRuntimeRefreshBlock(t *testing.T)
 		HTTPStatus: http.StatusServiceUnavailable,
 	}
 	local.NextRetryAfter = now.Add(time.Minute)
+	local.NextRefreshAfter = now.Add(time.Minute)
+	local.LastRefreshError = &Error{Code: refreshTransientErrorCode, Diagnostic: "stale refresh failure"}
 	local.RuntimeRefreshBlocked = true
 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), local); errRegister != nil {
 		t.Fatalf("Register() error = %v", errRegister)
@@ -1257,6 +1262,9 @@ func TestAdoptPersistedCooldownStateClearsStaleRuntimeRefreshBlock(t *testing.T)
 	}
 	if got.RuntimeRefreshBlocked || RefreshBlocksDispatch(got) {
 		t.Fatalf("adopted refresh block = runtime:%v effective:%v, want cleared", got.RuntimeRefreshBlocked, RefreshBlocksDispatch(got))
+	}
+	if got.LastRefreshError == nil || got.LastRefreshError.Code != refreshUnsupportedCode || got.LastRefreshError.Diagnostic != "refresh unsupported" || !got.NextRefreshAfter.Equal(refreshAt) {
+		t.Fatalf("adopted refresh diagnostic/backoff = %#v/%v, want authoritative diagnostic until %v", got.LastRefreshError, got.NextRefreshAfter, refreshAt)
 	}
 	if blocked, reason, next := isAuthBlockedForModel(got, "model-a", now); !blocked || reason != blockReasonCooldown || !next.Equal(quotaState.NextRetryAfter) {
 		t.Fatalf("model-a blocked/reason/next = %v/%v/%v, want quota cooldown until %v", blocked, reason, next, quotaState.NextRetryAfter)
@@ -1453,6 +1461,85 @@ func TestClearQuotaCooldownPreservesLocalNonQuotaState(t *testing.T) {
 	state := local.ModelStates["gpt-a"]
 	if state.LastError == nil || state.LastError.HTTPStatus != http.StatusServiceUnavailable || state.Quota.Exceeded || state.NextRetryAfter.IsZero() {
 		t.Fatalf("local model state = %#v, want 5xx preserved with quota cleared", state)
+	}
+}
+
+func TestClearQuotaCooldownAdoptsNewerPersistedCredentialSnapshot(t *testing.T) {
+	const authID = "auth-clear-newer-credential"
+	const quotaModel = "gpt-quota"
+	const localModel = "gpt-local-only"
+	now := time.Now().UTC()
+	quotaState := quotaCooldownModelState(now, 10*time.Minute)
+	quotaState.Quota.Scope = quotaScopeModel
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:             authID,
+		Index:          authID,
+		Provider:       "codex",
+		Label:          "authoritative-label",
+		Status:         StatusError,
+		StatusMessage:  quotaState.StatusMessage,
+		Unavailable:    true,
+		NextRetryAfter: quotaState.NextRetryAfter,
+		Quota:          quotaState.Quota,
+		StateVersion:   11,
+		Attributes:     map[string]string{"base_url": "https://authoritative.example"},
+		Metadata:       map[string]any{"access_token": "rotated-access-token"},
+		ModelStates:    map[string]*ModelState{quotaModel: quotaState},
+	}}
+	manager := NewManager(store, nil, nil)
+	runtimeMarker := &struct{ name string }{name: "runtime"}
+	storageMarker := &testTokenStorage{}
+	localState := &ModelState{
+		Status:         StatusError,
+		StatusMessage:  "local transient failure",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+		UpdatedAt:      now.Add(time.Second),
+	}
+	local := &Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "codex",
+		Label:        "stale-label",
+		Status:       StatusActive,
+		StateVersion: 10,
+		Attributes:   map[string]string{"base_url": "https://stale.example"},
+		Metadata:     map[string]any{"access_token": "stale-access-token"},
+		ModelStates:  map[string]*ModelState{localModel: localState},
+		Runtime:      runtimeMarker,
+		Storage:      storageMarker,
+	}
+	if _, errRegister := manager.Register(context.Background(), local); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	result, errClear := manager.ClearQuotaCooldown(context.Background(), authID, quotaModel)
+	if errClear != nil {
+		t.Fatalf("ClearQuotaCooldown() error = %v", errClear)
+	}
+	if !result.Cleared {
+		t.Fatalf("ClearQuotaCooldown() result = %#v, want cleared", result)
+	}
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("GetByID() missing auth")
+	}
+	if current.StateVersion != 11 || current.Metadata["access_token"] != "rotated-access-token" {
+		t.Fatalf("credential snapshot = version %d token %v, want version 11 with rotated token", current.StateVersion, current.Metadata["access_token"])
+	}
+	if current.Label != "authoritative-label" || current.Attributes["base_url"] != "https://authoritative.example" {
+		t.Fatalf("credential fields = label %q attributes %#v, want authoritative snapshot", current.Label, current.Attributes)
+	}
+	if current.Runtime != runtimeMarker || current.Storage != storageMarker {
+		t.Fatalf("runtime state = Runtime %#v Storage %#v, want local runtime objects preserved", current.Runtime, current.Storage)
+	}
+	if state := current.ModelStates[localModel]; state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("local model state = %#v, want unpersisted execution state preserved", state)
+	}
+	if state := current.ModelStates[quotaModel]; state != nil && state.Quota.Exceeded {
+		t.Fatalf("quota model state = %#v, want persisted quota cleared", state)
 	}
 }
 

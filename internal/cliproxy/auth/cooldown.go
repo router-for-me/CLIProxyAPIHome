@@ -81,9 +81,7 @@ func (m *Manager) mutateCooldownState(ctx context.Context, credentialID string, 
 
 	result.authSnapshot, result.adopted = m.adoptPersistedCooldownState(persisted, now)
 	if result.adopted && result.authSnapshot != nil {
-		if m.scheduler != nil {
-			m.scheduler.upsertAuth(result.authSnapshot)
-		}
+		m.RefreshSchedulerEntry(credentialID)
 		m.ReconcileRegistryModelStates(ctx, credentialID)
 	}
 	return result, nil
@@ -288,19 +286,20 @@ func (m *Manager) clearLocalDisabledCooldownState(ctx context.Context, authID st
 	if m == nil {
 		return nil, false
 	}
+	unlockUpdate := m.updateLocks.lock(authID)
 	m.mu.Lock()
 	auth := m.auths[authID]
 	if auth == nil {
 		m.mu.Unlock()
+		unlockUpdate()
 		return nil, false
 	}
 	changed := clearDisabledCooldownState(auth, now)
 	snapshot := auth.Clone()
 	m.mu.Unlock()
+	unlockUpdate()
 	if changed {
-		if m.scheduler != nil {
-			m.scheduler.upsertAuth(snapshot)
-		}
+		m.RefreshSchedulerEntry(authID)
 		m.ReconcileRegistryModelStates(ctx, authID)
 	}
 	return snapshot, changed
@@ -745,6 +744,8 @@ func (m *Manager) adoptPersistedCooldownState(persisted *Auth, now time.Time) (*
 	if m == nil || persisted == nil {
 		return nil, false
 	}
+	unlockUpdate := m.updateLocks.lock(persisted.ID)
+	defer unlockUpdate()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	local := m.auths[persisted.ID]
@@ -758,13 +759,18 @@ func (m *Manager) adoptPersistedCooldownState(persisted *Auth, now time.Time) (*
 	persistedClone := persisted.Clone()
 	persistedLegacyCredentialQuota := hasLegacyCredentialQuota(persistedClone)
 	persistedGlobalError := persistedClone.LastError != nil && statusCodeFromResult(persistedClone.LastError) != http.StatusTooManyRequests && !authErrorMirroredByModel(persistedClone)
+	if persistedClone.StateVersion > 0 && persistedClone.StateVersion > local.StateVersion {
+		m.adoptPersistedCredentialLocked(local, persistedClone)
+	}
 	local.StateVersion = persistedClone.StateVersion
 	local.Disabled = persistedClone.Disabled
 	local.Status = persistedClone.Status
 	local.StatusMessage = persistedClone.StatusMessage
 	local.LastError = cloneError(persistedClone.LastError)
+	local.LastRefreshError = cloneError(persistedClone.LastRefreshError)
 	local.Unavailable = persistedClone.Unavailable
 	local.RuntimeRefreshBlocked = RefreshBlocksDispatch(persistedClone)
+	local.NextRefreshAfter = persistedClone.NextRefreshAfter
 	local.NextRetryAfter = persistedClone.NextRetryAfter
 	local.Quota = persistedClone.Quota
 	local.ModelStates = mergePersistedCooldownModelStates(persistedClone.ModelStates, local.ModelStates)

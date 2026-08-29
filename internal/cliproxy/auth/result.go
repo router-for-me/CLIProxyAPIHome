@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
-	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -65,50 +64,54 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if resultModel == "" {
 		return
 	}
-	resultAuthID := ""
-	now := time.Now()
-
-	m.mu.Lock()
-	auth := m.resultAuthLocked(result)
-	var mutator StateMutator
-	stateMutatorAvailable := false
-	if auth != nil {
-		resultAuthID = auth.ID
-		disableCooling = m.quotaCooldownDisabledForAuth(auth)
-		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
-			auth.Success++
-		} else {
-			auth.Failed++
-		}
-		localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
-			!isModelSupportResultError(result.Error) &&
-			disableCooling &&
-			disabledQuotaStateAlreadyApplied(auth, resultModel)
-		if localOnlyDisabledQuota {
-			localAvailabilityBefore = availabilityFingerprint(auth, resultModel)
-		}
-		if stateMutator, ok := m.store.(StateMutator); ok {
-			stateMutatorAvailable = true
-			if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
-				mutator = stateMutator
-			}
-		}
-		// A locally clean token-versioned success has no state to clear. Drop its
-		// transition rather than enqueue a stale row or read the database per success;
-		// cluster events reconcile any newer authoritative state.
-		if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
-			transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
-			if localOnlyDisabledQuota {
-				skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
-			}
-			authSnapshot = auth.Clone()
-		}
-	}
-	m.mu.Unlock()
+	resultAuthID := m.resultAuthID(result)
 	if resultAuthID == "" {
 		return
 	}
+	now := time.Now()
+
+	unlockUpdate := m.updateLocks.lock(resultAuthID)
+	m.mu.Lock()
+	auth := m.resultAuthLocked(result)
+	if auth == nil || auth.ID != resultAuthID {
+		m.mu.Unlock()
+		unlockUpdate()
+		return
+	}
+	var mutator StateMutator
+	stateMutatorAvailable := false
+	disableCooling = m.quotaCooldownDisabledForAuth(auth)
+	auth.recordRecentRequest(now, result.Success)
+	if result.Success {
+		auth.Success++
+	} else {
+		auth.Failed++
+	}
+	localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
+		!isModelSupportResultError(result.Error) &&
+		disableCooling &&
+		disabledQuotaStateAlreadyApplied(auth, resultModel)
+	if localOnlyDisabledQuota {
+		localAvailabilityBefore = availabilityFingerprint(auth, resultModel)
+	}
+	if stateMutator, ok := m.store.(StateMutator); ok {
+		stateMutatorAvailable = true
+		if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
+			mutator = stateMutator
+		}
+	}
+	// A locally clean token-versioned success has no state to clear. Drop its
+	// transition rather than enqueue a stale row or read the database per success;
+	// cluster events reconcile any newer authoritative state.
+	if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
+		transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
+		if localOnlyDisabledQuota {
+			skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
+		}
+		authSnapshot = auth.Clone()
+	}
+	m.mu.Unlock()
+	unlockUpdate()
 
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
@@ -143,12 +146,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			transition = markResultTransition{}
 		}
 	} else if !skipResultPersist {
-		m.enqueueResultPersist(ctx, authSnapshot)
+		persistAuthID, schedulePersist := m.stageResultPersist(ctx, authSnapshot)
+		if schedulePersist {
+			defer m.scheduleResultPersist(persistAuthID)
+		}
 	}
 
-	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
-	}
+	m.RefreshSchedulerEntry(resultAuthID)
 	if authSnapshot != nil && authRefreshDisabled(authSnapshot) {
 		m.queueRefreshReschedule(authSnapshot.ID)
 	}
@@ -157,16 +161,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
 		return
 	}
-	if transition.clearModelQuota && resultModel != "" {
-		registry.GetGlobalRegistry().ClearModelQuotaExceeded(resultAuthID, resultModel)
-	}
-	if transition.setModelQuota && resultModel != "" {
-		registry.GetGlobalRegistry().SetModelQuotaExceeded(resultAuthID, resultModel)
-	}
-	if transition.shouldResumeModel {
-		registry.GetGlobalRegistry().ResumeClientModel(resultAuthID, resultModel)
-	} else if transition.shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(resultAuthID, resultModel, transition.suspendReason)
+	if transition.clearModelQuota || transition.setModelQuota || transition.shouldResumeModel || transition.shouldSuspendModel {
+		m.ReconcileRegistryModelStates(ctx, resultAuthID)
 	}
 }
 
@@ -475,6 +471,57 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 	return fp
 }
 
+// adoptPersistedCredentialLocked replaces persisted credential fields while
+// retaining state that only exists in the local runtime. The caller must hold m.mu.
+func (m *Manager) adoptPersistedCredentialLocked(local, persisted *Auth) {
+	if m == nil || local == nil || persisted == nil {
+		return
+	}
+
+	previousIndex := strings.TrimSpace(local.Index)
+	localModelStates := local.ModelStates
+	localStorage := local.Storage
+	localRuntime := local.Runtime
+	localFileName := local.FileName
+	localSuccess := local.Success
+	localFailed := local.Failed
+	localRecentRequests := local.recentRequests
+	localIndexAssigned := local.indexAssigned
+
+	replacement := persisted.Clone()
+	if strings.TrimSpace(replacement.Index) == "" {
+		replacement.Index = local.Index
+	}
+	if strings.TrimSpace(replacement.FileName) == "" {
+		replacement.FileName = localFileName
+	}
+	if replacement.Storage == nil {
+		replacement.Storage = localStorage
+	}
+	if replacement.Runtime == nil {
+		replacement.Runtime = localRuntime
+	}
+	replacement.ModelStates = localModelStates
+	replacement.Success = localSuccess
+	replacement.Failed = localFailed
+	replacement.recentRequests = localRecentRequests
+	replacement.indexAssigned = localIndexAssigned
+	*local = *replacement
+
+	nextIndex := strings.TrimSpace(local.Index)
+	if previousIndex != "" && previousIndex != nextIndex {
+		if indexed := m.indexAuth[previousIndex]; indexed == local {
+			delete(m.indexAuth, previousIndex)
+		}
+	}
+	if nextIndex != "" {
+		if m.indexAuth == nil {
+			m.indexAuth = make(map[string]*Auth)
+		}
+		m.indexAuth[nextIndex] = local
+	}
+}
+
 // adoptPersistedResultState merges the authoritative persisted state produced
 // by a StateMutator back into the manager's in-memory auth. The boolean reports
 // whether that snapshot remained current enough to apply its registry effects.
@@ -482,47 +529,37 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	if persisted == nil {
 		return nil, false
 	}
+	unlockUpdate := m.updateLocks.lock(persisted.ID)
+	defer unlockUpdate()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	local := m.resultAuthLocked(result)
+	local := m.auths[persisted.ID]
 	if local == nil {
-		return persisted.Clone(), true
+		return nil, false
 	}
 	if local.StateVersion > 0 && persisted.StateVersion > 0 && local.StateVersion > persisted.StateVersion {
 		return local.Clone(), false
 	}
+	localRefreshBlocked := local.RuntimeRefreshBlocked ||
+		(local.LastError != nil && strings.EqualFold(strings.TrimSpace(local.LastError.Code), refreshTransientErrorCode))
+	adoptPersistedCredential := persisted.StateVersion > 0 && persisted.StateVersion > local.StateVersion
 	if isTokenVersionFencedResult(result) {
 		if AuthIsNewerThanObserved(local, result.AccessTokenSHA256) {
 			return local.Clone(), false
 		}
 		if AuthIsNewerThanObserved(persisted, result.AccessTokenSHA256) {
-			replacement := persisted.Clone()
-			if replacement.Runtime == nil {
-				replacement.Runtime = local.Runtime
-			}
-			replacement.Success = local.Success
-			replacement.Failed = local.Failed
-			replacement.recentRequests = local.recentRequests
-			replacement.indexAssigned = local.indexAssigned
-			previousIndex := strings.TrimSpace(local.Index)
-			nextIndex := strings.TrimSpace(replacement.Index)
-			m.auths[replacement.ID] = replacement
-			if previousIndex != "" && previousIndex != nextIndex {
-				if indexed := m.indexAuth[previousIndex]; indexed == local {
-					delete(m.indexAuth, previousIndex)
-				}
-			}
-			if nextIndex != "" {
-				m.indexAuth[nextIndex] = replacement
-			}
-			return replacement.Clone(), true
+			adoptPersistedCredential = true
 		}
+	}
+	if adoptPersistedCredential {
+		m.adoptPersistedCredentialLocked(local, persisted)
+		local.ModelStates = mergePersistedCooldownModelStates(persisted.ModelStates, local.ModelStates)
 	}
 	local.Disabled = persisted.Disabled
 	local.UpdatedAt = persisted.UpdatedAt
 	local.StateVersion = persisted.StateVersion
-	localRefreshBlocked := local.RuntimeRefreshBlocked ||
-		(local.LastError != nil && strings.EqualFold(strings.TrimSpace(local.LastError.Code), refreshTransientErrorCode))
+	local.LastRefreshError = cloneError(persisted.LastRefreshError)
+	local.NextRefreshAfter = persisted.NextRefreshAfter
 	if state := persisted.ModelStates[resultModel]; state != nil {
 		if local.ModelStates == nil {
 			local.ModelStates = make(map[string]*ModelState)
@@ -597,6 +634,27 @@ func (m *Manager) resultAuthLocked(result Result) *Auth {
 		return m.indexAuth[index]
 	}
 	return nil
+}
+
+func (m *Manager) resultAuthID(result Result) string {
+	if m == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(result.AuthID); id != "" {
+		return id
+	}
+	index := strings.TrimSpace(result.AuthIndex)
+	if index == "" {
+		return ""
+	}
+	m.mu.RLock()
+	auth := m.indexAuth[index]
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	m.mu.RUnlock()
+	return authID
 }
 
 // quotaCooldownDisabledForAuth reports whether cooldown scheduling is disabled
@@ -853,6 +911,7 @@ func disableAuthAfterUnauthorized(auth *Auth, state *ModelState, resultErr *Erro
 	auth.StatusMessage = "unauthorized"
 	auth.NextRetryAfter = time.Time{}
 	auth.NextRefreshAfter = time.Time{}
+	auth.LastRefreshError = nil
 	auth.Quota = QuotaState{}
 	auth.UpdatedAt = now
 	if resultErr != nil {

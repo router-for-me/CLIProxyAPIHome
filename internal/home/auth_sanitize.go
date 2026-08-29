@@ -15,6 +15,13 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth) *coreauth.Auth {
 	}
 
 	out := auth.Clone()
+	out.LastRefreshError = nil
+	if out.LastError != nil {
+		switch strings.ToLower(strings.TrimSpace(out.LastError.Code)) {
+		case "refresh_temporarily_unavailable", "refresh_unsupported":
+			out.LastError = nil
+		}
+	}
 
 	if out.Attributes != nil {
 		delete(out.Attributes, "refresh_token")

@@ -193,8 +193,9 @@ func (c *RefreshController) syncForwardedAuth(ctx context.Context, authUUID stri
 	return errUpdate
 }
 
-// applyForwardedRefreshFailureInMemory fails closed when the master persisted
-// a blocking refresh failure but the standby cannot reload that state.
+// applyForwardedRefreshFailureInMemory applies the master's refresh outcome
+// when the standby cannot reload the persisted state. A locally known-safe
+// Antigravity token remains dispatchable outside the request safety window.
 func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Context, authUUID string, authErr *coreauth.Error) error {
 	if c == nil || c.runtime == nil {
 		return fmt.Errorf("cluster refresh: runtime is nil")
@@ -236,7 +237,10 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 		auth.StatusMessage = "unauthorized"
 		auth.NextRetryAfter = time.Time{}
 		auth.NextRefreshAfter = time.Time{}
+		auth.LastRefreshError = nil
 		auth.Quota = coreauth.QuotaState{}
+		auth.UpdatedAt = now
+		auth.LastError = lastError
 	case "refresh_temporarily_unavailable":
 		if strings.TrimSpace(lastError.Message) == "" {
 			lastError.Message = "credential refresh temporarily unavailable"
@@ -245,17 +249,10 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 			lastError.HTTPStatus = http.StatusServiceUnavailable
 		}
 		lastError.Retryable = true
-		auth.Unavailable = true
-		auth.RuntimeRefreshBlocked = true
-		if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
-			auth.Status = coreauth.StatusError
-			auth.StatusMessage = lastError.Message
-		}
+		coreauth.ApplyRefreshFailureState(auth, lastError, now)
 	default:
 		return fmt.Errorf("cluster refresh: unsupported forwarded error %q", lastError.Code)
 	}
-	auth.UpdatedAt = now
-	auth.LastError = lastError
 	_, errUpdate := c.runtime.UpdateAuthInMemory(ctx, auth)
 	return errUpdate
 }
@@ -325,10 +322,16 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 		}
 		if coreauth.RefreshRetryBackoffOpen(auth, now) {
 			refreshErr = coreauth.NewTransientRefreshError()
-			if snapshot := auth.Clone(); snapshot.LastError != nil {
-				switch strings.ToLower(strings.TrimSpace(snapshot.LastError.Code)) {
-				case "refresh_temporarily_unavailable", "refresh_unsupported":
-					refreshErr = snapshot.LastError
+			if snapshot := auth.Clone(); snapshot != nil {
+				refreshError := snapshot.LastRefreshError
+				if refreshError == nil {
+					refreshError = snapshot.LastError
+				}
+				if refreshError != nil {
+					switch strings.ToLower(strings.TrimSpace(refreshError.Code)) {
+					case "refresh_temporarily_unavailable", "refresh_unsupported":
+						refreshErr = refreshError
+					}
 				}
 			}
 			skipRefresh = true
@@ -390,14 +393,28 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 		}
 		return nil, errIndex
 	}
-	if _, errUpdate := c.runtime.UpdateAuthInMemory(syncCtx, updated); errUpdate != nil {
+	updatedInMemory, errUpdate := c.runtime.UpdateAuthInMemory(syncCtx, updated)
+	if errUpdate != nil {
 		if refreshErr != nil {
 			log.Warnf("cluster refresh memory sync failed after persisted refresh failure | auth=%s err=%v", targetUUID, errUpdate)
 			return nil, refreshErr
 		}
 		return nil, errUpdate
 	}
+	updated = updatedInMemory
+	if updated.Disabled || updated.Status == coreauth.StatusDisabled {
+		if updated.LastError != nil && strings.EqualFold(strings.TrimSpace(updated.LastError.Code), "authentication_error") {
+			return nil, updated.LastError
+		}
+		return nil, newClusterUnauthorizedRefreshError()
+	}
 	if refreshErr != nil {
+		if coreauth.AuthIsNewerThanObserved(updated, observedAccessTokenSHA256) {
+			return home.BuildRefreshPayload(updated)
+		}
+		if coreauth.CanUseObservedTokenAfterRefreshFailure(updated, observedAccessTokenSHA256, refreshErr, time.Now().UTC()) {
+			return home.BuildRefreshPayload(updated)
+		}
 		return nil, refreshErr
 	}
 	if targetIndex != requestedIndex {
@@ -537,54 +554,42 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 	if refreshed.Disabled || refreshed.Status == coreauth.StatusDisabled {
 		merged.Disabled = refreshed.Disabled
 		merged.Unavailable = refreshed.Unavailable
+		merged.RuntimeRefreshBlocked = refreshed.RuntimeRefreshBlocked
 		merged.Status = refreshed.Status
 		merged.StatusMessage = refreshed.StatusMessage
 		merged.LastError = refreshed.LastError
+		merged.LastRefreshError = refreshed.LastRefreshError
 		merged.LastRefreshedAt = refreshed.LastRefreshedAt
 		merged.NextRefreshAfter = refreshed.NextRefreshAfter
 		merged.NextRetryAfter = refreshed.NextRetryAfter
+		merged.Quota = refreshed.Quota
 		merged.UpdatedAt = refreshed.UpdatedAt
 		return merged
 	}
 
-	// Preserve concurrent model and quota details while applying credential-level
-	// refresh transitions. Transient failures block the credential, while an
-	// unsupported refresh clears only the credential-level refresh block.
+	// Preserve concurrent model and quota details while applying only the
+	// credential-level refresh transition to the latest persisted snapshot.
 	merged.LastRefreshedAt = refreshed.LastRefreshedAt
 	merged.NextRefreshAfter = refreshed.NextRefreshAfter
-	blockingRefreshFailure := refreshed.Unavailable && refreshed.LastError != nil && strings.EqualFold(strings.TrimSpace(refreshed.LastError.Code), "refresh_temporarily_unavailable")
 	unsupportedRefresh := refreshed.LastError != nil && strings.EqualFold(strings.TrimSpace(refreshed.LastError.Code), "refresh_unsupported")
-	if blockingRefreshFailure {
-		merged.Unavailable = refreshed.Unavailable
-		merged.Status = refreshed.Status
-		merged.StatusMessage = refreshed.StatusMessage
-		merged.NextRetryAfter = refreshed.NextRetryAfter
-		merged.LastError = refreshed.LastError
-	} else if unsupportedRefresh {
+	switch {
+	case errors.Is(errRefresh, context.Canceled), errors.Is(errRefresh, context.DeadlineExceeded):
+		// Keep the lease backoff without turning a canceled acquisition into a
+		// credential availability failure.
+	case unsupportedRefresh:
 		coreauth.ApplyUnsupportedRefreshBackoff(merged, now)
 		merged.NextRefreshAfter = refreshed.NextRefreshAfter
 		merged.LastError = refreshed.LastError
-	} else if refreshExecutionStateEqual(current, base) {
-		merged.LastError = refreshed.LastError
+	default:
+		coreauth.ApplyRefreshFailureState(merged, errRefresh, now)
+		if !refreshed.NextRefreshAfter.IsZero() && (merged.NextRefreshAfter.IsZero() || refreshed.NextRefreshAfter.Before(merged.NextRefreshAfter)) {
+			merged.NextRefreshAfter = refreshed.NextRefreshAfter
+		}
 	}
 	if merged.UpdatedAt.Before(refreshed.UpdatedAt) {
 		merged.UpdatedAt = refreshed.UpdatedAt
 	}
 	return merged
-}
-
-func refreshExecutionStateEqual(left, right *coreauth.Auth) bool {
-	if left == nil || right == nil {
-		return left == right
-	}
-	return left.Disabled == right.Disabled &&
-		left.Unavailable == right.Unavailable &&
-		left.Status == right.Status &&
-		left.StatusMessage == right.StatusMessage &&
-		left.NextRetryAfter.Equal(right.NextRetryAfter) &&
-		reflect.DeepEqual(left.Quota, right.Quota) &&
-		reflect.DeepEqual(left.LastError, right.LastError) &&
-		reflect.DeepEqual(left.ModelStates, right.ModelStates)
 }
 
 func mergeRefreshString(current, base, refreshed string) string {

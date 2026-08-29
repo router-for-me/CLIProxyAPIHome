@@ -582,6 +582,11 @@ func (a *RuntimeAdapter) authStateMarker(uuid string) (int64, bool) {
 	return version, active
 }
 
+// ObservedAuthState returns the newest auth revision and active state known to this runtime.
+func (a *RuntimeAdapter) ObservedAuthState(uuid string) (int64, bool) {
+	return a.authStateMarker(strings.TrimSpace(uuid))
+}
+
 func (a *RuntimeAdapter) removeAuthIndexIfUnchanged(uuid string, observedVersion int64, observedActive bool) bool {
 	if a == nil {
 		return false
@@ -642,6 +647,7 @@ func (a *RuntimeAdapter) GetFullAuth(ctx context.Context, uuid string) (*coreaut
 		}
 		auth.ID = uuid
 		auth.Index = uuid
+		auth.RuntimeRefreshBlocked = coreauth.RefreshBlocksDispatch(auth)
 
 		item := authIndexFromRecord(record, auth)
 		a.mu.Lock()

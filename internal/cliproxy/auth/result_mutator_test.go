@@ -22,6 +22,10 @@ type fakeMutatorStore struct {
 	saves     int
 }
 
+type testTokenStorage struct{}
+
+func (*testTokenStorage) SaveTokenToFile(string) error { return nil }
+
 func (s *fakeMutatorStore) List(context.Context) ([]*Auth, error) { return nil, nil }
 
 func (s *fakeMutatorStore) Save(_ context.Context, auth *Auth) (string, error) {
@@ -368,6 +372,72 @@ func TestMarkResultUnauthorizedMutatesPersistedStateWithoutReplacingTokens(t *te
 	}
 }
 
+func TestMarkResultAdoptsNewerPersistedCredentialSnapshot(t *testing.T) {
+	const authID = "auth-cluster-newer-credential"
+	const resultModel = "gpt-5"
+	const localModel = "gpt-local-only"
+	now := time.Now().UTC()
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "codex",
+		Label:        "authoritative-label",
+		Status:       StatusActive,
+		StateVersion: 11,
+		Attributes:   map[string]string{"base_url": "https://authoritative.example"},
+		Metadata:     map[string]any{"access_token": "rotated-access-token"},
+	}}
+	manager := NewManager(store, nil, nil)
+	runtimeMarker := &struct{ name string }{name: "runtime"}
+	storageMarker := &testTokenStorage{}
+	localState := &ModelState{
+		Status:         StatusError,
+		StatusMessage:  "local transient failure",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+		UpdatedAt:      now.Add(time.Second),
+	}
+	local := &Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "codex",
+		Label:        "stale-label",
+		Status:       StatusActive,
+		StateVersion: 10,
+		Attributes:   map[string]string{"base_url": "https://stale.example"},
+		Metadata:     map[string]any{"access_token": "stale-access-token"},
+		ModelStates:  map[string]*ModelState{localModel: localState},
+		Runtime:      runtimeMarker,
+		Storage:      storageMarker,
+	}
+	if _, errRegister := manager.Register(context.Background(), local); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), quotaResult(authID, resultModel))
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("GetByID() missing auth")
+	}
+	if current.StateVersion != 11 || current.Metadata["access_token"] != "rotated-access-token" {
+		t.Fatalf("credential snapshot = version %d token %v, want version 11 with rotated token", current.StateVersion, current.Metadata["access_token"])
+	}
+	if current.Label != "authoritative-label" || current.Attributes["base_url"] != "https://authoritative.example" {
+		t.Fatalf("credential fields = label %q attributes %#v, want authoritative snapshot", current.Label, current.Attributes)
+	}
+	if current.Runtime != runtimeMarker || current.Storage != storageMarker {
+		t.Fatalf("runtime state = Runtime %#v Storage %#v, want local runtime objects preserved", current.Runtime, current.Storage)
+	}
+	if state := current.ModelStates[localModel]; state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("local model state = %#v, want unpersisted execution state preserved", state)
+	}
+	if state := current.ModelStates[resultModel]; state == nil || !state.Quota.Exceeded {
+		t.Fatalf("result model state = %#v, want persisted quota transition", state)
+	}
+}
+
 func TestMarkResultIgnoresUnauthorizedFromOlderAccessToken(t *testing.T) {
 	const authID = "auth-cluster-stale-unauthorized"
 	store := &fakeMutatorStore{persisted: &Auth{
@@ -564,18 +634,27 @@ func TestMarkResultAdoptsPersistedRefreshBlock(t *testing.T) {
 	const model = "gpt-5"
 	now := time.Now().UTC()
 	retryAt := now.Add(5 * time.Minute)
+	refreshAt := now.Add(3 * time.Minute)
 	const providerMessage = `codex refresh: Post "https://auth.openai.com/oauth/token": proxyconnect tcp: connection refused`
 	store := &fakeMutatorStore{persisted: &Auth{
-		ID:             authID,
-		Index:          authID,
-		Provider:       "codex",
-		Status:         StatusError,
-		StatusMessage:  providerMessage,
-		Unavailable:    true,
-		NextRetryAfter: retryAt,
+		ID:               authID,
+		Index:            authID,
+		Provider:         "codex",
+		Status:           StatusError,
+		StatusMessage:    providerMessage,
+		Unavailable:      true,
+		NextRefreshAfter: refreshAt,
+		NextRetryAfter:   retryAt,
 		LastError: &Error{
 			Code:       refreshTransientErrorCode,
 			Message:    providerMessage,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		LastRefreshError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    refreshTransientErrorMsg,
+			Diagnostic: "refresh proxy unavailable",
 			Retryable:  true,
 			HTTPStatus: http.StatusServiceUnavailable,
 		},
@@ -607,6 +686,9 @@ func TestMarkResultAdoptsPersistedRefreshBlock(t *testing.T) {
 	if local.LastError == nil || local.LastError.Code != refreshTransientErrorCode || local.LastError.Message != providerMessage {
 		t.Fatalf("local refresh error = %#v, want persisted provider diagnostic", local.LastError)
 	}
+	if local.LastRefreshError == nil || local.LastRefreshError.Diagnostic != "refresh proxy unavailable" || !local.NextRefreshAfter.Equal(refreshAt) {
+		t.Fatalf("local refresh diagnostic/backoff = %#v/%v, want persisted diagnostic until %v", local.LastRefreshError, local.NextRefreshAfter, refreshAt)
+	}
 	if blocked, _, _ := isAuthBlockedForModel(local, model, retryAt.Add(time.Hour)); !blocked {
 		t.Fatal("late execution success made refresh-failed auth dispatchable")
 	}
@@ -629,6 +711,83 @@ func (s *blockingMutatorStore) MutateAuthState(ctx context.Context, id string, m
 		return nil, ctx.Err()
 	}
 	return s.fakeMutatorStore.MutateAuthState(ctx, id, mutate)
+}
+
+type committedMutatorStore struct {
+	fakeMutatorStore
+	committed chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *committedMutatorStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.persisted != nil && s.persisted.ID == id {
+		s.persisted = nil
+	}
+	return nil
+}
+
+func (s *committedMutatorStore) MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
+	persisted, errMutate := s.fakeMutatorStore.MutateAuthState(ctx, id, mutate)
+	s.once.Do(func() { close(s.committed) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return persisted, errMutate
+}
+
+func TestMarkResultDoesNotRestoreDeletedAuthToScheduler(t *testing.T) {
+	const authID = "auth-deleted-after-result-commit"
+	store := &committedMutatorStore{
+		fakeMutatorStore: fakeMutatorStore{
+			persisted: &Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   StatusActive,
+				Metadata: map[string]any{"access_token": "stored-token"},
+			},
+		},
+		committed: make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	manager := newHomeNodeManager(t, &store.fakeMutatorStore, authID)
+	manager.SetStore(store)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.MarkResult(context.Background(), quotaResult(authID, "gpt-5"))
+	}()
+
+	select {
+	case <-store.committed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("persisted result mutation did not commit")
+	}
+	if errDelete := manager.Delete(context.Background(), authID); errDelete != nil {
+		t.Fatalf("Delete() error = %v", errDelete)
+	}
+	close(store.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkResult did not finish after mutation release")
+	}
+
+	if current, ok := manager.GetByID(authID); ok || current != nil {
+		t.Fatalf("GetByID() = %#v, %v, want deleted auth to stay absent", current, ok)
+	}
+	manager.scheduler.mu.Lock()
+	_, scheduled := manager.scheduler.authProviders[authID]
+	manager.scheduler.mu.Unlock()
+	if scheduled {
+		t.Fatal("deleted auth was restored to the scheduler by a late result mutation")
+	}
 }
 
 func TestMarkResultDoesNotHoldManagerLockDuringStateMutation(t *testing.T) {

@@ -125,6 +125,22 @@ func (a *refreshTestFailingIndexAdapter) RefreshAuthIndex(context.Context, strin
 	return errors.New("injected refresh index failure")
 }
 
+type refreshTestIndexHookAdapter struct {
+	*RuntimeAdapter
+	beforeRefreshAuthIndex func(context.Context, string) error
+}
+
+func (a *refreshTestIndexHookAdapter) RefreshAuthIndex(ctx context.Context, uuid string) error {
+	hook := a.beforeRefreshAuthIndex
+	a.beforeRefreshAuthIndex = nil
+	if hook != nil {
+		if errHook := hook(ctx, uuid); errHook != nil {
+			return errHook
+		}
+	}
+	return a.RuntimeAdapter.RefreshAuthIndex(ctx, uuid)
+}
+
 func newRefreshTestRepository(t *testing.T) *Repository {
 	t.Helper()
 	return openRefreshTestRepositoryAt(t, filepath.Join(t.TempDir(), "home.db"), true)
@@ -386,11 +402,12 @@ func TestRefreshControllerMasterInvalidGrantPersistsDisabledAuth(t *testing.T) {
 	}
 }
 
-func TestRefreshControllerTransientFailureBlocksCredentialDispatch(t *testing.T) {
+func TestRefreshControllerTransientFailureKeepsSafeCredentialDispatchable(t *testing.T) {
 	const authID = "antigravity-transient"
 	ctx := context.Background()
 	repo := newRefreshTestRepository(t)
 	auth := newInvalidGrantRefreshAuth(authID)
+	auth.Metadata["expired"] = time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339Nano)
 	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
 		t.Fatalf("UpsertAuth() error = %v", errUpsert)
 	}
@@ -410,19 +427,27 @@ func TestRefreshControllerTransientFailureBlocksCredentialDispatch(t *testing.T)
 	markRefreshTestMaster(t, repo, coordinator)
 	controller := NewRefreshController(coordinator, runtime, repo, nil)
 
-	_, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	observedHash := coreauth.AccessTokenSHA256(auth)
+	for attempt := 1; attempt <= 2; attempt++ {
+		payload, errRefresh := controller.RefreshNowObserved(ctx, authID, observedHash)
+		if errRefresh != nil {
+			t.Fatalf("RefreshNowObserved() attempt %d error = %v", attempt, errRefresh)
+		}
+		if !bytes.Contains(payload, []byte(`"access_token":"stored-access-secret"`)) {
+			t.Fatalf("RefreshNowObserved() attempt %d payload = %s, want current token", attempt, payload)
+		}
+	}
+
+	_, errRefresh := controller.RefreshNow(ctx, authID)
 	var authErr *coreauth.Error
 	if !errors.As(errRefresh, &authErr) || authErr.Code != "refresh_temporarily_unavailable" || authErr.HTTPStatus != http.StatusServiceUnavailable {
-		t.Fatalf("RefreshNowObserved() error = %#v, want transient 503", errRefresh)
+		t.Fatalf("RefreshNow() error = %#v, want transient 503", errRefresh)
 	}
 	if got := errRefresh.Error(); got != responseBody {
-		t.Fatalf("RefreshNowObserved() error = %q, want exact upstream body %q", got, responseBody)
+		t.Fatalf("RefreshNow() error = %q, want exact upstream body %q", got, responseBody)
 	}
 	if authErr.Upstream == nil || authErr.Upstream.Status != http.StatusBadRequest || string(authErr.Upstream.Body) != responseBody {
-		t.Fatalf("RefreshNowObserved() upstream = %#v, want 400/%q", authErr.Upstream, responseBody)
-	}
-	if _, errRepeated := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth)); errRepeated == nil || errRepeated.Error() != errRefresh.Error() {
-		t.Fatalf("repeated refresh error = %v, want persisted diagnostic %v", errRepeated, errRefresh)
+		t.Fatalf("RefreshNow() upstream = %#v, want 400/%q", authErr.Upstream, responseBody)
 	}
 	if providerCalls != 1 {
 		t.Fatalf("provider refresh calls = %d, want 1 during refresh backoff", providerCalls)
@@ -432,11 +457,11 @@ func TestRefreshControllerTransientFailureBlocksCredentialDispatch(t *testing.T)
 	if errAuth != nil {
 		t.Fatalf("GetAuth() error = %v", errAuth)
 	}
-	if persisted.Disabled || !persisted.Unavailable || persisted.Status != coreauth.StatusError {
-		t.Fatalf("transient refresh state = %#v, want unavailable error state", persisted)
+	if persisted.Disabled || persisted.Unavailable || persisted.RuntimeRefreshBlocked || persisted.Status != coreauth.StatusActive {
+		t.Fatalf("transient refresh state = %#v, want safe credential to remain active", persisted)
 	}
-	if persisted.NextRefreshAfter.IsZero() || !persisted.NextRetryAfter.Equal(persisted.NextRefreshAfter) {
-		t.Fatalf("refresh/retry deadlines = %v/%v, want matching backoff", persisted.NextRefreshAfter, persisted.NextRetryAfter)
+	if persisted.NextRefreshAfter.IsZero() || !persisted.NextRetryAfter.IsZero() {
+		t.Fatalf("refresh/retry deadlines = %v/%v, want refresh-only backoff", persisted.NextRefreshAfter, persisted.NextRetryAfter)
 	}
 	if persisted.LastError == nil || persisted.LastError.Code != "refresh_temporarily_unavailable" {
 		t.Fatalf("LastError = %#v, want transient refresh error", persisted.LastError)
@@ -448,8 +473,368 @@ func TestRefreshControllerTransientFailureBlocksCredentialDispatch(t *testing.T)
 		t.Fatalf("persisted upstream response = %#v, want 400/%q", persisted.LastError.Upstream, responseBody)
 	}
 	inMemory, ok := runtime.CoreManager().GetByID(authID)
-	if !ok || inMemory == nil || !inMemory.Unavailable || inMemory.Status != coreauth.StatusError {
-		t.Fatalf("in-memory refresh state = %#v, want unavailable error state", inMemory)
+	if !ok || inMemory == nil || inMemory.Unavailable || inMemory.RuntimeRefreshBlocked || inMemory.Status != coreauth.StatusActive {
+		t.Fatalf("in-memory refresh state = %#v, want safe credential to remain active", inMemory)
+	}
+}
+
+func TestRefreshControllerTransientFailureReturnsConcurrentRotatedToken(t *testing.T) {
+	const authID = "antigravity-concurrent-rotation"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	auth.Metadata["expired"] = time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339Nano)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	const responseBody = `{"error":"invalid_request","error_description":"Malformed request"}`
+	transport := refreshRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(responseBody)),
+		}, nil
+	})
+	runtime, errRuntime := home.NewRuntime(&config.Config{})
+	if errRuntime != nil {
+		t.Fatalf("NewRuntime() error = %v", errRuntime)
+	}
+	adapter := &refreshTestIndexHookAdapter{RuntimeAdapter: NewRuntimeAdapter(repo, "")}
+	adapter.beforeRefreshAuthIndex = func(hookCtx context.Context, uuid string) error {
+		_, _, _, errMutate := repo.MutateAuth(hookCtx, uuid, "test-concurrent-rotation", func(current *coreauth.Auth) bool {
+			current.Metadata["access_token"] = "concurrently-rotated-access-token"
+			current.Metadata["refresh_token"] = "concurrently-rotated-refresh-token"
+			current.Metadata["expired"] = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+			current.Disabled = false
+			current.Unavailable = false
+			current.RuntimeRefreshBlocked = false
+			current.Status = coreauth.StatusActive
+			current.StatusMessage = ""
+			current.LastError = nil
+			current.NextRetryAfter = time.Time{}
+			current.NextRefreshAfter = time.Time{}
+			return true
+		})
+		return errMutate
+	}
+	runtime.SetClusterAdapter(adapter)
+	runtime.CoreManager().SetRoundTripperProvider(refreshTestRoundTripperProvider{rt: transport})
+	if _, errRegister := runtime.CoreManager().Register(coreauth.WithSkipPersist(ctx), auth.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	t.Cleanup(runtime.Stop)
+
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9308, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	payload, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	if errRefresh != nil {
+		t.Fatalf("RefreshNowObserved() error = %v, want concurrent rotation", errRefresh)
+	}
+	if !bytes.Contains(payload, []byte(`"access_token":"concurrently-rotated-access-token"`)) {
+		t.Fatalf("RefreshNowObserved() payload = %s, want concurrent rotated token", payload)
+	}
+	inMemory, ok := runtime.CoreManager().GetByID(authID)
+	if !ok || inMemory == nil || inMemory.Metadata["access_token"] != "concurrently-rotated-access-token" {
+		t.Fatalf("in-memory auth = %#v, want concurrent rotated token", inMemory)
+	}
+	persisted, record, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if inMemory.StateVersion != record.Version || persisted.StateVersion != record.Version {
+		t.Fatalf("state versions = memory %d persisted %d record %d, want concurrent record", inMemory.StateVersion, persisted.StateVersion, record.Version)
+	}
+}
+
+func TestRefreshControllerTransientFailureUsesConcurrentUnauthorizedSnapshot(t *testing.T) {
+	const authID = "antigravity-concurrent-unauthorized-refresh"
+	const model = "gemini-3.7-flash-high"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	auth.Metadata["expired"] = time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339Nano)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	const responseBody = `{"error":"invalid_request","error_description":"Malformed request"}`
+	transport := refreshRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(responseBody)),
+		}, nil
+	})
+	runtime, errRuntime := home.NewRuntime(&config.Config{})
+	if errRuntime != nil {
+		t.Fatalf("NewRuntime() error = %v", errRuntime)
+	}
+	adapter := &refreshTestIndexHookAdapter{RuntimeAdapter: NewRuntimeAdapter(repo, "")}
+	adapter.beforeRefreshAuthIndex = func(hookCtx context.Context, uuid string) error {
+		_, _, _, errMutate := repo.MutateAuth(hookCtx, uuid, "test-unauthorized-result", func(current *coreauth.Auth) bool {
+			current.ModelStates = map[string]*coreauth.ModelState{
+				model: {
+					Status:        coreauth.StatusError,
+					StatusMessage: "unauthorized",
+					Unavailable:   true,
+					LastError:     &coreauth.Error{Message: "access token expired", HTTPStatus: http.StatusUnauthorized},
+					UpdatedAt:     time.Now().UTC(),
+				},
+			}
+			return true
+		})
+		return errMutate
+	}
+	runtime.SetClusterAdapter(adapter)
+	runtime.CoreManager().SetRoundTripperProvider(refreshTestRoundTripperProvider{rt: transport})
+	if _, errRegister := runtime.CoreManager().Register(coreauth.WithSkipPersist(ctx), auth.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	t.Cleanup(runtime.Stop)
+
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9307, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	payload, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	var authErr *coreauth.Error
+	if !errors.As(errRefresh, &authErr) || authErr == nil || authErr.Code != "refresh_temporarily_unavailable" {
+		t.Fatalf("RefreshNowObserved() error = %#v, want transient refresh error", errRefresh)
+	}
+	if payload != nil {
+		t.Fatalf("RefreshNowObserved() payload = %s, want no credential after concurrent unauthorized result", payload)
+	}
+	inMemory, ok := runtime.CoreManager().GetByID(authID)
+	if !ok || inMemory == nil {
+		t.Fatal("GetByID() did not find auth")
+	}
+	state := inMemory.ModelStates[model]
+	if state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("in-memory concurrent unauthorized state = %#v, want 401", state)
+	}
+	persisted, record, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	if inMemory.StateVersion != record.Version || persisted.StateVersion != record.Version {
+		t.Fatalf("state versions = memory %d persisted %d record %d, want latest record", inMemory.StateVersion, persisted.StateVersion, record.Version)
+	}
+}
+
+func TestRefreshControllerSuccessfulRefreshUsesConcurrentDisabledSnapshot(t *testing.T) {
+	const authID = "antigravity-concurrent-disable-after-success"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	transport := &refreshTestRoundTripper{
+		statusCode: http.StatusOK,
+		body:       `{"access_token":"new-access-token","refresh_token":"new-refresh-token","expires_in":3600}`,
+	}
+	runtime, errRuntime := home.NewRuntime(&config.Config{})
+	if errRuntime != nil {
+		t.Fatalf("NewRuntime() error = %v", errRuntime)
+	}
+	adapter := &refreshTestIndexHookAdapter{RuntimeAdapter: NewRuntimeAdapter(repo, "")}
+	adapter.beforeRefreshAuthIndex = func(hookCtx context.Context, uuid string) error {
+		_, _, _, errMutate := repo.MutateAuth(hookCtx, uuid, "test-concurrent-disable", func(current *coreauth.Auth) bool {
+			current.Disabled = true
+			current.Unavailable = true
+			current.Status = coreauth.StatusDisabled
+			current.StatusMessage = "credential unauthorized"
+			current.LastError = &coreauth.Error{
+				Code:       "authentication_error",
+				Message:    "credential unauthorized",
+				HTTPStatus: http.StatusUnauthorized,
+			}
+			current.LastRefreshError = current.LastError
+			current.NextRefreshAfter = time.Time{}
+			current.NextRetryAfter = time.Time{}
+			return true
+		})
+		return errMutate
+	}
+	runtime.SetClusterAdapter(adapter)
+	runtime.CoreManager().SetRoundTripperProvider(refreshTestRoundTripperProvider{rt: transport})
+	if _, errRegister := runtime.CoreManager().Register(coreauth.WithSkipPersist(ctx), auth.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	t.Cleanup(runtime.Stop)
+
+	coordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9309, Secret: "master-secret"}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, coordinator)
+	controller := NewRefreshController(coordinator, runtime, repo, nil)
+
+	payload, errRefresh := controller.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	if payload != nil {
+		t.Fatalf("RefreshNowObserved() payload = %s, want no concurrently disabled credential", payload)
+	}
+	requireTerminalRefreshError(t, errRefresh)
+	if transport.calls != 1 {
+		t.Fatalf("provider refresh calls = %d, want 1", transport.calls)
+	}
+	persisted, _, errAuth := repo.GetAuth(ctx, authID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	requireDisabledRefreshAuth(t, persisted)
+	inMemory, ok := runtime.CoreManager().GetByID(authID)
+	if !ok {
+		t.Fatal("GetByID() did not find auth")
+	}
+	requireDisabledRefreshAuth(t, inMemory)
+}
+
+func TestMergeClusterRefreshOutcomeClearsPreviousBlockForSafeToken(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	previousRetryAt := now.Add(-time.Second)
+	base := &coreauth.Auth{
+		ID:               "antigravity-safe-retry",
+		Provider:         "antigravity",
+		Status:           coreauth.StatusError,
+		StatusMessage:    "credential refresh temporarily unavailable",
+		Unavailable:      true,
+		NextRetryAfter:   previousRetryAt,
+		NextRefreshAfter: previousRetryAt,
+		LastError: &coreauth.Error{
+			Code:       "refresh_temporarily_unavailable",
+			Message:    "credential refresh temporarily unavailable",
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		Metadata: map[string]any{
+			"access_token": "still-valid-access",
+			"expired":      now.Add(20 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}
+	current := base.Clone()
+	current.NextRefreshAfter = now.Add(5 * time.Minute)
+	refreshed := current.Clone()
+	refreshFailure := coreauth.ApplyRefreshFailureState(refreshed, errors.New("proxy connection refused"), now)
+
+	merged := mergeClusterRefreshOutcome(current, base, refreshed, refreshFailure, now)
+
+	if merged.Unavailable || merged.RuntimeRefreshBlocked || coreauth.RefreshBlocksDispatch(merged) || merged.Status != coreauth.StatusActive {
+		t.Fatalf("safe token remained blocked after cluster merge: %#v", merged)
+	}
+	if !merged.NextRetryAfter.IsZero() || !merged.NextRefreshAfter.Equal(refreshed.NextRefreshAfter) {
+		t.Fatalf("merged retry deadlines = %v/%v, want zero/%v", merged.NextRetryAfter, merged.NextRefreshAfter, refreshed.NextRefreshAfter)
+	}
+}
+
+func TestMergeClusterRefreshOutcomeKeepsEarlierConcurrentExpiryRetry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	base := &coreauth.Auth{
+		ID:       "antigravity-concurrent-expiry",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "still-valid-access",
+			"expired":      now.Add(20 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}
+	current := base.Clone()
+	current.Metadata["expired"] = now.Add(7 * time.Minute).Format(time.RFC3339Nano)
+	refreshed := base.Clone()
+	refreshFailure := coreauth.ApplyRefreshFailureState(refreshed, errors.New("proxy connection refused"), now)
+
+	merged := mergeClusterRefreshOutcome(current, base, refreshed, refreshFailure, now)
+	wantRetryAt := now.Add(2 * time.Minute)
+
+	if !merged.NextRefreshAfter.Equal(wantRetryAt) {
+		t.Fatalf("NextRefreshAfter = %v, want concurrent expiry safety deadline %v", merged.NextRefreshAfter, wantRetryAt)
+	}
+	if merged.Unavailable || coreauth.RefreshBlocksDispatch(merged) {
+		t.Fatalf("safe token became unavailable after merge: %#v", merged)
+	}
+}
+
+func TestMergeClusterRefreshOutcomeBlocksConcurrentlyUnauthorizedToken(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	base := &coreauth.Auth{
+		ID:       "antigravity-concurrent-unauthorized",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "known-invalid-access",
+			"expired":      now.Add(20 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}
+	current := base.Clone()
+	current.ModelStates = map[string]*coreauth.ModelState{
+		"gemini-3.7-flash-high": {
+			Status:        coreauth.StatusError,
+			StatusMessage: "unauthorized",
+			Unavailable:   true,
+			LastError:     &coreauth.Error{Message: "access token expired", HTTPStatus: http.StatusUnauthorized},
+		},
+	}
+	refreshed := base.Clone()
+	refreshFailure := coreauth.ApplyRefreshFailureState(refreshed, errors.New("proxy connection refused"), now)
+
+	merged := mergeClusterRefreshOutcome(current, base, refreshed, refreshFailure, now)
+
+	if !merged.Unavailable || !merged.RuntimeRefreshBlocked || !coreauth.RefreshBlocksDispatch(merged) {
+		t.Fatalf("concurrently unauthorized token remained dispatchable after cluster merge: %#v", merged)
+	}
+	if state := merged.ModelStates["gemini-3.7-flash-high"]; state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("concurrent unauthorized model state was lost: %#v", state)
+	}
+}
+
+func TestMergeClusterRefreshOutcomeTerminalFailureClearsPriorRefreshAndQuotaState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	base := &coreauth.Auth{
+		ID:       "terminal-refresh-clears-prior-state",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "expired-access-token",
+			"expired":      now.Add(-time.Minute).Format(time.RFC3339Nano),
+		},
+	}
+	current := base.Clone()
+	current.Status = coreauth.StatusError
+	current.Unavailable = true
+	current.RuntimeRefreshBlocked = true
+	current.LastRefreshError = coreauth.NewTransientRefreshError().(*coreauth.Error)
+	current.Quota = coreauth.QuotaState{
+		Exceeded:      true,
+		Reason:        "stale quota",
+		NextRecoverAt: now.Add(time.Hour),
+	}
+	refreshed := base.Clone()
+	terminalErr := &coreauth.Error{
+		Code:       "authentication_error",
+		Message:    "credential unauthorized",
+		HTTPStatus: http.StatusUnauthorized,
+	}
+	coreauth.ApplyRefreshFailureState(refreshed, terminalErr, now)
+
+	merged := mergeClusterRefreshOutcome(current, base, refreshed, terminalErr, now)
+
+	if !merged.Disabled || !merged.Unavailable || merged.Status != coreauth.StatusDisabled {
+		t.Fatalf("terminal refresh state = %#v, want disabled credential", merged)
+	}
+	if merged.RuntimeRefreshBlocked || merged.LastRefreshError != nil {
+		t.Fatalf("terminal refresh retained stale refresh state: %#v", merged)
+	}
+	if merged.Quota.Exceeded || merged.Quota.Reason != "" || !merged.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("terminal refresh retained stale quota: %#v", merged.Quota)
 	}
 }
 
