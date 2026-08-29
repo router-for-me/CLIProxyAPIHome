@@ -95,6 +95,28 @@ func TestMarkResultQuotaBackoffEscalatesAfterWindowExpiry(t *testing.T) {
 	}
 }
 
+func TestQuotaCooldownAfterFailureKeepsBackoffFloorForShortRetryDelay(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 0, 0, 0, 0, time.UTC)
+	retryAfter := time.Second
+	result := Result{
+		Provider:   "antigravity",
+		RetryAfter: &retryAfter,
+	}
+	quota := QuotaState{}
+	for index, wantDelay := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second} {
+		deadline, level := quotaCooldownAfterFailure(quota, now, result)
+		if delay := deadline.Sub(now); delay != wantDelay {
+			t.Fatalf("failure %d delay = %v, want %v", index+1, delay, wantDelay)
+		}
+		if wantLevel := index + 1; level != wantLevel {
+			t.Fatalf("failure %d BackoffLevel = %d, want %d", index+1, level, wantLevel)
+		}
+		quota.NextRecoverAt = deadline
+		quota.BackoffLevel = level
+		now = deadline.Add(time.Nanosecond)
+	}
+}
+
 func TestNextQuotaCooldownLadder(t *testing.T) {
 	cases := []struct {
 		prevLevel    int

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -20,8 +19,6 @@ const (
 	quotaScopeModel          = "model"
 )
 
-var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
-
 // Result captures an upstream execution result reported by a downstream CPA node.
 type Result struct {
 	AuthID            string
@@ -31,6 +28,7 @@ type Result struct {
 	Success           bool
 	Error             *Error
 	RetryAfter        *time.Duration
+	ResetAt           *time.Time
 	AccessTokenSHA256 string
 }
 
@@ -259,7 +257,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.clearModelQuota = true
 				transition.shouldResumeModel = true
 			} else {
-				next, nextBackoffLevel := quotaCooldownAfterFailure(state.Quota, now)
+				next, nextBackoffLevel := quotaCooldownAfterFailure(state.Quota, now, result)
 				state.NextRetryAfter = next
 				state.QuotaResetAt = time.Time{}
 				state.Quota = QuotaState{
@@ -325,12 +323,19 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 		// written back as complete auth snapshots.
 		return !disabledQuotaStateAlreadyApplied(auth, resultModel)
 	}
-	// A locally visible open window means the shared row already carries this
-	// cooldown, so the failure can be absorbed without a database round-trip.
-	if authQuotaWindowOpen(auth, resultModel, now) {
-		return false
+	state := auth.ModelStates[resultModel]
+	quota := QuotaState{}
+	if state != nil {
+		quota = state.Quota
 	}
-	return true
+	next, nextBackoffLevel := quotaCooldownAfterFailure(quota, now, result)
+	if !authQuotaWindowOpen(auth, resultModel, now) {
+		return true
+	}
+	return state == nil ||
+		!state.NextRetryAfter.Equal(next) ||
+		!state.Quota.NextRecoverAt.Equal(next) ||
+		state.Quota.BackoffLevel != nextBackoffLevel
 }
 
 // disabledQuotaStateAlreadyApplied reports whether a disabled-cooling 429 can
@@ -957,15 +962,35 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 // a quota failure observed at now. Failures that land while a previous quota
 // window is still open reuse that window instead of escalating, so a burst of
 // concurrent failures advances the backoff ladder at most once per window.
-func quotaCooldownAfterFailure(quota QuotaState, now time.Time) (time.Time, int) {
-	if quota.NextRecoverAt.After(now) {
-		return quota.NextRecoverAt, quota.BackoffLevel
+// Future Antigravity reset timestamps are authoritative and suppress relative
+// retry delays. Without one, the later of exponential backoff and RetryAfter
+// is used. Open windows keep their backoff level and are never shortened.
+func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (time.Time, int) {
+	windowOpen := quota.NextRecoverAt.After(now)
+	deadline := quota.NextRecoverAt
+	nextLevel := quota.BackoffLevel
+	if !windowOpen {
+		cooldown, level := nextQuotaCooldown(quota.BackoffLevel, false)
+		deadline = now.Add(cooldown)
+		nextLevel = level
 	}
-	cooldown, nextLevel := nextQuotaCooldown(quota.BackoffLevel, false)
-	if cooldown <= 0 {
-		return time.Time{}, nextLevel
+
+	if !strings.EqualFold(strings.TrimSpace(result.Provider), "antigravity") {
+		return deadline, nextLevel
 	}
-	return now.Add(cooldown), nextLevel
+	if result.ResetAt != nil && result.ResetAt.After(now) {
+		resetAt := result.ResetAt.UTC()
+		if !windowOpen || resetAt.After(deadline) {
+			deadline = resetAt
+		}
+		return deadline, nextLevel
+	}
+	if result.RetryAfter != nil && *result.RetryAfter > 0 {
+		if retryAt := now.Add(*result.RetryAfter); retryAt.After(deadline) {
+			deadline = retryAt
+		}
+	}
+	return deadline, nextLevel
 }
 
 // NewUsageResult creates a new usage result.
@@ -993,12 +1018,14 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 	if message == "" {
 		message = fmt.Sprintf("request failed with status %d", statusCode)
 	}
+	retryAfter, resetAt := parseUsageRetryHints(provider, body, statusCode)
 	return Result{
 		AuthIndex:  authIndex,
 		Provider:   provider,
 		Model:      model,
 		Success:    false,
-		RetryAfter: parseUsageRetryAfter(body, statusCode),
+		RetryAfter: retryAfter,
+		ResetAt:    resetAt,
 		Error: &Error{
 			Message:    message,
 			HTTPStatus: statusCode,
@@ -1006,59 +1033,37 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 	}
 }
 
-func parseUsageRetryAfter(body string, statusCode int) *time.Duration {
-	if statusCode != http.StatusTooManyRequests {
-		return nil
+func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {
+	if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") || statusCode != http.StatusTooManyRequests || !gjson.Valid(body) {
+		return nil, nil
 	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return nil
-	}
-	if gjson.Valid(body) {
-		if retryAfter := parseGoogleRetryDelay(body); retryAfter != nil {
-			return retryAfter
-		}
-		if retryAfter := parseRetryDelayFromMessage(gjson.Get(body, "error.message").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return parseRetryDelayFromMessage(body)
-}
-
-func parseGoogleRetryDelay(body string) *time.Duration {
 	details := gjson.Get(body, "error.details")
 	if !details.Exists() || !details.IsArray() {
-		return nil
+		return nil, nil
 	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.RetryInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("retryDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("metadata.quotaResetDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return nil
-}
 
-func parseRetryDelayFromMessage(message string) *time.Duration {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return nil
+	var retryAfter *time.Duration
+	var resetAt *time.Time
+	for _, detail := range details.Array() {
+		switch detail.Get("@type").String() {
+		case "type.googleapis.com/google.rpc.RetryInfo":
+			if retryAfter == nil {
+				retryAfter = parseDurationPointer(detail.Get("retryDelay").String())
+			}
+		case "type.googleapis.com/google.rpc.ErrorInfo":
+			if resetAt == nil {
+				value := strings.TrimSpace(detail.Get("metadata.quotaResetTimeStamp").String())
+				if value != "" {
+					parsedResetAt, errParse := time.Parse(time.RFC3339Nano, value)
+					if errParse == nil {
+						parsedResetAt = parsedResetAt.UTC()
+						resetAt = &parsedResetAt
+					}
+				}
+			}
+		}
 	}
-	matches := usageRetryDelayPattern.FindStringSubmatch(message)
-	if len(matches) < 2 {
-		return nil
-	}
-	return parseDurationPointer(matches[1])
+	return retryAfter, resetAt
 }
 
 func parseDurationPointer(value string) *time.Duration {

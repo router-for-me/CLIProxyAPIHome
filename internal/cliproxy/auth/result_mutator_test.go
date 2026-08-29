@@ -168,6 +168,129 @@ func TestMarkResultQuotaEscalationIsAtomicAcrossManagers(t *testing.T) {
 	}
 }
 
+func TestMarkResultAntigravityFullRetryHintsReuseSharedResetWindow(t *testing.T) {
+	const authID = "auth-cluster-reset-timestamp"
+	const model = "gemini-3.7-flash-high"
+	ctx := context.Background()
+	seed := &Auth{ID: authID, Index: authID, Provider: "antigravity", Status: StatusActive}
+	store := &fakeMutatorStore{persisted: seed.Clone()}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	retryAfter := 4 * time.Hour
+	resetAt := time.Now().UTC().Add(retryAfter).Truncate(time.Millisecond)
+	result := quotaResult(authID, model)
+	result.Provider = "antigravity"
+	result.RetryAfter = &retryAfter
+	result.ResetAt = &resetAt
+	manager.MarkResult(ctx, result)
+
+	persisted := store.persistedSnapshot()
+	state := persisted.ModelStates[model]
+	if state == nil || !state.NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("persisted Antigravity reset state = %#v, want %v", state, resetAt)
+	}
+	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+		t.Fatalf("Quota.NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("BackoffLevel = %d, want first exponential level 1", state.Quota.BackoffLevel)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 1 {
+		t.Fatalf("mutation attempts after reset timestamp = %d, want 1", attempts)
+	}
+
+	manager.MarkResult(ctx, result)
+	manager.flushResultPersistQueue()
+	if attempts := store.mutationAttemptCount(); attempts != 1 {
+		t.Fatalf("mutation attempts after repeated full retry hints = %d, want 1", attempts)
+	}
+	if saves := store.saveCount(); saves != 0 {
+		t.Fatalf("Save() calls after repeated full retry hints = %d, want 0", saves)
+	}
+	if repeated := store.persistedSnapshot().ModelStates[model]; repeated == nil || !repeated.NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("repeated persisted Antigravity reset state = %#v, want unchanged deadline %v", repeated, resetAt)
+	}
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || local.ModelStates[model] == nil || !local.ModelStates[model].NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("repeated local Antigravity reset state = %#v, want unchanged deadline %v", local, resetAt)
+	}
+}
+
+func TestMarkResultAntigravityRetryDelayExtendsOpenSharedWindow(t *testing.T) {
+	const authID = "auth-cluster-retry-delay-extend"
+	const model = "gemini-3.7-flash-high"
+	ctx := context.Background()
+	seed := &Auth{ID: authID, Index: authID, Provider: "antigravity", Status: StatusActive}
+	store := &fakeMutatorStore{persisted: seed.Clone()}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	// First 429 has no retry hints -> exponential backoff establishes a short window (1s).
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: "antigravity",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+	firstSnapshot := store.persistedSnapshot().ModelStates[model]
+	if firstSnapshot == nil || !firstSnapshot.Quota.Exceeded {
+		t.Fatalf("first 429 failed to establish quota window: %#v", firstSnapshot)
+	}
+
+	// Second concurrent 429 arrives within the short window carrying a large retryDelay (2h).
+	retryAfter := 2 * time.Hour
+	beforeSecond := time.Now()
+	manager.MarkResult(ctx, Result{
+		AuthID:     authID,
+		Provider:   "antigravity",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+
+	extended := store.persistedSnapshot().ModelStates[model]
+	if extended == nil {
+		t.Fatalf("extended state is missing")
+	}
+	if extended.NextRetryAfter.Before(beforeSecond.Add(retryAfter - time.Minute)) {
+		t.Fatalf("NextRetryAfter = %v, want extended to about 2h after failure", extended.NextRetryAfter)
+	}
+	if !extended.Quota.NextRecoverAt.Equal(extended.NextRetryAfter) {
+		t.Fatalf("Quota.NextRecoverAt = %v, want %v", extended.Quota.NextRecoverAt, extended.NextRetryAfter)
+	}
+	if extended.Quota.BackoffLevel != 1 {
+		t.Fatalf("BackoffLevel = %d, want backoff level preserved across in-window extension", extended.Quota.BackoffLevel)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 2 {
+		t.Fatalf("mutation attempts = %d, want 2", attempts)
+	}
+
+	// A third 429 with a shorter retryDelay (5s) should NOT shorten the 2h window.
+	shortRetry := 5 * time.Second
+	manager.MarkResult(ctx, Result{
+		AuthID:     authID,
+		Provider:   "antigravity",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &shortRetry,
+		Error:      &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+	notShortened := store.persistedSnapshot().ModelStates[model]
+	if notShortened == nil || !notShortened.NextRetryAfter.Equal(extended.NextRetryAfter) {
+		t.Fatalf("NextRetryAfter was shortened to %v, want retained %v", notShortened.NextRetryAfter, extended.NextRetryAfter)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 2 {
+		t.Fatalf("mutation attempts after shorter hint = %d, want retained 2", attempts)
+	}
+}
+
 func TestMarkResultDisabledQuotaSkipsRepeatedPersistence(t *testing.T) {
 	const authID = "auth-disabled-quota-local-repeat"
 	const model = "gpt-5"
