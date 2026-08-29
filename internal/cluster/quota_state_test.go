@@ -59,6 +59,7 @@ func newQuotaTestNode(t *testing.T, repo *Repository, authID string) *coreauth.M
 	t.Helper()
 	adapter := NewRuntimeAdapter(repo, "127.0.0.1")
 	manager := coreauth.NewManager(adapter, nil, nil)
+	t.Cleanup(manager.Shutdown)
 	minimal := &coreauth.Auth{ID: authID, Index: authID, Provider: "codex"}
 	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), minimal); errRegister != nil {
 		t.Fatalf("Register returned error: %v", errRegister)
@@ -514,6 +515,7 @@ func TestClusterMinimalAuthPreservesDisableCoolingForTransientResults(t *testing
 			}
 
 			manager := coreauth.NewManager(adapter, nil, nil)
+			t.Cleanup(manager.Shutdown)
 			if _, errRegister := manager.Register(coreauth.WithSkipPersist(ctx), minimals[0]); errRegister != nil {
 				t.Fatalf("Register returned error: %v", errRegister)
 			}
@@ -597,6 +599,7 @@ func TestClusterDisabledCoolingFencesQueuedRequestErrorSnapshots(t *testing.T) {
 				saveDone:       make(chan struct{}),
 			}
 			manager := coreauth.NewManager(store, nil, nil)
+			t.Cleanup(manager.Shutdown)
 			manager.SetConfig(&appconfig.Config{DisableCooling: false})
 			if _, errRegister := manager.Register(coreauth.WithSkipPersist(ctx), minimal); errRegister != nil {
 				t.Fatalf("Register() error = %v", errRegister)
@@ -744,6 +747,7 @@ func TestClusterMinimalAuthUsesFullAuthForQuotaResultWithCoolingOverride(t *test
 				t.Fatalf("runtime override = %#v, want nil", minimal.RuntimeDisableCooling)
 			}
 			manager := coreauth.NewManager(adapter, nil, nil)
+			t.Cleanup(manager.Shutdown)
 			if tc.globalDisable {
 				manager.SetConfig(&appconfig.Config{DisableCooling: true})
 			}

@@ -127,9 +127,14 @@ type Manager struct {
 	resultPersistMu           sync.Mutex
 	resultPersistOnce         sync.Once
 	resultPersistCond         *sync.Cond
+	resultPersistCtx          context.Context
+	resultPersistCancel       context.CancelFunc
+	resultPersistWG           sync.WaitGroup
+	resultPersistClosed       bool
 	resultPersistPending      map[string]*Auth
 	resultPersistActive       map[string]struct{}
 	resultPersistQueue        []string
+	resultPersistRetryTimers  map[string]*time.Timer
 	resultPersistWorkers      int
 	resultPersistTimeout      time.Duration
 	resultPersistRetryBackoff time.Duration
@@ -141,13 +146,17 @@ func NewManager(store Store, selector Selector, _ any) *Manager {
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
+	resultPersistCtx, resultPersistCancel := context.WithCancel(context.Background())
 	mgr := &Manager{
 		store:                     store,
 		selector:                  selector,
 		auths:                     make(map[string]*Auth),
 		indexAuth:                 make(map[string]*Auth),
+		resultPersistCtx:          resultPersistCtx,
+		resultPersistCancel:       resultPersistCancel,
 		resultPersistPending:      make(map[string]*Auth),
 		resultPersistActive:       make(map[string]struct{}),
+		resultPersistRetryTimers:  make(map[string]*time.Timer),
 		resultPersistWorkers:      defaultResultPersistWorkers,
 		resultPersistTimeout:      defaultResultPersistTimeout,
 		resultPersistRetryBackoff: defaultResultPersistRetryBackoff,
@@ -701,6 +710,10 @@ func (m *Manager) stageResultPersist(ctx context.Context, auth *Auth) (string, b
 	}
 
 	m.resultPersistMu.Lock()
+	if m.resultPersistClosed {
+		m.resultPersistMu.Unlock()
+		return "", false
+	}
 	if m.resultPersistPending == nil {
 		m.resultPersistPending = make(map[string]*Auth)
 	}
@@ -725,6 +738,10 @@ func (m *Manager) scheduleResultPersist(authID string) {
 	}
 	m.startResultPersistWorkers()
 	m.resultPersistMu.Lock()
+	if m.resultPersistClosed {
+		m.resultPersistMu.Unlock()
+		return
+	}
 	if _, active := m.resultPersistActive[authID]; active && m.resultPersistPending[authID] != nil {
 		m.resultPersistQueue = append(m.resultPersistQueue, authID)
 		m.resultPersistCond.Signal()
@@ -738,6 +755,10 @@ func (m *Manager) startResultPersistWorkers() {
 	}
 	m.resultPersistOnce.Do(func() {
 		m.resultPersistMu.Lock()
+		if m.resultPersistClosed {
+			m.resultPersistMu.Unlock()
+			return
+		}
 		if m.resultPersistCond == nil {
 			m.resultPersistCond = sync.NewCond(&m.resultPersistMu)
 		}
@@ -745,10 +766,14 @@ func (m *Manager) startResultPersistWorkers() {
 		if workerCount <= 0 {
 			workerCount = defaultResultPersistWorkers
 		}
+		m.resultPersistWG.Add(workerCount)
 		m.resultPersistMu.Unlock()
 
 		for worker := 0; worker < workerCount; worker++ {
-			go m.runResultPersistWorker()
+			go func() {
+				defer m.resultPersistWG.Done()
+				m.runResultPersistWorker()
+			}()
 		}
 	})
 }
@@ -758,8 +783,12 @@ func (m *Manager) startResultPersistWorkers() {
 func (m *Manager) runResultPersistWorker() {
 	for {
 		m.resultPersistMu.Lock()
-		for len(m.resultPersistQueue) == 0 {
+		for len(m.resultPersistQueue) == 0 && !m.resultPersistClosed {
 			m.resultPersistCond.Wait()
+		}
+		if m.resultPersistClosed {
+			m.resultPersistMu.Unlock()
+			return
 		}
 		authID := m.resultPersistQueue[0]
 		m.resultPersistQueue[0] = ""
@@ -779,13 +808,23 @@ func (m *Manager) runResultPersistWorker() {
 		if retryBackoff <= 0 {
 			retryBackoff = defaultResultPersistRetryBackoff
 		}
+		persistParent := m.resultPersistCtx
+		if persistParent == nil {
+			persistParent = context.Background()
+		}
 		m.resultPersistMu.Unlock()
 
-		persistCtx, cancelPersist := context.WithTimeout(context.Background(), persistTimeout)
+		persistCtx, cancelPersist := context.WithTimeout(persistParent, persistTimeout)
 		errPersist := m.persistQueued(persistCtx, auth)
 		cancelPersist()
 		if errPersist == nil {
 			m.resultPersistMu.Lock()
+			if m.resultPersistClosed {
+				delete(m.resultPersistPending, authID)
+				delete(m.resultPersistActive, authID)
+				m.resultPersistMu.Unlock()
+				continue
+			}
 			if m.resultPersistPending[authID] != nil {
 				m.resultPersistQueue = append(m.resultPersistQueue, authID)
 				m.resultPersistCond.Signal()
@@ -796,21 +835,28 @@ func (m *Manager) runResultPersistWorker() {
 			continue
 		}
 
-		log.WithFields(log.Fields{
-			"auth":        authID,
-			"retry_after": retryBackoff,
-		}).WithError(errPersist).Warn("auth manager: background result persistence failed")
-
 		m.resultPersistMu.Lock()
+		if m.resultPersistClosed {
+			delete(m.resultPersistPending, authID)
+			delete(m.resultPersistActive, authID)
+			m.resultPersistMu.Unlock()
+			continue
+		}
 		if m.resultPersistPending[authID] == nil {
 			m.resultPersistPending[authID] = auth
 		}
-		m.resultPersistMu.Unlock()
-
 		retryAuthID := authID
-		time.AfterFunc(retryBackoff, func() {
+		var retryTimer *time.Timer
+		retryTimer = time.AfterFunc(retryBackoff, func() {
 			m.resultPersistMu.Lock()
 			defer m.resultPersistMu.Unlock()
+			if current := m.resultPersistRetryTimers[retryAuthID]; current != retryTimer {
+				return
+			}
+			delete(m.resultPersistRetryTimers, retryAuthID)
+			if m.resultPersistClosed {
+				return
+			}
 			if _, active := m.resultPersistActive[retryAuthID]; !active {
 				return
 			}
@@ -821,6 +867,19 @@ func (m *Manager) runResultPersistWorker() {
 			m.resultPersistQueue = append(m.resultPersistQueue, retryAuthID)
 			m.resultPersistCond.Signal()
 		})
+		if m.resultPersistRetryTimers == nil {
+			m.resultPersistRetryTimers = make(map[string]*time.Timer)
+		}
+		if previous := m.resultPersistRetryTimers[retryAuthID]; previous != nil {
+			previous.Stop()
+		}
+		m.resultPersistRetryTimers[retryAuthID] = retryTimer
+		m.resultPersistMu.Unlock()
+
+		log.WithFields(log.Fields{
+			"auth":        authID,
+			"retry_after": retryBackoff,
+		}).WithError(errPersist).Warn("auth manager: background result persistence failed")
 	}
 }
 
@@ -832,6 +891,10 @@ func (m *Manager) flushResultPersistQueue() {
 	}
 	m.startResultPersistWorkers()
 	m.resultPersistMu.Lock()
+	if m.resultPersistClosed {
+		m.resultPersistMu.Unlock()
+		return
+	}
 	if m.resultPersistActive == nil {
 		m.resultPersistActive = make(map[string]struct{})
 	}
@@ -2482,9 +2545,43 @@ func (m *Manager) StopAutoRefresh() {
 	m.stopAutoRefresh(false)
 }
 
-// Shutdown manages shutdown.
+// Shutdown stops background auth work and releases selector resources.
 func (m *Manager) Shutdown() {
 	m.stopAutoRefresh(true)
+	m.stopResultPersistWorkers()
+}
+
+func (m *Manager) stopResultPersistWorkers() {
+	if m == nil {
+		return
+	}
+	m.resultPersistMu.Lock()
+	if m.resultPersistClosed {
+		m.resultPersistMu.Unlock()
+		m.resultPersistWG.Wait()
+		return
+	}
+	m.resultPersistClosed = true
+	cancelPersist := m.resultPersistCancel
+	for authID, retryTimer := range m.resultPersistRetryTimers {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+		delete(m.resultPersistRetryTimers, authID)
+	}
+	clear(m.resultPersistPending)
+	clear(m.resultPersistActive)
+	clear(m.cooldownFencePending)
+	m.resultPersistQueue = nil
+	if m.resultPersistCond != nil {
+		m.resultPersistCond.Broadcast()
+	}
+	m.resultPersistMu.Unlock()
+
+	if cancelPersist != nil {
+		cancelPersist()
+	}
+	m.resultPersistWG.Wait()
 }
 
 // stopAutoRefresh stops an auto refresh.

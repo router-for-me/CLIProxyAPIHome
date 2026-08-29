@@ -568,6 +568,7 @@ func TestManagerBackgroundPersistDoesNotBlockDifferentAuthUpdate(t *testing.T) {
 	}
 	store := newPerAuthBlockingUpdateStore([]*Auth{first, second}, first.ID)
 	manager := NewManager(store, nil, nil)
+	t.Cleanup(manager.Shutdown)
 	for _, auth := range []*Auth{first, second} {
 		if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
 			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
@@ -613,6 +614,7 @@ func TestManagerBackgroundPersistUsesDeadlineAndRetries(t *testing.T) {
 	const authID = "retry-background-auth"
 	store := newRetryingBackgroundPersistStore()
 	manager := NewManager(store, nil, nil)
+	t.Cleanup(manager.Shutdown)
 	manager.resultPersistTimeout = 25 * time.Millisecond
 	manager.resultPersistRetryBackoff = 10 * time.Millisecond
 	auth := &Auth{
@@ -652,6 +654,7 @@ func TestManagerBackgroundPersistBoundsCrossAuthConcurrency(t *testing.T) {
 	)
 	store := newWorkerLimitedPersistStore(authCount)
 	manager := NewManager(store, nil, nil)
+	t.Cleanup(manager.Shutdown)
 	manager.resultPersistWorkers = workerCount
 	auths := make([]*Auth, 0, authCount)
 	for index := 0; index < authCount; index++ {
@@ -699,6 +702,109 @@ func TestManagerBackgroundPersistBoundsCrossAuthConcurrency(t *testing.T) {
 	}
 	if maximum != workerCount {
 		t.Fatalf("maximum concurrent Save() calls = %d, want %d", maximum, workerCount)
+	}
+}
+
+func TestManagerShutdownCancelsInFlightBackgroundPersist(t *testing.T) {
+	const authID = "shutdown-in-flight-background-auth"
+	store := newWorkerLimitedPersistStore(1)
+	manager := NewManager(store, nil, nil)
+	manager.resultPersistWorkers = 1
+	manager.resultPersistTimeout = time.Second
+	auth := &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "gemini",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "stored-token"},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.enqueueResultPersist(context.Background(), auth)
+	select {
+	case <-store.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background persistence did not start")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		manager.Shutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown() did not cancel the in-flight persistence")
+	}
+
+	manager.enqueueResultPersist(context.Background(), auth)
+	select {
+	case persistedAuthID := <-store.started:
+		t.Fatalf("persistence restarted after shutdown for auth %s", persistedAuthID)
+	case <-time.After(50 * time.Millisecond):
+	}
+	calls, maximum := store.snapshot()
+	if calls != 1 || maximum != 1 {
+		t.Fatalf("Save() calls/maximum = %d/%d, want 1/1", calls, maximum)
+	}
+}
+
+func TestManagerShutdownCancelsScheduledBackgroundPersistRetry(t *testing.T) {
+	const authID = "shutdown-scheduled-retry-auth"
+	store := newRetryingBackgroundPersistStore()
+	manager := NewManager(store, nil, nil)
+	manager.resultPersistWorkers = 1
+	manager.resultPersistTimeout = 20 * time.Millisecond
+	manager.resultPersistRetryBackoff = 100 * time.Millisecond
+	auth := &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "gemini",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "stored-token"},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.enqueueResultPersist(context.Background(), auth)
+	retryScheduled := false
+	deadline := time.NewTimer(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for !retryScheduled {
+		select {
+		case <-deadline.C:
+			t.Fatal("background persistence did not schedule a retry")
+		case <-ticker.C:
+			manager.resultPersistMu.Lock()
+			retryScheduled = manager.resultPersistRetryTimers[authID] != nil
+			manager.resultPersistMu.Unlock()
+		}
+	}
+
+	manager.Shutdown()
+	select {
+	case saved := <-store.saved:
+		t.Fatalf("retry persisted after shutdown: %#v", saved)
+	case <-time.After(150 * time.Millisecond):
+	}
+	calls, _ := store.snapshot()
+	if calls != 1 {
+		t.Fatalf("Save() calls = %d, want only the initial failed attempt", calls)
+	}
+	manager.resultPersistMu.Lock()
+	queued := len(manager.resultPersistQueue)
+	pending := len(manager.resultPersistPending)
+	active := len(manager.resultPersistActive)
+	timers := len(manager.resultPersistRetryTimers)
+	manager.resultPersistMu.Unlock()
+	if queued != 0 || pending != 0 || active != 0 || timers != 0 {
+		t.Fatalf("shutdown queue state = queued:%d pending:%d active:%d timers:%d, want all empty", queued, pending, active, timers)
 	}
 }
 
