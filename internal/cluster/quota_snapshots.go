@@ -647,7 +647,7 @@ func (r *Repository) claimQuotaProbe(ctx context.Context, credentialID string, o
 			}
 			provider := normalizeQuotaProviderID(authRecord.Provider)
 			credentialType := quotaCredentialType(auth)
-			if !quotaCredentialCollectorPlanned(provider, credentialType) || authRecord.Disabled || authRecord.Status == coreauth.StatusDisabled || authRecord.NextRetryAfter != nil && authRecord.NextRetryAfter.After(now) {
+			if !quotaCredentialCollectorPlanned(provider, credentialType) || authRecord.Disabled || authRecord.Status == coreauth.StatusDisabled || coreauth.RefreshBlocksDispatch(auth) {
 				return nil
 			}
 			targetCollectorVersion = QuotaSnapshotVersion(provider)

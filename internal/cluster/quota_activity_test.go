@@ -116,6 +116,91 @@ func TestForceClaimEligibleQuotaProbeBypassesActivityButNotLease(t *testing.T) {
 	}
 }
 
+func TestEligibleQuotaProbeIgnoresCooldownButRejectsDisabledAndRefreshBlocked(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 10, 0, 0, time.UTC)
+	tests := []struct {
+		name          string
+		auth          *coreauth.Auth
+		wantScheduled bool
+		wantForced    bool
+	}{
+		{
+			name: "cooldown",
+			auth: &coreauth.Auth{
+				Provider: "kimi", Status: coreauth.StatusError, Unavailable: true,
+				NextRetryAfter: now.Add(time.Hour), Metadata: map[string]any{"type": "kimi"},
+			},
+			wantScheduled: true,
+			wantForced:    true,
+		},
+		{
+			name: "disabled",
+			auth: &coreauth.Auth{
+				Provider: "kimi", Status: coreauth.StatusDisabled, Disabled: true,
+				Metadata: map[string]any{"type": "kimi"},
+			},
+		},
+		{
+			name: "refresh blocked",
+			auth: &coreauth.Auth{
+				Provider: "kimi", Status: coreauth.StatusError, Unavailable: true,
+				LastError:      &coreauth.Error{Code: "refresh_temporarily_unavailable"},
+				NextRetryAfter: now.Add(time.Hour), Metadata: map[string]any{"type": "kimi"},
+			},
+		},
+		{
+			name: "refresh unsupported",
+			auth: &coreauth.Auth{
+				Provider: "kimi", Status: coreauth.StatusActive,
+				LastRefreshError: &coreauth.Error{Code: "refresh_unsupported"},
+				Metadata:         map[string]any{"type": "kimi"},
+			},
+			wantScheduled: true,
+			wantForced:    true,
+		},
+		{
+			name: "safe refresh backoff",
+			auth: &coreauth.Auth{
+				Provider: "kimi", Status: coreauth.StatusActive,
+				NextRefreshAfter: now.Add(time.Hour),
+				Metadata:         map[string]any{"type": "kimi"},
+			},
+			wantScheduled: true,
+			wantForced:    true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo, closeRepo := newBillingTestRepository(t, ctx)
+			defer closeRepo()
+			credentialID := "force-" + strings.ReplaceAll(test.name, " ", "-")
+			test.auth.ID = credentialID
+			test.auth.Index = credentialID
+			test.auth.Label = credentialID
+			test.auth.CreatedAt = now
+			test.auth.UpdatedAt = now
+			if _, errUpsert := repo.UpsertAuth(ctx, test.auth, "test"); errUpsert != nil {
+				t.Fatalf("UpsertAuth() error = %v", errUpsert)
+			}
+			recordQuotaUsageActivityAt(t, repo, credentialID, "kimi", "oauth", now.Add(-time.Minute))
+
+			claimed, errClaim := repo.ClaimEligibleQuotaProbe(ctx, credentialID, "home-a", now, time.Minute)
+			if errClaim != nil || claimed != test.wantScheduled {
+				t.Fatalf("scheduled claim = %v, %v, want %v, nil", claimed, errClaim, test.wantScheduled)
+			}
+			forceAt := now
+			if claimed {
+				forceAt = now.Add(2 * time.Minute)
+			}
+			claimed, errClaim = repo.ForceClaimEligibleQuotaProbe(ctx, credentialID, "home-b", forceAt, time.Minute)
+			if errClaim != nil || claimed != test.wantForced {
+				t.Fatalf("forced claim = %v, %v, want %v, nil", claimed, errClaim, test.wantForced)
+			}
+		})
+	}
+}
+
 func TestExpiredForcedQuotaProbeLeaseReturnsInactiveCredentialToIdle(t *testing.T) {
 	now := time.Date(2026, 8, 23, 12, 15, 0, 0, time.UTC)
 	oldActivity := -quotaProbeActivityWindow - time.Second
