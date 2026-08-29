@@ -156,7 +156,7 @@ func (c *RefreshController) RefreshNowObserved(ctx context.Context, authIndex, o
 				if errSync := c.syncForwardedAuth(refreshCtx, forwardAuthUUID); errSync != nil {
 					log.Warnf("cluster refresh forwarded auth sync failed | auth=%s err=%v", forwardAuthUUID, errSync)
 					switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
-					case "authentication_error", "refresh_temporarily_unavailable":
+					case "authentication_error", "refresh_temporarily_unavailable", "refresh_unsupported":
 						if errFailClosed := c.applyForwardedRefreshFailureInMemory(refreshCtx, forwardAuthUUID, authErr); errFailClosed != nil {
 							log.Warnf("cluster refresh forwarded auth fail-closed update failed | auth=%s err=%v", forwardAuthUUID, errFailClosed)
 						}
@@ -250,6 +250,15 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 		}
 		lastError.Retryable = true
 		coreauth.ApplyRefreshFailureState(auth, lastError, now)
+	case "refresh_unsupported":
+		if strings.TrimSpace(lastError.Message) == "" {
+			lastError.Message = "token refresh is not supported for this provider"
+		}
+		coreauth.ApplyUnsupportedRefreshBackoff(auth, now)
+		auth.LastRefreshError = lastError
+		if auth.LastError != nil && strings.EqualFold(strings.TrimSpace(auth.LastError.Code), "refresh_unsupported") {
+			auth.LastError = lastError
+		}
 	default:
 		return fmt.Errorf("cluster refresh: unsupported forwarded error %q", lastError.Code)
 	}
@@ -571,7 +580,11 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 	// credential-level refresh transition to the latest persisted snapshot.
 	merged.LastRefreshedAt = refreshed.LastRefreshedAt
 	merged.NextRefreshAfter = refreshed.NextRefreshAfter
-	unsupportedRefresh := refreshed.LastError != nil && strings.EqualFold(strings.TrimSpace(refreshed.LastError.Code), "refresh_unsupported")
+	refreshError := refreshed.LastRefreshError
+	if refreshError == nil {
+		refreshError = refreshed.LastError
+	}
+	unsupportedRefresh := refreshError != nil && strings.EqualFold(strings.TrimSpace(refreshError.Code), "refresh_unsupported")
 	switch {
 	case errors.Is(errRefresh, context.Canceled), errors.Is(errRefresh, context.DeadlineExceeded):
 		// Keep the lease backoff without turning a canceled acquisition into a
@@ -579,7 +592,7 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 	case unsupportedRefresh:
 		coreauth.ApplyUnsupportedRefreshBackoff(merged, now)
 		merged.NextRefreshAfter = refreshed.NextRefreshAfter
-		merged.LastError = refreshed.LastError
+		merged.LastRefreshError = refreshError
 	default:
 		coreauth.ApplyRefreshFailureState(merged, errRefresh, now)
 		if !refreshed.NextRefreshAfter.IsZero() && (merged.NextRefreshAfter.IsZero() || refreshed.NextRefreshAfter.Before(merged.NextRefreshAfter)) {

@@ -303,6 +303,54 @@ func TestRefreshControllerForwardedAuthFailureFailsClosed(t *testing.T) {
 	requireDisabledRefreshAuth(t, inMemory)
 }
 
+func TestRefreshControllerForwardedUnsupportedRefreshClearsOldBlock(t *testing.T) {
+	const authID = "antigravity-unsupported-clears-block"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	auth := newInvalidGrantRefreshAuth(authID)
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+	persisted, _, errGet := repo.GetAuth(ctx, authID)
+	if errGet != nil {
+		t.Fatalf("GetAuth() error = %v", errGet)
+	}
+	auth = persisted
+	auth.RuntimeRefreshBlocked = true
+	auth.Unavailable = true
+	auth.Status = coreauth.StatusError
+	auth.LastError = &coreauth.Error{
+		Code:       "refresh_temporarily_unavailable",
+		Message:    "credential refresh temporarily unavailable",
+		HTTPStatus: http.StatusServiceUnavailable,
+		Retryable:  true,
+	}
+	runtime := newRefreshTestRuntime(t, repo, auth, &refreshTestRoundTripper{})
+	controller := NewRefreshController(nil, runtime, repo, nil)
+
+	errUnsupported := controller.applyForwardedRefreshFailureInMemory(ctx, authID, &coreauth.Error{
+		Code:       "refresh_unsupported",
+		Message:    "token refresh is not supported for this provider",
+		Diagnostic: "provider=antigravity reason=missing_refresh_token",
+	})
+	if errUnsupported != nil {
+		t.Fatalf("applyForwardedRefreshFailureInMemory() error = %v", errUnsupported)
+	}
+	inMemory, ok := runtime.CoreManager().GetByID(authID)
+	if !ok {
+		t.Fatal("GetByID() did not find auth")
+	}
+	if inMemory.RuntimeRefreshBlocked {
+		t.Fatalf("inMemory.RuntimeRefreshBlocked = true, want false")
+	}
+	if coreauth.RefreshBlocksDispatch(inMemory) {
+		t.Fatalf("inMemory is still refresh blocked: %#v", inMemory)
+	}
+	if inMemory.LastRefreshError == nil || inMemory.LastRefreshError.Code != "refresh_unsupported" || inMemory.LastRefreshError.Diagnostic != "provider=antigravity reason=missing_refresh_token" {
+		t.Fatalf("inMemory.LastRefreshError = %#v, want forwarded unsupported diagnostic", inMemory.LastRefreshError)
+	}
+}
+
 func TestRefreshControllerMasterFailureFailsClosedWhenIndexSyncFails(t *testing.T) {
 	const authID = "antigravity-master-fail-closed"
 	ctx := context.Background()
@@ -953,6 +1001,9 @@ func TestMergeClusterRefreshOutcomeClearsTransientBlockWhenRefreshBecomesUnsuppo
 				if merged.Status != coreauth.StatusActive || merged.StatusMessage != "" || merged.Unavailable || !merged.NextRetryAfter.IsZero() {
 					t.Fatalf("merged availability = %#v, want active credential", merged)
 				}
+				if merged.LastError == nil || merged.LastError.Code != "refresh_unsupported" {
+					t.Fatalf("LastError = %#v, want unsupported refresh without an execution error", merged.LastError)
+				}
 			},
 		},
 		{
@@ -987,6 +1038,34 @@ func TestMergeClusterRefreshOutcomeClearsTransientBlockWhenRefreshBecomesUnsuppo
 				if !merged.Quota.Exceeded || !merged.Quota.NextRecoverAt.Equal(state.Quota.NextRecoverAt) {
 					t.Fatalf("concurrent quota state was lost: %#v", merged.Quota)
 				}
+				if merged.LastError == nil || merged.LastError.Message != "quota exceeded" {
+					t.Fatalf("LastError = %#v, want concurrent model error preserved", merged.LastError)
+				}
+			},
+		},
+		{
+			name: "preserves concurrent legacy credential quota",
+			mutateCurrent: func(current *coreauth.Auth) {
+				quotaRetryAt := now.Add(20 * time.Minute)
+				current.Quota = coreauth.QuotaState{
+					Exceeded:      true,
+					Scope:         "credential",
+					Reason:        "credential quota exceeded",
+					NextRecoverAt: quotaRetryAt,
+					BackoffLevel:  4,
+				}
+			},
+			check: func(t *testing.T, merged *coreauth.Auth) {
+				t.Helper()
+				if !merged.Quota.Exceeded || merged.Quota.Scope != "credential" {
+					t.Fatalf("credential quota was lost: %#v", merged.Quota)
+				}
+				if merged.Status != coreauth.StatusError || !merged.Unavailable || !merged.NextRetryAfter.Equal(merged.Quota.NextRecoverAt) {
+					t.Fatalf("merged availability = %#v, want credential quota state", merged)
+				}
+				if merged.LastError == nil || merged.LastError.HTTPStatus != http.StatusTooManyRequests || merged.LastError.Message != merged.Quota.Reason {
+					t.Fatalf("LastError = %#v, want reconstructed credential quota error", merged.LastError)
+				}
 			},
 		},
 	}
@@ -1002,7 +1081,7 @@ func TestMergeClusterRefreshOutcomeClearsTransientBlockWhenRefreshBecomesUnsuppo
 
 			merged := mergeClusterRefreshOutcome(current, base, refreshed, coreauth.ErrRefreshUnsupported, now)
 
-			if merged.LastError == nil || merged.LastError.Code != "refresh_unsupported" || coreauth.RefreshBlocksDispatch(merged) {
+			if merged.LastRefreshError == nil || merged.LastRefreshError.Code != "refresh_unsupported" || coreauth.RefreshBlocksDispatch(merged) {
 				t.Fatalf("merged refresh state = %#v, want unsupported refresh-only backoff", merged)
 			}
 			if !merged.NextRefreshAfter.Equal(refreshed.NextRefreshAfter) {
@@ -1386,5 +1465,82 @@ func TestRefreshControllerStandbyTransientMasterErrorFailsClosedWhenSyncFails(t 
 	}
 	if standbyAuth.LastError == nil || standbyAuth.LastError.Code != "refresh_temporarily_unavailable" || standbyAuth.LastError.Diagnostic != authErr.Diagnostic || standbyAuth.LastError.Upstream == nil || string(standbyAuth.LastError.Upstream.Body) != responseBody {
 		t.Fatalf("standby LastError = %#v, want forwarded transient upstream response", standbyAuth.LastError)
+	}
+}
+
+func TestRefreshControllerStandbyUnsupportedMasterErrorClearsOldBlockWhenSyncFails(t *testing.T) {
+	const authID = "antigravity-forwarded-unsupported"
+	ctx := context.Background()
+	repo := newRefreshTestRepository(t)
+	// Create an auth without refresh_token so master treats it as unsupported refresh
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"access_token": "valid-access-token",
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	masterTransport := &refreshTestRoundTripper{}
+	standbyTransport := &refreshTestRoundTripper{}
+	masterRuntime := newRefreshTestRuntime(t, repo, auth, masterTransport)
+
+	standbyRuntime := newRefreshTestRuntime(t, repo, auth, standbyTransport)
+	standbyRuntime.SetClusterAdapter(&refreshTestFailingIndexAdapter{RuntimeAdapter: NewRuntimeAdapter(repo, "")})
+
+	// Prime standby memory with an old refresh block
+	standbyAuthPrimed := auth.Clone()
+	standbyAuthPrimed.RuntimeRefreshBlocked = true
+	standbyAuthPrimed.Unavailable = true
+	standbyAuthPrimed.Status = coreauth.StatusError
+	standbyAuthPrimed.LastError = &coreauth.Error{
+		Code:       "refresh_temporarily_unavailable",
+		Message:    "transient refresh error",
+		HTTPStatus: http.StatusServiceUnavailable,
+		Retryable:  true,
+	}
+	if _, errUpdate := standbyRuntime.UpdateAuthInMemory(ctx, standbyAuthPrimed); errUpdate != nil {
+		t.Fatalf("UpdateAuthInMemory() error = %v", errUpdate)
+	}
+
+	masterCoordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.1", Port: 9407, Secret: "master-secret", StartedAt: time.Now().UTC().Add(-time.Minute)}, CoordinatorOptions{})
+	markRefreshTestMaster(t, repo, masterCoordinator)
+	masterController := NewRefreshController(masterCoordinator, masterRuntime, repo, nil)
+
+	standbyCoordinator := NewCoordinator(repo, NodeIdentity{IP: "127.0.0.2", Port: 9408, Secret: "standby-secret"}, CoordinatorOptions{})
+	standbyCoordinator.setMaster(false)
+	standbyController := NewRefreshController(standbyCoordinator, standbyRuntime, repo, nil)
+	standbyController.forwardRefresh = func(ctx context.Context, _ *ClusterNodeRecord, forwardedAuthID, _ string, observedAccessTokenSHA256 string, _ *tls.Config) ([]byte, error) {
+		payload, errMasterRefresh := masterController.RefreshNowObserved(ctx, forwardedAuthID, observedAccessTokenSHA256)
+		if errMasterRefresh == nil {
+			return payload, nil
+		}
+		wire := "-" + FormatRESPError(errMasterRefresh) + "\r\n"
+		return readRESPBulk(bufio.NewReader(strings.NewReader(wire)))
+	}
+
+	_, errRefresh := standbyController.RefreshNowObserved(ctx, authID, coreauth.AccessTokenSHA256(auth))
+	var authErr *coreauth.Error
+	if !errors.As(errRefresh, &authErr) || authErr == nil || authErr.Code != "refresh_unsupported" {
+		t.Fatalf("standby refresh error = %#v, want unsupported refresh error", errRefresh)
+	}
+
+	standbyAuth, ok := standbyRuntime.CoreManager().GetByID(authID)
+	if !ok || standbyAuth == nil {
+		t.Fatal("standby GetByID() did not find auth")
+	}
+	if standbyAuth.RuntimeRefreshBlocked {
+		t.Fatalf("standby RuntimeRefreshBlocked = true, want false")
+	}
+	if coreauth.RefreshBlocksDispatch(standbyAuth) {
+		t.Fatalf("standby auth is still refresh-blocked: %#v", standbyAuth)
+	}
+	if standbyAuth.LastRefreshError == nil || standbyAuth.LastRefreshError.Code != "refresh_unsupported" {
+		t.Fatalf("standby LastRefreshError = %#v, want refresh_unsupported", standbyAuth.LastRefreshError)
 	}
 }

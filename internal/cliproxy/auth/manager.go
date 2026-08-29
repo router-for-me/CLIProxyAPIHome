@@ -1895,9 +1895,12 @@ func clearRefreshDispatchBlock(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
-	preserveCredentialQuota := hasLegacyCredentialQuota(auth)
+	legacyCredentialQuota := hasLegacyCredentialQuota(auth)
+	preserveCredentialQuota := legacyCredentialQuota && auth.Quota.NextRecoverAt.After(now)
 	preservedQuota := auth.Quota
-	preserveNonRefreshError := auth.LastError != nil && !isRefreshAcquisitionError(auth.LastError) && !authErrorMirroredByModel(auth)
+	errorMirroredByModel := authErrorMirroredByModel(auth)
+	clearExpiredQuotaError := legacyCredentialQuota && !preserveCredentialQuota && auth.LastError != nil && statusCodeFromResult(auth.LastError) == http.StatusTooManyRequests && !errorMirroredByModel
+	preserveNonRefreshError := auth.LastError != nil && !isRefreshAcquisitionError(auth.LastError) && !clearExpiredQuotaError && !errorMirroredByModel
 	preservedStatus := auth.Status
 	preservedStatusMessage := auth.StatusMessage
 	preservedLastError := cloneError(auth.LastError)
@@ -1905,7 +1908,7 @@ func clearRefreshDispatchBlock(auth *Auth, now time.Time) {
 	preservedRetryAfter := auth.NextRetryAfter
 
 	auth.RuntimeRefreshBlocked = false
-	if isRefreshAcquisitionError(auth.LastError) {
+	if isRefreshAcquisitionError(auth.LastError) || clearExpiredQuotaError {
 		auth.LastError = nil
 		auth.StatusMessage = ""
 	}
@@ -1986,25 +1989,16 @@ func ApplyUnsupportedRefreshBackoff(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
-	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
 	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
-	auth.NextRetryAfter = time.Time{}
-	auth.Unavailable = false
-	auth.RuntimeRefreshBlocked = false
-	auth.LastError = cloneError(ErrRefreshUnsupported)
-	auth.LastError.Diagnostic = unsupportedRefreshDiagnostic(auth)
-	auth.LastRefreshError = cloneError(auth.LastError)
-	auth.StatusMessage = ""
-	auth.UpdatedAt = now
-	updateAggregatedAvailability(auth, now)
-	if wasDisabled {
-		auth.Status = StatusDisabled
-		auth.Unavailable = true
-	} else if hasModelError(auth, now) {
-		auth.Status = StatusError
-	} else {
-		auth.Status = StatusActive
+	refreshFailure := cloneError(ErrRefreshUnsupported)
+	refreshFailure.Diagnostic = unsupportedRefreshDiagnostic(auth)
+	auth.LastRefreshError = cloneError(refreshFailure)
+	clearRefreshDispatchBlock(auth, now)
+	if !hasHigherPriorityExecutionError(auth, now) {
+		auth.LastError = cloneError(refreshFailure)
+		auth.StatusMessage = ""
 	}
+	auth.UpdatedAt = now
 }
 
 func unsupportedRefreshDiagnostic(auth *Auth) string {
@@ -2722,7 +2716,7 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 		if !authRefreshDisabled(updatedPersisted) && AuthIsNewerThanObserved(updatedPersisted, observedAccessTokenSHA256) {
 			return updatedPersisted, nil
 		}
-		persistedFailure := snapshot.LastError
+		persistedFailure := snapshot.LastRefreshError
 		if updatedPersisted.LastRefreshError != nil {
 			persistedFailure = cloneError(updatedPersisted.LastRefreshError)
 		}
@@ -2806,7 +2800,7 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	if !refreshAttempted {
 		snapshot := target.Clone()
 		ApplyUnsupportedRefreshBackoff(snapshot, now)
-		return snapshot, cloneError(snapshot.LastError)
+		return snapshot, cloneError(snapshot.LastRefreshError)
 	}
 	if updated == nil {
 		updated = target.Clone()
@@ -2906,18 +2900,12 @@ func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
 	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
 	clearUnauthorizedAuth := isUnauthorizedAuthState(auth)
 	clearRefreshAcquisition := isRefreshAcquisitionState(auth)
+	clearExpiredCredentialQuota := hasLegacyCredentialQuota(auth) && !auth.Quota.NextRecoverAt.After(now)
 
 	auth.LastRefreshedAt = now
 	auth.NextRefreshAfter = time.Time{}
 	auth.LastRefreshError = nil
 	auth.UpdatedAt = now
-	if clearRefreshAcquisition {
-		auth.NextRetryAfter = time.Time{}
-		auth.Unavailable = false
-		auth.RuntimeRefreshBlocked = false
-		auth.LastError = nil
-		auth.StatusMessage = ""
-	}
 	if clearUnauthorizedAuth {
 		auth.NextRetryAfter = time.Time{}
 		auth.Unavailable = false
@@ -2934,16 +2922,12 @@ func applyRefreshSuccessState(auth *Auth, now time.Time) []string {
 			resumed = append(resumed, model)
 		}
 	}
-	if clearRefreshAcquisition || clearUnauthorizedAuth || len(resumed) > 0 {
-		updateAggregatedAvailability(auth, now)
+	if clearRefreshAcquisition || clearUnauthorizedAuth || clearExpiredCredentialQuota || len(resumed) > 0 {
+		clearRefreshDispatchBlock(auth, now)
 	}
 	if wasDisabled {
 		auth.Status = StatusDisabled
 		auth.Unavailable = true
-	} else if hasModelError(auth, now) {
-		auth.Status = StatusError
-	} else if clearRefreshAcquisition || clearUnauthorizedAuth || len(resumed) > 0 {
-		auth.Status = StatusActive
 	}
 	return resumed
 }

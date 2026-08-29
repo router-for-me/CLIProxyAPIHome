@@ -1314,3 +1314,55 @@ func TestRefreshNowObservedAdoptsAuthoritativeSnapshotAfterStoreRejectsOutcome(t
 		})
 	}
 }
+
+func TestRefreshNowObservedReturnsUnsupportedRefreshWhenStoreRejectsUpdateWithExecutionError(t *testing.T) {
+	t.Parallel()
+
+	authID := "refresh-unsupported-concurrent-error"
+	base := &Auth{
+		ID:            authID,
+		Index:         authID,
+		Provider:      "plugin-refresh-test",
+		Status:        StatusError,
+		StatusMessage: "upstream unavailable",
+		Unavailable:   true,
+		StateVersion:  10,
+		LastError: &Error{
+			Code:       "upstream_unavailable",
+			Message:    "upstream unavailable",
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		Metadata: map[string]any{
+			"access_token": "observed-access-token",
+		},
+	}
+	store := newBlockingVersionedUpdateStore(base)
+	manager := NewManager(store, nil, nil)
+	manager.SetFullAuthResolver(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), base); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	authoritative := base.Clone()
+	authoritative.StateVersion = 11
+	manager.SetPluginAuthRefresher(refreshTestPluginRefresher(func(_ context.Context, _ *Auth) (*Auth, bool, error) {
+		store.replacePersisted(authoritative)
+		return nil, false, nil
+	}))
+
+	updated, errRefresh := manager.RefreshNowObserved(context.Background(), authID, AccessTokenSHA256(base))
+	if updated != nil {
+		t.Fatalf("RefreshNowObserved() auth = %#v, want nil", updated)
+	}
+	if errRefresh == nil {
+		t.Fatal("RefreshNowObserved() error = nil, want unsupported refresh error")
+	}
+	if !errors.Is(errRefresh, ErrRefreshUnsupported) {
+		t.Fatalf("RefreshNowObserved() error = %#v, want ErrRefreshUnsupported compatibility", errRefresh)
+	}
+	var authErr *Error
+	if !errors.As(errRefresh, &authErr) || authErr == nil || authErr.Code != refreshUnsupportedCode {
+		t.Fatalf("RefreshNowObserved() error = %#v, want code %q", errRefresh, refreshUnsupportedCode)
+	}
+}

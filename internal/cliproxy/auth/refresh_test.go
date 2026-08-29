@@ -865,11 +865,14 @@ func TestUnsupportedRefreshBackoffDoesNotBlockDispatch(t *testing.T) {
 	if RefreshBlocksDispatch(auth) {
 		t.Fatal("unsupported refresh backoff was promoted to a credential-level dispatch block")
 	}
-	if auth.LastError == nil || auth.LastError.Code != refreshUnsupportedCode || auth.StatusMessage != "" {
-		t.Fatalf("unsupported refresh state = last error %#v status message %q", auth.LastError, auth.StatusMessage)
+	if auth.LastError == nil || auth.LastError.Message != "model cooldown" || auth.StatusMessage != "model cooldown" {
+		t.Fatalf("execution state = last error %#v status message %q, want model cooldown", auth.LastError, auth.StatusMessage)
 	}
-	if !strings.Contains(auth.LastError.Diagnostic, "provider=custom") || !strings.Contains(auth.LastError.Diagnostic, "reason=no_refresh_handler") {
-		t.Fatalf("unsupported refresh diagnostic = %q, want provider and capability reason", auth.LastError.Diagnostic)
+	if auth.LastRefreshError == nil || auth.LastRefreshError.Code != refreshUnsupportedCode {
+		t.Fatalf("LastRefreshError = %#v, want unsupported refresh", auth.LastRefreshError)
+	}
+	if !strings.Contains(auth.LastRefreshError.Diagnostic, "provider=custom") || !strings.Contains(auth.LastRefreshError.Diagnostic, "reason=no_refresh_handler") {
+		t.Fatalf("unsupported refresh diagnostic = %q, want provider and capability reason", auth.LastRefreshError.Diagnostic)
 	}
 	if blocked, _, _ := isAuthBlockedForModel(auth, "blocked-model", now); !blocked {
 		t.Fatal("existing model cooldown was cleared unexpectedly")
@@ -881,6 +884,134 @@ func TestUnsupportedRefreshBackoffDoesNotBlockDispatch(t *testing.T) {
 	NewManager(nil, nil, nil).applyResultTransition(auth, Result{AuthID: auth.ID, Model: "new-model", Success: true}, "new-model", now, false)
 	if auth.Unavailable || auth.RuntimeRefreshBlocked || RefreshBlocksDispatch(auth) {
 		t.Fatalf("successful result preserved an unsupported refresh as a dispatch block: %#v", auth)
+	}
+}
+
+func TestUnsupportedRefreshBackoffPreservesCredentialExecutionState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	quotaRetryAt := now.Add(15 * time.Minute)
+	expiredQuotaAt := now.Add(-time.Minute)
+	requestRetryAt := now.Add(10 * time.Minute)
+	tests := []struct {
+		name  string
+		auth  *Auth
+		check func(*testing.T, *Auth)
+	}{
+		{
+			name: "legacy credential quota",
+			auth: &Auth{
+				ID:                    "auth-legacy-credential-quota",
+				Provider:              "custom",
+				Status:                StatusError,
+				StatusMessage:         refreshTransientErrorMsg,
+				Unavailable:           true,
+				RuntimeRefreshBlocked: true,
+				NextRetryAfter:        now.Add(time.Minute),
+				LastError:             newTransientRefreshError(),
+				Quota: QuotaState{
+					Exceeded:      true,
+					Scope:         "credential",
+					Reason:        "credential quota exceeded",
+					NextRecoverAt: quotaRetryAt,
+					BackoffLevel:  3,
+				},
+			},
+			check: func(t *testing.T, auth *Auth) {
+				t.Helper()
+				if !auth.Quota.Exceeded || auth.Quota.Scope != "credential" || !auth.Quota.NextRecoverAt.Equal(quotaRetryAt) {
+					t.Fatalf("credential quota = %#v, want preserved until %v", auth.Quota, quotaRetryAt)
+				}
+				if auth.Status != StatusError || !auth.Unavailable || !auth.NextRetryAfter.Equal(quotaRetryAt) {
+					t.Fatalf("credential availability = %#v, want quota retry at %v", auth, quotaRetryAt)
+				}
+				if auth.LastError == nil || auth.LastError.HTTPStatus != http.StatusTooManyRequests || auth.LastError.Message != auth.Quota.Reason {
+					t.Fatalf("credential error = %#v, want reconstructed quota error", auth.LastError)
+				}
+			},
+		},
+		{
+			name: "expired legacy credential quota",
+			auth: &Auth{
+				ID:                    "auth-expired-legacy-credential-quota",
+				Provider:              "custom",
+				Status:                StatusError,
+				StatusMessage:         "expired credential quota",
+				Unavailable:           true,
+				RuntimeRefreshBlocked: true,
+				NextRetryAfter:        expiredQuotaAt,
+				LastError: &Error{
+					Message:    "expired credential quota",
+					Retryable:  true,
+					HTTPStatus: http.StatusTooManyRequests,
+				},
+				Quota: QuotaState{
+					Exceeded:      true,
+					Scope:         "credential",
+					Reason:        "expired credential quota",
+					NextRecoverAt: expiredQuotaAt,
+					BackoffLevel:  3,
+				},
+			},
+			check: func(t *testing.T, auth *Auth) {
+				t.Helper()
+				if auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() {
+					t.Fatalf("credential quota = %#v, want expired quota cleared", auth.Quota)
+				}
+				if auth.Status != StatusActive || auth.Unavailable || !auth.NextRetryAfter.IsZero() {
+					t.Fatalf("credential availability = %#v, want active after expired quota clear", auth)
+				}
+				if auth.LastError == nil || auth.LastError.Code != refreshUnsupportedCode {
+					t.Fatalf("credential error = %#v, want unsupported refresh diagnostic", auth.LastError)
+				}
+			},
+		},
+		{
+			name: "non-refresh credential error",
+			auth: &Auth{
+				ID:                    "auth-non-refresh-error",
+				Provider:              "custom",
+				Status:                StatusError,
+				StatusMessage:         "upstream unavailable",
+				Unavailable:           true,
+				RuntimeRefreshBlocked: true,
+				NextRetryAfter:        requestRetryAt,
+				LastError: &Error{
+					Code:       "upstream_unavailable",
+					Message:    "upstream unavailable",
+					Retryable:  true,
+					HTTPStatus: http.StatusServiceUnavailable,
+				},
+			},
+			check: func(t *testing.T, auth *Auth) {
+				t.Helper()
+				if auth.Status != StatusError || auth.StatusMessage != "upstream unavailable" || !auth.Unavailable || !auth.NextRetryAfter.Equal(requestRetryAt) {
+					t.Fatalf("credential availability = %#v, want non-refresh error preserved", auth)
+				}
+				if auth.LastError == nil || auth.LastError.Code != "upstream_unavailable" || auth.LastError.HTTPStatus != http.StatusServiceUnavailable {
+					t.Fatalf("credential error = %#v, want upstream error preserved", auth.LastError)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			auth := test.auth.Clone()
+			ApplyUnsupportedRefreshBackoff(auth, now)
+
+			if auth.RuntimeRefreshBlocked || RefreshBlocksDispatch(auth) {
+				t.Fatalf("unsupported refresh blocked dispatch: %#v", auth)
+			}
+			if auth.LastRefreshError == nil || auth.LastRefreshError.Code != refreshUnsupportedCode || !strings.Contains(auth.LastRefreshError.Diagnostic, "provider=custom") {
+				t.Fatalf("LastRefreshError = %#v, want structured unsupported refresh", auth.LastRefreshError)
+			}
+			if !auth.NextRefreshAfter.Equal(now.Add(refreshFailureBackoff)) {
+				t.Fatalf("NextRefreshAfter = %v, want %v", auth.NextRefreshAfter, now.Add(refreshFailureBackoff))
+			}
+			test.check(t, auth)
+		})
 	}
 }
 
@@ -907,6 +1038,41 @@ func TestRefreshAuthCredentialReturnsUnsupportedDiagnostic(t *testing.T) {
 	}
 	if !errors.Is(errRefresh, ErrRefreshUnsupported) {
 		t.Fatalf("RefreshAuthCredential() error = %#v, want ErrRefreshUnsupported compatibility", errRefresh)
+	}
+}
+
+func TestRefreshAuthCredentialPreservesExecutionErrorWhileReturningUnsupportedRefresh(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	retryAt := now.Add(10 * time.Minute)
+	auth := &Auth{
+		ID:             "antigravity-execution-error",
+		Provider:       "antigravity",
+		Status:         StatusError,
+		StatusMessage:  "upstream unavailable",
+		Unavailable:    true,
+		NextRetryAfter: retryAt,
+		LastError: &Error{
+			Code:       "upstream_unavailable",
+			Message:    "upstream unavailable",
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		Metadata: map[string]any{"access_token": "expired-access-token"},
+	}
+
+	refreshed, errRefresh := NewManager(nil, nil, nil).RefreshAuthCredential(context.Background(), auth)
+
+	var refreshErr *Error
+	if !errors.As(errRefresh, &refreshErr) || refreshErr == nil || refreshErr.Code != refreshUnsupportedCode || !errors.Is(errRefresh, ErrRefreshUnsupported) {
+		t.Fatalf("RefreshAuthCredential() error = %#v, want structured unsupported refresh", errRefresh)
+	}
+	if refreshed == nil || refreshed.LastError == nil || refreshed.LastError.Code != "upstream_unavailable" || refreshed.StatusMessage != "upstream unavailable" || !refreshed.Unavailable || !refreshed.NextRetryAfter.Equal(retryAt) {
+		t.Fatalf("RefreshAuthCredential() state = %#v, want execution error preserved", refreshed)
+	}
+	if refreshed.LastRefreshError == nil || refreshed.LastRefreshError.Code != refreshUnsupportedCode || refreshed.LastRefreshError.Diagnostic != refreshErr.Diagnostic {
+		t.Fatalf("LastRefreshError = %#v, want returned diagnostic %#v", refreshed.LastRefreshError, refreshErr)
 	}
 }
 
@@ -1353,6 +1519,94 @@ func TestRuntimeRefreshBlockPreventsDispatchAndClearsAfterRefresh(t *testing.T) 
 	}
 }
 
+func TestApplyRefreshSuccessStatePreservesLegacyCredentialQuota(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	quotaRetryAt := now.Add(15 * time.Minute)
+	auth := &Auth{
+		ID:                    "auth-refresh-success-credential-quota",
+		Provider:              "antigravity",
+		Status:                StatusError,
+		StatusMessage:         refreshTransientErrorMsg,
+		Unavailable:           true,
+		RuntimeRefreshBlocked: true,
+		NextRefreshAfter:      now.Add(time.Minute),
+		NextRetryAfter:        now.Add(time.Minute),
+		LastError:             newTransientRefreshError(),
+		LastRefreshError:      newTransientRefreshError(),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Scope:         "credential",
+			Reason:        "credential quota exceeded",
+			NextRecoverAt: quotaRetryAt,
+			BackoffLevel:  4,
+		},
+	}
+
+	resumed := applyRefreshSuccessState(auth, now)
+
+	if len(resumed) != 0 {
+		t.Fatalf("resumed models = %v, want none", resumed)
+	}
+	if auth.RuntimeRefreshBlocked || RefreshBlocksDispatch(auth) || auth.LastRefreshError != nil || !auth.NextRefreshAfter.IsZero() {
+		t.Fatalf("refresh state = %#v, want refresh block and diagnostic cleared", auth)
+	}
+	if !auth.Quota.Exceeded || auth.Quota.Scope != "credential" || !auth.Quota.NextRecoverAt.Equal(quotaRetryAt) {
+		t.Fatalf("credential quota = %#v, want preserved until %v", auth.Quota, quotaRetryAt)
+	}
+	if auth.Status != StatusError || auth.StatusMessage != auth.Quota.Reason || !auth.Unavailable || !auth.NextRetryAfter.Equal(quotaRetryAt) {
+		t.Fatalf("credential availability = %#v, want quota retry at %v", auth, quotaRetryAt)
+	}
+	if auth.LastError == nil || auth.LastError.HTTPStatus != http.StatusTooManyRequests || auth.LastError.Message != auth.Quota.Reason {
+		t.Fatalf("credential error = %#v, want reconstructed quota error", auth.LastError)
+	}
+}
+
+func TestApplyRefreshSuccessStateClearsExpiredLegacyCredentialQuota(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	expiredQuotaAt := now.Add(-time.Minute)
+	auth := &Auth{
+		ID:               "auth-refresh-success-expired-credential-quota",
+		Provider:         "antigravity",
+		Status:           StatusError,
+		StatusMessage:    "expired credential quota",
+		Unavailable:      true,
+		NextRefreshAfter: expiredQuotaAt,
+		NextRetryAfter:   expiredQuotaAt,
+		LastError: &Error{
+			Message:    "expired credential quota",
+			Retryable:  true,
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+		LastRefreshError: newTransientRefreshError(),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Scope:         "credential",
+			Reason:        "expired credential quota",
+			NextRecoverAt: expiredQuotaAt,
+			BackoffLevel:  4,
+		},
+	}
+
+	resumed := applyRefreshSuccessState(auth, now)
+
+	if len(resumed) != 0 {
+		t.Fatalf("resumed models = %v, want none", resumed)
+	}
+	if auth.RuntimeRefreshBlocked || RefreshBlocksDispatch(auth) || auth.LastRefreshError != nil || !auth.NextRefreshAfter.IsZero() {
+		t.Fatalf("refresh state = %#v, want refresh block and diagnostic cleared", auth)
+	}
+	if auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("credential quota = %#v, want expired quota cleared", auth.Quota)
+	}
+	if auth.Status != StatusActive || auth.StatusMessage != "" || auth.Unavailable || !auth.NextRetryAfter.IsZero() || auth.LastError != nil {
+		t.Fatalf("credential availability = %#v, want active after expired quota clear", auth)
+	}
+}
+
 func TestApplyRefreshSuccessStateClearsUnauthorizedModelCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -1392,5 +1646,102 @@ func TestApplyRefreshSuccessStateClearsUnauthorizedModelCooldown(t *testing.T) {
 	state := auth.ModelStates["gpt-5"]
 	if state == nil || state.Unavailable || state.Status != StatusActive || state.LastError != nil {
 		t.Fatalf("refreshed model state = %#v, want active", state)
+	}
+}
+
+func TestApplyRefreshSuccessStatePreservesLegacyCredentialQuotaAfterUnauthorizedAuth(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	quotaRetryAt := now.Add(20 * time.Minute)
+	auth := &Auth{
+		ID:             "auth-401-credential-quota",
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  "unauthorized",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		LastError: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Code:       "unauthorized",
+			Message:    "unauthorized",
+		},
+		Quota: QuotaState{
+			Exceeded:      true,
+			Scope:         "credential",
+			Reason:        "credential rate limit",
+			NextRecoverAt: quotaRetryAt,
+			BackoffLevel:  2,
+		},
+	}
+
+	resumed := applyRefreshSuccessState(auth, now)
+
+	if len(resumed) != 0 {
+		t.Fatalf("resumed models = %v, want none", resumed)
+	}
+	if !auth.Quota.Exceeded || auth.Quota.Scope != "credential" || !auth.Quota.NextRecoverAt.Equal(quotaRetryAt) {
+		t.Fatalf("credential quota = %#v, want preserved until %v", auth.Quota, quotaRetryAt)
+	}
+	if auth.Status != StatusError || !auth.Unavailable || !auth.NextRetryAfter.Equal(quotaRetryAt) {
+		t.Fatalf("credential status = %s, unavailable = %v, retry = %v, want StatusError and quota retry %v", auth.Status, auth.Unavailable, auth.NextRetryAfter, quotaRetryAt)
+	}
+	if auth.LastError == nil || auth.LastError.HTTPStatus != http.StatusTooManyRequests || auth.LastError.Message != auth.Quota.Reason {
+		t.Fatalf("credential error = %#v, want reconstructed quota error", auth.LastError)
+	}
+}
+
+func TestApplyRefreshSuccessStatePreservesLegacyCredentialQuotaAfterUnauthorizedModel(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	quotaRetryAt := now.Add(25 * time.Minute)
+	auth := &Auth{
+		ID:             "auth-401-model-with-credential-quota",
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  "unauthorized",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		LastError: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Code:       "unauthorized",
+			Message:    "unauthorized",
+		},
+		Quota: QuotaState{
+			Exceeded:      true,
+			Scope:         "credential",
+			Reason:        "credential quota exceeded",
+			NextRecoverAt: quotaRetryAt,
+			BackoffLevel:  3,
+		},
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				StatusMessage:  "unauthorized",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				LastError:      &Error{HTTPStatus: http.StatusUnauthorized, Message: "token expired"},
+			},
+		},
+	}
+
+	resumed := applyRefreshSuccessState(auth, now)
+
+	if len(resumed) != 1 || resumed[0] != "gpt-5" {
+		t.Fatalf("resumed models = %v, want [gpt-5]", resumed)
+	}
+	state := auth.ModelStates["gpt-5"]
+	if state == nil || state.Unavailable || state.Status != StatusActive || state.LastError != nil {
+		t.Fatalf("model state = %#v, want active after refresh", state)
+	}
+	if !auth.Quota.Exceeded || auth.Quota.Scope != "credential" || !auth.Quota.NextRecoverAt.Equal(quotaRetryAt) {
+		t.Fatalf("credential quota = %#v, want preserved until %v", auth.Quota, quotaRetryAt)
+	}
+	if auth.Status != StatusError || !auth.Unavailable || !auth.NextRetryAfter.Equal(quotaRetryAt) {
+		t.Fatalf("credential availability = %#v, want StatusError and quota retry %v", auth, quotaRetryAt)
+	}
+	if auth.LastError == nil || auth.LastError.HTTPStatus != http.StatusTooManyRequests || auth.LastError.Message != auth.Quota.Reason {
+		t.Fatalf("credential error = %#v, want reconstructed quota error", auth.LastError)
 	}
 }
