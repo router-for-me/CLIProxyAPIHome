@@ -615,6 +615,7 @@ type AuthIndex struct {
 	Status         coreauth.Status
 	Disabled       bool
 	Unavailable    bool
+	RefreshBlocked bool
 	NextRetryAfter time.Time
 	Quota          coreauth.QuotaState
 	ModelStates    map[string]*coreauth.ModelState

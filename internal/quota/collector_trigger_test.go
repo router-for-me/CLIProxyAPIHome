@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 )
 
@@ -41,6 +43,133 @@ func TestTriggerCollectionAcceptsEligibleCredentials(t *testing.T) {
 	}
 	waitForProbeRequests(t, &requests, 2)
 	collector.Wait()
+}
+
+func TestCoolingCredentialCollectionUsesActivityAndAllowsForce(t *testing.T) {
+	ctx := context.Background()
+	repo := newCollectorTestRepository(t)
+	const credentialID = "codex-cooling"
+	seedCollectorProviderAuth(t, repo, credentialID, "codex", map[string]any{"type": "codex", "access_token": "probe-secret"})
+	now := time.Now().UTC().Add(time.Hour)
+
+	auth, _, errAuth := repo.GetAuth(ctx, credentialID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	cooldownUntil := now.Add(time.Hour)
+	auth.Status = coreauth.StatusError
+	auth.Unavailable = true
+	auth.NextRetryAfter = cooldownUntil
+	auth.UpdatedAt = now
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "test-cooldown"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	var usageRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/usage":
+			usageRequests.Add(1)
+			_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":600,"reset_at":1784160600}}}`))
+		case "/reset":
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner:                "home-a",
+		CodexUsageURL:        server.URL + "/usage",
+		CodexResetCreditsURL: server.URL + "/reset",
+		Now:                  func() time.Time { return now },
+	})
+	collector.collect(ctx)
+	if got := usageRequests.Load(); got != 0 {
+		t.Fatalf("inactive scheduled quota probe requests = %d, want 0", got)
+	}
+
+	usagePayload := fmt.Sprintf(`{"timestamp":%q,"provider":"codex","auth_type":"oauth","auth_index":"codex-cooling"}`, now.Format(time.RFC3339Nano))
+	if _, errAppend := repo.AppendUsageWithRuntime(ctx, usagePayload, cluster.UsageRuntimeMetadata{ReceivedAt: now}); errAppend != nil {
+		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
+	}
+	collector.collect(ctx)
+	if got := usageRequests.Load(); got != 1 {
+		t.Fatalf("active scheduled quota probe requests = %d, want 1", got)
+	}
+	collector.collect(ctx)
+	if got := usageRequests.Load(); got != 1 {
+		t.Fatalf("repeated scheduled quota probe requests = %d, want 1", got)
+	}
+
+	accepted, errTrigger := collector.TriggerCollection(ctx, map[string]struct{}{credentialID: {}}, nil)
+	if errTrigger != nil || accepted != 1 {
+		t.Fatalf("TriggerCollection() = %d, %v, want 1, nil", accepted, errTrigger)
+	}
+	collector.Wait()
+	if got := usageRequests.Load(); got != 2 {
+		t.Fatalf("quota probe requests after force = %d, want 2", got)
+	}
+
+	item, errItem := repo.GetQuotaCredential(ctx, credentialID, now)
+	if errItem != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errItem)
+	}
+	if item.CredentialStatus != "cooldown" || item.CollectionStatus != "success" {
+		t.Fatalf("credential/collection status = %s/%s, want cooldown/success", item.CredentialStatus, item.CollectionStatus)
+	}
+}
+
+func TestRefreshBlockedCredentialSkipsScheduledAndTriggerCollection(t *testing.T) {
+	ctx := context.Background()
+	repo := newCollectorTestRepository(t)
+	const credentialID = "codex-refresh-blocked"
+	seedCollectorProviderAuth(t, repo, credentialID, "codex", map[string]any{"type": "codex", "access_token": "probe-secret"})
+	now := time.Now().UTC().Add(time.Hour)
+
+	auth, _, errAuth := repo.GetAuth(ctx, credentialID)
+	if errAuth != nil {
+		t.Fatalf("GetAuth() error = %v", errAuth)
+	}
+	auth.Status = coreauth.StatusError
+	auth.Unavailable = true
+	auth.LastError = &coreauth.Error{Code: "refresh_temporarily_unavailable"}
+	auth.UpdatedAt = now
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "test-refresh-block"); errUpsert != nil {
+		t.Fatalf("UpsertAuth() error = %v", errUpsert)
+	}
+
+	var usageRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		usageRequests.Add(1)
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":600,"reset_at":1784160600}}`))
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner:         "home-a",
+		CodexUsageURL: server.URL + "/usage",
+		Now:           func() time.Time { return now },
+	})
+
+	usagePayload := fmt.Sprintf(`{"timestamp":%q,"provider":"codex","auth_type":"oauth","auth_index":"codex-refresh-blocked"}`, now.Format(time.RFC3339Nano))
+	if _, errAppend := repo.AppendUsageWithRuntime(ctx, usagePayload, cluster.UsageRuntimeMetadata{ReceivedAt: now}); errAppend != nil {
+		t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
+	}
+	collector.collect(ctx)
+	if got := usageRequests.Load(); got != 0 {
+		t.Fatalf("scheduled quota probe requests for refresh-blocked credential = %d, want 0", got)
+	}
+
+	accepted, errTrigger := collector.TriggerCollection(ctx, map[string]struct{}{credentialID: {}}, nil)
+	if errTrigger != nil || accepted != 0 {
+		t.Fatalf("TriggerCollection() = %d, %v, want 0, nil", accepted, errTrigger)
+	}
+	collector.Wait()
+	if got := usageRequests.Load(); got != 0 {
+		t.Fatalf("quota probe requests after trigger = %d, want 0", got)
+	}
 }
 
 func TestTriggerCollectionFiltersByIDsAndProviders(t *testing.T) {

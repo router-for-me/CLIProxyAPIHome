@@ -8,7 +8,7 @@ Base URL:
 http://<host>:<port>/user
 ```
 
-Home examples usually use port `8327`. The effective listen address comes from runtime config, `cluster.yaml`, or the final `-addr` value.
+Home examples usually use port `8327`. An explicit `-addr` takes precedence; otherwise Home uses `node.port` from `cluster.yaml`. The runtime config `port` is distributed to CPA nodes and does not configure the Home listener.
 
 ## Runtime Model
 

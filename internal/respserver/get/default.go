@@ -2,6 +2,7 @@ package get
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -104,19 +106,32 @@ func buildRefreshErrorJSON(errRefresh error) string {
 		if message == "" {
 			message = "credential refresh failed"
 		}
-		return buildTypedErrorJSON(errorType, message)
+		return buildTypedErrorJSON(errorType, message, logging.SafeDiagnosticForLog(authErr.Diagnostic), authErr.Upstream)
 	}
 	if errRefresh != nil && strings.Contains(strings.ToLower(errRefresh.Error()), "auth not found") {
-		return buildTypedErrorJSON("auth_not_found", "credential not found")
+		return buildTypedErrorJSON("auth_not_found", "credential not found", "", nil)
 	}
-	return buildTypedErrorJSON("refresh_temporarily_unavailable", "credential refresh temporarily unavailable")
+	return buildTypedErrorJSON("refresh_temporarily_unavailable", "credential refresh temporarily unavailable", "", nil)
 }
 
-func buildTypedErrorJSON(errorType, message string) string {
-	out := "{}"
-	out, _ = sjson.Set(out, "error.type", errorType)
-	out, _ = sjson.Set(out, "error.message", message)
-	return out
+func buildTypedErrorJSON(errorType, message, diagnostic string, upstream *coreauth.UpstreamResponse) string {
+	payload := struct {
+		Error struct {
+			Type       string                     `json:"type"`
+			Message    string                     `json:"message"`
+			Diagnostic string                     `json:"diagnostic,omitempty"`
+			Upstream   *coreauth.UpstreamResponse `json:"upstream,omitempty"`
+		} `json:"error"`
+	}{}
+	payload.Error.Type = errorType
+	payload.Error.Message = message
+	payload.Error.Diagnostic = diagnostic
+	payload.Error.Upstream = upstream
+	raw, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return `{"error":{"type":"error","message":"credential refresh failed"}}`
+	}
+	return string(raw)
 }
 
 func looksLikeJSONObject(value string) bool {

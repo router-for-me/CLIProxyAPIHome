@@ -10,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
 type failingCooldownMutationStore struct {
@@ -17,8 +18,16 @@ type failingCooldownMutationStore struct {
 	attempts int
 }
 
+type runtimeAuthTestStorage struct{}
+
+func (*runtimeAuthTestStorage) SaveTokenToFile(string) error { return nil }
+
 type failingAuthIndexClusterAdapter struct {
-	err error
+	err             error
+	fullAuth        *coreauth.Auth
+	fullAuthErr     error
+	observedVersion int64
+	observedActive  bool
 }
 
 func (a *failingAuthIndexClusterAdapter) Enabled() bool {
@@ -34,7 +43,17 @@ func (a *failingAuthIndexClusterAdapter) ListMinimalAuths() []*coreauth.Auth {
 }
 
 func (a *failingAuthIndexClusterAdapter) GetFullAuth(context.Context, string) (*coreauth.Auth, error) {
-	return nil, nil
+	if a.fullAuthErr != nil {
+		return nil, a.fullAuthErr
+	}
+	if a.fullAuth == nil {
+		return nil, nil
+	}
+	return a.fullAuth.Clone(), nil
+}
+
+func (a *failingAuthIndexClusterAdapter) ObservedAuthState(string) (int64, bool) {
+	return a.observedVersion, a.observedActive
 }
 
 func (a *failingAuthIndexClusterAdapter) LoadConfigYAML(context.Context) ([]byte, error) {
@@ -66,6 +85,230 @@ func TestRuntimeAuthenticateRequestFailClosedWithoutAccessManager(t *testing.T) 
 	_, authErr := rt.authenticateRequest(context.Background(), http.Header{})
 	if !access.IsAuthErrorCode(authErr, access.AuthErrorCodeNoCredentials) {
 		t.Fatalf("authenticateRequest() error = %v, want no credentials", authErr)
+	}
+}
+
+func TestRuntimeUpdateAuthInMemoryUsesNewerClusterSnapshot(t *testing.T) {
+	t.Parallel()
+
+	const authID = "newer-cluster-auth"
+	manager := coreauth.NewManager(nil, nil, nil)
+	runtimeMarker := &struct{ name string }{name: "runtime"}
+	storageMarker := &runtimeAuthTestStorage{}
+	current := &coreauth.Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "antigravity",
+		Status:       coreauth.StatusActive,
+		StateVersion: 10,
+		Runtime:      runtimeMarker,
+		Storage:      storageMarker,
+		Success:      3,
+		Failed:       2,
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), current); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	newer := current.Clone()
+	newer.StateVersion = 11
+	newer.Status = coreauth.StatusError
+	newer.Unavailable = true
+	newer.LastError = &coreauth.Error{Message: "credential unauthorized", HTTPStatus: http.StatusUnauthorized}
+	newer.Runtime = nil
+	newer.Storage = nil
+	newer.Success = 0
+	newer.Failed = 0
+	runtime := &Runtime{
+		coreManager:    manager,
+		clusterAdapter: &failingAuthIndexClusterAdapter{fullAuth: newer},
+	}
+
+	updated, errUpdate := runtime.UpdateAuthInMemory(context.Background(), current)
+	if errUpdate != nil {
+		t.Fatalf("UpdateAuthInMemory() error = %v", errUpdate)
+	}
+	if updated.StateVersion != 11 || !updated.Unavailable || updated.LastError == nil || updated.LastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("UpdateAuthInMemory() = %#v, want version 11 unauthorized state", updated)
+	}
+	if updated.Runtime != runtimeMarker || updated.Storage != storageMarker || updated.Success != current.Success || updated.Failed != current.Failed {
+		t.Fatalf("UpdateAuthInMemory() runtime state = Runtime %#v Storage %#v Success/Failed %d/%d, want local runtime state preserved", updated.Runtime, updated.Storage, updated.Success, updated.Failed)
+	}
+	inMemory, ok := manager.GetByID(authID)
+	if !ok || inMemory == nil || inMemory.StateVersion != 11 || !inMemory.Unavailable || inMemory.LastError == nil || inMemory.LastError.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("GetByID() = %#v, want version 11 unauthorized state", inMemory)
+	}
+	if inMemory.Runtime != runtimeMarker || inMemory.Storage != storageMarker || inMemory.Success != current.Success || inMemory.Failed != current.Failed {
+		t.Fatalf("GetByID() runtime state = Runtime %#v Storage %#v Success/Failed %d/%d, want local runtime state preserved", inMemory.Runtime, inMemory.Storage, inMemory.Success, inMemory.Failed)
+	}
+}
+
+func TestRuntimeUpdateAuthInMemoryPreservesLocalModelState(t *testing.T) {
+	t.Parallel()
+
+	const authID = "newer-cluster-auth-with-local-model-state"
+	const model = "gemini-3-pro"
+	now := time.Now().UTC()
+	manager := coreauth.NewManager(nil, nil, nil)
+	current := &coreauth.Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "antigravity",
+		Status:       coreauth.StatusError,
+		StateVersion: 10,
+		ModelStates: map[string]*coreauth.ModelState{
+			model: {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "upstream unavailable",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				UpdatedAt:      now,
+				LastError:      &coreauth.Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), current); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	newer := current.Clone()
+	newer.StateVersion = 11
+	newer.Status = coreauth.StatusActive
+	newer.ModelStates = nil
+	runtime := &Runtime{
+		coreManager:    manager,
+		clusterAdapter: &failingAuthIndexClusterAdapter{fullAuth: newer},
+	}
+
+	updated, errUpdate := runtime.UpdateAuthInMemory(context.Background(), current)
+	if errUpdate != nil {
+		t.Fatalf("UpdateAuthInMemory() error = %v", errUpdate)
+	}
+	state := updated.ModelStates[model]
+	if updated.StateVersion != newer.StateVersion || state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("UpdateAuthInMemory() = %#v, want version %d with local model state", updated, newer.StateVersion)
+	}
+}
+
+func TestRuntimeUpdateAuthInMemoryRejectsSnapshotOlderThanObservedVersion(t *testing.T) {
+	t.Parallel()
+
+	const authID = "stale-cluster-auth"
+	manager := coreauth.NewManager(nil, nil, nil)
+	current := &coreauth.Auth{ID: authID, Index: authID, Provider: "antigravity", Status: coreauth.StatusActive, StateVersion: 10}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), current); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	errRead := errors.New("database temporarily unavailable")
+	runtime := &Runtime{
+		coreManager: manager,
+		clusterAdapter: &failingAuthIndexClusterAdapter{
+			fullAuthErr:     errRead,
+			observedVersion: 11,
+			observedActive:  true,
+		},
+	}
+
+	updated, errUpdate := runtime.UpdateAuthInMemory(context.Background(), current.Clone())
+	if !errors.Is(errUpdate, errRead) || updated != nil {
+		t.Fatalf("UpdateAuthInMemory() = %#v, %v, want nil and %v", updated, errUpdate, errRead)
+	}
+	inMemory, ok := manager.GetByID(authID)
+	if !ok || inMemory == nil || inMemory.StateVersion != current.StateVersion {
+		t.Fatalf("GetByID() = %#v, want unchanged version %d", inMemory, current.StateVersion)
+	}
+}
+
+func TestRuntimeUpdateAuthInMemoryAllowsObservedFailClosedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	const authID = "fail-closed-cluster-auth"
+	manager := coreauth.NewManager(nil, nil, nil)
+	current := &coreauth.Auth{ID: authID, Index: authID, Provider: "antigravity", Status: coreauth.StatusActive, StateVersion: 9}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), current); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	failClosed := current.Clone()
+	failClosed.StateVersion = 10
+	failClosed.Status = coreauth.StatusError
+	failClosed.Unavailable = true
+	failClosed.LastError = &coreauth.Error{Code: "refresh_temporarily_unavailable", Message: "credential refresh temporarily unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	runtime := &Runtime{
+		coreManager: manager,
+		clusterAdapter: &failingAuthIndexClusterAdapter{
+			fullAuthErr:     errors.New("database temporarily unavailable"),
+			observedVersion: failClosed.StateVersion,
+			observedActive:  true,
+		},
+	}
+
+	updated, errUpdate := runtime.UpdateAuthInMemory(context.Background(), failClosed)
+	if errUpdate != nil {
+		t.Fatalf("UpdateAuthInMemory() error = %v", errUpdate)
+	}
+	if updated == nil || updated.StateVersion != failClosed.StateVersion || !updated.Unavailable || updated.LastError == nil {
+		t.Fatalf("UpdateAuthInMemory() = %#v, want fail-closed version %d", updated, failClosed.StateVersion)
+	}
+}
+
+func TestApplyCoreAuthAddOrUpdateRegistersModelsFromAcceptedSnapshot(t *testing.T) {
+	const authID = "accepted-snapshot-model-registry"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(authID)
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	current := &coreauth.Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "claude",
+		Status:       coreauth.StatusActive,
+		StateVersion: 11,
+		Metadata: map[string]any{
+			"home_config_models": []map[string]any{{"id": "accepted-model"}},
+		},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), current); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	runtime := &Runtime{coreManager: manager, cfg: &config.Config{}}
+	stale := current.Clone()
+	stale.StateVersion = 10
+	stale.Metadata["home_config_models"] = []map[string]any{{"id": "stale-model"}}
+
+	runtime.applyCoreAuthAddOrUpdate(coreauth.WithSkipPersist(context.Background()), stale)
+
+	if !modelRegistry.ClientSupportsModel(authID, "accepted-model") {
+		t.Fatal("accepted model was not registered")
+	}
+	if modelRegistry.ClientSupportsModel(authID, "stale-model") {
+		t.Fatal("rejected stale model was registered")
+	}
+}
+
+func TestSanitizeAuthForDownstreamRemovesRefreshDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	auth := &coreauth.Auth{
+		ID:       "refresh-diagnostic-auth",
+		Provider: "antigravity",
+		LastError: &coreauth.Error{
+			Code:       "refresh_temporarily_unavailable",
+			Diagnostic: "safe refresh diagnostic",
+			Upstream:   &coreauth.UpstreamResponse{Status: http.StatusBadGateway, Body: []byte(`{"error":"proxy detail"}`)},
+		},
+		LastRefreshError: &coreauth.Error{Code: "refresh_temporarily_unavailable", Diagnostic: "safe refresh diagnostic"},
+	}
+	sanitized := SanitizeAuthForDownstream(auth)
+	if sanitized == nil || sanitized.LastRefreshError != nil || sanitized.LastError != nil {
+		t.Fatalf("SanitizeAuthForDownstream() = %#v, want refresh diagnostic removed", sanitized)
+	}
+	if auth.LastRefreshError == nil || auth.LastError == nil || auth.LastError.Upstream == nil {
+		t.Fatal("SanitizeAuthForDownstream() mutated the source auth")
+	}
+
+	executionErr := &coreauth.Error{Code: "model_failed", Diagnostic: "execution diagnostic", HTTPStatus: http.StatusBadGateway}
+	sanitizedExecution := SanitizeAuthForDownstream(&coreauth.Auth{ID: "execution-error-auth", LastError: executionErr})
+	if sanitizedExecution == nil || sanitizedExecution.LastError == nil || sanitizedExecution.LastError.Code != executionErr.Code {
+		t.Fatalf("SanitizeAuthForDownstream() removed ordinary execution error: %#v", sanitizedExecution)
 	}
 }
 

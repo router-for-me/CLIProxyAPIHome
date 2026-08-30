@@ -202,10 +202,9 @@ func (c *Collector) TriggerCollection(ctx context.Context, credentialIDs map[str
 		return 0, errAuths
 	}
 	accepted := make([]*coreauth.Auth, 0, len(auths))
-	now := c.options.Now().UTC()
 	c.onDemandMu.Lock()
 	for _, auth := range auths {
-		if !quotaProbeEligible(auth, now) {
+		if !quotaProbeEligible(auth) {
 			continue
 		}
 		if len(credentialIDs) > 0 {
@@ -248,7 +247,7 @@ func (c *Collector) Wait() {
 func (c *Collector) collectCredentials(ctx context.Context, auths []*coreauth.Auth, force bool) {
 	var wait sync.WaitGroup
 	for _, auth := range auths {
-		if !quotaProbeEligible(auth, c.options.Now().UTC()) {
+		if !quotaProbeEligible(auth) {
 			if force {
 				c.releaseOnDemandJob(auth)
 			}
@@ -568,11 +567,8 @@ func quotaBackoffWithJitter(delay time.Duration, credentialID string) time.Durat
 	return delay + delay*percent/100
 }
 
-func quotaProbeEligible(auth *coreauth.Auth, now time.Time) bool {
-	if auth == nil || strings.TrimSpace(auth.ID) == "" || auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		return false
-	}
-	if !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+func quotaProbeEligible(auth *coreauth.Auth) bool {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" || auth.Disabled || auth.Status == coreauth.StatusDisabled || coreauth.RefreshBlocksDispatch(auth) {
 		return false
 	}
 	if quotaProviderAPIKeyAuth(auth) {

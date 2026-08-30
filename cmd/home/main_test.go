@@ -548,6 +548,32 @@ func TestResolveClusterAdvertisedPortFallsBackToListenPort(t *testing.T) {
 	}
 }
 
+func TestResolveListenAddressSeparatesStandaloneHomeFromCPAPort(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Host: "127.0.0.1", Port: config.DefaultCPAPort}
+	addr, port, errResolve := resolveListenAddress("", cfg, nil, false)
+	if errResolve != nil {
+		t.Fatalf("resolveListenAddress() error = %v", errResolve)
+	}
+	if addr != "127.0.0.1:8327" || port != 8327 {
+		t.Fatalf("listen address = %q, port = %d, want 127.0.0.1:8327", addr, port)
+	}
+}
+
+func TestResolveListenAddressUsesExplicitAddressWithoutCluster(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Host: "127.0.0.1", Port: config.DefaultCPAPort}
+	addr, port, errResolve := resolveListenAddress("127.0.0.1:18327", cfg, nil, false)
+	if errResolve != nil {
+		t.Fatalf("resolveListenAddress() error = %v", errResolve)
+	}
+	if addr != "127.0.0.1:18327" || port != 18327 {
+		t.Fatalf("listen address = %q, port = %d, want 127.0.0.1:18327", addr, port)
+	}
+}
+
 func TestResolveSQLitePath_UsesFlagOverride(t *testing.T) {
 	t.Parallel()
 

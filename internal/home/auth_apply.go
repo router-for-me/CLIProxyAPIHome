@@ -23,6 +23,7 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 
 	op := "register"
 	var err error
+	var applied *coreauth.Auth
 	if existing, ok := r.coreManager.GetByID(auth.ID); ok && existing != nil {
 		auth.CreatedAt = existing.CreatedAt
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
@@ -31,9 +32,9 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 			auth.ModelStates = mergeModelStates(auth.ModelStates, existing.ModelStates)
 		}
 		op = "update"
-		_, err = r.coreManager.Update(ctx, auth)
+		applied, err = r.coreManager.Update(ctx, auth)
 	} else {
-		_, err = r.coreManager.Register(ctx, auth)
+		applied, err = r.coreManager.Register(ctx, auth)
 	}
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, auth.ID, err)
@@ -43,6 +44,8 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 			return
 		}
 		auth = current
+	} else if applied != nil {
+		auth = applied
 	}
 
 	r.registerModelsForAuth(auth)

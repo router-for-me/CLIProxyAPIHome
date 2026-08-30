@@ -24,6 +24,7 @@ import (
 const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Home-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
+	DefaultCPAPort               = 8317
 )
 
 var ErrInvalidProviderCredentialID = errors.New("provider credential id must be a canonical UUID")
@@ -34,7 +35,7 @@ type Config struct {
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
 	Host string `yaml:"host" json:"-"`
-	// Port is the network port on which the API server will listen.
+	// Port is the CPA server port distributed by Home.
 	Port int `yaml:"port" json:"-"`
 
 	// AllowHost limits RESP client connections to the listed IP addresses.

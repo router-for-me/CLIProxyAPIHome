@@ -1,9 +1,11 @@
 package get
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,6 +91,7 @@ func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
 		return nil, &coreauth.Error{
 			Code:       "authentication_error",
 			Message:    "credential unauthorized",
+			Diagnostic: `antigravity refresh failed: stage=upstream_response error="invalid_grant" refresh_token=provider-secret`,
 			HTTPStatus: 401,
 		}
 	})
@@ -101,11 +104,17 @@ func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
 		t.Fatalf("error.type = %q, want authentication_error; body=%s", got, string(reply.BulkString))
 	}
 	if got := gjson.GetBytes(reply.BulkString, "error.message").String(); got != "credential unauthorized" {
-		t.Fatalf("error.message = %q, want redacted authentication message; body=%s", got, string(reply.BulkString))
+		t.Fatalf("error.message = %q, want generic authentication message; body=%s", got, string(reply.BulkString))
+	}
+	if got := gjson.GetBytes(reply.BulkString, "error.diagnostic").String(); !strings.Contains(got, "stage=upstream_response") || !strings.Contains(got, "invalid_grant") {
+		t.Fatalf("error.diagnostic = %q, want safe provider diagnostic; body=%s", got, string(reply.BulkString))
+	}
+	if strings.Contains(string(reply.BulkString), "provider-secret") {
+		t.Fatalf("error.diagnostic leaked provider detail: %s", string(reply.BulkString))
 	}
 }
 
-func TestHandleDefaultGETRefreshRedactsTransientInfrastructureError(t *testing.T) {
+func TestHandleDefaultGETRefreshUsesGenericTransientInfrastructureError(t *testing.T) {
 	rt := newGetTestRuntime(t)
 	rt.SetClusterRefreshHandler(func(context.Context, string, string) ([]byte, error) {
 		return nil, errors.New("database unavailable: provider-secret")
@@ -116,7 +125,59 @@ func TestHandleDefaultGETRefreshRedactsTransientInfrastructureError(t *testing.T
 		t.Fatalf("error.type = %q, want refresh_temporarily_unavailable; body=%s", got, string(reply.BulkString))
 	}
 	if strings.Contains(string(reply.BulkString), "provider-secret") {
-		t.Fatalf("refresh error leaked infrastructure detail: %s", string(reply.BulkString))
+		t.Fatalf("refresh error included infrastructure detail: %s", string(reply.BulkString))
+	}
+	if gjson.GetBytes(reply.BulkString, "error.diagnostic").Exists() {
+		t.Fatalf("unstructured infrastructure error was exposed as diagnostic: %s", string(reply.BulkString))
+	}
+}
+
+func TestHandleDefaultGETRefreshPreservesUpstreamResponse(t *testing.T) {
+	rt := newGetTestRuntime(t)
+	tests := []struct {
+		name   string
+		status int
+		body   []byte
+	}{
+		{name: "json", status: http.StatusBadRequest, body: []byte(`{"error":"invalid_request","request_id":"req-123"}`)},
+		{name: "text", status: http.StatusBadGateway, body: []byte("provider unavailable")},
+		{name: "multiline", status: http.StatusTooManyRequests, body: []byte("first line\r\nsecond line\n")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt.SetClusterRefreshHandler(func(context.Context, string, string) ([]byte, error) {
+				return nil, &coreauth.Error{
+					Code:       "refresh_temporarily_unavailable",
+					Message:    "credential refresh temporarily unavailable",
+					Diagnostic: "antigravity refresh failed: stage=upstream_response status=400",
+					Retryable:  true,
+					HTTPStatus: http.StatusServiceUnavailable,
+					Upstream: &coreauth.UpstreamResponse{
+						Status: tt.status,
+						Body:   tt.body,
+					},
+				}
+			})
+
+			reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"refresh","auth_index":"auth-1"}`})
+			if got := gjson.GetBytes(reply.BulkString, "error.type").String(); got != "refresh_temporarily_unavailable" {
+				t.Fatalf("error.type = %q, want refresh_temporarily_unavailable; body=%s", got, string(reply.BulkString))
+			}
+			if got := gjson.GetBytes(reply.BulkString, "error.diagnostic").String(); !strings.Contains(got, "stage=upstream_response") {
+				t.Fatalf("error.diagnostic = %q, want safe provider diagnostic; body=%s", got, string(reply.BulkString))
+			}
+			var env struct {
+				Error struct {
+					Upstream *coreauth.UpstreamResponse `json:"upstream"`
+				} `json:"error"`
+			}
+			if errUnmarshal := json.Unmarshal(reply.BulkString, &env); errUnmarshal != nil {
+				t.Fatalf("unmarshal refresh response: %v", errUnmarshal)
+			}
+			if env.Error.Upstream == nil || env.Error.Upstream.Status != tt.status || !bytes.Equal(env.Error.Upstream.Body, tt.body) {
+				t.Fatalf("upstream response = %#v, want %d/%q", env.Error.Upstream, tt.status, tt.body)
+			}
+		})
 	}
 }
 

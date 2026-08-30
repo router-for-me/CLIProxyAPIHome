@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
-	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -21,8 +19,6 @@ const (
 	quotaScopeModel          = "model"
 )
 
-var usageRetryDelayPattern = regexp.MustCompile(`(?i)\b(?:resets in|after)\s+([0-9]+(?:\.[0-9]+)?(?:h|m|s)(?:[0-9]+(?:\.[0-9]+)?(?:h|m|s))*)`)
-
 // Result captures an upstream execution result reported by a downstream CPA node.
 type Result struct {
 	AuthID            string
@@ -32,6 +28,7 @@ type Result struct {
 	Success           bool
 	Error             *Error
 	RetryAfter        *time.Duration
+	ResetAt           *time.Time
 	AccessTokenSHA256 string
 }
 
@@ -65,50 +62,54 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if resultModel == "" {
 		return
 	}
-	resultAuthID := ""
-	now := time.Now()
-
-	m.mu.Lock()
-	auth := m.resultAuthLocked(result)
-	var mutator StateMutator
-	stateMutatorAvailable := false
-	if auth != nil {
-		resultAuthID = auth.ID
-		disableCooling = m.quotaCooldownDisabledForAuth(auth)
-		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
-			auth.Success++
-		} else {
-			auth.Failed++
-		}
-		localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
-			!isModelSupportResultError(result.Error) &&
-			disableCooling &&
-			disabledQuotaStateAlreadyApplied(auth, resultModel)
-		if localOnlyDisabledQuota {
-			localAvailabilityBefore = availabilityFingerprint(auth, resultModel)
-		}
-		if stateMutator, ok := m.store.(StateMutator); ok {
-			stateMutatorAvailable = true
-			if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
-				mutator = stateMutator
-			}
-		}
-		// A locally clean token-versioned success has no state to clear. Drop its
-		// transition rather than enqueue a stale row or read the database per success;
-		// cluster events reconcile any newer authoritative state.
-		if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
-			transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
-			if localOnlyDisabledQuota {
-				skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
-			}
-			authSnapshot = auth.Clone()
-		}
-	}
-	m.mu.Unlock()
+	resultAuthID := m.resultAuthID(result)
 	if resultAuthID == "" {
 		return
 	}
+	now := time.Now()
+
+	unlockUpdate := m.updateLocks.lock(resultAuthID)
+	m.mu.Lock()
+	auth := m.resultAuthLocked(result)
+	if auth == nil || auth.ID != resultAuthID {
+		m.mu.Unlock()
+		unlockUpdate()
+		return
+	}
+	var mutator StateMutator
+	stateMutatorAvailable := false
+	disableCooling = m.quotaCooldownDisabledForAuth(auth)
+	auth.recordRecentRequest(now, result.Success)
+	if result.Success {
+		auth.Success++
+	} else {
+		auth.Failed++
+	}
+	localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
+		!isModelSupportResultError(result.Error) &&
+		disableCooling &&
+		disabledQuotaStateAlreadyApplied(auth, resultModel)
+	if localOnlyDisabledQuota {
+		localAvailabilityBefore = availabilityFingerprint(auth, resultModel)
+	}
+	if stateMutator, ok := m.store.(StateMutator); ok {
+		stateMutatorAvailable = true
+		if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
+			mutator = stateMutator
+		}
+	}
+	// A locally clean token-versioned success has no state to clear. Drop its
+	// transition rather than enqueue a stale row or read the database per success;
+	// cluster events reconcile any newer authoritative state.
+	if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
+		transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
+		if localOnlyDisabledQuota {
+			skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
+		}
+		authSnapshot = auth.Clone()
+	}
+	m.mu.Unlock()
+	unlockUpdate()
 
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
@@ -143,12 +144,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			transition = markResultTransition{}
 		}
 	} else if !skipResultPersist {
-		m.enqueueResultPersist(ctx, authSnapshot)
+		persistAuthID, schedulePersist := m.stageResultPersist(ctx, authSnapshot)
+		if schedulePersist {
+			defer m.scheduleResultPersist(persistAuthID)
+		}
 	}
 
-	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
-	}
+	m.RefreshSchedulerEntry(resultAuthID)
 	if authSnapshot != nil && authRefreshDisabled(authSnapshot) {
 		m.queueRefreshReschedule(authSnapshot.ID)
 	}
@@ -157,16 +159,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
 		return
 	}
-	if transition.clearModelQuota && resultModel != "" {
-		registry.GetGlobalRegistry().ClearModelQuotaExceeded(resultAuthID, resultModel)
-	}
-	if transition.setModelQuota && resultModel != "" {
-		registry.GetGlobalRegistry().SetModelQuotaExceeded(resultAuthID, resultModel)
-	}
-	if transition.shouldResumeModel {
-		registry.GetGlobalRegistry().ResumeClientModel(resultAuthID, resultModel)
-	} else if transition.shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(resultAuthID, resultModel, transition.suspendReason)
+	if transition.clearModelQuota || transition.setModelQuota || transition.shouldResumeModel || transition.shouldSuspendModel {
+		m.ReconcileRegistryModelStates(ctx, resultAuthID)
 	}
 }
 
@@ -182,12 +176,25 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if isTokenVersionFencedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
 		return transition
 	}
+	preserveRefreshAcquisition := RefreshBlocksDispatch(auth)
+	refreshStatus := auth.Status
+	refreshStatusMessage := auth.StatusMessage
+	refreshLastError := cloneError(auth.LastError)
+	refreshNextRetryAfter := auth.NextRetryAfter
+	refreshRuntimeBlocked := auth.RuntimeRefreshBlocked
 
 	if result.Success {
 		state := ensureModelState(auth, resultModel)
 		resetModelState(state, now)
 		updateAggregatedAvailability(auth, now)
-		if !hasModelError(auth, now) {
+		if preserveRefreshAcquisition {
+			auth.Status = refreshStatus
+			auth.StatusMessage = refreshStatusMessage
+			auth.LastError = refreshLastError
+			auth.Unavailable = true
+			auth.NextRetryAfter = refreshNextRetryAfter
+			auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
+		} else if !hasModelError(auth, now) {
 			auth.LastError = nil
 			auth.StatusMessage = ""
 			auth.Status = StatusActive
@@ -250,7 +257,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.clearModelQuota = true
 				transition.shouldResumeModel = true
 			} else {
-				next, nextBackoffLevel := quotaCooldownAfterFailure(state.Quota, now)
+				next, nextBackoffLevel := quotaCooldownAfterFailure(state.Quota, now, result)
 				state.NextRetryAfter = next
 				state.QuotaResetAt = time.Time{}
 				state.Quota = QuotaState{
@@ -277,6 +284,14 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
+	if preserveRefreshAcquisition {
+		auth.Status = refreshStatus
+		auth.StatusMessage = refreshStatusMessage
+		auth.LastError = refreshLastError
+		auth.Unavailable = true
+		auth.NextRetryAfter = refreshNextRetryAfter
+		auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
+	}
 	return transition
 }
 
@@ -308,12 +323,19 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 		// written back as complete auth snapshots.
 		return !disabledQuotaStateAlreadyApplied(auth, resultModel)
 	}
-	// A locally visible open window means the shared row already carries this
-	// cooldown, so the failure can be absorbed without a database round-trip.
-	if authQuotaWindowOpen(auth, resultModel, now) {
-		return false
+	state := auth.ModelStates[resultModel]
+	quota := QuotaState{}
+	if state != nil {
+		quota = state.Quota
 	}
-	return true
+	next, nextBackoffLevel := quotaCooldownAfterFailure(quota, now, result)
+	if !authQuotaWindowOpen(auth, resultModel, now) {
+		return true
+	}
+	return state == nil ||
+		!state.NextRetryAfter.Equal(next) ||
+		!state.Quota.NextRecoverAt.Equal(next) ||
+		state.Quota.BackoffLevel != nextBackoffLevel
 }
 
 // disabledQuotaStateAlreadyApplied reports whether a disabled-cooling 429 can
@@ -454,6 +476,57 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 	return fp
 }
 
+// adoptPersistedCredentialLocked replaces persisted credential fields while
+// retaining state that only exists in the local runtime. The caller must hold m.mu.
+func (m *Manager) adoptPersistedCredentialLocked(local, persisted *Auth) {
+	if m == nil || local == nil || persisted == nil {
+		return
+	}
+
+	previousIndex := strings.TrimSpace(local.Index)
+	localModelStates := local.ModelStates
+	localStorage := local.Storage
+	localRuntime := local.Runtime
+	localFileName := local.FileName
+	localSuccess := local.Success
+	localFailed := local.Failed
+	localRecentRequests := local.recentRequests
+	localIndexAssigned := local.indexAssigned
+
+	replacement := persisted.Clone()
+	if strings.TrimSpace(replacement.Index) == "" {
+		replacement.Index = local.Index
+	}
+	if strings.TrimSpace(replacement.FileName) == "" {
+		replacement.FileName = localFileName
+	}
+	if replacement.Storage == nil {
+		replacement.Storage = localStorage
+	}
+	if replacement.Runtime == nil {
+		replacement.Runtime = localRuntime
+	}
+	replacement.ModelStates = localModelStates
+	replacement.Success = localSuccess
+	replacement.Failed = localFailed
+	replacement.recentRequests = localRecentRequests
+	replacement.indexAssigned = localIndexAssigned
+	*local = *replacement
+
+	nextIndex := strings.TrimSpace(local.Index)
+	if previousIndex != "" && previousIndex != nextIndex {
+		if indexed := m.indexAuth[previousIndex]; indexed == local {
+			delete(m.indexAuth, previousIndex)
+		}
+	}
+	if nextIndex != "" {
+		if m.indexAuth == nil {
+			m.indexAuth = make(map[string]*Auth)
+		}
+		m.indexAuth[nextIndex] = local
+	}
+}
+
 // adoptPersistedResultState merges the authoritative persisted state produced
 // by a StateMutator back into the manager's in-memory auth. The boolean reports
 // whether that snapshot remained current enough to apply its registry effects.
@@ -461,45 +534,37 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	if persisted == nil {
 		return nil, false
 	}
+	unlockUpdate := m.updateLocks.lock(persisted.ID)
+	defer unlockUpdate()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	local := m.resultAuthLocked(result)
+	local := m.auths[persisted.ID]
 	if local == nil {
-		return persisted.Clone(), true
+		return nil, false
 	}
 	if local.StateVersion > 0 && persisted.StateVersion > 0 && local.StateVersion > persisted.StateVersion {
 		return local.Clone(), false
 	}
+	localRefreshBlocked := local.RuntimeRefreshBlocked ||
+		(local.LastError != nil && strings.EqualFold(strings.TrimSpace(local.LastError.Code), refreshTransientErrorCode))
+	adoptPersistedCredential := persisted.StateVersion > 0 && persisted.StateVersion > local.StateVersion
 	if isTokenVersionFencedResult(result) {
 		if AuthIsNewerThanObserved(local, result.AccessTokenSHA256) {
 			return local.Clone(), false
 		}
 		if AuthIsNewerThanObserved(persisted, result.AccessTokenSHA256) {
-			replacement := persisted.Clone()
-			if replacement.Runtime == nil {
-				replacement.Runtime = local.Runtime
-			}
-			replacement.Success = local.Success
-			replacement.Failed = local.Failed
-			replacement.recentRequests = local.recentRequests
-			replacement.indexAssigned = local.indexAssigned
-			previousIndex := strings.TrimSpace(local.Index)
-			nextIndex := strings.TrimSpace(replacement.Index)
-			m.auths[replacement.ID] = replacement
-			if previousIndex != "" && previousIndex != nextIndex {
-				if indexed := m.indexAuth[previousIndex]; indexed == local {
-					delete(m.indexAuth, previousIndex)
-				}
-			}
-			if nextIndex != "" {
-				m.indexAuth[nextIndex] = replacement
-			}
-			return replacement.Clone(), true
+			adoptPersistedCredential = true
 		}
+	}
+	if adoptPersistedCredential {
+		m.adoptPersistedCredentialLocked(local, persisted)
+		local.ModelStates = mergePersistedCooldownModelStates(persisted.ModelStates, local.ModelStates)
 	}
 	local.Disabled = persisted.Disabled
 	local.UpdatedAt = persisted.UpdatedAt
 	local.StateVersion = persisted.StateVersion
+	local.LastRefreshError = cloneError(persisted.LastRefreshError)
+	local.NextRefreshAfter = persisted.NextRefreshAfter
 	if state := persisted.ModelStates[resultModel]; state != nil {
 		if local.ModelStates == nil {
 			local.ModelStates = make(map[string]*ModelState)
@@ -509,6 +574,34 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 		delete(local.ModelStates, resultModel)
 	}
 	updateAggregatedAvailability(local, now)
+	persistedRefreshBlocked := RefreshBlocksDispatch(persisted)
+	local.RuntimeRefreshBlocked = persistedRefreshBlocked
+	if localRefreshBlocked && !persistedRefreshBlocked {
+		local.StatusMessage = ""
+		local.LastError = nil
+		var latestModelError *ModelState
+		for _, state := range local.ModelStates {
+			if state == nil {
+				continue
+			}
+			activeError := state.LastError != nil ||
+				(state.Status == StatusError && state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)))
+			if !activeError {
+				continue
+			}
+			if latestModelError == nil || state.UpdatedAt.After(latestModelError.UpdatedAt) {
+				latestModelError = state
+			}
+		}
+		if latestModelError != nil {
+			local.Status = StatusError
+			local.StatusMessage = latestModelError.StatusMessage
+			local.LastError = cloneError(latestModelError.LastError)
+			if local.StatusMessage == "" && local.LastError != nil {
+				local.StatusMessage = local.LastError.Message
+			}
+		}
+	}
 	// The persisted copy can report a clean active state even though this
 	// node still tracks a model error that was never persisted (for example a
 	// transient 5xx). Keep the local error view in that case.
@@ -516,6 +609,10 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 		local.Status = persisted.Status
 		local.StatusMessage = persisted.StatusMessage
 		local.LastError = cloneError(persisted.LastError)
+	}
+	if persistedRefreshBlocked {
+		local.Unavailable = true
+		local.NextRetryAfter = persisted.NextRetryAfter
 	}
 	return local.Clone(), true
 }
@@ -542,6 +639,27 @@ func (m *Manager) resultAuthLocked(result Result) *Auth {
 		return m.indexAuth[index]
 	}
 	return nil
+}
+
+func (m *Manager) resultAuthID(result Result) string {
+	if m == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(result.AuthID); id != "" {
+		return id
+	}
+	index := strings.TrimSpace(result.AuthIndex)
+	if index == "" {
+		return ""
+	}
+	m.mu.RLock()
+	auth := m.indexAuth[index]
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	m.mu.RUnlock()
+	return authID
 }
 
 // quotaCooldownDisabledForAuth reports whether cooldown scheduling is disabled
@@ -704,12 +822,20 @@ func cloneError(err *Error) *Error {
 	if err == nil {
 		return nil
 	}
-	return &Error{
+	cloned := &Error{
 		Code:       err.Code,
 		Message:    err.Message,
+		Diagnostic: err.Diagnostic,
 		Retryable:  err.Retryable,
 		HTTPStatus: err.HTTPStatus,
 	}
+	if err.Upstream != nil {
+		cloned.Upstream = &UpstreamResponse{
+			Status: err.Upstream.Status,
+			Body:   append([]byte(nil), err.Upstream.Body...),
+		}
+	}
+	return cloned
 }
 
 // statusCodeFromResult derives status code from result.
@@ -785,10 +911,12 @@ func disableAuthAfterUnauthorized(auth *Auth, state *ModelState, resultErr *Erro
 	}
 	auth.Disabled = true
 	auth.Unavailable = true
+	auth.RuntimeRefreshBlocked = false
 	auth.Status = StatusDisabled
 	auth.StatusMessage = "unauthorized"
 	auth.NextRetryAfter = time.Time{}
 	auth.NextRefreshAfter = time.Time{}
+	auth.LastRefreshError = nil
 	auth.Quota = QuotaState{}
 	auth.UpdatedAt = now
 	if resultErr != nil {
@@ -834,15 +962,35 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 // a quota failure observed at now. Failures that land while a previous quota
 // window is still open reuse that window instead of escalating, so a burst of
 // concurrent failures advances the backoff ladder at most once per window.
-func quotaCooldownAfterFailure(quota QuotaState, now time.Time) (time.Time, int) {
-	if quota.NextRecoverAt.After(now) {
-		return quota.NextRecoverAt, quota.BackoffLevel
+// Future Antigravity reset timestamps are authoritative and suppress relative
+// retry delays. Without one, the later of exponential backoff and RetryAfter
+// is used. Open windows keep their backoff level and are never shortened.
+func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (time.Time, int) {
+	windowOpen := quota.NextRecoverAt.After(now)
+	deadline := quota.NextRecoverAt
+	nextLevel := quota.BackoffLevel
+	if !windowOpen {
+		cooldown, level := nextQuotaCooldown(quota.BackoffLevel, false)
+		deadline = now.Add(cooldown)
+		nextLevel = level
 	}
-	cooldown, nextLevel := nextQuotaCooldown(quota.BackoffLevel, false)
-	if cooldown <= 0 {
-		return time.Time{}, nextLevel
+
+	if !strings.EqualFold(strings.TrimSpace(result.Provider), "antigravity") {
+		return deadline, nextLevel
 	}
-	return now.Add(cooldown), nextLevel
+	if result.ResetAt != nil && result.ResetAt.After(now) {
+		resetAt := result.ResetAt.UTC()
+		if !windowOpen || resetAt.After(deadline) {
+			deadline = resetAt
+		}
+		return deadline, nextLevel
+	}
+	if result.RetryAfter != nil && *result.RetryAfter > 0 {
+		if retryAt := now.Add(*result.RetryAfter); retryAt.After(deadline) {
+			deadline = retryAt
+		}
+	}
+	return deadline, nextLevel
 }
 
 // NewUsageResult creates a new usage result.
@@ -870,12 +1018,14 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 	if message == "" {
 		message = fmt.Sprintf("request failed with status %d", statusCode)
 	}
+	retryAfter, resetAt := parseUsageRetryHints(provider, body, statusCode)
 	return Result{
 		AuthIndex:  authIndex,
 		Provider:   provider,
 		Model:      model,
 		Success:    false,
-		RetryAfter: parseUsageRetryAfter(body, statusCode),
+		RetryAfter: retryAfter,
+		ResetAt:    resetAt,
 		Error: &Error{
 			Message:    message,
 			HTTPStatus: statusCode,
@@ -883,59 +1033,37 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 	}
 }
 
-func parseUsageRetryAfter(body string, statusCode int) *time.Duration {
-	if statusCode != http.StatusTooManyRequests {
-		return nil
+func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {
+	if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") || statusCode != http.StatusTooManyRequests || !gjson.Valid(body) {
+		return nil, nil
 	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return nil
-	}
-	if gjson.Valid(body) {
-		if retryAfter := parseGoogleRetryDelay(body); retryAfter != nil {
-			return retryAfter
-		}
-		if retryAfter := parseRetryDelayFromMessage(gjson.Get(body, "error.message").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return parseRetryDelayFromMessage(body)
-}
-
-func parseGoogleRetryDelay(body string) *time.Duration {
 	details := gjson.Get(body, "error.details")
 	if !details.Exists() || !details.IsArray() {
-		return nil
+		return nil, nil
 	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.RetryInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("retryDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	for _, detail := range details.Array() {
-		if detail.Get("@type").String() != "type.googleapis.com/google.rpc.ErrorInfo" {
-			continue
-		}
-		if retryAfter := parseDurationPointer(detail.Get("metadata.quotaResetDelay").String()); retryAfter != nil {
-			return retryAfter
-		}
-	}
-	return nil
-}
 
-func parseRetryDelayFromMessage(message string) *time.Duration {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return nil
+	var retryAfter *time.Duration
+	var resetAt *time.Time
+	for _, detail := range details.Array() {
+		switch detail.Get("@type").String() {
+		case "type.googleapis.com/google.rpc.RetryInfo":
+			if retryAfter == nil {
+				retryAfter = parseDurationPointer(detail.Get("retryDelay").String())
+			}
+		case "type.googleapis.com/google.rpc.ErrorInfo":
+			if resetAt == nil {
+				value := strings.TrimSpace(detail.Get("metadata.quotaResetTimeStamp").String())
+				if value != "" {
+					parsedResetAt, errParse := time.Parse(time.RFC3339Nano, value)
+					if errParse == nil {
+						parsedResetAt = parsedResetAt.UTC()
+						resetAt = &parsedResetAt
+					}
+				}
+			}
+		}
 	}
-	matches := usageRetryDelayPattern.FindStringSubmatch(message)
-	if len(matches) < 2 {
-		return nil
-	}
-	return parseDurationPointer(matches[1])
+	return retryAfter, resetAt
 }
 
 func parseDurationPointer(value string) *time.Duration {

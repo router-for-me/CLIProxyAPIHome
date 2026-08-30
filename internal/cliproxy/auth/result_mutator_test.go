@@ -22,6 +22,10 @@ type fakeMutatorStore struct {
 	saves     int
 }
 
+type testTokenStorage struct{}
+
+func (*testTokenStorage) SaveTokenToFile(string) error { return nil }
+
 func (s *fakeMutatorStore) List(context.Context) ([]*Auth, error) { return nil, nil }
 
 func (s *fakeMutatorStore) Save(_ context.Context, auth *Auth) (string, error) {
@@ -161,6 +165,129 @@ func TestMarkResultQuotaEscalationIsAtomicAcrossManagers(t *testing.T) {
 
 	if store.saves != 0 {
 		t.Fatalf("expected no Save calls on the mutator path, got %d", store.saves)
+	}
+}
+
+func TestMarkResultAntigravityFullRetryHintsReuseSharedResetWindow(t *testing.T) {
+	const authID = "auth-cluster-reset-timestamp"
+	const model = "gemini-3.7-flash-high"
+	ctx := context.Background()
+	seed := &Auth{ID: authID, Index: authID, Provider: "antigravity", Status: StatusActive}
+	store := &fakeMutatorStore{persisted: seed.Clone()}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	retryAfter := 4 * time.Hour
+	resetAt := time.Now().UTC().Add(retryAfter).Truncate(time.Millisecond)
+	result := quotaResult(authID, model)
+	result.Provider = "antigravity"
+	result.RetryAfter = &retryAfter
+	result.ResetAt = &resetAt
+	manager.MarkResult(ctx, result)
+
+	persisted := store.persistedSnapshot()
+	state := persisted.ModelStates[model]
+	if state == nil || !state.NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("persisted Antigravity reset state = %#v, want %v", state, resetAt)
+	}
+	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+		t.Fatalf("Quota.NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("BackoffLevel = %d, want first exponential level 1", state.Quota.BackoffLevel)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 1 {
+		t.Fatalf("mutation attempts after reset timestamp = %d, want 1", attempts)
+	}
+
+	manager.MarkResult(ctx, result)
+	manager.flushResultPersistQueue()
+	if attempts := store.mutationAttemptCount(); attempts != 1 {
+		t.Fatalf("mutation attempts after repeated full retry hints = %d, want 1", attempts)
+	}
+	if saves := store.saveCount(); saves != 0 {
+		t.Fatalf("Save() calls after repeated full retry hints = %d, want 0", saves)
+	}
+	if repeated := store.persistedSnapshot().ModelStates[model]; repeated == nil || !repeated.NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("repeated persisted Antigravity reset state = %#v, want unchanged deadline %v", repeated, resetAt)
+	}
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil || local.ModelStates[model] == nil || !local.ModelStates[model].NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("repeated local Antigravity reset state = %#v, want unchanged deadline %v", local, resetAt)
+	}
+}
+
+func TestMarkResultAntigravityRetryDelayExtendsOpenSharedWindow(t *testing.T) {
+	const authID = "auth-cluster-retry-delay-extend"
+	const model = "gemini-3.7-flash-high"
+	ctx := context.Background()
+	seed := &Auth{ID: authID, Index: authID, Provider: "antigravity", Status: StatusActive}
+	store := &fakeMutatorStore{persisted: seed.Clone()}
+	manager := NewManager(store, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	// First 429 has no retry hints -> exponential backoff establishes a short window (1s).
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: "antigravity",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+	firstSnapshot := store.persistedSnapshot().ModelStates[model]
+	if firstSnapshot == nil || !firstSnapshot.Quota.Exceeded {
+		t.Fatalf("first 429 failed to establish quota window: %#v", firstSnapshot)
+	}
+
+	// Second concurrent 429 arrives within the short window carrying a large retryDelay (2h).
+	retryAfter := 2 * time.Hour
+	beforeSecond := time.Now()
+	manager.MarkResult(ctx, Result{
+		AuthID:     authID,
+		Provider:   "antigravity",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+
+	extended := store.persistedSnapshot().ModelStates[model]
+	if extended == nil {
+		t.Fatalf("extended state is missing")
+	}
+	if extended.NextRetryAfter.Before(beforeSecond.Add(retryAfter - time.Minute)) {
+		t.Fatalf("NextRetryAfter = %v, want extended to about 2h after failure", extended.NextRetryAfter)
+	}
+	if !extended.Quota.NextRecoverAt.Equal(extended.NextRetryAfter) {
+		t.Fatalf("Quota.NextRecoverAt = %v, want %v", extended.Quota.NextRecoverAt, extended.NextRetryAfter)
+	}
+	if extended.Quota.BackoffLevel != 1 {
+		t.Fatalf("BackoffLevel = %d, want backoff level preserved across in-window extension", extended.Quota.BackoffLevel)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 2 {
+		t.Fatalf("mutation attempts = %d, want 2", attempts)
+	}
+
+	// A third 429 with a shorter retryDelay (5s) should NOT shorten the 2h window.
+	shortRetry := 5 * time.Second
+	manager.MarkResult(ctx, Result{
+		AuthID:     authID,
+		Provider:   "antigravity",
+		Model:      model,
+		Success:    false,
+		RetryAfter: &shortRetry,
+		Error:      &Error{Message: "quota", HTTPStatus: http.StatusTooManyRequests},
+	})
+	notShortened := store.persistedSnapshot().ModelStates[model]
+	if notShortened == nil || !notShortened.NextRetryAfter.Equal(extended.NextRetryAfter) {
+		t.Fatalf("NextRetryAfter was shortened to %v, want retained %v", notShortened.NextRetryAfter, extended.NextRetryAfter)
+	}
+	if attempts := store.mutationAttemptCount(); attempts != 2 {
+		t.Fatalf("mutation attempts after shorter hint = %d, want retained 2", attempts)
 	}
 }
 
@@ -368,6 +495,72 @@ func TestMarkResultUnauthorizedMutatesPersistedStateWithoutReplacingTokens(t *te
 	}
 }
 
+func TestMarkResultAdoptsNewerPersistedCredentialSnapshot(t *testing.T) {
+	const authID = "auth-cluster-newer-credential"
+	const resultModel = "gpt-5"
+	const localModel = "gpt-local-only"
+	now := time.Now().UTC()
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "codex",
+		Label:        "authoritative-label",
+		Status:       StatusActive,
+		StateVersion: 11,
+		Attributes:   map[string]string{"base_url": "https://authoritative.example"},
+		Metadata:     map[string]any{"access_token": "rotated-access-token"},
+	}}
+	manager := NewManager(store, nil, nil)
+	runtimeMarker := &struct{ name string }{name: "runtime"}
+	storageMarker := &testTokenStorage{}
+	localState := &ModelState{
+		Status:         StatusError,
+		StatusMessage:  "local transient failure",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Minute),
+		LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+		UpdatedAt:      now.Add(time.Second),
+	}
+	local := &Auth{
+		ID:           authID,
+		Index:        authID,
+		Provider:     "codex",
+		Label:        "stale-label",
+		Status:       StatusActive,
+		StateVersion: 10,
+		Attributes:   map[string]string{"base_url": "https://stale.example"},
+		Metadata:     map[string]any{"access_token": "stale-access-token"},
+		ModelStates:  map[string]*ModelState{localModel: localState},
+		Runtime:      runtimeMarker,
+		Storage:      storageMarker,
+	}
+	if _, errRegister := manager.Register(context.Background(), local); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), quotaResult(authID, resultModel))
+
+	current, ok := manager.GetByID(authID)
+	if !ok || current == nil {
+		t.Fatal("GetByID() missing auth")
+	}
+	if current.StateVersion != 11 || current.Metadata["access_token"] != "rotated-access-token" {
+		t.Fatalf("credential snapshot = version %d token %v, want version 11 with rotated token", current.StateVersion, current.Metadata["access_token"])
+	}
+	if current.Label != "authoritative-label" || current.Attributes["base_url"] != "https://authoritative.example" {
+		t.Fatalf("credential fields = label %q attributes %#v, want authoritative snapshot", current.Label, current.Attributes)
+	}
+	if current.Runtime != runtimeMarker || current.Storage != storageMarker {
+		t.Fatalf("runtime state = Runtime %#v Storage %#v, want local runtime objects preserved", current.Runtime, current.Storage)
+	}
+	if state := current.ModelStates[localModel]; state == nil || state.LastError == nil || state.LastError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("local model state = %#v, want unpersisted execution state preserved", state)
+	}
+	if state := current.ModelStates[resultModel]; state == nil || !state.Quota.Exceeded {
+		t.Fatalf("result model state = %#v, want persisted quota transition", state)
+	}
+}
+
 func TestMarkResultIgnoresUnauthorizedFromOlderAccessToken(t *testing.T) {
 	const authID = "auth-cluster-stale-unauthorized"
 	store := &fakeMutatorStore{persisted: &Auth{
@@ -493,6 +686,137 @@ func TestAdoptPersistedStateKeepsLocalModelError(t *testing.T) {
 	}
 }
 
+func TestAdoptPersistedStateClearsRefreshErrorAndRebuildsLocalModelError(t *testing.T) {
+	const authID = "auth-clear-refresh-block"
+	now := time.Now().UTC()
+	retryAt := now.Add(5 * time.Minute)
+	manager := NewManager(nil, nil, nil)
+	local := &Auth{
+		ID:                    authID,
+		Index:                 authID,
+		Provider:              "codex",
+		Status:                StatusError,
+		StatusMessage:         refreshTransientErrorMsg,
+		Unavailable:           true,
+		RuntimeRefreshBlocked: true,
+		NextRetryAfter:        retryAt,
+		LastError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    refreshTransientErrorMsg,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		ModelStates: map[string]*ModelState{
+			"model-a": {
+				Status:         StatusError,
+				StatusMessage:  "model-a failed",
+				Unavailable:    true,
+				NextRetryAfter: retryAt,
+				LastError:      &Error{Message: "local upstream failure", HTTPStatus: http.StatusBadGateway},
+				UpdatedAt:      now,
+			},
+			"model-b": {
+				Status:    StatusError,
+				LastError: &Error{Message: "stale model-b error", HTTPStatus: http.StatusBadGateway},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), local); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	persisted := &Auth{
+		ID:       authID,
+		Index:    authID,
+		Provider: "codex",
+		Status:   StatusActive,
+	}
+
+	adopted, current := manager.adoptPersistedResultState(Result{AuthID: authID, Model: "model-b"}, "model-b", persisted, now)
+	if !current || adopted == nil {
+		t.Fatalf("adoptPersistedResultState() = %#v/%v, want current auth", adopted, current)
+	}
+	if !adopted.Unavailable || adopted.RuntimeRefreshBlocked || RefreshBlocksDispatch(adopted) {
+		t.Fatalf("cleared persisted refresh block remained active: %#v", adopted)
+	}
+	if adopted.Status != StatusError || adopted.StatusMessage != "model-a failed" || adopted.LastError == nil || adopted.LastError.Message != "local upstream failure" {
+		t.Fatalf("auth-level model error was not rebuilt from model-a: %#v", adopted)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(adopted, "model-a", now); !blocked {
+		t.Fatal("surviving model-a error was cleared with the credential refresh block")
+	}
+	if blocked, _, _ := isAuthBlockedForModel(adopted, "model-c", now); blocked {
+		t.Fatal("cleared credential refresh block still blocked an unrelated model")
+	}
+	if state := adopted.ModelStates["model-b"]; state != nil {
+		t.Fatalf("cleared persisted model-b state remained local: %#v", state)
+	}
+}
+
+func TestMarkResultAdoptsPersistedRefreshBlock(t *testing.T) {
+	const authID = "auth-adopt-refresh-block"
+	const model = "gpt-5"
+	now := time.Now().UTC()
+	retryAt := now.Add(5 * time.Minute)
+	refreshAt := now.Add(3 * time.Minute)
+	const providerMessage = `codex refresh: Post "https://auth.openai.com/oauth/token": proxyconnect tcp: connection refused`
+	store := &fakeMutatorStore{persisted: &Auth{
+		ID:               authID,
+		Index:            authID,
+		Provider:         "codex",
+		Status:           StatusError,
+		StatusMessage:    providerMessage,
+		Unavailable:      true,
+		NextRefreshAfter: refreshAt,
+		NextRetryAfter:   retryAt,
+		LastError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    providerMessage,
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		LastRefreshError: &Error{
+			Code:       refreshTransientErrorCode,
+			Message:    refreshTransientErrorMsg,
+			Diagnostic: "refresh proxy unavailable",
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		Metadata: map[string]any{"access_token": "persisted-access-token"},
+	}}
+	manager := NewManager(store, nil, nil)
+	minimal := &Auth{
+		ID:                    authID,
+		Index:                 authID,
+		Provider:              "codex",
+		Status:                StatusError,
+		Unavailable:           true,
+		RuntimeRefreshBlocked: true,
+		NextRetryAfter:        retryAt,
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), minimal); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), Result{AuthID: authID, Provider: "codex", Model: model, Success: true})
+
+	local, ok := manager.GetByID(authID)
+	if !ok || local == nil {
+		t.Fatal("GetByID() missing auth")
+	}
+	if local.Status != StatusError || !local.Unavailable || !local.RuntimeRefreshBlocked || !local.NextRetryAfter.Equal(retryAt) {
+		t.Fatalf("local refresh block = %#v, want persisted credential-level block", local)
+	}
+	if local.LastError == nil || local.LastError.Code != refreshTransientErrorCode || local.LastError.Message != providerMessage {
+		t.Fatalf("local refresh error = %#v, want persisted provider diagnostic", local.LastError)
+	}
+	if local.LastRefreshError == nil || local.LastRefreshError.Diagnostic != "refresh proxy unavailable" || !local.NextRefreshAfter.Equal(refreshAt) {
+		t.Fatalf("local refresh diagnostic/backoff = %#v/%v, want persisted diagnostic until %v", local.LastRefreshError, local.NextRefreshAfter, refreshAt)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(local, model, retryAt.Add(time.Hour)); !blocked {
+		t.Fatal("late execution success made refresh-failed auth dispatchable")
+	}
+}
+
 // blockingMutatorStore blocks inside MutateAuthState so tests can assert the
 // manager lock is not held during persisted state mutations.
 type blockingMutatorStore struct {
@@ -510,6 +834,83 @@ func (s *blockingMutatorStore) MutateAuthState(ctx context.Context, id string, m
 		return nil, ctx.Err()
 	}
 	return s.fakeMutatorStore.MutateAuthState(ctx, id, mutate)
+}
+
+type committedMutatorStore struct {
+	fakeMutatorStore
+	committed chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *committedMutatorStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.persisted != nil && s.persisted.ID == id {
+		s.persisted = nil
+	}
+	return nil
+}
+
+func (s *committedMutatorStore) MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
+	persisted, errMutate := s.fakeMutatorStore.MutateAuthState(ctx, id, mutate)
+	s.once.Do(func() { close(s.committed) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return persisted, errMutate
+}
+
+func TestMarkResultDoesNotRestoreDeletedAuthToScheduler(t *testing.T) {
+	const authID = "auth-deleted-after-result-commit"
+	store := &committedMutatorStore{
+		fakeMutatorStore: fakeMutatorStore{
+			persisted: &Auth{
+				ID:       authID,
+				Index:    authID,
+				Provider: "codex",
+				Status:   StatusActive,
+				Metadata: map[string]any{"access_token": "stored-token"},
+			},
+		},
+		committed: make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	manager := newHomeNodeManager(t, &store.fakeMutatorStore, authID)
+	manager.SetStore(store)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.MarkResult(context.Background(), quotaResult(authID, "gpt-5"))
+	}()
+
+	select {
+	case <-store.committed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("persisted result mutation did not commit")
+	}
+	if errDelete := manager.Delete(context.Background(), authID); errDelete != nil {
+		t.Fatalf("Delete() error = %v", errDelete)
+	}
+	close(store.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkResult did not finish after mutation release")
+	}
+
+	if current, ok := manager.GetByID(authID); ok || current != nil {
+		t.Fatalf("GetByID() = %#v, %v, want deleted auth to stay absent", current, ok)
+	}
+	manager.scheduler.mu.Lock()
+	_, scheduled := manager.scheduler.authProviders[authID]
+	manager.scheduler.mu.Unlock()
+	if scheduled {
+		t.Fatal("deleted auth was restored to the scheduler by a late result mutation")
+	}
 }
 
 func TestMarkResultDoesNotHoldManagerLockDuringStateMutation(t *testing.T) {

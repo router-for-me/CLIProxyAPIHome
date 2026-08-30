@@ -7,7 +7,7 @@ import (
 var (
 	codexRefreshLead       = 5 * 24 * time.Hour
 	claudeRefreshLead      = 4 * time.Hour
-	antigravityRefreshLead = 5 * time.Minute
+	antigravityRefreshLead = 30 * time.Minute
 	kimiRefreshLead        = 5 * time.Minute
 	xaiRefreshLead         = 5 * time.Minute
 )

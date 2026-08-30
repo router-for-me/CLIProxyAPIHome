@@ -162,6 +162,43 @@ func TestMarkResultUnauthorizedUsesRecoverableCooldown(t *testing.T) {
 	}
 }
 
+func TestNewUsageResultScopesGoogleResetTimestampToAntigravity(t *testing.T) {
+	resetAt := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","metadata":{"quotaResetTimeStamp":"` + resetAt.Format(time.RFC3339Nano) + `"}},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}`
+
+	antigravityResult := NewUsageResult("antigravity-auth", "antigravity", "gemini-3.7-flash-high", http.StatusTooManyRequests, body)
+	if antigravityResult.ResetAt == nil || !antigravityResult.ResetAt.Equal(resetAt) {
+		t.Fatalf("ResetAt = %v, want %v", antigravityResult.ResetAt, resetAt)
+	}
+	if antigravityResult.RetryAfter == nil || *antigravityResult.RetryAfter != 2*time.Second {
+		t.Fatalf("RetryAfter = %v, want 2s", antigravityResult.RetryAfter)
+	}
+
+	otherResult := NewUsageResult("other-auth", "codex", "gpt-5", http.StatusTooManyRequests, body)
+	if otherResult.RetryAfter != nil || otherResult.ResetAt != nil {
+		t.Fatalf("non-Antigravity result received retry hints: retryAfter=%v resetAt=%v", otherResult.RetryAfter, otherResult.ResetAt)
+	}
+}
+
+func TestNewUsageResultIgnoresAntigravityQuotaResetDelayAndMessage(t *testing.T) {
+	body := `{"error":{"code":429,"message":"Individual quota reached. Resets in 45m.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","metadata":{"quotaResetDelay":"45m"}}]}}`
+
+	result := NewUsageResult("antigravity-auth", "antigravity", "gemini-3.7-flash-high", http.StatusTooManyRequests, body)
+	if result.RetryAfter != nil || result.ResetAt != nil {
+		t.Fatalf("ignored retry fields produced hints: retryAfter=%v resetAt=%v", result.RetryAfter, result.ResetAt)
+	}
+}
+
+func TestNewUsageResultRequiresMatchingGoogleRetryDetailTypes(t *testing.T) {
+	resetAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","retryDelay":"2s"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","metadata":{"quotaResetTimeStamp":"` + resetAt + `"}}]}}`
+
+	result := NewUsageResult("antigravity-auth", "antigravity", "gemini-3.7-flash-high", http.StatusTooManyRequests, body)
+	if result.RetryAfter != nil || result.ResetAt != nil {
+		t.Fatalf("mismatched detail types produced hints: retryAfter=%v resetAt=%v", result.RetryAfter, result.ResetAt)
+	}
+}
+
 func TestMarkResultIgnoresMissingCanonicalModel(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	auth := &Auth{ID: "auth-missing-model", Index: "auth-missing-model", Provider: "codex", Status: StatusActive}

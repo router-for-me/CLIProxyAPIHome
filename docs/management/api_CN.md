@@ -20,7 +20,7 @@ GET /assets/*
 
 Panel assets 会在构建时内嵌到二进制中。
 
-Home 示例端口通常为 `8327`。实际监听地址来自 runtime config、`cluster.yaml` 或 `-addr` 的最终值。
+Home 示例端口通常为 `8327`。显式 `-addr` 优先；未指定时，Home 使用 `cluster.yaml` 中的 `node.port`。runtime config 的 `port` 仅下发给 CPA 节点，不参与 Home 监听端口配置。
 
 ## Runtime 模型
 
@@ -261,6 +261,9 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/plugin-store-auth/:id` |
 | `PATCH` | `/plugin-store-auth/:id` |
 | `DELETE` | `/plugin-store-auth/:id` |
+| `GET` | `/port` |
+| `PATCH` | `/port` |
+| `PUT` | `/port` |
 | `DELETE` | `/proxy-url` |
 | `GET` | `/proxy-url` |
 | `PATCH` | `/proxy-url` |
@@ -466,8 +469,12 @@ openai-compatibility
 
 这些接口会写入 cluster repository 中对应 config root，并 reload Home runtime。
 
+端口变更需要重启 CPA：`PUT/PATCH /port` 会立即持久化并下发新值，但已运行的 CPA 不会重新绑定监听端口，必须重启对应的 CPA 进程后才会生效。
+
 | Method | Path | 输入 | 输出 |
 | --- | --- | --- | --- |
+| `GET` | `/port` | 无 | `{ "port": number }` |
+| `PUT/PATCH` | `/port` | `{ "value": number }`；必须是 `1` 到 `65535` 之间的整数。 | `{ "status": "ok" }` |
 | `GET` | `/debug` | 无 | `{ "debug": boolean }` |
 | `PUT/PATCH` | `/debug` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/logging-to-file` | 无 | `{ "logging-to-file": boolean }` |
@@ -2853,7 +2860,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credential-in-
 
 Home 同时为 Claude、Antigravity、Codex、Kimi、xAI 的 OAuth/file credential 运行固定目标主动 collector。Codex 读取官方 usage endpoint，使用 `metered_feature` 作为 additional limit 的稳定身份，并推导规范化套餐元数据。无论 usage 汇总是否包含 `rate_limit_reset_credits`，collector 都会独立查询 reset-credit 详情 endpoint。详情请求失败且 usage 汇总报告了正数当前次数时，collection 返回 `partial`，保存本次最新次数和空详情列表，不再沿用旧数量或已过期 credit；两个 endpoint 都没有提供可靠 reset-credit 信息时，会清除旧 reset-credit 数据，但不影响仍然可用的额度窗口。Codex `primary_windows` 会分别保留默认 account family 与 `codex_bengalfox` family 的一个代表窗口，并在每个 family 内优先最长周期（通常为 weekly），因此默认 5 小时窗口或 code-review limit 不会挤掉 Spark。使用位置型 `*-primary`/`*-secondary` ID 的 Codex v1 旧快照会在下一次满足活动门控的定时扫描中触发立即 v2 主动重采集，即使 freshness 或 `next_probe_at` 原本会推迟采集；升级尝试会在发起请求前记录，失败后恢复正常 retry backoff，不会持续绕过退避。旧 raw windows 仍保留用于诊断，但成功升级前 API 表现为 `unknown`/`stale`，升级失败后表现为 `error`/`stale`；v2 成功后原子替换旧 ID，后续被动 Header 观测也不能降低快照版本。Management API 不提供消费 reset credit 的操作。Claude 查询 usage 和 profile，额度成功但 profile 元数据失败时返回 `partial`。Antigravity 携带 credential `project_id` 请求分组额度汇总 endpoint，只将 `gemini-5h`、`gemini-weekly`、`3p-5h` 和 `3p-weekly` 映射到稳定的 `gemini` 与 `third-party` model scope。数字、数字字符串和百分数字符串形式的比例都可解析；disabled、未知或畸形 bucket 会被逐项忽略。只有两个 weekly bucket 都有效时，响应才可以替换最后已知快照；两个 5 小时 bucket 分别可选，不要求成对出现。`primary_windows` 每个稳定 scope 保留一个窗口，并在存在时优先该 scope 的 5 小时窗口。使用旧模型 ID 的 Antigravity v1 快照会在下一次满足活动门控的定时扫描中触发立即 v2 重采集；升级期间 API 返回 `unknown`/`stale`，失败后返回 `error`/`stale` 并遵循正常 retry backoff，成功后原子替换旧模型窗口。Kimi 查询 coding usage，保留账号 usage 汇总和每个 limit 窗口，并兼容数字或字符串形式的数值字段。Kimi 的 Provider limit 优先进入 `primary_windows`，避免聚合 summary 挤掉周限额或 duration 限额。xAI 使用 Grok CLI token-auth、client-version、user-agent 及可选 user-ID Header 请求 billing endpoint；支持 camelCase/snake_case 字段，以及 `{ "val": ... }`、数字或字符串 cents。`monthlyLimit=15000` 推导为 SuperGrok，`monthlyLimit=150000` 推导为 SuperGrok Heavy；正数 `onDemandCap` 配合显式或推导出的 `onDemandUsed` 生成 `xai-on-demand` 月度 USD 窗口，cap 缺失或为 0 表示未启用按量付费，不输出该窗口。无法使用这些 OAuth collector 的 Provider API-key credential 返回 `unsupported`。
 
-collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新解析最新 DB 凭证，并直接使用其中当前保存的 access token，不会调用 OAuth 刷新；凭证刷新仍由独立的 runtime 刷新子系统负责。全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及 retry deadline 仍在未来的凭证不会被主动探测；deadline 过期后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
+collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新解析最新 DB 凭证，并直接使用其中当前保存的 access token，不会调用 OAuth 刷新；凭证刷新仍由独立的 runtime 刷新子系统负责。全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及因 OAuth 刷新失败而被阻断调度的凭证不会被主动探测；模型执行 cooldown 不会阻止额度采集，额度采集自身的重试退避（`next_probe_at`）会推迟定时扫描但不会阻断人工强制重采集。冷却过期或刷新阻断解除后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
 
 凭证核心字段：
 
@@ -3018,7 +3025,7 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 }
 ```
 
-`accepted` 统计本次新进入队列的符合条件凭证数。disabled、执行 cooldown、collector 不支持，以及已在本地排队/执行的凭证会跳过。任务取得并发槽后会强制申请 DB probe lease：已有未过期 lease 仍优先，但定时 collector 的近期 usage 与新 usage 门控、snapshot freshness、`next_probe_at` 和额度 retry backoff 都不会阻止这次人工请求。采集在后台运行；完成后通过 `GET /quota/credentials` 读取更新快照。运行时未接入 quota collector 时，该路由返回 `404`（`QUOTA_RECOLLECT_UNSUPPORTED`），且 `capabilities.quota_recollect` 为 `false`。
+`accepted` 统计本次新进入队列的符合条件凭证数。disabled、collector 不支持，以及已在本地排队/执行的凭证会跳过；执行 cooldown 既不会触发也不会阻止额度采集。定时 collector 仍要求近期存在未消费的新 usage，并遵循 snapshot freshness、`next_probe_at`、额度 retry backoff 和 DB probe lease，因此冷却后没有新请求的凭证不会持续定期采集。任务取得并发槽后会强制申请 DB probe lease：已有未过期 lease 仍优先，但定时 collector 的活动与调度门控不会阻止这次人工请求。采集只更新额度快照，不会清除执行 cooldown。采集在后台运行；完成后通过 `GET /quota/credentials` 读取更新快照。运行时未接入 quota collector 时，该路由返回 `404`（`QUOTA_RECOLLECT_UNSUPPORTED`），且 `capabilities.quota_recollect` 为 `false`。
 
 
 非法筛选、排序或分页返回 `400`，错误体为 `{"error":{"code":"INVALID_FILTER","message":"...","request_id":"","retryable":false}}`；凭证不存在返回 `404`；临时数据库/上下文不可用返回 `503`，其他数据库读取失败返回 `500`。
@@ -4034,7 +4041,7 @@ DELETE query：
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `host` | string | 服务绑定 host/interface。 |
-| `port` | integer | 服务监听端口。 |
+| `port` | integer | Home 下发的 CPA 服务监听端口；省略时默认为 `8317`。 |
 | `allow-host` | array of string | RESP client IP allowlist；空列表表示允许所有 host。 |
 | `tls.enable` | boolean | 启用 HTTPS。 |
 | `tls.cert` | string | TLS certificate 路径。 |

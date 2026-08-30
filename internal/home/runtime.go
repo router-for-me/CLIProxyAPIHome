@@ -166,6 +166,10 @@ type ClusterAdapter interface {
 	LoadConfigYAML(ctx context.Context) ([]byte, error)
 }
 
+type clusterAuthStateObserver interface {
+	ObservedAuthState(uuid string) (version int64, active bool)
+}
+
 type clusterUsageStore interface {
 	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
 }
@@ -470,7 +474,39 @@ func (r *Runtime) UpdateAuthInMemory(ctx context.Context, auth *coreauth.Auth) (
 	if r == nil || r.coreManager == nil {
 		return nil, fmt.Errorf("home runtime: runtime not ready")
 	}
-	return r.coreManager.Update(coreauth.WithSkipPersist(ctx), auth)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	update := auth
+	if auth != nil && r.clusterAdapter != nil && r.clusterAdapter.Enabled() {
+		failClosedUpdate := auth.Disabled || auth.Status == coreauth.StatusDisabled || coreauth.RefreshBlocksDispatch(auth)
+		latest, errLatest := r.clusterAdapter.GetFullAuth(ctx, auth.ID)
+		if errLatest != nil {
+			if !failClosedUpdate {
+				observer, okObserver := r.clusterAdapter.(clusterAuthStateObserver)
+				if !okObserver {
+					return nil, fmt.Errorf("home runtime: load authoritative auth %s: %w", auth.ID, errLatest)
+				}
+				observedVersion, observedActive := observer.ObservedAuthState(auth.ID)
+				if !observedActive || observedVersion > auth.StateVersion {
+					return nil, fmt.Errorf("home runtime: load authoritative auth %s at observed version %d: %w", auth.ID, observedVersion, errLatest)
+				}
+			}
+		} else if latest == nil && !failClosedUpdate {
+			return nil, fmt.Errorf("home runtime: authoritative auth %s is unavailable", auth.ID)
+		} else if latest != nil && latest.StateVersion > auth.StateVersion {
+			update = latest
+		}
+	}
+	if update != nil {
+		if current, ok := r.coreManager.GetByID(update.ID); ok && current != nil &&
+			!current.Disabled && current.Status != coreauth.StatusDisabled &&
+			!update.Disabled && update.Status != coreauth.StatusDisabled {
+			update = update.Clone()
+			update.ModelStates = mergeModelStates(update.ModelStates, current.ModelStates)
+		}
+	}
+	return r.coreManager.Update(coreauth.WithSkipPersist(ctx), update)
 }
 
 // RefreshClusterAuthIndex refreshes refresh cluster auth index.

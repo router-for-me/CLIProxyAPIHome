@@ -20,7 +20,7 @@ GET /assets/*
 
 The panel assets are embedded into the binary at build time.
 
-Home examples usually use port `8327`. The effective listen address comes from runtime config, `cluster.yaml`, or the final `-addr` value.
+Home examples usually use port `8327`. An explicit `-addr` takes precedence; otherwise Home uses `node.port` from `cluster.yaml`. The runtime config `port` is distributed to CPA nodes and does not configure the Home listener.
 
 ## Runtime Model
 
@@ -261,6 +261,9 @@ The table below is extracted from the final Home route registry built by `intern
 | `GET` | `/plugin-store-auth/:id` |
 | `PATCH` | `/plugin-store-auth/:id` |
 | `DELETE` | `/plugin-store-auth/:id` |
+| `GET` | `/port` |
+| `PATCH` | `/port` |
+| `PUT` | `/port` |
 | `DELETE` | `/proxy-url` |
 | `GET` | `/proxy-url` |
 | `PATCH` | `/proxy-url` |
@@ -466,8 +469,12 @@ Example response:
 
 These routes write the corresponding config root into the cluster repository and reload the Home runtime.
 
+Port changes require a CPA restart: `PUT/PATCH /port` persists and distributes the new value immediately, but an already running CPA does not rebind its listener until that CPA process is restarted.
+
 | Method | Path | Input | Output |
 | --- | --- | --- | --- |
+| `GET` | `/port` | none | `{ "port": number }` |
+| `PUT/PATCH` | `/port` | `{ "value": number }`; must be an integer from `1` to `65535`. | `{ "status": "ok" }` |
 | `GET` | `/debug` | none | `{ "debug": boolean }` |
 | `PUT/PATCH` | `/debug` | `{ "value": boolean }` | `{ "status": "ok" }` |
 | `GET` | `/logging-to-file` | none | `{ "logging-to-file": boolean }` |
@@ -2855,7 +2862,7 @@ Current passive collection extracts a bounded `quota_headers` object from the CP
 
 Home also runs fixed-target active collectors for Claude, Antigravity, Codex, Kimi, and xAI OAuth/file credentials. Codex reads the official usage endpoint, uses `metered_feature` as the stable identity for additional limits, and derives normalized plan metadata. It queries the reset-credit detail endpoint independently of whether the usage summary contains `rate_limit_reset_credits`. If that detail request fails while the usage summary reports a positive current count, the collection is `partial` and stores the latest count with an empty detail list instead of carrying forward older quantities or expired credits. If neither endpoint provides reliable reset-credit information, older reset-credit data is cleared without degrading otherwise usable quota windows. Codex `primary_windows` keeps one representative from the default account family and one from `codex_bengalfox`, preferring the longest (normally weekly) window in each family, so the default 5-hour window or code-review limits cannot hide Spark. At the next activity-eligible scheduled scan, existing Codex v1 snapshots that use positional `*-primary`/`*-secondary` IDs trigger one immediate v2 active recollection even when freshness or `next_probe_at` would normally defer it. The upgrade attempt is recorded before the request, so a failure returns to the normal retry backoff instead of bypassing it repeatedly. Legacy raw windows remain stored for diagnosis, but the API reports them as `unknown`/`stale` before a successful upgrade and `error`/`stale` after a failed upgrade; a successful v2 probe atomically replaces the old IDs, and later passive Header observations cannot downgrade the snapshot version. No reset-credit consume operation is exposed through the Management API. Claude reads usage and profile, reporting `partial` when quota succeeds but profile metadata fails. Antigravity calls the grouped quota-summary endpoint with the credential `project_id` and maps only `gemini-5h`, `gemini-weekly`, `3p-5h`, and `3p-weekly` into stable `gemini` and `third-party` model scopes. Numeric fractions, numeric strings, and percentage strings are accepted; disabled, unknown, or malformed buckets are omitted independently. Both weekly buckets are required before a response can replace the last-known snapshot, while either 5-hour bucket remains independently optional. Primary selection keeps one window per stable scope and prefers that scope's 5-hour bucket when present. At the next activity-eligible scheduled scan, existing model-ID Antigravity v1 snapshots trigger an immediate v2 recollection; they are reported as `unknown`/`stale` while upgrade is pending and `error`/`stale` after a failed upgrade, with normal retry backoff. A successful v2 probe atomically replaces the legacy model windows. Kimi reads coding usage and preserves both the account usage summary and each returned limit window while accepting numeric fields encoded as numbers or strings. Kimi provider limits take primary-window priority over its aggregate summary so weekly and duration limits remain visible in list views. xAI calls the Grok CLI billing endpoint with the CLI token-auth, client-version, user-agent, and optional user-ID headers. It accepts camelCase or snake_case billing fields and `{ "val": ... }`, numeric, or string cent values. `monthlyLimit=15000` maps to SuperGrok and `monthlyLimit=150000` maps to SuperGrok Heavy. Positive `onDemandCap` plus explicit or derived `onDemandUsed` values produce the `xai-on-demand` monthly USD window; a missing or zero cap means pay-as-you-go is disabled and no such window is emitted. Provider API-key credentials that cannot use these OAuth collectors are returned as `unsupported`.
 
-Collectors read DB credentials directly and never accept a URL from HMC. Before probing, they resolve the latest DB credential and use its currently stored access token without invoking OAuth refresh; credential refresh remains owned by the independent runtime refresh subsystem. They use the current hot-reloaded global proxy unless the credential has its own proxy. They use a 20-second request timeout, a per-provider concurrency limit of 3 on PostgreSQL and a global limit of 1 on SQLite, a per-credential DB lease, and a five-minute exponential retry backoff with per-credential jitter capped near one hour. `Retry-After` can extend the next attempt. Disabled credentials and credentials whose retry deadline is still in the future are not actively probed; persisted unavailable/error state no longer blocks recovery after that deadline. Successful snapshots are fresh for 30 minutes. Failures preserve last-known windows and store only structured, redacted error metadata.
+Collectors read DB credentials directly and never accept a URL from HMC. Before probing, they resolve the latest DB credential and use its currently stored access token without invoking OAuth refresh; credential refresh remains owned by the independent runtime refresh subsystem. They use the current hot-reloaded global proxy unless the credential has its own proxy. They use a 20-second request timeout, a per-provider concurrency limit of 3 on PostgreSQL and a global limit of 1 on SQLite, a per-credential DB lease, and a five-minute exponential retry backoff with per-credential jitter capped near one hour. `Retry-After` can extend the next attempt. Disabled credentials and credentials blocked by an OAuth refresh failure are not actively probed; model execution cooldowns do not prevent quota collection, and quota collection's own retry backoff (`next_probe_at`) defers scheduled scans without blocking on-demand force recollection. Persisted unavailable/error state from an expired cooldown or cleared refresh block no longer blocks recovery. Successful snapshots are fresh for 30 minutes. Failures preserve last-known windows and store only structured, redacted error metadata.
 
 Credential fields:
 
@@ -3037,7 +3044,7 @@ Response `202`:
 }
 ```
 
-`accepted` counts eligible credentials newly queued by this request. Disabled, execution-cooldown, collector-unsupported, and already queued/running local credentials are skipped. When a queued job reaches a concurrency slot it force-claims the DB probe lease: an active lease is still respected, but the scheduled collector's recent-usage and new-usage gates, snapshot freshness, `next_probe_at`, and quota retry backoff do not suppress the requested attempt. The collection round runs in the background; read updated snapshots through `GET /quota/credentials` after it finishes. When the runtime has no quota collector wired, the route returns `404` with `QUOTA_RECOLLECT_UNSUPPORTED` and `capabilities.quota_recollect` is `false`.
+`accepted` counts eligible credentials newly queued by this request. Disabled, collector-unsupported, and already queued/running local credentials are skipped; an execution cooldown neither triggers nor blocks quota collection. The scheduled collector still requires recent unconsumed usage and honors snapshot freshness, `next_probe_at`, quota retry backoff, and the DB probe lease, so a cooling credential with no new requests is not probed continuously. When a queued job reaches a concurrency slot it force-claims the DB probe lease: an active lease is still respected, but the scheduled collector's activity and scheduling gates do not suppress the requested attempt. Collection only updates the quota snapshot and does not clear the execution cooldown. The collection round runs in the background; read updated snapshots through `GET /quota/credentials` after it finishes. When the runtime has no quota collector wired, the route returns `404` with `QUOTA_RECOLLECT_UNSUPPORTED` and `capabilities.quota_recollect` is `false`.
 
 
 Quota endpoint validation errors use:
@@ -4066,7 +4073,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | Field | Type | Description |
 | --- | --- | --- |
 | `host` | string | Service bind host/interface. |
-| `port` | integer | Service listen port. |
+| `port` | integer | CPA service listen port distributed by Home; defaults to `8317` when omitted. |
 | `allow-host` | array of string | RESP client IP allowlist. Empty list allows all hosts. |
 | `tls.enable` | boolean | Enable HTTPS. |
 | `tls.cert` | string | TLS certificate path. |

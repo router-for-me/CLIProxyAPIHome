@@ -2,6 +2,8 @@ package home
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -54,24 +56,69 @@ func TestRecordUsagePayloadUsesModelAsUpstreamKey(t *testing.T) {
 	}
 }
 
-func TestRecordUsagePayloadUsesExponentialBackoffDespiteRetryDelay(t *testing.T) {
+func TestRecordUsagePayloadUsesAntigravityQuotaResetTimestamp(t *testing.T) {
 	auth := &coreauth.Auth{
-		ID:       "usage-retry-delay-auth",
-		Index:    "usage-retry-delay-index",
-		Provider: "gemini",
+		ID:       "usage-reset-timestamp-auth",
+		Index:    "usage-reset-timestamp-index",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	resetAt := time.Now().UTC().Add(45 * time.Minute).Truncate(time.Millisecond)
+	body := fmt.Sprintf(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetTimeStamp":%q}},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}`, resetAt.Format(time.RFC3339Nano))
+	encodedBody, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal(error body) error = %v", errMarshal)
+	}
+	rt.RecordUsagePayload(context.Background(), fmt.Sprintf(`{
+		"auth_index": "usage-reset-timestamp-index",
+		"provider": "antigravity",
+		"model": "gemini-3.7-flash-high",
+		"failed": true,
+		"fail": {
+			"status_code": 429,
+			"body": %s
+		}
+	}`, encodedBody))
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gemini-3.7-flash-high"]
+	if state == nil {
+		t.Fatalf("ModelStates[gemini-3.7-flash-high] missing after usage payload: %#v", got.ModelStates)
+	}
+	if !state.NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("ModelStates[gemini-3.7-flash-high].NextRetryAfter = %v, want %v", state.NextRetryAfter, resetAt)
+	}
+	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+		t.Fatalf("Quota.NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
+	}
+}
+
+func TestRecordUsagePayloadUsesRetryDelayWhenAntigravityResetTimestampMissing(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-missing-reset-timestamp-auth",
+		Index:    "usage-missing-reset-timestamp-index",
+		Provider: "antigravity",
 		Status:   coreauth.StatusActive,
 	}
 	rt := newUsageResultTestRuntime(t, auth)
 
 	before := time.Now()
 	rt.RecordUsagePayload(context.Background(), `{
-		"auth_index": "usage-retry-delay-index",
-		"provider": "gemini",
-		"model": "gemini-3-pro-preview",
+		"auth_index": "usage-missing-reset-timestamp-index",
+		"provider": "antigravity",
+		"model": "gemini-3.7-flash-high",
 		"failed": true,
 		"fail": {
 			"status_code": 429,
-			"body": "{\"error\":{\"code\":429,\"message\":\"Individual quota reached. Contact your administrator to enable overages. Resets in 45m7s.\",\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"QUOTA_EXHAUSTED\",\"metadata\":{\"quotaResetDelay\":\"2707.893713377s\",\"quotaResetTimeStamp\":\"2026-06-23T17:45:04Z\"}},{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"2707.893713377s\"}]}}"
+			"body": "{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"QUOTA_EXHAUSTED\"},{\"@type\":\"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"45m\"}]}}"
 		}
 	}`)
 
@@ -79,16 +126,13 @@ func TestRecordUsagePayloadUsesExponentialBackoffDespiteRetryDelay(t *testing.T)
 	if !ok || got == nil {
 		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
 	}
-	state := got.ModelStates["gemini-3-pro-preview"]
+	state := got.ModelStates["gemini-3.7-flash-high"]
 	if state == nil {
-		t.Fatalf("ModelStates[gemini-3-pro-preview] missing after usage payload: %#v", got.ModelStates)
+		t.Fatalf("ModelStates[gemini-3.7-flash-high] missing after usage payload: %#v", got.ModelStates)
 	}
 	delay := state.NextRetryAfter.Sub(before)
-	if delay < 500*time.Millisecond || delay > 2*time.Second {
-		t.Fatalf("ModelStates[gemini-3-pro-preview].NextRetryAfter delay = %v, want first exponential backoff", delay)
-	}
-	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
-		t.Fatalf("Quota.NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	if delay < 45*time.Minute || delay > 46*time.Minute {
+		t.Fatalf("ModelStates[gemini-3.7-flash-high].NextRetryAfter delay = %v, want retryDelay", delay)
 	}
 	if state.Quota.BackoffLevel != 1 {
 		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)

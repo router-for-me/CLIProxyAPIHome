@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -117,7 +118,7 @@ func (a *XAIAuth) Discover(ctx context.Context) (*Discovery, error) {
 		return nil, fmt.Errorf("xai discovery: read response: %w", errRead)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("xai discovery failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, oautherror.NewResponseError(resp.StatusCode, body)
 	}
 	var payload struct {
 		AuthorizationEndpoint string `json:"authorization_endpoint"`
@@ -219,7 +220,7 @@ func (a *XAIAuth) postTokenForm(ctx context.Context, tokenEndpoint string, form 
 		return nil, fmt.Errorf("xai token response: read body: %w", errRead)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("xai token request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, oautherror.NewResponseError(resp.StatusCode, body)
 	}
 	var payload struct {
 		AccessToken  string `json:"access_token"`

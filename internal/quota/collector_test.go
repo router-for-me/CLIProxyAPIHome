@@ -280,7 +280,7 @@ func TestAntigravityMissingProjectFailsWithoutUpstreamRequest(t *testing.T) {
 	}
 }
 
-func TestQuotaProbeEligibilitySkipsDisabledCooldownAndUnavailableCredentials(t *testing.T) {
+func TestQuotaProbeEligibilityIgnoresCooldown(t *testing.T) {
 	now := time.Date(2026, 7, 16, 9, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name string
@@ -289,9 +289,13 @@ func TestQuotaProbeEligibilitySkipsDisabledCooldownAndUnavailableCredentials(t *
 	}{
 		{name: "active", auth: &coreauth.Auth{ID: "active", Provider: "codex", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "codex"}}, want: true},
 		{name: "disabled", auth: &coreauth.Auth{ID: "disabled", Provider: "codex", Status: coreauth.StatusDisabled, Disabled: true}, want: false},
-		{name: "cooldown", auth: &coreauth.Auth{ID: "cooldown", Provider: "codex", Status: coreauth.StatusActive, NextRetryAfter: now.Add(time.Minute)}, want: false},
+		{name: "cooldown", auth: &coreauth.Auth{ID: "cooldown", Provider: "codex", Status: coreauth.StatusActive, NextRetryAfter: now.Add(time.Minute)}, want: true},
 		{name: "expired cooldown", auth: &coreauth.Auth{ID: "expired-cooldown", Provider: "codex", Status: coreauth.StatusError, Unavailable: true, NextRetryAfter: now.Add(-time.Minute)}, want: true},
 		{name: "unavailable without future cooldown", auth: &coreauth.Auth{ID: "unavailable", Provider: "codex", Status: coreauth.StatusError, Unavailable: true}, want: true},
+		{name: "refresh blocked", auth: &coreauth.Auth{ID: "refresh-blocked", Provider: "codex", Status: coreauth.StatusError, Unavailable: true, LastError: &coreauth.Error{Code: "refresh_temporarily_unavailable"}}, want: false},
+		{name: "runtime refresh blocked", auth: &coreauth.Auth{ID: "runtime-refresh-blocked", Provider: "codex", Status: coreauth.StatusError, Unavailable: true, RuntimeRefreshBlocked: true}, want: false},
+		{name: "refresh unsupported", auth: &coreauth.Auth{ID: "refresh-unsupported", Provider: "codex", Status: coreauth.StatusActive, LastRefreshError: &coreauth.Error{Code: "refresh_unsupported"}}, want: true},
+		{name: "refresh backoff", auth: &coreauth.Auth{ID: "refresh-backoff", Provider: "antigravity", Status: coreauth.StatusActive, NextRefreshAfter: now.Add(time.Minute)}, want: true},
 		{name: "provider api key", auth: &coreauth.Auth{ID: "api-key", Provider: "xai", Status: coreauth.StatusActive, Attributes: map[string]string{"source": "config:xai", "api_key": "secret"}}, want: false},
 		{name: "explicit api key wins legacy oauth metadata", auth: &coreauth.Auth{ID: "explicit-api-key", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"auth_kind": "apikey", "api_key": "secret"}, Metadata: map[string]any{"type": "codex"}}, want: false},
 		{name: "explicit oauth wins api key shape", auth: &coreauth.Auth{ID: "explicit-oauth", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"auth_kind": "oauth", "api_key": "secret"}, Metadata: map[string]any{"type": "codex"}}, want: true},
@@ -299,7 +303,7 @@ func TestQuotaProbeEligibilitySkipsDisabledCooldownAndUnavailableCredentials(t *
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := quotaProbeEligible(test.auth, now); got != test.want {
+			if got := quotaProbeEligible(test.auth); got != test.want {
 				t.Fatalf("quotaProbeEligible() = %v, want %v", got, test.want)
 			}
 		})

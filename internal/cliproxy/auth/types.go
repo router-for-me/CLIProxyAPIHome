@@ -52,10 +52,16 @@ type Auth struct {
 	// RuntimeDisableCooling carries the auth-scoped cooling override in minimal
 	// projections without serializing provider metadata or secrets.
 	RuntimeDisableCooling *bool `json:"-"`
+	// RuntimeRefreshBlocked preserves a credential-level refresh block in
+	// minimal projections without copying provider response diagnostics.
+	RuntimeRefreshBlocked bool `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
 	LastError *Error `json:"last_error,omitempty"`
+	// LastRefreshError preserves refresh acquisition diagnostics independently
+	// from ordinary execution results while refresh backoff remains active.
+	LastRefreshError *Error `json:"last_refresh_error,omitempty"`
 	// CreatedAt is the creation timestamp in UTC.
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is the last modification timestamp in UTC.
@@ -214,6 +220,8 @@ func (a *Auth) Clone() *Auth {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.LastError = cloneError(a.LastError)
+	copyAuth.LastRefreshError = cloneError(a.LastRefreshError)
 	if a.RuntimeDisableCooling != nil {
 		disableCooling := *a.RuntimeDisableCooling
 		copyAuth.RuntimeDisableCooling = &disableCooling
@@ -357,14 +365,7 @@ func (m *ModelState) Clone() *ModelState {
 		return nil
 	}
 	copyState := *m
-	if m.LastError != nil {
-		copyState.LastError = &Error{
-			Code:       m.LastError.Code,
-			Message:    m.LastError.Message,
-			Retryable:  m.LastError.Retryable,
-			HTTPStatus: m.LastError.HTTPStatus,
-		}
-	}
+	copyState.LastError = cloneError(m.LastError)
 	return &copyState
 }
 
@@ -556,8 +557,8 @@ func (a *Auth) AccountInfo() (string, string) {
 }
 
 // ExpirationTime attempts to extract the credential expiration timestamp from metadata.
-// It inspects common keys such as "expired", "expire", "expires_at", and also
-// nested "token" objects to remain compatible with legacy auth file formats.
+// It inspects common absolute expiry keys, expires_in plus timestamp, and nested
+// token objects to remain compatible with legacy auth file formats.
 func (a *Auth) ExpirationTime() (time.Time, bool) {
 	if a == nil {
 		return time.Time{}, false
@@ -599,6 +600,11 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 			}
 		}
 	}
+	if expiresIn, okExpiresIn := parseRelativeExpirySeconds(meta); okExpiresIn {
+		if timestamp, okTimestamp := parseRelativeExpiryTimestamp(meta); okTimestamp {
+			return timestamp.Add(time.Duration(expiresIn) * time.Second), true
+		}
+	}
 	for _, nestedKey := range []string{"token", "Token"} {
 		if nested, ok := meta[nestedKey]; ok {
 			switch val := nested.(type) {
@@ -614,6 +620,28 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 				if ts, ok1 := expirationFromMap(temp); ok1 {
 					return ts, true
 				}
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseRelativeExpirySeconds(meta map[string]any) (int, bool) {
+	for _, key := range []string{"expires_in", "expiresIn"} {
+		if value, ok := meta[key]; ok {
+			if seconds, okSeconds := parseIntAny(value); okSeconds && seconds > 0 {
+				return seconds, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func parseRelativeExpiryTimestamp(meta map[string]any) (time.Time, bool) {
+	for _, key := range []string{"timestamp", "issued_at", "issuedAt"} {
+		if value, ok := meta[key]; ok {
+			if timestamp, okTimestamp := parseTimeValue(value); okTimestamp && !timestamp.IsZero() {
+				return timestamp, true
 			}
 		}
 	}
@@ -667,6 +695,10 @@ func parseTimeValue(v any) (time.Time, bool) {
 			return normaliseUnix(unix), true
 		}
 	case float64:
+		return normaliseUnix(int64(value)), true
+	case int:
+		return normaliseUnix(int64(value)), true
+	case int32:
 		return normaliseUnix(int64(value)), true
 	case int64:
 		return normaliseUnix(value), true

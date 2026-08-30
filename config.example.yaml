@@ -2,8 +2,8 @@
 # Use "127.0.0.1" or "localhost" to restrict access to local machine only.
 host: ""
 
-# Server port
-port: 8327
+# CPA server port
+port: 8317
 
 # RESP client IP allowlist. When this list is empty, clients from any host can connect.
 # When one or more IP addresses are listed, only those client IPs are allowed to connect.

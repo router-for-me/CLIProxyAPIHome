@@ -11,7 +11,7 @@ func TestSanitizeConfigYAMLForDownstream_RemovesSensitiveKeys(t *testing.T) {
 	input := strings.TrimSpace(`
 # head comment
 host: ""
-port: 8327
+port: 8317
 disable-cooling: false
 tls:
   enable: false
@@ -84,7 +84,7 @@ plugins:
 	}
 
 	assertContains("host:")
-	assertContains("port:")
+	assertContains("port: 8317")
 	assertContains("usage-statistics-enabled: true")
 	assertContains("disable-cooling: true")
 	assertContains("ws-auth: false")
