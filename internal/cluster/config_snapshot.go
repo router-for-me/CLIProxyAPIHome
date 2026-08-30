@@ -177,6 +177,9 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 		return nil, nil, errNormalizeIDs
 	}
 	cfg.NormalizePluginsConfig()
+	if cfg.Port <= 0 {
+		cfg.Port = appconfig.DefaultCPAPort
+	}
 	cfg.NormalizeUserEmailConfig()
 	cfg.NormalizeTrustedProxies()
 	if errTrustedProxies := appconfig.ValidateTrustedProxies(cfg.TrustedProxies); errTrustedProxies != nil {

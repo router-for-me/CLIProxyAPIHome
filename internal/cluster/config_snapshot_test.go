@@ -35,6 +35,18 @@ func TestRuntimeConfigFromRootAppliesConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigFromRootNormalizesNonPositivePort(t *testing.T) {
+	for _, invalidPort := range []int{0, -1, -8317} {
+		cfg, _, errConfig := RuntimeConfigFromRoot(map[string]any{"port": invalidPort})
+		if errConfig != nil {
+			t.Fatalf("RuntimeConfigFromRoot(port=%d) error = %v", invalidPort, errConfig)
+		}
+		if cfg.Port != appconfig.DefaultCPAPort {
+			t.Fatalf("Port for %d = %d, want %d", invalidPort, cfg.Port, appconfig.DefaultCPAPort)
+		}
+	}
+}
+
 func TestRuntimeConfigFromRootPreservesConcurrencyLimiterConfig(t *testing.T) {
 	root := map[string]any{
 		"credential-concurrency": map[string]any{
