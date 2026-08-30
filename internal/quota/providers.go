@@ -61,6 +61,9 @@ func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (
 			if errRequest.code == "UPSTREAM_AUTH_REJECTED" || probeCtx.Err() != nil {
 				break
 			}
+			if deadline, ok := probeCtx.Deadline(); ok && !time.Now().Before(deadline) {
+				break
+			}
 			continue
 		}
 		windows, errParse := parseAntigravityWindows(payload, c.options.Now().UTC())

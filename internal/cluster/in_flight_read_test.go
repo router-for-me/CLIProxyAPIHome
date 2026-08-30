@@ -266,6 +266,15 @@ func TestReadInFlightObservationCloseReopenDuringReadSQLite(t *testing.T) {
 	if errOpenReader != nil {
 		t.Fatalf("open reader SQLite database: %v", errOpenReader)
 	}
+	readerSQL, errReaderDB := readerDB.DB()
+	if errReaderDB != nil {
+		t.Fatalf("reader db.DB() error = %v", errReaderDB)
+	}
+	t.Cleanup(func() {
+		if errClose := readerSQL.Close(); errClose != nil {
+			t.Errorf("close reader sqlite db: %v", errClose)
+		}
+	})
 	if errMigrate := AutoMigrate(readerDB); errMigrate != nil {
 		t.Fatalf("migrate reader SQLite database: %v", errMigrate)
 	}
@@ -273,6 +282,15 @@ func TestReadInFlightObservationCloseReopenDuringReadSQLite(t *testing.T) {
 	if errOpenWriter != nil {
 		t.Fatalf("open writer SQLite database: %v", errOpenWriter)
 	}
+	writerSQL, errWriterDB := writerDB.DB()
+	if errWriterDB != nil {
+		t.Fatalf("writer db.DB() error = %v", errWriterDB)
+	}
+	t.Cleanup(func() {
+		if errClose := writerSQL.Close(); errClose != nil {
+			t.Errorf("close writer sqlite db: %v", errClose)
+		}
+	})
 	repo, identity := newActiveInFlightTestRepositoryWithDatabase(t, readerDB)
 	testReadInFlightObservationCloseReopenDuringRead(t, repo, writerDB, identity)
 }

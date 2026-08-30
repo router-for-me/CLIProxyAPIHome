@@ -11,6 +11,15 @@ func TestConcurrencyObservationBarrierUpdatedAtIsRequired(t *testing.T) {
 	if errOpen != nil {
 		t.Fatalf("OpenSQLite() error = %v", errOpen)
 	}
+	sqlDB, errDB := db.DB()
+	if errDB != nil {
+		t.Fatalf("db.DB() error = %v", errDB)
+	}
+	t.Cleanup(func() {
+		if errClose := sqlDB.Close(); errClose != nil {
+			t.Errorf("close sqlite db: %v", errClose)
+		}
+	})
 	if errMigrate := AutoMigrate(db); errMigrate != nil {
 		t.Fatalf("AutoMigrate() error = %v", errMigrate)
 	}

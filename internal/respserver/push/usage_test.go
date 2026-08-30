@@ -3,6 +3,7 @@ package push
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -84,12 +85,14 @@ func TestSanitizeExistingUsageLogRemovesHistoricalProviderAPIKeySources(t *testi
 		t.Fatalf("late historical usage was not sanitized: %s", string(data))
 	}
 
-	info, errStat := os.Stat(filePath)
-	if errStat != nil {
-		t.Fatalf("stat sanitized usage log: %v", errStat)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("sanitized usage log mode = %o, want 600", info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		info, errStat := os.Stat(filePath)
+		if errStat != nil {
+			t.Fatalf("stat sanitized usage log: %v", errStat)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("sanitized usage log mode = %o, want 600", info.Mode().Perm())
+		}
 	}
 }
 

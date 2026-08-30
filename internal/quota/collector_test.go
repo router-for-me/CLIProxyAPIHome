@@ -422,8 +422,18 @@ func TestCollectorAuthRejectionBacksOffAndRecoversAfterTokenUpdate(t *testing.T)
 		Owner: "home-a", CodexUsageURL: server.URL + "/usage", CodexResetCreditsURL: server.URL + "/resets",
 		Now: func() time.Time { return now },
 	})
+	seedCollectorUsage := func(offset time.Duration) {
+		usageAt := time.Now().UTC().Add(offset)
+		usagePayload := fmt.Sprintf(`{"timestamp":%q,"provider":"codex","auth_type":"oauth","auth_index":%q}`, usageAt.Format(time.RFC3339Nano), candidate.ID)
+		if _, errAppend := repo.AppendUsageWithRuntime(context.Background(), usagePayload, cluster.UsageRuntimeMetadata{ReceivedAt: usageAt}); errAppend != nil {
+			t.Fatalf("AppendUsageWithRuntime() error = %v", errAppend)
+		}
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		attemptedAt := now
+		if attempt > 0 {
+			seedCollectorUsage(time.Duration(attempt) * time.Minute)
+		}
 		collector.collectCredential(context.Background(), candidate, false)
 		item, errGet := repo.GetQuotaCredential(context.Background(), candidate.ID, now)
 		if errGet != nil {
@@ -452,6 +462,7 @@ func TestCollectorAuthRejectionBacksOffAndRecoversAfterTokenUpdate(t *testing.T)
 		t.Fatalf("UpsertAuth(fresh token) error = %v", errUpsert)
 	}
 
+	seedCollectorUsage(2 * time.Minute)
 	collector.collectCredential(context.Background(), candidate, false)
 	item, errGet := repo.GetQuotaCredential(context.Background(), candidate.ID, now)
 	if errGet != nil {
