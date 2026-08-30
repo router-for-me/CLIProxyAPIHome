@@ -139,6 +139,167 @@ func TestRecordUsagePayloadUsesRetryDelayWhenAntigravityResetTimestampMissing(t 
 	}
 }
 
+func TestRecordUsagePayloadUsesCodexQuotaResetTimestamp(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-codex-reset-auth",
+		Index:    "usage-codex-reset-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	resetAt := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Second)
+	body := fmt.Sprintf(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":%d,"resets_in_seconds":30}}`, resetAt.Unix())
+	encodedBody, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal(error body) error = %v", errMarshal)
+	}
+	rt.RecordUsagePayload(context.Background(), fmt.Sprintf(`{
+		"auth_index": "usage-codex-reset-index",
+		"provider": "codex",
+		"model": "gpt-5",
+		"failed": true,
+		"fail": {
+			"status_code": 429,
+			"body": %s
+		}
+	}`, encodedBody))
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gpt-5"]
+	if state == nil {
+		t.Fatalf("ModelStates[gpt-5] missing after usage payload: %#v", got.ModelStates)
+	}
+	if !state.NextRetryAfter.Equal(resetAt) {
+		t.Fatalf("ModelStates[gpt-5].NextRetryAfter = %v, want %v", state.NextRetryAfter, resetAt)
+	}
+	if !state.Quota.NextRecoverAt.Equal(state.NextRetryAfter) {
+		t.Fatalf("Quota.NextRecoverAt = %v, want %v", state.Quota.NextRecoverAt, state.NextRetryAfter)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
+	}
+}
+
+func TestRecordUsagePayloadUsesRetryDelayWhenCodexResetTimestampMissing(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-codex-relative-auth",
+		Index:    "usage-codex-relative-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	before := time.Now()
+	rt.RecordUsagePayload(context.Background(), `{
+		"auth_index": "usage-codex-relative-index",
+		"provider": "codex",
+		"model": "gpt-5",
+		"failed": true,
+		"fail": {
+			"status_code": 429,
+			"body": "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_in_seconds\":7200}}"
+		}
+	}`)
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gpt-5"]
+	if state == nil {
+		t.Fatalf("ModelStates[gpt-5] missing after usage payload: %#v", got.ModelStates)
+	}
+	delay := state.NextRetryAfter.Sub(before)
+	if delay < 119*time.Minute || delay > 121*time.Minute {
+		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want ~2h", delay)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
+	}
+}
+
+func TestRecordUsagePayloadTransientCodexRateLimitKeepsExponentialBackoff(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-codex-transient-auth",
+		Index:    "usage-codex-transient-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	before := time.Now()
+	rt.RecordUsagePayload(context.Background(), `{
+		"auth_index": "usage-codex-transient-index",
+		"provider": "codex",
+		"model": "gpt-5",
+		"failed": true,
+		"fail": {
+			"status_code": 429,
+			"body": "{\"error\":{\"type\":\"rate_limit_error\",\"resets_in_seconds\":999999}}"
+		}
+	}`)
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gpt-5"]
+	if state == nil {
+		t.Fatalf("ModelStates[gpt-5] missing after usage payload: %#v", got.ModelStates)
+	}
+	delay := state.NextRetryAfter.Sub(before)
+	if delay < 500*time.Millisecond || delay > 3*time.Second {
+		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want first exponential backoff (1s)", delay)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
+	}
+}
+
+func TestRecordUsagePayloadCodexHintsExceedingMaxHorizonFallbackToExponential(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-codex-horizon-auth",
+		Index:    "usage-codex-horizon-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	// resets_at > 60 days (e.g. 90 days), and resets_in_seconds > 60 days
+	farFuture := time.Now().UTC().Add(90 * 24 * time.Hour)
+	before := time.Now()
+	rt.RecordUsagePayload(context.Background(), fmt.Sprintf(`{
+		"auth_index": "usage-codex-horizon-index",
+		"provider": "codex",
+		"model": "gpt-5",
+		"failed": true,
+		"fail": {
+			"status_code": 429,
+			"body": "{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":%d,\"resets_in_seconds\":7776000}}"
+		}
+	}`, farFuture.Unix()))
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gpt-5"]
+	if state == nil {
+		t.Fatalf("ModelStates[gpt-5] missing after usage payload: %#v", got.ModelStates)
+	}
+	delay := state.NextRetryAfter.Sub(before)
+	if delay < 500*time.Millisecond || delay > 3*time.Second {
+		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want fallback exponential backoff (1s)", delay)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
+	}
+}
+
 func TestRecordUsagePayloadIgnoresUnauthorizedFromOlderToken(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-stale-auth",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,10 +14,11 @@ import (
 )
 
 const (
-	quotaBackoffBase         = time.Second
-	quotaBackoffMax          = 30 * time.Minute
-	unauthorizedRetryBackoff = time.Minute
-	quotaScopeModel          = "model"
+	quotaBackoffBase            = time.Second
+	quotaBackoffMax             = 30 * time.Minute
+	unauthorizedRetryBackoff    = time.Minute
+	quotaScopeModel             = "model"
+	providerQuotaHintMaxHorizon = 60 * 24 * time.Hour
 )
 
 // Result captures an upstream execution result reported by a downstream CPA node.
@@ -382,13 +384,13 @@ func (m *Manager) reconcileCoveredCooldownAfterResult(ctx context.Context, authI
 }
 
 // authQuotaWindowOpen reports whether the auth (or the given model state)
-// already tracks an unexpired quota cooldown window.
+// already tracks an unexpired quota cooldown window within the maximum horizon.
 func authQuotaWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
 	if auth == nil || resultModel == "" {
 		return false
 	}
 	state := auth.ModelStates[resultModel]
-	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now)
+	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) && state.Quota.NextRecoverAt.Sub(now) <= providerQuotaHintMaxHorizon
 }
 
 // authHasClearableAvailabilityState reports whether a success outcome would
@@ -948,6 +950,9 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 	if disableCooling {
 		return 0, prevLevel
 	}
+	if prevLevel >= 11 {
+		return quotaBackoffMax, prevLevel
+	}
 	cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
 	if cooldown < quotaBackoffBase {
 		cooldown = quotaBackoffBase
@@ -962,11 +967,11 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 // a quota failure observed at now. Failures that land while a previous quota
 // window is still open reuse that window instead of escalating, so a burst of
 // concurrent failures advances the backoff ladder at most once per window.
-// Future Antigravity reset timestamps are authoritative and suppress relative
+// Future provider reset timestamps are authoritative and suppress relative
 // retry delays. Without one, the later of exponential backoff and RetryAfter
 // is used. Open windows keep their backoff level and are never shortened.
 func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (time.Time, int) {
-	windowOpen := quota.NextRecoverAt.After(now)
+	windowOpen := quota.NextRecoverAt.After(now) && quota.NextRecoverAt.Sub(now) <= providerQuotaHintMaxHorizon
 	deadline := quota.NextRecoverAt
 	nextLevel := quota.BackoffLevel
 	if !windowOpen {
@@ -975,17 +980,20 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 		nextLevel = level
 	}
 
-	if !strings.EqualFold(strings.TrimSpace(result.Provider), "antigravity") {
+	provider := strings.ToLower(strings.TrimSpace(result.Provider))
+	if provider != "antigravity" && provider != "codex" {
 		return deadline, nextLevel
 	}
 	if result.ResetAt != nil && result.ResetAt.After(now) {
 		resetAt := result.ResetAt.UTC()
-		if !windowOpen || resetAt.After(deadline) {
-			deadline = resetAt
+		if resetAt.Sub(now) <= providerQuotaHintMaxHorizon {
+			if resetAt.After(deadline) {
+				deadline = resetAt
+			}
+			return deadline, nextLevel
 		}
-		return deadline, nextLevel
 	}
-	if result.RetryAfter != nil && *result.RetryAfter > 0 {
+	if result.RetryAfter != nil && *result.RetryAfter > 0 && *result.RetryAfter <= providerQuotaHintMaxHorizon {
 		if retryAt := now.Add(*result.RetryAfter); retryAt.After(deadline) {
 			deadline = retryAt
 		}
@@ -1034,36 +1042,68 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 }
 
 func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {
-	if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") || statusCode != http.StatusTooManyRequests || !gjson.Valid(body) {
+	if statusCode != http.StatusTooManyRequests || !gjson.Valid(body) {
 		return nil, nil
 	}
-	details := gjson.Get(body, "error.details")
-	if !details.Exists() || !details.IsArray() {
-		return nil, nil
-	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "antigravity":
+		details := gjson.Get(body, "error.details")
+		if !details.Exists() || !details.IsArray() {
+			return nil, nil
+		}
 
-	var retryAfter *time.Duration
-	var resetAt *time.Time
-	for _, detail := range details.Array() {
-		switch detail.Get("@type").String() {
-		case "type.googleapis.com/google.rpc.RetryInfo":
-			if retryAfter == nil {
-				retryAfter = parseDurationPointer(detail.Get("retryDelay").String())
-			}
-		case "type.googleapis.com/google.rpc.ErrorInfo":
-			if resetAt == nil {
-				value := strings.TrimSpace(detail.Get("metadata.quotaResetTimeStamp").String())
-				if value != "" {
-					parsedResetAt, errParse := time.Parse(time.RFC3339Nano, value)
-					if errParse == nil {
-						parsedResetAt = parsedResetAt.UTC()
-						resetAt = &parsedResetAt
+		var retryAfter *time.Duration
+		var resetAt *time.Time
+		for _, detail := range details.Array() {
+			switch detail.Get("@type").String() {
+			case "type.googleapis.com/google.rpc.RetryInfo":
+				if retryAfter == nil {
+					retryAfter = parseDurationPointer(detail.Get("retryDelay").String())
+				}
+			case "type.googleapis.com/google.rpc.ErrorInfo":
+				if resetAt == nil {
+					value := strings.TrimSpace(detail.Get("metadata.quotaResetTimeStamp").String())
+					if value != "" {
+						parsedResetAt, errParse := time.Parse(time.RFC3339Nano, value)
+						if errParse == nil {
+							parsedResetAt = parsedResetAt.UTC()
+							resetAt = &parsedResetAt
+						}
 					}
 				}
 			}
 		}
+		return retryAfter, resetAt
+	case "codex":
+		if strings.TrimSpace(gjson.Get(body, "error.type").String()) != "usage_limit_reached" {
+			return nil, nil
+		}
+		var resetAt *time.Time
+		if seconds, ok := parseUsageHintSeconds(gjson.Get(body, "error.resets_at")); ok {
+			parsedResetAt := time.Unix(seconds, 0).UTC()
+			resetAt = &parsedResetAt
+		}
+		var retryAfter *time.Duration
+		if seconds, ok := parseUsageHintSeconds(gjson.Get(body, "error.resets_in_seconds")); ok {
+			duration := time.Duration(seconds) * time.Second
+			retryAfter = &duration
+		}
+		return retryAfter, resetAt
+	default:
+		return nil, nil
 	}
-	return retryAfter, resetAt
+}
+
+func parseUsageHintSeconds(value gjson.Result) (int64, bool) {
+	if value.Type != gjson.Number {
+		return 0, false
+	}
+	seconds, errParse := strconv.ParseInt(value.Raw, 10, 64)
+	const maxSeconds = int64(1<<63-1) / int64(time.Second)
+	if errParse != nil || seconds <= 0 || seconds > maxSeconds {
+		return 0, false
+	}
+	return seconds, true
 }
 
 func parseDurationPointer(value string) *time.Duration {
