@@ -124,7 +124,7 @@ func TestQuotaCooldownAfterFailureCodexOpenWindowExtendsAndNeverShortens(t *test
 	now := time.Date(2026, 8, 4, 9, 2, 7, 0, time.UTC)
 	open := QuotaState{
 		Exceeded:      true,
-		NextRecoverAt: now.Add(time.Hour),
+		NextRecoverAt: now.Add(10 * time.Minute),
 		BackoffLevel:  3,
 	}
 
@@ -134,16 +134,22 @@ func TestQuotaCooldownAfterFailureCodexOpenWindowExtendsAndNeverShortens(t *test
 		t.Fatalf("shorter delay changed open window: deadline = %v, level = %d", deadline, level)
 	}
 
+	medium := 20 * time.Minute
+	deadline, level = quotaCooldownAfterFailure(open, now, Result{Provider: "codex", RetryAfter: &medium})
+	if !deadline.Equal(now.Add(medium)) || level != 3 {
+		t.Fatalf("medium delay failed to extend open window: deadline = %v, level = %d", deadline, level)
+	}
+
 	long := 72 * time.Hour
 	deadline, level = quotaCooldownAfterFailure(open, now, Result{Provider: "codex", RetryAfter: &long})
-	if !deadline.Equal(now.Add(long)) || level != 3 {
-		t.Fatalf("longer delay failed to extend open window: deadline = %v, level = %d", deadline, level)
+	if !deadline.Equal(now.Add(30*time.Minute)) || level != 3 {
+		t.Fatalf("longer delay failed to clamp and extend open window: deadline = %v, level = %d", deadline, level)
 	}
 
 	futureReset := now.Add(96 * time.Hour)
 	deadline, level = quotaCooldownAfterFailure(open, now, Result{Provider: "codex", ResetAt: &futureReset})
-	if !deadline.Equal(futureReset) || level != 3 {
-		t.Fatalf("longer reset timestamp failed to extend open window: deadline = %v, level = %d", deadline, level)
+	if !deadline.Equal(now.Add(30*time.Minute)) || level != 3 {
+		t.Fatalf("longer reset timestamp failed to clamp and extend open window: deadline = %v, level = %d", deadline, level)
 	}
 }
 
