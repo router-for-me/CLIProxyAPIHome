@@ -148,7 +148,7 @@ func TestRecordUsagePayloadUsesCodexQuotaResetTimestamp(t *testing.T) {
 	}
 	rt := newUsageResultTestRuntime(t, auth)
 
-	resetAt := time.Now().UTC().Add(10 * time.Minute).Truncate(time.Second)
+	resetAt := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Second)
 	body := fmt.Sprintf(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":%d,"resets_in_seconds":30}}`, resetAt.Unix())
 	encodedBody, errMarshal := json.Marshal(body)
 	if errMarshal != nil {
@@ -201,7 +201,7 @@ func TestRecordUsagePayloadUsesRetryDelayWhenCodexResetTimestampMissing(t *testi
 		"failed": true,
 		"fail": {
 			"status_code": 429,
-			"body": "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_in_seconds\":600}}"
+			"body": "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_in_seconds\":7200}}"
 		}
 	}`)
 
@@ -214,8 +214,8 @@ func TestRecordUsagePayloadUsesRetryDelayWhenCodexResetTimestampMissing(t *testi
 		t.Fatalf("ModelStates[gpt-5] missing after usage payload: %#v", got.ModelStates)
 	}
 	delay := state.NextRetryAfter.Sub(before)
-	if delay < 9*time.Minute || delay > 11*time.Minute {
-		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want ~10m", delay)
+	if delay < 119*time.Minute || delay > 121*time.Minute {
+		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want ~2h", delay)
 	}
 	if state.Quota.BackoffLevel != 1 {
 		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)
@@ -260,7 +260,7 @@ func TestRecordUsagePayloadTransientCodexRateLimitKeepsExponentialBackoff(t *tes
 	}
 }
 
-func TestRecordUsagePayloadCodexHintsExceedingMaxHorizonClampedToThirtyMinutes(t *testing.T) {
+func TestRecordUsagePayloadCodexHintsExceedingMaxHorizonFallbackToExponential(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-codex-horizon-auth",
 		Index:    "usage-codex-horizon-index",
@@ -269,8 +269,8 @@ func TestRecordUsagePayloadCodexHintsExceedingMaxHorizonClampedToThirtyMinutes(t
 	}
 	rt := newUsageResultTestRuntime(t, auth)
 
-	// resets_at > 30m (e.g. 72 hours), and resets_in_seconds > 30m (e.g. 72 hours)
-	farFuture := time.Now().UTC().Add(72 * time.Hour)
+	// resets_at > 60 days (e.g. 90 days), and resets_in_seconds > 60 days
+	farFuture := time.Now().UTC().Add(90 * 24 * time.Hour)
 	before := time.Now()
 	rt.RecordUsagePayload(context.Background(), fmt.Sprintf(`{
 		"auth_index": "usage-codex-horizon-index",
@@ -279,7 +279,7 @@ func TestRecordUsagePayloadCodexHintsExceedingMaxHorizonClampedToThirtyMinutes(t
 		"failed": true,
 		"fail": {
 			"status_code": 429,
-			"body": "{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":%d,\"resets_in_seconds\":259200}}"
+			"body": "{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":%d,\"resets_in_seconds\":7776000}}"
 		}
 	}`, farFuture.Unix()))
 
@@ -292,8 +292,8 @@ func TestRecordUsagePayloadCodexHintsExceedingMaxHorizonClampedToThirtyMinutes(t
 		t.Fatalf("ModelStates[gpt-5] missing after usage payload: %#v", got.ModelStates)
 	}
 	delay := state.NextRetryAfter.Sub(before)
-	if delay < 29*time.Minute || delay > 31*time.Minute {
-		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want clamped 30m horizon", delay)
+	if delay < 500*time.Millisecond || delay > 3*time.Second {
+		t.Fatalf("ModelStates[gpt-5].NextRetryAfter delay = %v, want fallback exponential backoff (1s)", delay)
 	}
 	if state.Quota.BackoffLevel != 1 {
 		t.Fatalf("Quota.BackoffLevel = %d, want first exponential level", state.Quota.BackoffLevel)

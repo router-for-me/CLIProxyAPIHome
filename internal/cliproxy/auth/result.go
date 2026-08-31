@@ -19,15 +19,7 @@ const (
 	unauthorizedRetryBackoff    = time.Minute
 	quotaScopeModel             = "model"
 	providerQuotaHintMaxHorizon = 60 * 24 * time.Hour
-	codexQuotaHintMaxHorizon    = quotaBackoffMax
 )
-
-func maxQuotaHorizon(provider string) time.Duration {
-	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
-		return codexQuotaHintMaxHorizon
-	}
-	return providerQuotaHintMaxHorizon
-}
 
 // Result captures an upstream execution result reported by a downstream CPA node.
 type Result struct {
@@ -86,9 +78,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		unlockUpdate()
 		return
 	}
-	if auth.Provider != "" {
-		result.Provider = auth.Provider
-	}
 	var mutator StateMutator
 	stateMutatorAvailable := false
 	disableCooling = m.quotaCooldownDisabledForAuth(auth)
@@ -130,11 +119,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
 			before := availabilityFingerprint(persisted, resultModel)
 			baseVersion := persisted.StateVersion
-			mutationResult := result
-			if persisted != nil && persisted.Provider != "" {
-				mutationResult.Provider = persisted.Provider
-			}
-			transition = m.applyResultTransition(persisted, mutationResult, resultModel, now, disableCooling)
+			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
 			changed := availabilityFingerprint(persisted, resultModel) != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
@@ -405,7 +390,7 @@ func authQuotaWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
 		return false
 	}
 	state := auth.ModelStates[resultModel]
-	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) && state.Quota.NextRecoverAt.Sub(now) <= maxQuotaHorizon(auth.Provider)
+	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) && state.Quota.NextRecoverAt.Sub(now) <= providerQuotaHintMaxHorizon
 }
 
 // authHasClearableAvailabilityState reports whether a success outcome would
@@ -984,12 +969,9 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 // concurrent failures advances the backoff ladder at most once per window.
 // Future provider reset timestamps are authoritative and suppress relative
 // retry delays. Without one, the later of exponential backoff and RetryAfter
-// is used. Reset hints exceeding the provider maximum quota horizon are clamped
-// to the horizon (e.g. 30m for Codex). Open windows keep their backoff level and
-// are never shortened.
+// is used. Open windows keep their backoff level and are never shortened.
 func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (time.Time, int) {
-	horizon := maxQuotaHorizon(result.Provider)
-	windowOpen := quota.Exceeded && quota.NextRecoverAt.After(now) && quota.NextRecoverAt.Sub(now) <= horizon
+	windowOpen := quota.NextRecoverAt.After(now) && quota.NextRecoverAt.Sub(now) <= providerQuotaHintMaxHorizon
 	deadline := quota.NextRecoverAt
 	nextLevel := quota.BackoffLevel
 	if !windowOpen {
@@ -1004,20 +986,15 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 	}
 	if result.ResetAt != nil && result.ResetAt.After(now) {
 		resetAt := result.ResetAt.UTC()
-		if resetAt.Sub(now) > horizon {
-			resetAt = now.Add(horizon)
+		if resetAt.Sub(now) <= providerQuotaHintMaxHorizon {
+			if resetAt.After(deadline) {
+				deadline = resetAt
+			}
+			return deadline, nextLevel
 		}
-		if resetAt.After(deadline) {
-			deadline = resetAt
-		}
-		return deadline, nextLevel
 	}
-	if result.RetryAfter != nil && *result.RetryAfter > 0 {
-		retryDelay := *result.RetryAfter
-		if retryDelay > horizon {
-			retryDelay = horizon
-		}
-		if retryAt := now.Add(retryDelay); retryAt.After(deadline) {
+	if result.RetryAfter != nil && *result.RetryAfter > 0 && *result.RetryAfter <= providerQuotaHintMaxHorizon {
+		if retryAt := now.Add(*result.RetryAfter); retryAt.After(deadline) {
 			deadline = retryAt
 		}
 	}

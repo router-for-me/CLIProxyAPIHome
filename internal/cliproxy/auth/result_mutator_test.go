@@ -302,7 +302,7 @@ func TestMarkResultCodexFullRetryHintsReuseSharedResetWindow(t *testing.T) {
 		t.Fatalf("Register() error = %v", errRegister)
 	}
 
-	retryAfter := 10 * time.Minute
+	retryAfter := 72 * time.Hour
 	resetAt := time.Now().UTC().Add(retryAfter).Truncate(time.Second)
 	result := quotaResult(authID, model)
 	result.Provider = "codex"
@@ -368,7 +368,7 @@ func TestMarkResultCodexRetryDelayExtendsOpenSharedWindow(t *testing.T) {
 		t.Fatalf("first 429 failed to establish quota window: %#v", firstSnapshot)
 	}
 
-	// Second concurrent 429 arrives within the short window carrying a large retry delay (72h), clamped to 30m.
+	// Second concurrent 429 arrives within the short window carrying a large retry delay (72h).
 	retryAfter := 72 * time.Hour
 	beforeSecond := time.Now()
 	manager.MarkResult(ctx, Result{
@@ -384,8 +384,8 @@ func TestMarkResultCodexRetryDelayExtendsOpenSharedWindow(t *testing.T) {
 	if extended == nil {
 		t.Fatalf("extended state is missing")
 	}
-	if extended.NextRetryAfter.Before(beforeSecond.Add(29*time.Minute)) || extended.NextRetryAfter.After(beforeSecond.Add(31*time.Minute)) {
-		t.Fatalf("NextRetryAfter = %v, want clamped to about 30m after failure", extended.NextRetryAfter)
+	if extended.NextRetryAfter.Before(beforeSecond.Add(retryAfter - time.Minute)) {
+		t.Fatalf("NextRetryAfter = %v, want extended to about 72h after failure", extended.NextRetryAfter)
 	}
 	if !extended.Quota.NextRecoverAt.Equal(extended.NextRetryAfter) {
 		t.Fatalf("Quota.NextRecoverAt = %v, want %v", extended.Quota.NextRecoverAt, extended.NextRetryAfter)
@@ -397,7 +397,7 @@ func TestMarkResultCodexRetryDelayExtendsOpenSharedWindow(t *testing.T) {
 		t.Fatalf("mutation attempts = %d, want 2", attempts)
 	}
 
-	// A third 429 with a shorter retry delay (5s) should NOT shorten the 30m window.
+	// A third 429 with a shorter retry delay (5s) should NOT shorten the 72h window.
 	shortRetry := 5 * time.Second
 	manager.MarkResult(ctx, Result{
 		AuthID:     authID,
@@ -450,8 +450,8 @@ func TestMarkResultCodexRetryDelayCrossManagerExtension(t *testing.T) {
 		t.Fatalf("mutation attempts after initial 429 = %d, want 1", attempts)
 	}
 
-	// 2. Node B receives a Codex 429 carrying a 20-minute reset timestamp -> extends the shared store.
-	retryAfter := 20 * time.Minute
+	// 2. Node B receives a Codex 429 carrying a 72-hour reset timestamp -> extends the shared store.
+	retryAfter := 72 * time.Hour
 	resetAt := time.Now().UTC().Add(retryAfter).Truncate(time.Second)
 	nodeB.MarkResult(ctx, Result{
 		AuthID:     authID,
@@ -470,8 +470,8 @@ func TestMarkResultCodexRetryDelayCrossManagerExtension(t *testing.T) {
 		t.Fatalf("mutation attempts after node B extension = %d, want 2", attempts)
 	}
 
-	// 3. Node A receives another 429 with the same 20m hint -> its local 10m window is earlier than
-	// the hint, so it triggers global transition, sees the store already at 20m, and adopts it.
+	// 3. Node A receives another 429 with the same 72h hint -> its local 1s window is earlier than
+	// the hint, so it triggers global transition, sees the store already at 72h, and adopts it.
 	nodeA.MarkResult(ctx, Result{
 		AuthID:     authID,
 		Provider:   "codex",
@@ -485,7 +485,7 @@ func TestMarkResultCodexRetryDelayCrossManagerExtension(t *testing.T) {
 	if !ok || localA == nil || localA.ModelStates[model] == nil || !localA.ModelStates[model].NextRetryAfter.Equal(resetAt) {
 		t.Fatalf("node A failed to adopt extended reset deadline: %#v, want %v", localA, resetAt)
 	}
-	// The shared row was already at 20m, so the mutator performed no new mutation on the row.
+	// The shared row was already at 72h, so the mutator performed no new mutation on the row.
 	if mutations := store.mutationCount(); mutations != 2 {
 		t.Fatalf("changed mutations after node A sync = %d, want 2", mutations)
 	}
