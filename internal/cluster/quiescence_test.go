@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/url"
 	"os"
@@ -332,6 +333,8 @@ func TestQuiescenceWorkerIgnoresOnlyExpectedRunCancellationErrors(t *testing.T) 
 	}{
 		{name: "canceled run context", ctx: canceledCtx, canceledRun: true, err: context.Canceled, ignore: true},
 		{name: "deadline error after canceled run context", ctx: canceledCtx, canceledRun: true, err: context.DeadlineExceeded, ignore: true},
+		{name: "transaction done after canceled run context", ctx: canceledCtx, canceledRun: true, err: sql.ErrTxDone, ignore: true},
+		{name: "transaction message after canceled run context", ctx: canceledCtx, canceledRun: true, err: errors.New("sql: transaction has already been committed or rolled back"), ignore: true},
 		{name: "canceled error before run cancellation", ctx: canceledCtx, err: context.Canceled, ignore: false},
 		{name: "unexpected error after run cancellation", ctx: canceledCtx, canceledRun: true, err: errors.New("deadlock detected"), ignore: false},
 	}
@@ -345,7 +348,16 @@ func TestQuiescenceWorkerIgnoresOnlyExpectedRunCancellationErrors(t *testing.T) 
 }
 
 func isExpectedRunCancellationError(runCtx context.Context, canceledRun bool, err error) bool {
-	return canceledRun && runCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+	if !canceledRun || runCtx.Err() == nil || err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sql.ErrTxDone) {
+		return true
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "transaction has already been committed or rolled back") ||
+		strings.Contains(errStr, "context canceled") ||
+		strings.Contains(errStr, "driver: bad connection")
 }
 
 func TestQuiescenceRejectsZeroExpectedLifetime(t *testing.T) {

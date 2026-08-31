@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -98,22 +99,57 @@ func TestMarkResultQuotaBackoffEscalatesAfterWindowExpiry(t *testing.T) {
 func TestQuotaCooldownAfterFailureKeepsBackoffFloorForShortRetryDelay(t *testing.T) {
 	now := time.Date(2026, time.August, 29, 0, 0, 0, 0, time.UTC)
 	retryAfter := time.Second
-	result := Result{
-		Provider:   "antigravity",
-		RetryAfter: &retryAfter,
+	for _, provider := range []string{"antigravity", "codex"} {
+		result := Result{
+			Provider:   provider,
+			RetryAfter: &retryAfter,
+		}
+		quota := QuotaState{}
+		for index, wantDelay := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second} {
+			deadline, level := quotaCooldownAfterFailure(quota, now, result)
+			if delay := deadline.Sub(now); delay != wantDelay {
+				t.Fatalf("%s failure %d delay = %v, want %v", provider, index+1, delay, wantDelay)
+			}
+			if wantLevel := index + 1; level != wantLevel {
+				t.Fatalf("%s failure %d BackoffLevel = %d, want %d", provider, index+1, level, wantLevel)
+			}
+			quota.NextRecoverAt = deadline
+			quota.BackoffLevel = level
+			now = deadline.Add(time.Nanosecond)
+		}
 	}
-	quota := QuotaState{}
-	for index, wantDelay := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second} {
-		deadline, level := quotaCooldownAfterFailure(quota, now, result)
-		if delay := deadline.Sub(now); delay != wantDelay {
-			t.Fatalf("failure %d delay = %v, want %v", index+1, delay, wantDelay)
-		}
-		if wantLevel := index + 1; level != wantLevel {
-			t.Fatalf("failure %d BackoffLevel = %d, want %d", index+1, level, wantLevel)
-		}
-		quota.NextRecoverAt = deadline
-		quota.BackoffLevel = level
-		now = deadline.Add(time.Nanosecond)
+}
+
+func TestQuotaCooldownAfterFailureCodexOpenWindowExtendsAndNeverShortens(t *testing.T) {
+	now := time.Date(2026, 8, 4, 9, 2, 7, 0, time.UTC)
+	open := QuotaState{
+		Exceeded:      true,
+		NextRecoverAt: now.Add(10 * time.Minute),
+		BackoffLevel:  3,
+	}
+
+	short := 5 * time.Second
+	deadline, level := quotaCooldownAfterFailure(open, now, Result{Provider: "codex", RetryAfter: &short})
+	if !deadline.Equal(open.NextRecoverAt) || level != 3 {
+		t.Fatalf("shorter delay changed open window: deadline = %v, level = %d", deadline, level)
+	}
+
+	medium := 20 * time.Minute
+	deadline, level = quotaCooldownAfterFailure(open, now, Result{Provider: "codex", RetryAfter: &medium})
+	if !deadline.Equal(now.Add(medium)) || level != 3 {
+		t.Fatalf("medium delay failed to extend open window: deadline = %v, level = %d", deadline, level)
+	}
+
+	long := 72 * time.Hour
+	deadline, level = quotaCooldownAfterFailure(open, now, Result{Provider: "codex", RetryAfter: &long})
+	if !deadline.Equal(now.Add(30*time.Minute)) || level != 3 {
+		t.Fatalf("longer delay failed to clamp and extend open window: deadline = %v, level = %d", deadline, level)
+	}
+
+	futureReset := now.Add(96 * time.Hour)
+	deadline, level = quotaCooldownAfterFailure(open, now, Result{Provider: "codex", ResetAt: &futureReset})
+	if !deadline.Equal(now.Add(30*time.Minute)) || level != 3 {
+		t.Fatalf("longer reset timestamp failed to clamp and extend open window: deadline = %v, level = %d", deadline, level)
 	}
 }
 
@@ -130,6 +166,11 @@ func TestNextQuotaCooldownLadder(t *testing.T) {
 		{10, 1024 * time.Second, 11},
 		{11, quotaBackoffMax, 11},
 		{20, quotaBackoffMax, 20},
+		{62, quotaBackoffMax, 62},
+		{63, quotaBackoffMax, 63},
+		{64, quotaBackoffMax, 64},
+		{100, quotaBackoffMax, 100},
+		{math.MaxInt, quotaBackoffMax, math.MaxInt},
 	}
 	for _, tc := range cases {
 		cooldown, level := nextQuotaCooldown(tc.prevLevel, false)

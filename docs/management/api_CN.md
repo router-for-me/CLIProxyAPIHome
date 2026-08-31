@@ -2730,7 +2730,7 @@ Token 替换更严格：只要任意 header 包含 `$TOKEN$`，`auth_index` 就�
 
 清除一个凭证中由 Home 管理的执行 quota cooldown。不带 query 参数时，会清除全部模型的 quota cooldown；带 `?model=<model>` 时，会先移除请求选项后缀（例如 `(high)`），再按目标凭证把公开 alias 或 prefix 解析为 canonical upstream model 后查找。若兼容用的 route-model key 与 upstream key 不同，也会一并清除。
 
-执行 cooldown 始终限定到 credential 与 canonical model 的组合；Home 不会创建凭证级执行 cooldown。缺少 canonical model 的 CPA 执行结果不会进入 cooldown 状态机。有效策略优先采用凭证/provider 的显式 `disable-cooling`，没有覆盖时才继承全局值：`true` 会让受覆盖的请求错误及 429 结果保持可调度，并在 auth reload 时清除已有且受覆盖的请求错误和 quota cooldown；`false` 会显式启用冷却。启用冷却时，HTTP 429 使用有上限的模型级指数退避，不使用 `Retry-After` 或 provider `retryDelay` 提示进行调度。HTTP 401 与 model-not-supported 的恢复逻辑不受影响。
+执行 cooldown 始终限定到 credential 与 canonical model 的组合；Home 不会创建凭证级执行 cooldown。缺少 canonical model 的 CPA 执行结果不会进入 cooldown 状态机。有效策略优先采用凭证/provider 的显式 `disable-cooling`，没有覆盖时才继承全局值：`true` 会让受覆盖的请求错误及 429 结果保持可调度，并在 auth reload 时清除已有且受覆盖的请求错误和 quota cooldown；`false` 会显式启用冷却。启用冷却时，HTTP 429 优先采用权威的 Provider quota 重置提示（例如 Antigravity 最长支持 60 天上限、Codex 上限 clamp 为 30 分钟），并以有上限的模型级指数退避作为最小兜底。HTTP 401 与 model-not-supported 的恢复逻辑不受影响。
 
 该操作是幂等的，只清除 quota-exceeded/HTTP 429 产生的 cooldown 状态，包括 quota 标记、retry deadline 和 backoff level。它不会启用人工 disabled 的凭证，不会清除模型级 401/403/404/5xx 状态，不会改变 refresh 调度、修改 provider quota snapshot，也不会消费 provider reset credit。
 
