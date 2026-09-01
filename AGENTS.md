@@ -63,3 +63,4 @@ go build -o test-output ./cmd/home && rm test-output # Verify compile after Go c
 - Use logrus structured logging where helpful, and never leak secrets, tokens, API keys, or certificate material in logs.
 - Avoid panics in HTTP handlers; prefer logged errors and meaningful HTTP status codes.
 - Keep network timeout behavior consistent with the existing runtime. Do not add broad upstream timeouts after an upstream connection is established unless the existing code path already has an intentional exception.
+- Avoid wall-clock `time.Sleep` in TTL, expiration, ordering, or cache-eviction unit tests due to platform timer granularity (e.g. Windows default timer resolution of ~15.6ms) and CI jitter under load; prefer controllable clocks (`nowFunc` / mock clock), explicit timestamp manipulation, or deterministic synchronization primitives.
