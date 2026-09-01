@@ -101,6 +101,10 @@ The table below is extracted from the final Home route registry built by `intern
 | Method | Path |
 | --- | --- |
 | `GET` | `/anthropic-auth-url` |
+| `DELETE` | `/antigravity` |
+| `GET` | `/antigravity` |
+| `PATCH` | `/antigravity` |
+| `PUT` | `/antigravity` |
 | `GET` | `/antigravity-auth-url` |
 | `POST` | `/api-call` |
 | `GET` | `/api-key-usage` |
@@ -367,6 +371,9 @@ Example response:
   },
   "antigravity-signature-cache-enabled": true,
   "antigravity-signature-bypass-strict": false,
+  "antigravity": {
+    "sensitive-words": ["word"]
+  },
   "gemini-api-key": [],
   "interactions-api-key": [],
   "codex-api-key": [],
@@ -551,6 +558,32 @@ Port changes require a CPA restart: `PUT/PATCH /port` persists and distributes t
 `PATCH /payload` accepts the same body shapes and applies object merge-patch semantics to the existing `payload` root: submitted object fields are merged recursively, `null` removes a field, arrays are replaced as whole values, and sibling fields not present in the patch are preserved. This lets clients update one section, such as `filter`, without deleting `default`, `override`, or advanced matcher fields.
 
 `DELETE /payload` removes the root from the config snapshot.
+
+Successful writes return:
+
+```json
+{ "status": "ok" }
+```
+
+### `/antigravity` Config Root
+
+`GET /antigravity` returns:
+
+```json
+{
+  "antigravity": {
+    "sensitive-words": ["API", "proxy"]
+  }
+}
+```
+
+`GET /antigravity` returns the persisted `antigravity` provider config root.
+
+`PUT /antigravity` accepts a raw antigravity object, `{ "value": <antigravity> }`, or `{ "antigravity": <antigravity> }`. It replaces the complete `antigravity` root and validates its schema.
+
+`PATCH /antigravity` accepts the same body shapes and applies object merge-patch semantics to the existing `antigravity` root: submitted object fields are merged recursively, `null` removes a field, and arrays are replaced as whole values.
+
+`DELETE /antigravity` removes the root from the config snapshot.
 
 Successful writes return:
 
@@ -4133,6 +4166,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `routing.session-affinity-ttl` | string | Session-to-auth binding duration. |
 | `antigravity-signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `antigravity-signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
+| `antigravity.sensitive-words` | array of string | Words to obfuscate with zero-width characters in system instructions. |
 | `gemini-api-key` | array of `GeminiKey` | Gemini API-key credentials; use provider-key routes. |
 | `interactions-api-key` | array of `GeminiKey` | Native Google Interactions API-key credentials; use provider-key routes. |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials; use provider-key routes. |

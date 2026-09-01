@@ -101,6 +101,10 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | Method | Path |
 | --- | --- |
 | `GET` | `/anthropic-auth-url` |
+| `DELETE` | `/antigravity` |
+| `GET` | `/antigravity` |
+| `PATCH` | `/antigravity` |
+| `PUT` | `/antigravity` |
 | `GET` | `/antigravity-auth-url` |
 | `POST` | `/api-call` |
 | `GET` | `/api-key-usage` |
@@ -367,6 +371,9 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
   },
   "antigravity-signature-cache-enabled": true,
   "antigravity-signature-bypass-strict": false,
+  "antigravity": {
+    "sensitive-words": ["word"]
+  },
   "gemini-api-key": [],
   "interactions-api-key": [],
   "codex-api-key": [],
@@ -551,6 +558,32 @@ openai-compatibility
 `PATCH /payload` 接受相同 body 形态，并对现有 `payload` root 应用 object merge-patch 语义：提交的 object 字段会递归合并，`null` 删除字段，array 作为整体替换，patch 中未出现的 sibling 字段会保留。这样前端只更新 `filter` 等单个 section 时，不会删除 `default`、`override` 或高级 matcher 字段。
 
 `DELETE /payload` 从 config snapshot 删除该 root。
+
+写入成功返回：
+
+```json
+{ "status": "ok" }
+```
+
+### `/antigravity` Config Root
+
+`GET /antigravity` 输出：
+
+```json
+{
+  "antigravity": {
+    "sensitive-words": ["API", "proxy"]
+  }
+}
+```
+
+`GET /antigravity` 返回持久化的 `antigravity` provider config root。
+
+`PUT /antigravity` 接受原始 antigravity object、`{ "value": <antigravity> }` 或 `{ "antigravity": <antigravity> }`。它会替换完整 `antigravity` root，并校验其 schema。
+
+`PATCH /antigravity` 接受相同 body 形态，并对现有 `antigravity` root 应用 object merge-patch 语义：提交的 object 字段会递归合并，`null` 删除字段，array 作为整体替换。
+
+`DELETE /antigravity` 从 config snapshot 删除该 root。
 
 写入成功返回：
 
@@ -4101,6 +4134,7 @@ DELETE query：
 | `routing.session-affinity-ttl` | string | Session-to-auth binding 持续时间。 |
 | `antigravity-signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `antigravity-signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
+| `antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
 | `gemini-api-key` | array of `GeminiKey` | Gemini API-key credentials；应使用 provider-key routes。 |
 | `interactions-api-key` | array of `GeminiKey` | 原生 Google Interactions API-key credentials；应使用 provider-key routes。 |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials；应使用 provider-key routes。 |

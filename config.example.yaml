@@ -242,6 +242,12 @@ nonstream-keepalive-interval: 0
 # When false (default), only checks R/E prefix + base64 + first byte 0x12.
 # antigravity-signature-bypass-strict: false
 
+# Antigravity provider behavior.
+# antigravity:
+#   sensitive-words:             # optional: words to obfuscate with zero-width characters in system instructions
+#     - "API"
+#     - "proxy"
+
 # Gemini API keys
 # gemini-api-key:
 #   - api-key: "AIzaSy...01" # may be omitted when base-url is set, for example with header-based authentication
