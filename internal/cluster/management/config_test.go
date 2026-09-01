@@ -777,3 +777,102 @@ func TestPutPortRejectsOutOfRangeValues(t *testing.T) {
 		t.Fatalf("snapshot port = %s, want 8317", snapshot["port"])
 	}
 }
+
+func TestAntigravityConfigRoutes(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+
+	repo := cluster.NewRepository(db)
+	handler := NewHandler(repo, nil, "127.0.0.1", 8327)
+	engine := gin.New()
+	engine.GET("/antigravity", handler.GetConfigRoot("/antigravity"))
+	engine.PUT("/antigravity", handler.PutConfigRoot("/antigravity"))
+	engine.PATCH("/antigravity", handler.PatchConfigRoot("/antigravity"))
+	engine.DELETE("/antigravity", handler.DeleteConfigRoot("/antigravity"))
+	engine.GET("/config", handler.GetConfig)
+	engine.GET("/config.yaml", handler.GetConfigYAML)
+
+	// Initially empty
+	getResp := httptest.NewRecorder()
+	engine.ServeHTTP(getResp, httptest.NewRequest(http.MethodGet, "/antigravity", nil))
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("initial GET /antigravity status = %d", getResp.Code)
+	}
+
+	// PUT /antigravity
+	putPayload := `{
+		"sensitive-words": ["API", "proxy"]
+	}`
+	putReq := httptest.NewRequest(http.MethodPut, "/antigravity", strings.NewReader(putPayload))
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp := httptest.NewRecorder()
+	engine.ServeHTTP(putResp, putReq)
+	if putResp.Code != http.StatusOK {
+		t.Fatalf("PUT /antigravity status = %d, body = %s", putResp.Code, putResp.Body.String())
+	}
+
+	// GET /antigravity
+	getResp2 := httptest.NewRecorder()
+	engine.ServeHTTP(getResp2, httptest.NewRequest(http.MethodGet, "/antigravity", nil))
+	if getResp2.Code != http.StatusOK {
+		t.Fatalf("GET /antigravity status = %d", getResp2.Code)
+	}
+	if !strings.Contains(getResp2.Body.String(), `"API"`) || !strings.Contains(getResp2.Body.String(), `"proxy"`) {
+		t.Fatalf("GET /antigravity body = %s, want API and proxy", getResp2.Body.String())
+	}
+
+	// GET /config
+	configResp := httptest.NewRecorder()
+	engine.ServeHTTP(configResp, httptest.NewRequest(http.MethodGet, "/config", nil))
+	if configResp.Code != http.StatusOK {
+		t.Fatalf("GET /config status = %d", configResp.Code)
+	}
+	if !strings.Contains(configResp.Body.String(), `"antigravity"`) || !strings.Contains(configResp.Body.String(), `"sensitive-words"`) {
+		t.Fatalf("GET /config body = %s, want antigravity object", configResp.Body.String())
+	}
+
+	// GET /config.yaml
+	yamlResp := httptest.NewRecorder()
+	engine.ServeHTTP(yamlResp, httptest.NewRequest(http.MethodGet, "/config.yaml", nil))
+	if yamlResp.Code != http.StatusOK {
+		t.Fatalf("GET /config.yaml status = %d", yamlResp.Code)
+	}
+	if !strings.Contains(yamlResp.Body.String(), "antigravity:") || !strings.Contains(yamlResp.Body.String(), "sensitive-words:") {
+		t.Fatalf("GET /config.yaml body = %s, want antigravity yaml", yamlResp.Body.String())
+	}
+
+	// PATCH /antigravity
+	patchPayload := `{
+		"sensitive-words": ["internal-secret"]
+	}`
+	patchReq := httptest.NewRequest(http.MethodPatch, "/antigravity", strings.NewReader(patchPayload))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchResp := httptest.NewRecorder()
+	engine.ServeHTTP(patchResp, patchReq)
+	if patchResp.Code != http.StatusOK {
+		t.Fatalf("PATCH /antigravity status = %d, body = %s", patchResp.Code, patchResp.Body.String())
+	}
+
+	getResp3 := httptest.NewRecorder()
+	engine.ServeHTTP(getResp3, httptest.NewRequest(http.MethodGet, "/antigravity", nil))
+	if !strings.Contains(getResp3.Body.String(), "internal-secret") {
+		t.Fatalf("GET /antigravity after PATCH body = %s", getResp3.Body.String())
+	}
+
+	// DELETE /antigravity
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/antigravity", nil)
+	deleteResp := httptest.NewRecorder()
+	engine.ServeHTTP(deleteResp, deleteReq)
+	if deleteResp.Code != http.StatusOK {
+		t.Fatalf("DELETE /antigravity status = %d, body = %s", deleteResp.Code, deleteResp.Body.String())
+	}
+
+	getResp4 := httptest.NewRecorder()
+	engine.ServeHTTP(getResp4, httptest.NewRequest(http.MethodGet, "/antigravity", nil))
+	if getResp4.Code != http.StatusOK {
+		t.Fatalf("GET /antigravity after DELETE status = %d", getResp4.Code)
+	}
+	if strings.Contains(getResp4.Body.String(), "internal-secret") {
+		t.Fatalf("GET /antigravity after DELETE body = %s, expected deleted", getResp4.Body.String())
+	}
+}

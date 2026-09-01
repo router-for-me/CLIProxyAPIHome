@@ -131,6 +131,9 @@ type Config struct {
 
 	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
 
+	// Antigravity configures provider-wide Antigravity request behavior.
+	Antigravity AntigravityConfig `yaml:"antigravity" json:"antigravity"`
+
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
 
@@ -197,6 +200,12 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// AntigravityConfig configures provider-wide Antigravity request behavior.
+type AntigravityConfig struct {
+	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
+	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -846,6 +855,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Sanitize Antigravity configuration.
+	cfg.SanitizeAntigravity()
+
 	ForceHomeRuntimeConfig(&cfg)
 
 	// Return the populated configuration struct.
@@ -939,6 +951,21 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
+// SanitizeAntigravity trims surrounding whitespace and drops empty words from Antigravity sensitive words.
+func (cfg *Config) SanitizeAntigravity() {
+	if cfg == nil || len(cfg.Antigravity.SensitiveWords) == 0 {
+		return
+	}
+	cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
+	for _, word := range cfg.Antigravity.SensitiveWords {
+		word = strings.TrimSpace(word)
+		if word != "" {
+			cleaned = append(cleaned, word)
+		}
+	}
+	cfg.Antigravity.SensitiveWords = cleaned
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.

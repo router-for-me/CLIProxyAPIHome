@@ -348,6 +348,10 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPut, "/payload", handler.PutConfigRoot("/payload"))
 	r.Set(http.MethodPatch, "/payload", handler.PatchConfigRoot("/payload"))
 	r.Set(http.MethodDelete, "/payload", handler.DeleteConfigRoot("/payload"))
+	r.Set(http.MethodGet, "/antigravity", handler.GetConfigRoot("/antigravity"))
+	r.Set(http.MethodPut, "/antigravity", handler.PutConfigRoot("/antigravity"))
+	r.Set(http.MethodPatch, "/antigravity", handler.PatchConfigRoot("/antigravity"))
+	r.Set(http.MethodDelete, "/antigravity", handler.DeleteConfigRoot("/antigravity"))
 
 	r.Set(http.MethodGet, "/auth-files", handler.ListAuthFiles)
 	r.Set(http.MethodGet, "/auth-files/models", handler.GetAuthFileModels)
