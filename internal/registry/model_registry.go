@@ -839,3 +839,25 @@ func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 	}
 	return result
 }
+
+// GetModelInfoForClient returns one client-specific model definition.
+func (r *ModelRegistry) GetModelInfoForClient(clientID, modelID string) *ModelInfo {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return nil
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	clientInfos := r.clientModelInfos[clientID]
+	if info := clientInfos[modelID]; info != nil {
+		return cloneModelInfo(info)
+	}
+	for id, info := range clientInfos {
+		if info != nil && strings.EqualFold(id, modelID) {
+			return cloneModelInfo(info)
+		}
+	}
+	return nil
+}

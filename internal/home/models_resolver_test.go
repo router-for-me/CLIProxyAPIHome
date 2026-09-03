@@ -1,11 +1,41 @@
 package home
 
 import (
+	"reflect"
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
+
+func TestDispatchModelInfoForAuthUsesSelectedHomeCapabilities(t *testing.T) {
+	const (
+		authID  = "dispatch-model-info-antigravity-auth"
+		modelID = "gemini-3.8-flash-high"
+	)
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "antigravity", []*registry.ModelInfo{{
+		ID:            modelID,
+		Type:          "gemini",
+		ContextLength: 1048576,
+		Thinking: &registry.ThinkingSupport{
+			Levels: []string{"low", "medium", "high"},
+		},
+	}})
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	got := dispatchModelInfoForAuth(authID, modelID+"(medium)", modelID)
+	if got == nil {
+		t.Fatal("dispatch model info = nil")
+	}
+	if got.ID != modelID || got.ContextLength != 1048576 {
+		t.Fatalf("dispatch model info = %#v, want %s with 1048576 context", got, modelID)
+	}
+	if got.Thinking == nil || !reflect.DeepEqual(got.Thinking.Levels, []string{"low", "medium", "high"}) {
+		t.Fatalf("dispatch thinking levels = %#v, want low/medium/high", got.Thinking)
+	}
+}
 
 func TestResolveConfigGeminiKeyEntryUsesConfigIdentity(t *testing.T) {
 	entries := []config.GeminiKey{
