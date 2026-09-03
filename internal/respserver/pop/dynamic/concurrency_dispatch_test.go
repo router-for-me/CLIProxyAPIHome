@@ -187,6 +187,43 @@ func TestPrepareDispatchResponseIncludesForceMapping(t *testing.T) {
 	}
 }
 
+func TestPrepareDispatchResponseIncludesModelInfo(t *testing.T) {
+	result := &home.DispatchResult{
+		Model:    "gemini-3.8-flash-high",
+		Provider: "antigravity",
+		ModelInfo: &home.DispatchModelInfo{
+			ID:            "gemini-3.8-flash-high",
+			Type:          "gemini",
+			ContextLength: 1048576,
+			Thinking: &registry.ThinkingSupport{
+				Levels: []string{"low", "medium", "high"},
+			},
+		},
+		Auth: &coreauth.Auth{
+			ID:       "antigravity-model-info-auth",
+			Index:    "antigravity-model-info-auth",
+			Provider: "antigravity",
+			Status:   coreauth.StatusActive,
+		},
+	}
+
+	unaccounted, accounted, errPrepare := prepareDispatchResponse(result, "user-key")
+	if errPrepare != nil {
+		t.Fatalf("prepareDispatchResponse() error = %v", errPrepare)
+	}
+	for name, payload := range map[string][]byte{"unaccounted": unaccounted, "accounted": accounted} {
+		if got := gjson.GetBytes(payload, "model_info.context_length").Int(); got != 1048576 {
+			t.Fatalf("%s model context_length = %d, want 1048576; payload=%s", name, got, payload)
+		}
+		if got := gjson.GetBytes(payload, "model_info.thinking.levels.#").Int(); got != 3 {
+			t.Fatalf("%s thinking level count = %d, want 3; payload=%s", name, got, payload)
+		}
+		if got := gjson.GetBytes(payload, "model_info.thinking.levels.2").String(); got != "high" {
+			t.Fatalf("%s highest thinking level = %q, want high; payload=%s", name, got, payload)
+		}
+	}
+}
+
 func TestHandleAuthSkipsSaturatedAffinityCandidate(t *testing.T) {
 	runtime, admitter := newConcurrencyDispatchRuntime(t, []string{"cred-a", "cred-b"})
 	admitter.SetResult("cred-a", concurrencyError("credential_concurrency_exceeded"))

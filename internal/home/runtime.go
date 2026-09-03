@@ -845,6 +845,7 @@ type DispatchResult struct {
 	RequestRetry  int
 	ForceMapping  bool
 	OriginalAlias string
+	ModelInfo     *DispatchModelInfo
 
 	AuthID   string
 	Provider string
@@ -854,6 +855,18 @@ type DispatchResult struct {
 	UnaccountedReply      []byte
 	AccountedReply        []byte
 	AdmissionFenceFailure error
+}
+
+// DispatchModelInfo carries the selected model capabilities needed by CPA at execution time.
+type DispatchModelInfo struct {
+	ID                  string                    `json:"id"`
+	Type                string                    `json:"type,omitempty"`
+	InputTokenLimit     int                       `json:"inputTokenLimit,omitempty"`
+	OutputTokenLimit    int                       `json:"outputTokenLimit,omitempty"`
+	ContextLength       int                       `json:"context_length,omitempty"`
+	MaxCompletionTokens int                       `json:"max_completion_tokens,omitempty"`
+	Thinking            *registry.ThinkingSupport `json:"thinking,omitempty"`
+	UserDefined         bool                      `json:"user_defined"`
 }
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.
@@ -978,7 +991,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
 			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
-			AuthID: auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
+			ModelInfo: dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel),
+			AuthID:    auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
 			Concurrency: ConcurrencyAdmissionResult{CredentialID: auth.ID, Model: concurrencyModel},
 		}
 		if concurrencyCtx.PrepareResponse != nil {

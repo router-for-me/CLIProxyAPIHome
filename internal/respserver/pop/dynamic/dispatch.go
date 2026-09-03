@@ -165,6 +165,11 @@ func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]
 				return nil, errSet
 			}
 		}
+		if result.ModelInfo != nil {
+			if errSet := set("model_info", result.ModelInfo); errSet != nil {
+				return nil, errSet
+			}
+		}
 		if errSet := set("auth_index", authIndex); errSet != nil {
 			return nil, errSet
 		}

@@ -123,6 +123,49 @@ func (r *Runtime) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 	registry.GetGlobalRegistry().RegisterClient(a.ID, providerKey, models)
 }
 
+func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *DispatchModelInfo {
+	modelRegistry := registry.GetGlobalRegistry()
+	candidates := []string{
+		strings.TrimSpace(upstreamModel),
+		strings.TrimSpace(routeModel),
+		coreauth.CanonicalModelID(upstreamModel),
+		coreauth.CanonicalModelID(routeModel),
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	var selected *ModelInfo
+	for _, candidate := range candidates {
+		key := strings.ToLower(strings.TrimSpace(candidate))
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		if selected = modelRegistry.GetModelInfoForClient(authID, candidate); selected != nil {
+			break
+		}
+	}
+	if selected == nil {
+		return nil
+	}
+
+	modelID := coreauth.CanonicalModelID(upstreamModel)
+	if modelID == "" {
+		modelID = coreauth.CanonicalModelID(selected.ID)
+	}
+	return &DispatchModelInfo{
+		ID:                  modelID,
+		Type:                selected.Type,
+		InputTokenLimit:     selected.InputTokenLimit,
+		OutputTokenLimit:    selected.OutputTokenLimit,
+		ContextLength:       selected.ContextLength,
+		MaxCompletionTokens: selected.MaxCompletionTokens,
+		Thinking:            selected.Thinking,
+		UserDefined:         selected.UserDefined,
+	}
+}
+
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
 func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if r == nil || a == nil || a.ID == "" {
