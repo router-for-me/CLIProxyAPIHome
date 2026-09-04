@@ -597,7 +597,7 @@ func buildOpenAICompatibilityModels(models []appconfig.OpenAICompatibilityModel,
 			OwnedBy:     compatName,
 			Type:        "openai-compatibility",
 			DisplayName: modelID,
-			UserDefined: false,
+			UserDefined: true,
 			Thinking:    thinking,
 		})
 	}

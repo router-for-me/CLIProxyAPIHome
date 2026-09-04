@@ -74,7 +74,9 @@ func TestConfigSynthesizerPreservesOpenAICompatUpstreamModelInMetadata(t *testin
 	if !okModels || len(rawModels) != 1 {
 		t.Fatalf("home_config_models = %#v", auths[0].Metadata[homeConfigModelsMetadataKey])
 	}
-	if rawModels[0]["id"] != "fractalops-coding" || rawModels[0]["name"] != "glm-5.3" {
+	if rawModels[0]["id"] != "fractalops-coding" ||
+		rawModels[0]["name"] != "glm-5.3" ||
+		rawModels[0]["user_defined"] != true {
 		t.Fatalf("model metadata = %#v, want alias and upstream name", rawModels[0])
 	}
 }
