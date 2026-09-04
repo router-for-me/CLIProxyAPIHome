@@ -50,6 +50,35 @@ func TestConfigSynthesizerBuildsHeaderAuthenticatedInteractionsAuth(t *testing.T
 	}
 }
 
+func TestConfigSynthesizerPreservesOpenAICompatUpstreamModelInMetadata(t *testing.T) {
+	cfg := &appconfig.Config{OpenAICompatibility: []appconfig.OpenAICompatibility{{
+		Name:    "zai-coding",
+		BaseURL: "https://api.example.test/v1",
+		Models: []appconfig.OpenAICompatibilityModel{{
+			Name:  "glm-5.3",
+			Alias: "fractalops-coding",
+		}},
+	}}}
+	auths, errSynthesize := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+		Config:      cfg,
+		Now:         time.Unix(100, 0).UTC(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if errSynthesize != nil {
+		t.Fatal(errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	rawModels, okModels := auths[0].Metadata[homeConfigModelsMetadataKey].([]map[string]any)
+	if !okModels || len(rawModels) != 1 {
+		t.Fatalf("home_config_models = %#v", auths[0].Metadata[homeConfigModelsMetadataKey])
+	}
+	if rawModels[0]["id"] != "fractalops-coding" || rawModels[0]["name"] != "glm-5.3" {
+		t.Fatalf("model metadata = %#v, want alias and upstream name", rawModels[0])
+	}
+}
+
 func TestConfigSynthesizerUsesFullGeminiCredentialIdentity(t *testing.T) {
 	base := appconfig.GeminiKey{
 		APIKey:   "shared-key",
