@@ -60,21 +60,9 @@ func TestDispatchResolvesXAIAPIKeyModelAlias(t *testing.T) {
 	}
 }
 
-func TestDispatchResolvesOpenAICompatibilityModelAlias(t *testing.T) {
+func TestDispatchResolvesOpenAICompatibilityMetadataAliasWithEmptyConfig(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{
-		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
-			Name:    "zai-coding",
-			BaseURL: "https://api.example.test/v1",
-			APIKeyEntries: []internalconfig.OpenAICompatibilityAPIKey{{
-				APIKey: "zai-key",
-			}},
-			Models: []internalconfig.OpenAICompatibilityModel{{
-				Name:  "glm-5.3",
-				Alias: "fractalops-coding",
-			}},
-		}},
-	})
+	manager.SetConfig(&internalconfig.Config{})
 	auth := &Auth{
 		ID:       "zai-api-key-auth",
 		Provider: "zai-coding",
