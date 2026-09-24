@@ -47,7 +47,7 @@ type Config struct {
 
 	// TrustedProxies lists reverse-proxy IPs or CIDRs whose forwarded client
 	// address headers the HTTP server may trust. Empty disables forwarded headers.
-	TrustedProxies []string `yaml:"trusted-proxies" json:"-"`
+	TrustedProxies []string `yaml:"trusted-proxies" json:"trusted-proxies"`
 
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
