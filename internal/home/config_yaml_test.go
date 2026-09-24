@@ -94,10 +94,11 @@ plugins:
 	assertContains("sample:")
 	assertContains("mode: fast")
 	assertContains("value: keep")
+	assertContains("trusted-proxies:")
+	assertContains("127.0.0.1")
 
 	assertNotContains("tls:")
 	assertNotContains("remote-management:")
-	assertNotContains("trusted-proxies:")
 	assertNotContains("user-email:")
 	assertNotContains("HOME_USER_EMAIL_SMTP_PASSWORD")
 	assertNotContains("auth-dir:")
