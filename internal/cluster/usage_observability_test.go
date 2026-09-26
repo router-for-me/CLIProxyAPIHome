@@ -1716,3 +1716,67 @@ func seedUsageObservabilityRecord(t *testing.T, ctx context.Context, repo *Repos
 		t.Fatalf("AppendUsage() error = %v", errUsage)
 	}
 }
+
+func TestSessionTreeDistinguishesCompactionFromFork(t *testing.T) {
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+
+	// 1. Root session turn
+	payloadRoot := `{"timestamp":"2026-06-10T01:00:00Z","provider":"google","model":"gemini-2.5-pro","session_id":"root-sess","request_id":"req-1","tokens":{"total_tokens":100}}`
+	if _, err := repo.AppendUsage(ctx, payloadRoot, "127.0.0.1"); err != nil {
+		t.Fatalf("AppendUsage(root) error = %v", err)
+	}
+
+	// 2. Compaction boundary node: child of root-sess, marked as compaction, not fork
+	payloadCompaction := `{"timestamp":"2026-06-10T01:05:00Z","provider":"google","model":"gemini-2.5-pro","session_id":"compacted-sess","parent_session_id":"root-sess","node_kind":"compaction","is_compaction":true,"is_fork":false,"request_id":"req-2","tokens":{"total_tokens":50}}`
+	if _, err := repo.AppendUsage(ctx, payloadCompaction, "127.0.0.1"); err != nil {
+		t.Fatalf("AppendUsage(compaction) error = %v", err)
+	}
+
+	// 3. Speculative fork node: child of root-sess, marked as fork
+	payloadFork := `{"timestamp":"2026-06-10T01:10:00Z","provider":"google","model":"gemini-2.5-pro","session_id":"fork-sess","parent_session_id":"root-sess","node_kind":"fork","is_fork":true,"is_compaction":false,"request_id":"req-3","tokens":{"total_tokens":30}}`
+	if _, err := repo.AppendUsage(ctx, payloadFork, "127.0.0.1"); err != nil {
+		t.Fatalf("AppendUsage(fork) error = %v", err)
+	}
+
+	treeRes, errTree := repo.GetSessionTree(ctx, "root-sess")
+	if errTree != nil {
+		t.Fatalf("SessionTree() error = %v", errTree)
+	}
+	if len(treeRes.Tree) != 1 {
+		t.Fatalf("expected 1 root in tree, got %d", len(treeRes.Tree))
+	}
+	rootNode := treeRes.Tree[0]
+	if rootNode.SessionID != "root-sess" {
+		t.Fatalf("root session = %q, want root-sess", rootNode.SessionID)
+	}
+	if len(rootNode.Children) != 2 {
+		t.Fatalf("expected 2 children (compaction and fork), got %d", len(rootNode.Children))
+	}
+
+	var compactionNode, forkNode *SessionTreeNode
+	for _, child := range rootNode.Children {
+		if child.SessionID == "compacted-sess" {
+			compactionNode = child
+		} else if child.SessionID == "fork-sess" {
+			forkNode = child
+		}
+	}
+
+	if compactionNode == nil {
+		t.Fatal("compaction node not found in children")
+	}
+	if compactionNode.NodeKind != "compaction" || !compactionNode.IsCompaction || compactionNode.IsFork {
+		t.Fatalf("compaction node invalid: NodeKind=%q IsCompaction=%v IsFork=%v, want (compaction, true, false)",
+			compactionNode.NodeKind, compactionNode.IsCompaction, compactionNode.IsFork)
+	}
+
+	if forkNode == nil {
+		t.Fatal("fork node not found in children")
+	}
+	if forkNode.NodeKind != "fork" || !forkNode.IsFork || forkNode.IsCompaction {
+		t.Fatalf("fork node invalid: NodeKind=%q IsFork=%v IsCompaction=%v, want (fork, true, false)",
+			forkNode.NodeKind, forkNode.IsFork, forkNode.IsCompaction)
+	}
+}

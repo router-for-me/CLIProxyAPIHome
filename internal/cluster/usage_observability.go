@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 )
 
@@ -4022,6 +4023,9 @@ type SessionTreeNode struct {
 	SessionID       string                   `json:"session_id"`
 	ParentSessionID string                   `json:"parent_session_id,omitempty"`
 	RootSessionID   string                   `json:"root_session_id"`
+	NodeKind        string                   `json:"node_kind,omitempty"`
+	IsFork          bool                     `json:"is_fork,omitempty"`
+	IsCompaction    bool                     `json:"is_compaction,omitempty"`
 	FirstSeenAt     time.Time                `json:"first_seen_at"`
 	LastSeenAt      time.Time                `json:"last_seen_at"`
 	RequestCount    int64                    `json:"request_count"`
@@ -4142,7 +4146,7 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 	}
 
 	// Step 2: Query all records belonging to this family tree (bounded to prevent runaway memory usage).
-	const sessionTreeColumns = "id, timestamp, request_id, session_id, parent_session_id, root_session_id, model, provider, latency_ms, ttft_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, failed, fail_status_code, upstream_status_code"
+	const sessionTreeColumns = "id, timestamp, request_id, session_id, parent_session_id, root_session_id, model, provider, latency_ms, ttft_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, failed, fail_status_code, upstream_status_code, payload"
 	var truncated bool
 
 	var records []UsageRecord
@@ -4331,11 +4335,17 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 			sessID = trueRootID
 		}
 		node, exists := nodesMap[sessID]
+		nodeKind := strings.TrimSpace(gjson.GetBytes([]byte(rec.PayloadJSON), "node_kind").String())
+		isFork := gjson.GetBytes([]byte(rec.PayloadJSON), "is_fork").Bool()
+		isCompaction := gjson.GetBytes([]byte(rec.PayloadJSON), "is_compaction").Bool()
 		if !exists {
 			node = &SessionTreeNode{
 				SessionID:       sessID,
 				ParentSessionID: rec.ParentSessionID,
 				RootSessionID:   trueRootID,
+				NodeKind:        nodeKind,
+				IsFork:          isFork,
+				IsCompaction:    isCompaction,
 				FirstSeenAt:     rec.Timestamp.UTC(),
 				LastSeenAt:      rec.Timestamp.UTC(),
 				Children:        make([]*SessionTreeNode, 0),
@@ -4343,8 +4353,19 @@ func (r *Repository) GetSessionTree(ctx context.Context, identifier string) (*Se
 			}
 			nodesMap[sessID] = node
 			orderedKeys = append(orderedKeys, sessID)
-		} else if node.ParentSessionID == "" && rec.ParentSessionID != "" {
-			node.ParentSessionID = rec.ParentSessionID
+		} else {
+			if node.ParentSessionID == "" && rec.ParentSessionID != "" {
+				node.ParentSessionID = rec.ParentSessionID
+			}
+			if node.NodeKind == "" && nodeKind != "" {
+				node.NodeKind = nodeKind
+			}
+			if !node.IsCompaction && isCompaction {
+				node.IsCompaction = true
+			}
+			if !node.IsFork && isFork {
+				node.IsFork = true
+			}
 		}
 		turnCounters[sessID]++
 		node.RequestCount++
