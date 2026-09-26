@@ -37,11 +37,12 @@ func ApplyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth) Cr
 }
 
 type credentialModelPair struct {
-	Name         string
-	Alias        string
-	DisplayName  string
-	ForceMapping bool
-	Thinking     *registry.ThinkingSupport
+	Name                       string
+	Alias                      string
+	DisplayName                string
+	ForceMapping               bool
+	SupportConfigurationUpdate bool
+	Thinking                   *registry.ThinkingSupport
 }
 
 type credentialOpenAICompatGroup struct {
@@ -388,10 +389,11 @@ func credentialCodexModels(auth *coreauth.Auth) []appconfig.CodexModel {
 	out := make([]appconfig.CodexModel, 0, len(pairs))
 	for _, pair := range pairs {
 		out = append(out, appconfig.CodexModel{
-			Name:         pair.Name,
-			Alias:        pair.Alias,
-			DisplayName:  pair.DisplayName,
-			ForceMapping: pair.ForceMapping,
+			Name:                       pair.Name,
+			Alias:                      pair.Alias,
+			DisplayName:                pair.DisplayName,
+			ForceMapping:               pair.ForceMapping,
+			SupportConfigurationUpdate: pair.SupportConfigurationUpdate,
 		})
 	}
 	return out
@@ -486,12 +488,14 @@ func credentialModelPairs(auth *coreauth.Auth) []credentialModelPair {
 		}
 		seen[key] = struct{}{}
 		forceMapping, _ := boolFromAny(modelMap["force_mapping"])
+		supportConfigurationUpdate, _ := boolFromAny(modelMap["support_configuration_update"])
 		out = append(out, credentialModelPair{
-			Name:         name,
-			Alias:        alias,
-			DisplayName:  strings.TrimSpace(stringFromAny(modelMap["config_display_name"])),
-			ForceMapping: forceMapping,
-			Thinking:     credentialThinking(modelMap["thinking"]),
+			Name:                       name,
+			Alias:                      alias,
+			DisplayName:                strings.TrimSpace(stringFromAny(modelMap["config_display_name"])),
+			ForceMapping:               forceMapping,
+			SupportConfigurationUpdate: supportConfigurationUpdate,
+			Thinking:                   credentialThinking(modelMap["thinking"]),
 		})
 	}
 	return out

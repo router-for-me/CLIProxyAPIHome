@@ -4205,6 +4205,7 @@ These fields are accepted by Home YAML config. `PUT /config.yaml` accepts non-cr
 | `gemini-api-key` | array of `GeminiKey` | Gemini API-key credentials; use provider-key routes. |
 | `interactions-api-key` | array of `GeminiKey` | Native Google Interactions API-key credentials; use provider-key routes. |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials; use provider-key routes. |
+| `codex-api-key[].models[].support-configuration-update` | boolean | Enables Responses `configuration_update` for this configured model only; defaults to `false`. |
 | `xai-api-key` | array of `XAIKey` | Native xAI API-key credentials; use provider-key routes. |
 | `meta-api-key` | array of `MetaKey` | Native Meta Muse API-key credentials; use provider-key routes. |
 | `codex-header-defaults.user-agent` | string | Default Codex User-Agent. |

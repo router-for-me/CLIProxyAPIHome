@@ -273,6 +273,18 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		}
 		models := buildConfigModels(entry.Models, modelOwner, modelType, now)
 		if provider == "codex" {
+			for _, configured := range entry.Models {
+				alias := strings.TrimSpace(configured.Alias)
+				if alias == "" {
+					alias = strings.TrimSpace(configured.Name)
+				}
+				for _, model := range models {
+					if strings.EqualFold(model.ID, alias) {
+						model.SupportConfigurationUpdate = configured.SupportConfigurationUpdate
+						break
+					}
+				}
+			}
 			models = registry.WithCodexBuiltins(models)
 		}
 		addConfigModelsToMetadata(metadata, models)

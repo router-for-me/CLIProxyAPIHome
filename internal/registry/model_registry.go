@@ -64,6 +64,9 @@ type ModelInfo struct {
 	// NativeCapabilities is forwarded to CPA for the selected dispatch route.
 	NativeCapabilities *NativeCapabilities `json:"native_capabilities,omitempty"`
 
+	// SupportConfigurationUpdate controls Responses input configuration updates.
+	SupportConfigurationUpdate bool `json:"support_configuration_update,omitempty"`
+
 	// UserDefined indicates this model was defined through config file's models[]
 	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
 	// UserDefined models have thinking configuration passed through without validation.

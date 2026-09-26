@@ -691,16 +691,20 @@ func credentialAPIKeyModels(auth *coreauth.Auth) []map[string]any {
 		if pair.ForceMapping {
 			item["force-mapping"] = true
 		}
+		if strings.EqualFold(auth.Provider, "codex") && pair.SupportConfigurationUpdate {
+			item["support-configuration-update"] = true
+		}
 		out = append(out, item)
 	}
 	return out
 }
 
 type credentialAPIKeyModelPair struct {
-	Name         string
-	Alias        string
-	DisplayName  string
-	ForceMapping bool
+	Name                       string
+	Alias                      string
+	DisplayName                string
+	ForceMapping               bool
+	SupportConfigurationUpdate bool
 }
 
 // credentialModelPairs returns unique model name/alias pairs from auth metadata.
@@ -742,11 +746,13 @@ func credentialModelPairs(auth *coreauth.Auth) []credentialAPIKeyModelPair {
 		}
 		seen[key] = struct{}{}
 		forceMapping, _ := parseBoolAny(modelMap["force_mapping"])
+		supportConfigurationUpdate, _ := parseBoolAny(modelMap["support_configuration_update"])
 		out = append(out, credentialAPIKeyModelPair{
-			Name:         name,
-			Alias:        alias,
-			DisplayName:  strings.TrimSpace(stringFromAny(modelMap["config_display_name"])),
-			ForceMapping: forceMapping,
+			Name:                       name,
+			Alias:                      alias,
+			DisplayName:                strings.TrimSpace(stringFromAny(modelMap["config_display_name"])),
+			ForceMapping:               forceMapping,
+			SupportConfigurationUpdate: supportConfigurationUpdate,
 		})
 	}
 	return out

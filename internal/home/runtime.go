@@ -860,15 +860,16 @@ type DispatchResult struct {
 
 // DispatchModelInfo carries the selected model capabilities needed by CPA at execution time.
 type DispatchModelInfo struct {
-	ID                  string                       `json:"id"`
-	Type                string                       `json:"type,omitempty"`
-	InputTokenLimit     int                          `json:"inputTokenLimit,omitempty"`
-	OutputTokenLimit    int                          `json:"outputTokenLimit,omitempty"`
-	ContextLength       int                          `json:"context_length,omitempty"`
-	MaxCompletionTokens int                          `json:"max_completion_tokens,omitempty"`
-	Thinking            *registry.ThinkingSupport    `json:"thinking,omitempty"`
-	NativeCapabilities  *registry.NativeCapabilities `json:"native_capabilities,omitempty"`
-	UserDefined         bool                         `json:"user_defined"`
+	ID                         string                       `json:"id"`
+	Type                       string                       `json:"type,omitempty"`
+	InputTokenLimit            int                          `json:"inputTokenLimit,omitempty"`
+	OutputTokenLimit           int                          `json:"outputTokenLimit,omitempty"`
+	ContextLength              int                          `json:"context_length,omitempty"`
+	MaxCompletionTokens        int                          `json:"max_completion_tokens,omitempty"`
+	Thinking                   *registry.ThinkingSupport    `json:"thinking,omitempty"`
+	NativeCapabilities         *registry.NativeCapabilities `json:"native_capabilities,omitempty"`
+	SupportConfigurationUpdate bool                         `json:"support_configuration_update"`
+	UserDefined                bool                         `json:"user_defined"`
 }
 
 // DispatchForAPIKey processes dispatch with API-key channel restrictions.

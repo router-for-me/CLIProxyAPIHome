@@ -192,9 +192,10 @@ func TestPrepareDispatchResponseIncludesModelInfo(t *testing.T) {
 		Model:    "gemini-3.8-flash-high",
 		Provider: "antigravity",
 		ModelInfo: &home.DispatchModelInfo{
-			ID:            "gemini-3.8-flash-high",
-			Type:          "gemini",
-			ContextLength: 1048576,
+			ID:                         "gemini-3.8-flash-high",
+			Type:                       "gemini",
+			ContextLength:              1048576,
+			SupportConfigurationUpdate: true,
 			Thinking: &registry.ThinkingSupport{
 				Levels: []string{"low", "medium", "high"},
 			},
@@ -220,6 +221,9 @@ func TestPrepareDispatchResponseIncludesModelInfo(t *testing.T) {
 		}
 		if got := gjson.GetBytes(payload, "model_info.thinking.levels.2").String(); got != "high" {
 			t.Fatalf("%s highest thinking level = %q, want high; payload=%s", name, got, payload)
+		}
+		if got := gjson.GetBytes(payload, "model_info.support_configuration_update"); !got.Exists() || !got.Bool() {
+			t.Fatalf("%s dispatch response omitted selected configuration update capability: %s", name, payload)
 		}
 	}
 }

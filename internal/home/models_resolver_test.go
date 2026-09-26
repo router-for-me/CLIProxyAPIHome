@@ -16,9 +16,10 @@ func TestDispatchModelInfoForAuthUsesSelectedHomeCapabilities(t *testing.T) {
 	)
 	modelRegistry := registry.GetGlobalRegistry()
 	modelRegistry.RegisterClient(authID, "antigravity", []*registry.ModelInfo{{
-		ID:            modelID,
-		Type:          "gemini",
-		ContextLength: 1048576,
+		ID:                         modelID,
+		Type:                       "gemini",
+		ContextLength:              1048576,
+		SupportConfigurationUpdate: true,
 		Thinking: &registry.ThinkingSupport{
 			Levels: []string{"low", "medium", "high"},
 		},
@@ -34,6 +35,9 @@ func TestDispatchModelInfoForAuthUsesSelectedHomeCapabilities(t *testing.T) {
 	}
 	if got.Thinking == nil || !reflect.DeepEqual(got.Thinking.Levels, []string{"low", "medium", "high"}) {
 		t.Fatalf("dispatch thinking levels = %#v, want low/medium/high", got.Thinking)
+	}
+	if !got.SupportConfigurationUpdate {
+		t.Fatalf("selected registry capability lost in dispatch: %+v", got)
 	}
 }
 

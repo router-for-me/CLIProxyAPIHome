@@ -4173,6 +4173,7 @@ DELETE query：
 | `gemini-api-key` | array of `GeminiKey` | Gemini API-key credentials；应使用 provider-key routes。 |
 | `interactions-api-key` | array of `GeminiKey` | 原生 Google Interactions API-key credentials；应使用 provider-key routes。 |
 | `codex-api-key` | array of `CodexKey` | Codex API-key credentials；应使用 provider-key routes。 |
+| `codex-api-key[].models[].support-configuration-update` | boolean | 仅为该配置模型启用 Responses `configuration_update`；默认值为 `false`。 |
 | `xai-api-key` | array of `XAIKey` | 原生 xAI API-key credentials；应使用 provider-key routes。 |
 | `meta-api-key` | array of `MetaKey` | 原生 Meta Muse API-key credentials；应使用 provider-key routes。 |
 | `codex-header-defaults.user-agent` | string | 默认 Codex User-Agent。 |

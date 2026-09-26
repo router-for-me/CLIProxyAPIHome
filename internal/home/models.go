@@ -155,15 +155,16 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 		modelID = coreauth.CanonicalModelID(selected.ID)
 	}
 	return &DispatchModelInfo{
-		ID:                  modelID,
-		Type:                selected.Type,
-		InputTokenLimit:     selected.InputTokenLimit,
-		OutputTokenLimit:    selected.OutputTokenLimit,
-		ContextLength:       selected.ContextLength,
-		MaxCompletionTokens: selected.MaxCompletionTokens,
-		Thinking:            selected.Thinking,
-		NativeCapabilities:  selected.NativeCapabilities,
-		UserDefined:         selected.UserDefined,
+		ID:                         modelID,
+		Type:                       selected.Type,
+		InputTokenLimit:            selected.InputTokenLimit,
+		OutputTokenLimit:           selected.OutputTokenLimit,
+		ContextLength:              selected.ContextLength,
+		MaxCompletionTokens:        selected.MaxCompletionTokens,
+		Thinking:                   selected.Thinking,
+		NativeCapabilities:         selected.NativeCapabilities,
+		SupportConfigurationUpdate: selected.SupportConfigurationUpdate,
+		UserDefined:                selected.UserDefined,
 	}
 }
 
@@ -289,14 +290,21 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		default:
 			models = registry.GetCodexProModels()
 		}
-		if len(configModels) > 0 {
+		configuredModels := len(configModels) > 0
+		if configuredModels {
 			models = configModels
 		} else if entry := r.resolveConfigCodexKey(cfg, a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
+				configuredModels = true
 			}
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
+			}
+		}
+		if authKind == "apikey" && !configuredModels {
+			for _, model := range models {
+				model.SupportConfigurationUpdate = false
 			}
 		}
 		models = applyExcludedModels(models, excluded)
@@ -891,7 +899,20 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
+	models := buildConfigModels(entry.Models, "openai", "openai")
+	for i := range entry.Models {
+		alias := strings.TrimSpace(entry.Models[i].Alias)
+		if alias == "" {
+			alias = strings.TrimSpace(entry.Models[i].Name)
+		}
+		for _, model := range models {
+			if strings.EqualFold(model.ID, alias) {
+				model.SupportConfigurationUpdate = entry.Models[i].SupportConfigurationUpdate
+				break
+			}
+		}
+	}
+	return registry.WithCodexBuiltins(models)
 }
 
 // rewriteModelInfoName rewrites a model info name.
