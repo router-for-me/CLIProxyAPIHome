@@ -28,14 +28,21 @@ const (
 func sanitizeUsageQuotaHeaders(payload string) (string, error) {
 	provider := strings.ToLower(strings.TrimSpace(gjson.Get(payload, "provider").String()))
 	filtered := make(map[string]string)
+	var isAllowedQuotaHeaderKey func(key string) bool
+	switch provider {
+	case "codex":
+		isAllowedQuotaHeaderKey = isCodexQuotaHeaderKey
+	case "claude":
+		isAllowedQuotaHeaderKey = isClaudeRateLimitHeaderKey
+	}
 	collect := func(result gjson.Result) {
-		if provider != "codex" || !result.IsObject() {
+		if isAllowedQuotaHeaderKey == nil || !result.IsObject() {
 			return
 		}
 		for rawKey, rawValue := range result.Map() {
 			key := http.CanonicalHeaderKey(strings.TrimSpace(rawKey))
 			value := quotaHeaderResultValue(rawValue)
-			if isCodexQuotaHeaderKey(key) && value != "" && len(value) <= quotaHeaderValueMaxLength {
+			if isAllowedQuotaHeaderKey(key) && value != "" && len(value) <= quotaHeaderValueMaxLength {
 				filtered[key] = value
 			}
 		}
@@ -604,6 +611,28 @@ func isCodexQuotaHeaderKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// claudeRateLimitHeaderKeys is the exact allowlist of Anthropic rate-limit
+// headers the Claude quota-reset fix (internal/cliproxy/auth/claude_ratelimit.go)
+// consumes -- the unified status header, the 5h/7d/7d_oi status+reset window
+// pairs, and Retry-After. Nothing else survives sanitizeUsageQuotaHeaders for
+// a Claude payload; in particular this never admits credential material.
+var claudeRateLimitHeaderKeys = map[string]struct{}{
+	"Anthropic-Ratelimit-Unified-Status":       {},
+	"Anthropic-Ratelimit-Unified-5h-Status":    {},
+	"Anthropic-Ratelimit-Unified-5h-Reset":     {},
+	"Anthropic-Ratelimit-Unified-7d-Status":    {},
+	"Anthropic-Ratelimit-Unified-7d-Reset":     {},
+	"Anthropic-Ratelimit-Unified-7d_oi-Status": {},
+	"Anthropic-Ratelimit-Unified-7d_oi-Reset":  {},
+	"Anthropic-Ratelimit-Unified-Reset":        {},
+	"Retry-After":                              {},
+}
+
+func isClaudeRateLimitHeaderKey(key string) bool {
+	_, ok := claudeRateLimitHeaderKeys[key]
+	return ok
 }
 
 func firstQuotaHeaderValue(headers http.Header, key string) string {

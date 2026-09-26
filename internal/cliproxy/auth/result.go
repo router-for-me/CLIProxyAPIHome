@@ -32,6 +32,12 @@ type Result struct {
 	RetryAfter        *time.Duration
 	ResetAt           *time.Time
 	AccessTokenSHA256 string
+	// CredentialScope reports whether the parsed reset hint applies to the
+	// whole credential rather than just the requested model. Today this is
+	// only ever set true for a Claude request explicitly rejected on the
+	// shared Anthropic 5h/7d unified rate-limit window (see
+	// claudeHeadersIndicateUnifiedRateLimitRejection).
+	CredentialScope bool
 }
 
 // markResultTransition captures the registry side effects derived from a result transition.
@@ -272,6 +278,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 				transition.suspendReason = "quota"
 				transition.shouldSuspendModel = true
 				transition.setModelQuota = true
+				if result.CredentialScope {
+					blockSiblingModelStatesUntil(auth, resultModel, next, nextBackoffLevel, now)
+				}
 			}
 		case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 			if disableCooling {
@@ -295,6 +304,64 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
 	}
 	return transition
+}
+
+// blockSiblingModelStatesUntil marks every ModelState on auth other than
+// resultModel unavailable until deadline. It is used when a 429 result
+// carries a credential-scoped signal (currently: a Claude request explicitly
+// rejected on the shared Anthropic 5h/7d unified rate-limit window), so a
+// sibling model on the same credential is not left selectable.
+//
+// This intentionally does NOT write auth.Unavailable/auth.Quota/
+// auth.NextRetryAfter directly: updateAggregatedAvailability (called right
+// after this, at the end of applyResultTransition's failure path) derives
+// those three fields unconditionally from auth.ModelStates on every result,
+// so a direct write here would be overwritten immediately. Instead this
+// works WITH that aggregation: once every ModelState is unavailable,
+// updateAggregatedAvailability's own allUnavailable computation sets the
+// auth-level fields correctly, and the existing per-model gate in
+// isAuthBlockedForModel (selector.go) blocks every model -- no selector.go
+// change required. Mirrors CPA's own sdk/cliproxy/auth/conductor_cooldown.go
+// fan-out for a credential-scoped rate limit.
+//
+// Known limitation, intentionally not addressed here: a model with no
+// recorded ModelState (never dispatched under this credential) has nothing
+// to mark and is not covered. Addressing that would require an auth-level
+// check in selector.go, which the base-branch parity constraint (result.go
+// and usage_result.go are byte-identical between v1.0.72 and dev; selector.go
+// is not) rules out for this fix.
+func blockSiblingModelStatesUntil(auth *Auth, resultModel string, deadline time.Time, backoffLevel int, now time.Time) {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return
+	}
+	for key, sibling := range auth.ModelStates {
+		if sibling == nil || key == resultModel {
+			continue
+		}
+		sibling.Unavailable = true
+		sibling.Status = StatusError
+		sibling.NextRetryAfter = deadline
+		sibling.QuotaResetAt = time.Time{}
+		sibling.Quota = QuotaState{
+			Exceeded: true,
+			// Deliberately quotaScopeModel, not quotaScopeCredential, even
+			// though this whole fan-out only runs for a credential-scoped
+			// rejection (result.CredentialScope): aggregateModelQuota
+			// (invoked by updateAggregatedAvailability right after this
+			// call returns) unconditionally hardcodes Scope: quotaScopeModel
+			// on the auth-level Quota it derives from every ModelState,
+			// ignoring whatever Scope each individual ModelState carries.
+			// Setting "credential" here would be silently clobbered on the
+			// very next aggregation pass -- the credential-scoped signal is
+			// expressed by fanning this state out to every sibling model,
+			// not by this field's value.
+			Scope:         quotaScopeModel,
+			Reason:        "quota",
+			NextRecoverAt: deadline,
+			BackoffLevel:  backoffLevel,
+		}
+		sibling.UpdatedAt = now
+	}
 }
 
 // resultNeedsGlobalTransition reports whether the result must be applied to
@@ -980,8 +1047,13 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 		nextLevel = level
 	}
 
-	provider := strings.ToLower(strings.TrimSpace(result.Provider))
-	if provider != "antigravity" && provider != "codex" {
+	// Gate on whether a reset hint was actually produced, not on a hardcoded
+	// provider allowlist. parseUsageRetryHints returns (nil, nil) for any
+	// provider without an explicit case (its own default branch), so this
+	// cannot change antigravity/codex behavior -- it only stops the
+	// allowlist here and the provider switch in parseUsageRetryHints from
+	// drifting apart (see cooldown_backoff_test.go parity coverage).
+	if result.ResetAt == nil && result.RetryAfter == nil {
 		return deadline, nextLevel
 	}
 	if result.ResetAt != nil && result.ResetAt.After(now) {
@@ -1001,8 +1073,20 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 	return deadline, nextLevel
 }
 
-// NewUsageResult creates a new usage result.
+// NewUsageResult creates a new usage result from a status code and response
+// body only. It carries no response headers, so provider hints that require
+// headers (Claude's Anthropic-Ratelimit-Unified-* headers) are unavailable
+// through this entry point -- use NewUsageResultWithHeaders when headers are
+// available.
 func NewUsageResult(authIndex, provider, model string, statusCode int, body string) Result {
+	return NewUsageResultWithHeaders(authIndex, provider, model, statusCode, body, nil)
+}
+
+// NewUsageResultWithHeaders creates a new usage result, additionally parsing
+// provider-specific reset hints out of response headers for providers whose
+// rate-limit information is not carried in the response body (Claude's
+// Anthropic-Ratelimit-Unified-* headers).
+func NewUsageResultWithHeaders(authIndex, provider, model string, statusCode int, body string, headers http.Header) Result {
 	// Keep validation before state changes so failures leave existing data intact.
 	authIndex = strings.TrimSpace(authIndex)
 	provider = strings.TrimSpace(provider)
@@ -1026,14 +1110,15 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 	if message == "" {
 		message = fmt.Sprintf("request failed with status %d", statusCode)
 	}
-	retryAfter, resetAt := parseUsageRetryHints(provider, body, statusCode)
+	retryAfter, resetAt, credentialScope := parseUsageRetryHints(provider, body, statusCode, headers)
 	return Result{
-		AuthIndex:  authIndex,
-		Provider:   provider,
-		Model:      model,
-		Success:    false,
-		RetryAfter: retryAfter,
-		ResetAt:    resetAt,
+		AuthIndex:       authIndex,
+		Provider:        provider,
+		Model:           model,
+		Success:         false,
+		RetryAfter:      retryAfter,
+		ResetAt:         resetAt,
+		CredentialScope: credentialScope,
 		Error: &Error{
 			Message:    message,
 			HTTPStatus: statusCode,
@@ -1041,15 +1126,25 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 	}
 }
 
-func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {
-	if statusCode != http.StatusTooManyRequests || !gjson.Valid(body) {
-		return nil, nil
+// parseUsageRetryHints returns a provider-specific retry delay and/or reset
+// timestamp for a 429 response, plus whether the hint is credential-scoped
+// (applies to every model on the credential) rather than model-scoped. A
+// provider with no explicit case below always returns (nil, nil, false), so
+// extending or narrowing the quotaCooldownAfterFailure gate to "a hint was
+// produced" instead of a hardcoded provider string cannot change behavior
+// for a provider that has no case here.
+func parseUsageRetryHints(provider, body string, statusCode int, headers http.Header) (*time.Duration, *time.Time, bool) {
+	if statusCode != http.StatusTooManyRequests {
+		return nil, nil, false
 	}
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "antigravity":
+		if !gjson.Valid(body) {
+			return nil, nil, false
+		}
 		details := gjson.Get(body, "error.details")
 		if !details.Exists() || !details.IsArray() {
-			return nil, nil
+			return nil, nil, false
 		}
 
 		var retryAfter *time.Duration
@@ -1073,10 +1168,13 @@ func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration
 				}
 			}
 		}
-		return retryAfter, resetAt
+		return retryAfter, resetAt, false
 	case "codex":
+		if !gjson.Valid(body) {
+			return nil, nil, false
+		}
 		if strings.TrimSpace(gjson.Get(body, "error.type").String()) != "usage_limit_reached" {
-			return nil, nil
+			return nil, nil, false
 		}
 		var resetAt *time.Time
 		if seconds, ok := parseUsageHintSeconds(gjson.Get(body, "error.resets_at")); ok {
@@ -1088,9 +1186,15 @@ func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration
 			duration := time.Duration(seconds) * time.Second
 			retryAfter = &duration
 		}
-		return retryAfter, resetAt
+		return retryAfter, resetAt, false
+	case "claude":
+		// Anthropic reports rate-limit reset information in response headers,
+		// not the body, so this case ignores body entirely.
+		credentialScope := claudeHeadersIndicateUnifiedRateLimitRejection(headers)
+		resetAt := parseClaudeRateLimitResetAt(headers, time.Now().UTC())
+		return nil, resetAt, credentialScope
 	default:
-		return nil, nil
+		return nil, nil, false
 	}
 }
 
