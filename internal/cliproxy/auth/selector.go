@@ -219,15 +219,54 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-// collectAvailableByPriority handles a collect available by priority.
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+// authRateLimitWarned reports whether a candidate currently carries an
+// active rate-limit warning for any window. It is read-only: it never
+// mutates auth.RateLimitWarnings (that pruning happens only on the
+// result/mutation path, where the manager lock or StateMutator is held;
+// selection can run without holding it).
+//
+// Iterates the fixed claudeRateLimitWarningWindows array (result.go) and
+// does a keyed lookup per window rather than ranging auth.RateLimitWarnings
+// directly: selection runs unlocked while MarkResult mutates that same map
+// under a lock elsewhere, and ranging a map that is concurrently written is
+// the shape that triggers Go's fatal "concurrent map iteration and map
+// write" error, which would take the whole router down. A keyed lookup is
+// the same shape as the pre-existing unsynchronized keyed read of
+// auth.ModelStates in isAuthBlockedForModel below -- it does not introduce
+// a new crash mode, it just stops amplifying the existing one. This does
+// NOT add locking. The underlying lack of synchronization is
+// pre-existing in this package and is deliberately left out of scope
+// for this change rather than fixed here.
+func authRateLimitWarned(auth *Auth, now time.Time) bool {
+	if auth == nil || len(auth.RateLimitWarnings) == 0 {
+		return false
+	}
+	for _, window := range claudeRateLimitWarningWindows {
+		if warning, ok := auth.RateLimitWarnings[window]; ok && rateLimitWarningActive(warning, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectAvailableByPriority handles a collect available by priority. It
+// returns two priority-bucketed maps: available (never warned) and warned
+// (carrying an active rate-limit warning but otherwise fully serviceable).
+// Callers must prefer available and fall back to warned only when available
+// is empty, so a warned-but-usable credential is never treated as absent.
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, warned map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
+	warned = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
 		if !blocked {
 			priority := authPriority(candidate)
-			available[priority] = append(available[priority], candidate)
+			if authRateLimitWarned(candidate, now) {
+				warned[priority] = append(warned[priority], candidate)
+			} else {
+				available[priority] = append(available[priority], candidate)
+			}
 			continue
 		}
 		if reason == blockReasonCooldown {
@@ -237,18 +276,44 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			}
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, warned, cooldownCount, earliest
 }
 
-// getAvailableAuths returns an available auths.
+// bestPriorityBucket returns the highest-priority non-empty bucket from a
+// priority-keyed map, sorted by ID within the bucket, or nil if the map is
+// empty.
+func bestPriorityBucket(byPriority map[int][]*Auth) []*Auth {
+	bestPriority := 0
+	found := false
+	for priority := range byPriority {
+		if !found || priority > bestPriority {
+			bestPriority = priority
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	best := byPriority[bestPriority]
+	if len(best) > 1 {
+		sort.Slice(best, func(i, j int) bool { return best[i].ID < best[j].ID })
+	}
+	return best
+}
+
+// getAvailableAuths returns an available auths. A candidate warned by a
+// provider early-warning header is de-preferred (only used when no
+// never-warned candidate exists at any priority) but is NEVER treated as
+// unavailable: never-starve is structural here, not a runtime guard — the
+// warned bucket is consulted before any error is built.
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	// Build the candidate view before applying availability rules.
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
-	if len(availableByPriority) == 0 {
+	availableByPriority, warnedByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	if len(availableByPriority) == 0 && len(warnedByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
@@ -263,20 +328,10 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
+	if best := bestPriorityBucket(availableByPriority); len(best) > 0 {
+		return best, nil
 	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
-	}
-	return available, nil
+	return bestPriorityBucket(warnedByPriority), nil
 }
 
 func filterConcurrencyExcludedAuths(auths []*Auth, model string, opts Options) []*Auth {
