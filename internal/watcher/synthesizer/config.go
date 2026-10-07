@@ -619,12 +619,13 @@ func buildOpenAICompatibilityModels(models []appconfig.OpenAICompatibilityModel,
 		}
 		info := &registry.ModelInfo{
 			ID:          modelID,
+			Name:        strings.TrimSpace(model.Name),
 			Object:      "model",
 			Created:     created,
 			OwnedBy:     compatName,
 			Type:        "openai-compatibility",
 			DisplayName: modelID,
-			UserDefined: false,
+			UserDefined: true,
 			Thinking:    thinking,
 		}
 		modelconfig.ApplyConfiguredCapabilities(info, model)
