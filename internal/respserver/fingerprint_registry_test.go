@@ -134,6 +134,41 @@ func TestSubscriptionStopsPongWhenSharedLivenessFails(t *testing.T) {
 	}
 }
 
+func TestSubscriptionCancellationDoesNotFenceOtherConnections(t *testing.T) {
+	registry := NewFingerprintRegistry()
+	lifetime := cluster.ConnectionLifetime{Fingerprint: "fp-canceled-subscription", ConnectedAt: time.Unix(10, 0), Subscription: true}
+	connection := newSubscriptionTestConn()
+	tracked, errAccept := registry.Accept(context.Background(), connection, lifetime)
+	if errAccept != nil {
+		t.Fatal(errAccept)
+	}
+	t.Cleanup(func() { _ = tracked.Close() })
+	started, returned := make(chan struct{}), make(chan struct{})
+	handler := &blockingClusterHandler{liveness: func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		defer close(returned)
+		return ctx.Err()
+	}}
+	server := New("", nil)
+	server.fingerprints = registry
+	server.SetClusterHandler(handler)
+	cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connection))
+	t.Cleanup(cancel)
+	waitSubscriptionTestSignal(t, started, "heartbeat database read")
+	cancel()
+	waitSubscriptionTestSignal(t, returned, "canceled heartbeat database read")
+	// Allow the heartbeat error path to run after its database call returns.
+	select {
+	case <-tracked.Context().Done():
+		t.Fatal("canceling subscription updates fenced the membership")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if strings.Contains(connection.Output(), "pong") {
+		t.Fatal("canceled heartbeat published pong")
+	}
+}
+
 func TestActiveLifetimeFenceClosesBootstrapOriginatedSubscription(t *testing.T) {
 	registry := NewFingerprintRegistry()
 	serverConn, clientConn := net.Pipe()
@@ -240,6 +275,7 @@ func TestClosedLifetimeFenceDoesNotBlockNewLifetime(t *testing.T) {
 type blockingClusterHandler struct {
 	lifetime        cluster.ConnectionLifetime
 	livenessErr     error
+	liveness        func(context.Context) error
 	started         chan struct{}
 	release         chan struct{}
 	contextCanceled chan struct{}
@@ -253,7 +289,10 @@ func (h *blockingClusterHandler) SubscribeMembership(context.Context, string, st
 	return h.lifetime, nil
 }
 
-func (h *blockingClusterHandler) RefreshCPALiveness(context.Context, cluster.ConnectionLifetime) error {
+func (h *blockingClusterHandler) RefreshCPALiveness(ctx context.Context, _ cluster.ConnectionLifetime) error {
+	if h.liveness != nil {
+		return h.liveness(ctx)
+	}
 	return h.livenessErr
 }
 

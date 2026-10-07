@@ -163,6 +163,11 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedC
 			case <-heartbeatTicker.C:
 				lifetime := tracked.Lifetime()
 				if errLiveness := s.refreshSubscriptionLiveness(runCtx, lifetime); errLiveness != nil {
+					// Stopping this subscription cancels an in-progress database read;
+					// it does not invalidate other connections in the same lifetime.
+					if runCtx.Err() != nil {
+						return
+					}
 					log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
 					if s.fingerprints != nil {
 						if errFence := s.fingerprints.Fence(context.WithoutCancel(runCtx), lifetime, s.fingerprints.LatestFenceRevision(lifetime)); errFence != nil {
