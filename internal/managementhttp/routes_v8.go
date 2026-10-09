@@ -24,6 +24,7 @@ func managementV8Routes(legacy *RouteRegistry, sdk *cpasdkapi.Handler, home *clu
 		"/usage-queue":                "/observability/usage/queue",
 		"/auth-files":                 "/credentials",
 		"/auth-files/models":          "/credentials/models",
+		"/auth-files/model-states":    "/credentials/model-states",
 		"/auth-files/download":        "/credentials/download",
 		"/auth-files/status":          "/credentials/status",
 		"/auth-files/fields":          "/credentials/fields",

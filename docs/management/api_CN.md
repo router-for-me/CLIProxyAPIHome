@@ -169,6 +169,8 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/credentials/in-flight` |
 | `GET` | `/credentials/in-flight/summary` |
 | `GET` | `/credentials/models` |
+| `GET` | `/credentials/model-states` |
+| `GET` | `/credentials/:credential_id/model-states` |
 | `POST` | `/credentials/quota/fetch` |
 | `GET` | `/credentials/quota/providers` |
 | `POST` | `/credentials/quota/reset` |
@@ -2100,6 +2102,88 @@ Query 参数：
   ]
 }
 ```
+
+### GET `/credentials/model-states` 与 `/credentials/:credential_id/model-states`
+
+读取**当前 Home 节点运行时**中的模型执行历史和有效阻断状态。这是只读快照，不进行凭证选取、不读取数据库完整凭证、不混合持久化状态，也不汇总其他 Home 节点。
+
+v0 兼容列表路径：`GET /auth-files/model-states`。
+
+| Query | 类型 | 说明 |
+| --- | --- | --- |
+| `credential_id` | string | 列表接口按精确 credential ID 过滤；单凭证接口使用路径 ID。不支持 filename 或 display name 查询。 |
+| `provider` | string | 可选，按 provider 过滤（如 `xai`、`codex`），不区分大小写。 |
+| `model` | string | 可选，不区分大小写。支持带前缀的可见 ID、API-key/OAuth alias、强制前缀下的裸 alias 和上游模型 ID。映射到同一上游模型的多个可见路由均可能匹配，筛选前缀和模型名的大小写不影响匹配结果。此诊断行为不改变 Dispatch 的前缀匹配规则。 |
+
+列表接口**始终**返回 `{status, source, node, observed_at, total, credentials}`，携带 `credential_id` 时也不改变结构。不匹配的凭证及无匹配模型的凭证不会返回；无结果时为 `total: 0`、`credentials: []`。
+
+路径接口返回 `{status, source, node, observed_at, credential}`。凭证不存在、路径 ID 为空或仅含空白、provider 不匹配时返回 `404 credential_not_found`；已提供的路径 ID 不会被 query ID 替换。model 无匹配时返回该凭证及 `models: []`。运行时 auth manager 不可用时，两个接口均返回 `503 runtime_unavailable`。
+
+单凭证响应示例：
+
+```json
+{
+  "status": "ok",
+  "source": "runtime",
+  "node": {"ip": "192.0.2.10", "port": 8317},
+  "observed_at": "2026-10-09T08:05:00Z",
+  "credential": {
+    "credential_id": "auth-uuid-1",
+    "provider": "xai",
+    "prefix": "team",
+    "state_version": 7,
+    "status": "error",
+    "disabled": false,
+    "unavailable": false,
+    "refresh_blocked": false,
+    "models": [
+      {
+        "model": "team/fast",
+        "upstream_model": "grok-4.7-build-fast",
+        "state_key": "grok-4.7-build-fast",
+        "registered": true,
+        "status": "error",
+        "status_message": "context canceled",
+        "unavailable": true,
+        "blocked": false,
+        "block_reason": "none",
+        "last_error": {
+          "http_status": 499,
+          "message": "context canceled",
+          "retryable": false
+        },
+        "updated_at": "2026-10-09T08:01:16Z"
+      }
+    ]
+  }
+}
+```
+
+快照及凭证字段：
+
+- `source` 固定为 `runtime`；`node` 标识当前查询的 Home IP/端口，`observed_at` 为阻断判断时间。
+- `state_version` 是该运行时凭证最后接受的存储版本，并不是每次本地请求结果的递增版本；本地模型历史可能更新于此版本。
+- `prefix`、`label`、`status_message`、凭证级 `last_error` 和凭证级 `next_retry_after` 有值时返回。
+- `refresh_blocked` 标识凭证级刷新阻断。刷新阻断或禁用凭证可以在没有模型错误历史时阻断所有模型。
+
+模型项字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `model` | 已注册的客户端可见路由 ID，或未注册的历史状态键。 |
+| `upstream_model` | 复用 Dispatch 的前缀与 alias 解析所得上游模型 ID。未注册的历史状态键不会再次做 alias 解析。 |
+| `state_key` | 本次返回模型历史所使用的键。通常为上游 ID；旧路由状态阻断调度或上游历史不存在时，可以是旧路由键。凭证级刷新阻断或禁用不会隐藏已有模型历史。 |
+| `registered` | 当前凭证是否注册了该路由。`registered: false` 的历史状态不代表路由可被调度。 |
+| `display_name` | 可选，已注册模型的显示名。 |
+| `status`、`status_message`、`unavailable`、`last_error`、`quota`、`updated_at` | `state_key` 的执行历史，不等于当前有效可用性。 |
+| `blocked`、`block_reason` | 应用当前全局及凭证级 `disable-cooling` 策略后的凭证/模型状态阻断。原因为 `none`、`cooldown`（额度）、`disabled` 或 `other`（包括刷新与非额度错误）。 |
+| `next_retry_after`、`remaining_cooldown` | 被阻断模型的未来有效重试时间和剩余时间，剩余时间向上取整到秒。未阻断或不存在未来截止时间时省略。 |
+
+因此，499 记录没有重试截止时间时，可以同时表现为 `status: error`、`unavailable: true`、`blocked: false`。禁用冷却也会保留历史错误，但移除对应的有效阻断。旧 alias 状态阻断路由时，返回它的错误详情及对应有效重试时间，避免字段来自不同状态。
+
+模型可选字段无值时省略，不序列化为 `null`；只有额度已超限或记录的恢复时间非零时返回 `quota`。模型与凭证均按 ID 排序。
+
+**范围限制：** `blocked: false` 不保证请求一定会选中该凭证。此快照不检查调度分片缓存、完整凭证复查、API-key/渠道权限、权重、重试排除、并发准入或上游模型健康情况。排查节点差异时，应分别查询每个 Home 节点。
 
 ### GET `/credentials/download`
 
@@ -4102,6 +4186,7 @@ Payload 嵌套结构：
 | `/auth-files/download` | `/credentials/download` |
 | `/auth-files/fields` | `/credentials/fields` |
 | `/auth-files/models` | `/credentials/models` |
+| `/auth-files/model-states` | `/credentials/model-states` |
 | `/auth-files/status` | `/credentials/status` |
 | `/get-auth-status` | `/oauth/status` |
 | `/latest-version` | `/server/latest-version` |

@@ -218,6 +218,8 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodGet, "/credentials/:credential_id/concurrency-policy", handler.GetCredentialConcurrencyPolicy)
 	r.Set(http.MethodPatch, "/credentials/:credential_id/concurrency-policy", handler.PatchCredentialConcurrencyPolicy)
 	r.Set(http.MethodDelete, "/credentials/:credential_id/cooldown", handler.ClearCredentialCooldown)
+	r.Set(http.MethodGet, "/credentials/:credential_id/model-states", handler.GetCredentialModelStates)
+	r.Set(http.MethodGet, "/credentials/model-states", handler.GetCredentialModelStates)
 	r.Set(http.MethodGet, "/quota/credentials", handler.ListQuotaCredentials)
 	r.Set(http.MethodGet, "/quota/credentials/:credential_id", handler.GetQuotaCredential)
 	r.Set(http.MethodPost, "/quota/collect", handler.CollectQuota)
@@ -360,6 +362,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 
 	r.Set(http.MethodGet, "/auth-files", handler.ListAuthFiles)
 	r.Set(http.MethodGet, "/auth-files/models", handler.GetAuthFileModels)
+	r.Set(http.MethodGet, "/auth-files/model-states", handler.GetCredentialModelStates)
 	r.Set(http.MethodGet, "/auth-files/download", handler.DownloadAuthFile)
 	r.Set(http.MethodPost, "/auth-files", handler.UploadAuthFile)
 	r.Set(http.MethodDelete, "/auth-files", handler.DeleteAuthFile)

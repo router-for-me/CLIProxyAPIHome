@@ -1214,13 +1214,20 @@ func classifyDispatchAvailability(auth *Auth, blockedModel string, blocked bool,
 	return false, reason, next
 }
 
-func dispatchAvailabilityForModel(auth *Auth, resolvedModel, routeModel string, now time.Time) (bool, blockReason, time.Time) {
+// dispatchModelBlockStatus preserves the upstream-first check and legacy route fallback.
+// Returning the checked model lets diagnostics identify the state that blocks dispatch.
+func dispatchModelBlockStatus(auth *Auth, resolvedModel, routeModel string, now time.Time) (string, bool, blockReason, time.Time) {
 	blockedModel := resolvedModel
 	blocked, reason, next := isAuthBlockedForModel(auth, blockedModel, now)
 	if !blocked && resolvedModel != canonicalModelKey(routeModel) {
 		blockedModel = routeModel
 		blocked, reason, next = isAuthBlockedForModel(auth, blockedModel, now)
 	}
+	return blockedModel, blocked, reason, next
+}
+
+func dispatchAvailabilityForModel(auth *Auth, resolvedModel, routeModel string, now time.Time) (bool, blockReason, time.Time) {
+	blockedModel, blocked, reason, next := dispatchModelBlockStatus(auth, resolvedModel, routeModel, now)
 	return classifyDispatchAvailability(auth, blockedModel, blocked, reason, next, now)
 }
 
