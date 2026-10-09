@@ -845,12 +845,7 @@ func (m *modelScheduler) refreshEntryStateLocked(entry *scheduledAuth, now time.
 	entry.alphaSearchAllowed = credentialPolicyAllows(CredentialPolicyCodexAlphaSearchV1, entry.auth)
 	entry.schedulerEligible = entry.meta != nil && entry.meta.supportsModel(m.modelKey)
 	runtimeModelKey := m.runtimeModelKeyForAuth(entry.auth)
-	blockedModel := runtimeModelKey
-	blocked, reason, next := isAuthBlockedForModel(entry.auth, blockedModel, now)
-	if !blocked && runtimeModelKey != canonicalModelKey(m.modelKey) {
-		blockedModel = m.modelKey
-		blocked, reason, next = isAuthBlockedForModel(entry.auth, blockedModel, now)
-	}
+	blockedModel, blocked, reason, next := dispatchModelBlockStatus(entry.auth, runtimeModelKey, m.modelKey, now)
 	switch {
 	case !blocked:
 		entry.state = scheduledStateReady

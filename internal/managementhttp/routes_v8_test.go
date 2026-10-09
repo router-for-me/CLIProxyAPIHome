@@ -28,6 +28,7 @@ func TestManagementV8Routes(t *testing.T) {
 	for _, route := range []string{
 		"GET /config", "PUT /config", "PATCH /config", "GET /config.yaml", "PUT /config.yaml", "DELETE /config/*path",
 		"GET /credentials", "POST /credentials/refresh", "GET /credentials/in-flight", "PATCH /credentials/:credential_id/concurrency-policy",
+		"GET /credentials/model-states", "GET /credentials/:credential_id/model-states",
 		"GET /oauth/auth-url", "POST /oauth/import", "GET /oauth/status", "DELETE /oauth/session",
 		"GET /server/latest-version", "POST /requests/api-call", "POST /routing/cooldown/reset",
 		"GET /observability/logs", "GET /observability/usage/api-keys", "GET /plugins/store", "DELETE /plugins/:id",

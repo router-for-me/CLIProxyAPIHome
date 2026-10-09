@@ -68,6 +68,15 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
+	// Keep the model tier synchronized with refreshed subscription claims.
+	if claims, errParse := codexauth.ParseJWTToken(td.IDToken); errParse == nil && claims != nil {
+		if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+			if auth.Attributes == nil {
+				auth.Attributes = make(map[string]string)
+			}
+			auth.Attributes["plan_type"] = planType
+		}
+	}
 	auth.Metadata["id_token"] = td.IDToken
 	auth.Metadata["access_token"] = td.AccessToken
 	if td.RefreshToken != "" {
