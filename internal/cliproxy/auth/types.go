@@ -57,6 +57,10 @@ type Auth struct {
 	RuntimeRefreshBlocked bool `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
+	// RateLimitWarnings records provider early-warnings keyed by window. A warned
+	// credential is still fully serviceable; it is merely de-preferred by the
+	// selector so traffic drains off it before the provider starts rejecting.
+	RateLimitWarnings map[string]RateLimitWarning `json:"rate_limit_warnings,omitempty"`
 	// LastError stores the last failure encountered while executing or refreshing.
 	LastError *Error `json:"last_error,omitempty"`
 	// LastRefreshError preserves refresh acquisition diagnostics independently
@@ -120,6 +124,16 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+}
+
+// RateLimitWarning records a provider early-warning for one rate-limit window.
+type RateLimitWarning struct {
+	// Window is the provider's window key (e.g. "5h", "7d", "7d_oi").
+	Window string `json:"window"`
+	// ResetAt is when the window resets, when the provider supplied it.
+	ResetAt time.Time `json:"reset_at,omitzero"`
+	// ObservedAt is when this warning was last seen.
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
@@ -242,6 +256,12 @@ func (a *Auth) Clone() *Auth {
 		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
+		}
+	}
+	if len(a.RateLimitWarnings) > 0 {
+		copyAuth.RateLimitWarnings = make(map[string]RateLimitWarning, len(a.RateLimitWarnings))
+		for key, warning := range a.RateLimitWarnings {
+			copyAuth.RateLimitWarnings[key] = warning
 		}
 	}
 	copyAuth.Runtime = a.Runtime
