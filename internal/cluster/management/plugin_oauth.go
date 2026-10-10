@@ -241,6 +241,9 @@ func (h *Handler) respondPluginAuthStatus(c *gin.Context, ctx context.Context, s
 			c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 			return true
 		}
+		for _, auth := range auths {
+			cluster.EnsurePluginAuthIdentity(auth)
+		}
 		if errComplete := h.repo.CompleteOAuthSessionWithAuths(ctx, session.State, auths); errComplete != nil {
 			if errors.Is(errComplete, cluster.ErrOAuthSessionNotPending) {
 				h.GetAuthStatus(c)
