@@ -169,7 +169,7 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(auth))
+	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(r.pluginDiscoveryAuth(ctx, auth)))
 	if !result.Handled {
 		return false
 	}
@@ -245,6 +245,26 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	}
 	registry.GetGlobalRegistry().UnregisterClient(activeAuth.ID)
 	return true
+}
+
+// pluginDiscoveryAuth returns the credential a plugin needs for per-auth model discovery.
+// In cluster mode the runtime keeps minimal auths whose metadata carries only Home-owned
+// fields, so a plugin would receive no provider credentials and could not list models.
+// The full auth is loaded from the cluster store; the minimal auth is used as a fallback.
+func (r *Runtime) pluginDiscoveryAuth(ctx context.Context, auth *homeauth.Auth) *homeauth.Auth {
+	if r == nil || auth == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
+		return auth
+	}
+	full, errFull := r.clusterAdapter.GetFullAuth(ctx, auth.ID)
+	if errFull != nil {
+		log.WithError(errFull).WithField("auth_id", auth.ID).Debug("plugin model discovery: full auth unavailable, using runtime auth")
+		return auth
+	}
+	if full == nil {
+		return auth
+	}
+	full.ID = auth.ID
+	return full
 }
 
 func (r *Runtime) pluginModelsForProvider(providerKey string) []*ModelInfo {
