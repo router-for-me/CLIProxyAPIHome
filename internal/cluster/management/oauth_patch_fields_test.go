@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
 
 func TestApplyOAuthFieldPatchArbitraryFields(t *testing.T) {
@@ -22,7 +23,7 @@ func TestApplyOAuthFieldPatchArbitraryFields(t *testing.T) {
 	}
 	fields := mustRawFields(t, `{"abc":true,"nested.cde":true,"fgh":{"ijk":true},"websockets":false}`)
 
-	changed, errPatch := applyOAuthFieldPatch(auth, fields)
+	changed, errPatch := applyOAuthFieldPatch(auth, fields, nil)
 	if errPatch != nil {
 		t.Fatalf("applyOAuthFieldPatch returned error: %v", errPatch)
 	}
@@ -86,7 +87,7 @@ func TestApplyOAuthFieldPatchCanonicalPrecedenceOverLegacyAliases(t *testing.T) 
 				Attributes: map[string]string{"priority": "10"},
 				Metadata:   map[string]any{"type": "codex", "request_retry": 1},
 			}
-			changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, tc.patch))
+			changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, tc.patch), nil)
 			if errPatch != nil || !changed {
 				t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want successful patch", tc.patch, changed, errPatch)
 			}
@@ -119,7 +120,7 @@ func TestApplyOAuthFieldPatchRejectsConflictingOrOverlappingPaths(t *testing.T) 
 			Attributes: map[string]string{"priority": "10"},
 			Metadata:   map[string]any{"type": "codex", "request_retry": 1},
 		}
-		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch))
+		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch), nil)
 		if errPatch == nil || changed {
 			t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want unchanged conflict/overlap error", patch, changed, errPatch)
 		}
@@ -148,7 +149,7 @@ func TestApplyOAuthFieldPatchRejectsInvalidRequestRetryAtomically(t *testing.T) 
 			Attributes: map[string]string{"priority": "10"},
 			Metadata:   map[string]any{"type": "codex", "priority": 10, "request_retry": 1},
 		}
-		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch))
+		changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, patch), nil)
 		if errPatch == nil || changed {
 			t.Fatalf("applyOAuthFieldPatch(%s) = (%t, %v), want unchanged validation error", patch, changed, errPatch)
 		}
@@ -167,7 +168,7 @@ func TestApplyOAuthFieldPatchNegativeRequestRetryClearsOverride(t *testing.T) {
 		Provider: "codex",
 		Metadata: map[string]any{"type": "codex", "request_retry": 1, "request-retry": 2},
 	}
-	changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"request-retry":-1}`))
+	changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"request-retry":-1}`), nil)
 	if errPatch != nil || !changed {
 		t.Fatalf("applyOAuthFieldPatch() = (%t, %v), want successful clear", changed, errPatch)
 	}
@@ -591,6 +592,145 @@ func TestPatchAuthFileFieldsRoundTripsDisableCooling(t *testing.T) {
 	}
 	if disabled := persisted.DisableCoolingOverride(); disabled == nil || !*disabled {
 		t.Fatalf("persisted override after hyphenated patch = %#v, want true", disabled)
+	}
+}
+
+func TestApplyOAuthFieldPatchRejectsInvalidExcludedModelsAtomically(t *testing.T) {
+	for _, key := range []string{"excluded_models", "excluded-models"} {
+		for _, tc := range []struct {
+			name   string
+			suffix string
+			value  string
+		}{
+			{name: "number", value: `123`},
+			{name: "string", value: `"claude-new"`},
+			{name: "boolean", value: `true`},
+			{name: "object", value: `{}`},
+			{name: "mixed array", value: `["claude-new",123]`},
+			{name: "null entry", value: `["claude-new",null]`},
+			{name: "boolean entry", value: `[false]`},
+			{name: "object entry", value: `[{}]`},
+			{name: "nested array", value: `[["claude-new"]]`},
+			{name: "child path", suffix: ".child", value: `["claude-new"]`},
+			{name: "null child path", suffix: ".child", value: `null`},
+			{name: "index path", suffix: ".0", value: `"claude-new"`},
+		} {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				auth := &coreauth.Auth{
+					ID:       "claude-auth",
+					Provider: "claude",
+					Attributes: map[string]string{
+						"auth_kind":            "oauth",
+						"excluded_models":      "claude-old",
+						"excluded_models_hash": "old-hash",
+					},
+					Metadata: map[string]any{
+						"type":            "claude",
+						"excluded_models": []string{"claude-old"},
+						"excluded-models": []string{"claude-legacy"},
+					},
+				}
+				before, errMarshal := json.Marshal(auth)
+				if errMarshal != nil {
+					t.Fatalf("marshal auth before patch: %v", errMarshal)
+				}
+				fields := map[string]json.RawMessage{
+					"abc":           json.RawMessage(`true`),
+					key + tc.suffix: json.RawMessage(tc.value),
+				}
+				changed, errPatch := applyOAuthFieldPatch(auth, fields, nil)
+				if errPatch == nil || changed {
+					t.Fatalf("applyOAuthFieldPatch() = (%t, %v), want unchanged validation error", changed, errPatch)
+				}
+				after, errMarshalAfter := json.Marshal(auth)
+				if errMarshalAfter != nil {
+					t.Fatalf("marshal auth after patch: %v", errMarshalAfter)
+				}
+				if string(after) != string(before) {
+					t.Fatalf("auth changed after rejected patch: before=%s after=%s", before, after)
+				}
+			})
+		}
+	}
+}
+
+func TestPatchAuthFileFieldsRejectsInvalidExcludedModels(t *testing.T) {
+	handler, engine, _, closeRepo := newConcurrencyManagementTestServer(t)
+	defer closeRepo()
+	seedOAuthAuth(t, handler.repo, "oauth-exclusions")
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(`{"id":"oauth-exclusions","excluded_models":["codex-old"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("initial PATCH status = %d body=%s", response.Code, response.Body.String())
+	}
+	_, before, errAuth := handler.repo.GetAuth(t.Context(), "oauth-exclusions")
+	if errAuth != nil {
+		t.Fatalf("GetAuth() before rejected patch: %v", errAuth)
+	}
+
+	for _, patch := range []string{
+		`{"id":"oauth-exclusions","abc":true,"excluded_models":123}`,
+		`{"id":"oauth-exclusions","abc":true,"excluded-models":"codex-new"}`,
+		`{"id":"oauth-exclusions","abc":true,"excluded_models":["codex-new",null]}`,
+		`{"id":"oauth-exclusions","abc":true,"excluded-models.child":null}`,
+	} {
+		response = httptest.NewRecorder()
+		request = httptest.NewRequest(http.MethodPatch, "/auth-files/fields", strings.NewReader(patch))
+		request.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("PATCH %s status = %d body=%s, want 400", patch, response.Code, response.Body.String())
+		}
+		_, after, errAuthAfter := handler.repo.GetAuth(t.Context(), "oauth-exclusions")
+		if errAuthAfter != nil {
+			t.Fatalf("GetAuth() after rejected patch: %v", errAuthAfter)
+		}
+		if string(after.AuthJSON) != string(before.AuthJSON) || after.Version != before.Version {
+			t.Fatalf("persisted auth changed after rejected patch %s", patch)
+		}
+	}
+}
+
+func TestApplyOAuthFieldPatchSyncsExcludedModelsAttribute(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:         "claude-auth",
+		Provider:   "claude",
+		Attributes: map[string]string{"auth_kind": "oauth"},
+		Metadata:   map[string]any{"type": "claude"},
+	}
+	cfg := &appconfig.Config{OAuthExcludedModels: map[string][]string{"claude": {"claude-global"}}}
+
+	// Legacy key, mixed case and duplicates must normalize and merge with global exclusions.
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded-models":["Claude-B","claude-a","claude-b"]}`), cfg); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() error = %v", errPatch)
+	}
+	if got, want := auth.Attributes["excluded_models"], "claude-a,claude-b,claude-global"; got != want {
+		t.Fatalf("attributes.excluded_models = %q, want %q", got, want)
+	}
+	if auth.Attributes["excluded_models_hash"] == "" {
+		t.Fatalf("attributes.excluded_models_hash is empty")
+	}
+
+	// Clearing the per-account list keeps only global exclusions.
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded_models":[]}`), cfg); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() clear error = %v", errPatch)
+	}
+	if got, want := auth.Attributes["excluded_models"], "claude-global"; got != want {
+		t.Fatalf("attributes.excluded_models after clear = %q, want %q", got, want)
+	}
+
+	// Without global exclusions, clearing removes the stale attributes entirely.
+	if _, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"excluded_models":null}`), nil); errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch() null error = %v", errPatch)
+	}
+	if _, ok := auth.Attributes["excluded_models"]; ok {
+		t.Fatalf("attributes.excluded_models = %q, want removed", auth.Attributes["excluded_models"])
+	}
+	if _, ok := auth.Attributes["excluded_models_hash"]; ok {
+		t.Fatalf("attributes.excluded_models_hash = %q, want removed", auth.Attributes["excluded_models_hash"])
 	}
 }
 
