@@ -90,7 +90,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			if len(auths) == 0 {
 				return nil
 			}
-			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+			perAccountExcluded := ExtractExcludedModelsFromMetadata(metadata)
 			for _, auth := range auths {
 				auth.CreatedAt = now
 				auth.UpdatedAt = now
@@ -152,7 +152,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 
 	// Read per-account excluded models from the OAuth JSON file.
-	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+	perAccountExcluded := ExtractExcludedModelsFromMetadata(metadata)
 
 	a := &coreauth.Auth{
 		ID:       id,
@@ -234,9 +234,9 @@ func compactPluginAuths(auths []*coreauth.Auth) []*coreauth.Auth {
 	return out
 }
 
-// extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
+// ExtractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
 // Supports both "excluded_models" and "excluded-models" keys, and accepts both []string and []interface{}.
-func extractExcludedModelsFromMetadata(metadata map[string]any) []string {
+func ExtractExcludedModelsFromMetadata(metadata map[string]any) []string {
 	if metadata == nil {
 		return nil
 	}

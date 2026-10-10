@@ -2333,7 +2333,8 @@ Editable fields:
 | `disabled` | boolean or string bool | Updates auth disabled state and status. |
 | `disable-cooling` | boolean or `null` | Credential cooling override. `true` disables cooling, `false` enables it, and `null` clears the override so the credential inherits the global setting. The hyphenated response field is accepted directly by this PATCH route. |
 | `request-retry` | integer or `null` | Additional credential retry-round override. `0` disables additional rounds; `null` or a negative value inherits the global setting. Both `request-retry` and `request_retry` are accepted; when both appear together, `request_retry` takes precedence. |
-| any nested path | any valid JSON | Sets arbitrary metadata paths such as `token.access_token`. |
+| `excluded_models`, `excluded-models` | string array or `null` | Per-credential model exclusion patterns, merged with global OAuth exclusions. `[]` or `null` clears only the per-credential list. When both names are provided, `excluded_models` takes precedence. Invalid types, non-string array elements, and nested paths under this field return `400` without applying any changes. |
+| any other nested path | any valid JSON | Sets arbitrary metadata paths such as `token.access_token`. |
 
 Example response:
 

@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
 )
 
@@ -259,7 +260,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 	removeOAuthFieldPatchIdentifierFields(body)
 	removeOAuthFieldPatchConcurrencyFields(body)
-	changed, errPatch := applyOAuthFieldPatch(auth, body)
+	var cfg *appconfig.Config
+	if h.runtime != nil {
+		cfg = h.runtime.Config()
+	}
+	changed, errPatch := applyOAuthFieldPatch(auth, body, cfg)
 	if errPatch != nil {
 		respondError(c, http.StatusBadRequest, "invalid body", errPatch)
 		return
@@ -612,7 +617,7 @@ func authFileDisplayName(auth *coreauth.Auth) string {
 }
 
 // applyOAuthFieldPatch applies an o auth field patch.
-func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage) (bool, error) {
+func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage, cfg *appconfig.Config) (bool, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	normalizedFields := make(map[string]json.RawMessage, len(fields))
 	pathOwners := make(map[string]string, len(fields))
@@ -693,6 +698,22 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 				}
 			}
 		}
+		if rootOAuthField(metadataPath) == "excluded_models" {
+			if metadataPath != "excluded_models" {
+				return false, fmt.Errorf("invalid field %s", fieldPath)
+			}
+			if value != nil {
+				models, okModels := value.([]any)
+				if !okModels {
+					return false, fmt.Errorf("invalid field %s", fieldPath)
+				}
+				for _, model := range models {
+					if _, okString := model.(string); !okString {
+						return false, fmt.Errorf("invalid field %s", fieldPath)
+					}
+				}
+			}
+		}
 		decodedValues[metadataPath] = value
 	}
 	if auth.Metadata == nil {
@@ -731,7 +752,7 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 		changed = true
 	}
 	if changed {
-		syncOAuthMetadataFields(auth, touchedRoots)
+		syncOAuthMetadataFields(auth, touchedRoots, cfg)
 	}
 	return changed, nil
 }
@@ -925,7 +946,7 @@ func oauthHeadersStringMap(value any) (map[string]string, bool) {
 	}
 }
 
-func syncOAuthMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct{}) {
+func syncOAuthMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct{}, cfg *appconfig.Config) {
 	if auth == nil || len(touchedRoots) == 0 {
 		return
 	}
@@ -950,6 +971,27 @@ func syncOAuthMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncOAuthDisabledState(auth)
 	}
+	if _, ok := touchedRoots["excluded_models"]; ok {
+		syncOAuthExcludedModelsAttribute(auth, cfg)
+	}
+}
+
+// syncOAuthExcludedModelsAttribute rebuilds the runtime excluded_models attributes from metadata,
+// merging global oauth-excluded-models the same way auth file synthesis does.
+func syncOAuthExcludedModelsAttribute(auth *coreauth.Auth, cfg *appconfig.Config) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	// ApplyAuthExcludedModelsMeta never clears attributes, so drop stale values first.
+	delete(auth.Attributes, "excluded_models")
+	delete(auth.Attributes, "excluded_models_hash")
+	if cfg == nil {
+		cfg = &appconfig.Config{}
+	}
+	synthesizer.ApplyAuthExcludedModelsMeta(auth, cfg, synthesizer.ExtractExcludedModelsFromMetadata(auth.Metadata), "oauth")
 }
 
 func syncOAuthHeaderAttributes(auth *coreauth.Auth) {
