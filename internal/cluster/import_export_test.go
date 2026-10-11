@@ -265,6 +265,34 @@ func TestImportLocalStateRejectsDuplicateProviderCredentialIDs(t *testing.T) {
 	}
 }
 
+func TestImportLocalStateRejectsInvalidAuthFileExcludedModels(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	authDir := filepath.Join(dir, "auth")
+	if errMk := os.MkdirAll(authDir, 0o700); errMk != nil {
+		t.Fatal(errMk)
+	}
+	writeFile(t, configPath, "gemini-api-key:\n  - api-key: gemini\n")
+	writeFile(t, filepath.Join(authDir, "a.json"), `{"type":"antigravity","email":"a@example.test"}`)
+	badPath := filepath.Join(authDir, "b.json")
+	writeFile(t, badPath, `{"type":"antigravity","email":"b@example.test","excluded_models":123}`)
+	repo := NewRepository(openImportTestSQLite(t))
+
+	stats, errImport := ImportLocalState(ctx, ImportOptions{ConfigPath: configPath, AuthDir: authDir, Repository: repo})
+	if errImport == nil || !strings.Contains(errImport.Error(), badPath) {
+		t.Fatalf("ImportLocalState() = (%+v, %v), want error naming %s", stats, errImport, badPath)
+	}
+	// Collection fails before the import transaction, so nothing from the batch is written.
+	auths, errList := repo.ListAuths(ctx)
+	if errList != nil {
+		t.Fatalf("ListAuths() error = %v", errList)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("ListAuths() = %d auths, want none after a rejected import", len(auths))
+	}
+}
+
 func TestImportLocalStateRejectsExistingCredentialIdentityCollisions(t *testing.T) {
 	tests := []struct {
 		name     string

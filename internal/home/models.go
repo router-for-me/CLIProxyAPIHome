@@ -205,8 +205,9 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	}
 
 	excluded := r.oauthExcludedModels(cfg, provider, authKind)
-	// The synthesizer pre-merges per-account and global exclusions into the "excluded_models" attribute.
-	// If this attribute is present, it represents the complete list of exclusions and overrides the global config.
+	// The "excluded_models" attribute holds only the credential's own exclusions.
+	// When present it takes priority over the global oauth-excluded-models config;
+	// otherwise the current global config applies, so global changes take effect without rewriting credentials.
 	if a.Attributes != nil {
 		if val, ok := a.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
 			excluded = strings.Split(val, ",")

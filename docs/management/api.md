@@ -2333,7 +2333,7 @@ Editable fields:
 | `disabled` | boolean or string bool | Updates auth disabled state and status. |
 | `disable-cooling` | boolean or `null` | Credential cooling override. `true` disables cooling, `false` enables it, and `null` clears the override so the credential inherits the global setting. The hyphenated response field is accepted directly by this PATCH route. |
 | `request-retry` | integer or `null` | Additional credential retry-round override. `0` disables additional rounds; `null` or a negative value inherits the global setting. Both `request-retry` and `request_retry` are accepted; when both appear together, `request_retry` takes precedence. |
-| `excluded_models`, `excluded-models` | string array or `null` | Per-credential model exclusion patterns, merged with global OAuth exclusions. `[]` or `null` clears only the per-credential list. When both names are provided, `excluded_models` takes precedence. Invalid types, non-string array elements, and nested paths under this field return `400` without applying any changes. |
+| `excluded_models`, `excluded-models` | string array or `null` | Per-credential model exclusion patterns. A non-empty list takes priority over the global OAuth exclusions for this credential (it is not merged with them). `[]` or `null` clears the per-credential list so the credential inherits the current global OAuth exclusions. When both names are provided, `excluded_models` takes precedence. Invalid types, non-string array elements, and nested paths under this field return `400` without applying any changes. |
 | any other nested path | any valid JSON | Sets arbitrary metadata paths such as `token.access_token`. |
 
 Example response:
@@ -3947,7 +3947,9 @@ Response:
 { "claude": ["claude-opus-4.5"], "codex": ["*-preview"] }
 ```
 
-`PUT /config/oauth/excluded-models/claude` accepts a raw string array. `DELETE /config/oauth/excluded-models/claude` removes only that provider; deleting `/config/oauth/excluded-models` removes the whole map. These rules apply to OAuth/file credentials; upstream API-key groups use their own `excluded-models`.
+`PUT /config/oauth/excluded-models/claude` accepts a raw string array. `DELETE /config/oauth/excluded-models/claude` removes only that provider; deleting `/config/oauth/excluded-models` removes the whole map. These rules apply to OAuth/file credentials; upstream API-key groups use their own `excluded-models`. A credential with its own non-empty `excluded_models` uses that list instead of these global rules; every other credential picks up changes here on the next config reload without rewriting credentials.
+
+Upgrade note: earlier Home versions merged these global rules into each OAuth credential when it was saved. The database version 7 startup migration rebuilds every OAuth credential's stored exclusions from its own `excluded_models`, removing those merged copies. This upgrade requires downtime: stop every older Home node before starting the new version, and do not run older and newer nodes against the same database at the same time. A still-running older node can write the merged copies back, and PostgreSQL does not rerun the migration afterwards.
 
 ### `/config/oauth/model-alias`
 

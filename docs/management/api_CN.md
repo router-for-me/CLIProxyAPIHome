@@ -2331,7 +2331,7 @@ Selector 字段：
 | `disabled` | boolean or string bool | 更新 auth disabled state 和 status。 |
 | `disable-cooling` | boolean 或 `null` | 凭证级 cooling 覆盖。`true` 禁用冷却，`false` 启用冷却，`null` 清除覆盖并继承全局设置。该 hyphenated response 字段可直接用于此 PATCH 接口。 |
 | `request-retry` | integer 或 `null` | 凭证级额外重试轮次覆盖。`0` 禁用额外轮次；`null` 或负值继承全局设置。接受 `request-retry` 和 `request_retry`；两者同时提供时以 `request_retry` 优先。 |
-| `excluded_models`, `excluded-models` | string array 或 `null` | 凭证级模型排除规则，与全局 OAuth 排除规则合并。`[]` 或 `null` 仅清除凭证级规则。两种名称同时提供时以 `excluded_models` 优先。非法类型、包含非字符串元素的数组及该字段下的 nested path 返回 `400`，不会应用任何修改。 |
+| `excluded_models`, `excluded-models` | string array 或 `null` | 凭证级模型排除规则。非空时对该凭证优先于全局 OAuth 排除规则（覆盖而非合并）。`[]` 或 `null` 清除凭证级规则，使该凭证继承当前的全局 OAuth 排除规则。两种名称同时提供时以 `excluded_models` 优先。非法类型、包含非字符串元素的数组及该字段下的 nested path 返回 `400`，不会应用任何修改。 |
 | 其他任意 nested path | any valid JSON | 可以设置任意 metadata path，例如 `token.access_token`。 |
 
 输出示例：
@@ -3945,7 +3945,9 @@ Query 参数：
 { "claude": ["claude-opus-4.5"], "codex": ["*-preview"] }
 ```
 
-`PUT /config/oauth/excluded-models/claude` 接收原始字符串数组。`DELETE /config/oauth/excluded-models/claude` 只删除该 provider；删除 `/config/oauth/excluded-models` 则移除整个映射。这些规则作用于 OAuth/文件凭证，上游 API Key 分组使用自己的 `excluded-models`。
+`PUT /config/oauth/excluded-models/claude` 接收原始字符串数组。`DELETE /config/oauth/excluded-models/claude` 只删除该 provider；删除 `/config/oauth/excluded-models` 则移除整个映射。这些规则作用于 OAuth/文件凭证，上游 API Key 分组使用自己的 `excluded-models`。配置了非空凭证级 `excluded_models` 的凭证使用自己的规则而不是这里的全局规则；其余凭证在配置重新加载后即生效，无需改写凭证。
+
+升级说明：旧版本 Home 在保存 OAuth 凭证时会把这些全局规则合并写入凭证。数据库版本 7 的启动迁移会按每个 OAuth 凭证自己的 `excluded_models` 重新生成已存储的排除规则，清除这些合并副本。本次升级必须停机：启动新版本前先停掉所有旧版本 Home 节点，不要让新旧版本同时连接同一个数据库。仍在运行的旧节点可能把合并副本写回，而 PostgreSQL 之后不会再次执行该迁移。
 
 ### `/config/oauth/model-alias`
 

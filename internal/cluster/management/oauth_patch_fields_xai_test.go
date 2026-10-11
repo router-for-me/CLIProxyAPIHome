@@ -19,7 +19,7 @@ func TestApplyOAuthFieldPatchXaiWebsockets(t *testing.T) {
 	}
 	fields := mustRawFields(t, `{"websockets":true}`)
 
-	changed, errPatch := applyOAuthFieldPatch(auth, fields, nil)
+	changed, errPatch := applyOAuthFieldPatch(auth, fields)
 	if errPatch != nil {
 		t.Fatalf("applyOAuthFieldPatch returned error: %v", errPatch)
 	}

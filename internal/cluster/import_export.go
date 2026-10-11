@@ -628,7 +628,10 @@ func collectImportAuthFiles(cfg *appconfig.Config, authDir string, now time.Time
 			return currentFileUUID
 		}
 
-		auths := synthesizer.SynthesizeAuthFile(sctx, fullPath, updatedPayload)
+		auths, errSynthesize := synthesizer.SynthesizeAuthFile(sctx, fullPath, updatedPayload)
+		if errSynthesize != nil {
+			return errSynthesize
+		}
 		if len(auths) == 0 {
 			stats.Skipped++
 			continue

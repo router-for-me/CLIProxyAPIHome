@@ -28,12 +28,15 @@ func TestSynthesizeAuthFileUsesPluginMultiAuthParser(t *testing.T) {
 		},
 	}
 
-	auths := SynthesizeAuthFile(&SynthesisContext{
+	auths, errSynthesize := SynthesizeAuthFile(&SynthesisContext{
 		Config:           &config.Config{},
 		AuthDir:          authDir,
 		Now:              now,
 		PluginAuthParser: parser,
 	}, fullPath, []byte(`{"type":"acme","excluded_models":["skip-me"]}`))
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile() error = %v", errSynthesize)
+	}
 
 	if len(auths) != 2 {
 		t.Fatalf("len(auths) = %d, want 2", len(auths))
@@ -80,9 +83,9 @@ func TestKimiAICredentialProvider(t *testing.T) {
 		{`{"type":"kimi","domain":"kimi.ai","access_token":"fixture"}`, "kimi-ai"},
 		{`{"type":"kimi","base_url":"https://api.kimi.ai/coding","access_token":"fixture"}`, "kimi-ai"},
 	} {
-		auths := SynthesizeAuthFile(&SynthesisContext{}, "kimi-fixture.json", []byte(tc.raw))
-		if len(auths) != 1 || auths[0].Provider != tc.provider {
-			t.Fatalf("provider for %s = %+v", tc.raw, auths)
+		auths, errSynthesize := SynthesizeAuthFile(&SynthesisContext{}, "kimi-fixture.json", []byte(tc.raw))
+		if errSynthesize != nil || len(auths) != 1 || auths[0].Provider != tc.provider {
+			t.Fatalf("provider for %s = %+v, error = %v", tc.raw, auths, errSynthesize)
 		}
 	}
 }

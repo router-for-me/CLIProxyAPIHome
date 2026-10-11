@@ -1163,56 +1163,36 @@ func (r *Runtime) AddToken(ctx context.Context, rawJSON string) (string, error) 
 	baseName := strings.ToLower(tokenType) + "-" + token + ".json"
 	fullPath := filepath.Join(authDir, baseName)
 
-	if errMk := os.MkdirAll(authDir, 0o755); errMk != nil {
-		return "", fmt.Errorf("home runtime: create auth dir: %w", errMk)
-	}
-
-	if _, errStat := os.Stat(fullPath); errStat == nil {
-		r.applyAuthFile(ctx, fullPath, []byte(rawJSON))
-		return baseName, nil
-	} else if !os.IsNotExist(errStat) {
-		return "", fmt.Errorf("home runtime: stat auth file: %w", errStat)
-	}
-
-	if errWrite := os.WriteFile(fullPath, []byte(rawJSON), 0o600); errWrite != nil {
-		return "", fmt.Errorf("home runtime: write auth file: %w", errWrite)
-	}
-
-	r.applyAuthFile(ctx, fullPath, []byte(rawJSON))
-	return baseName, nil
-}
-
-// applyAuthFile applies an auth file.
-func (r *Runtime) applyAuthFile(ctx context.Context, fullPath string, data []byte) {
-	// Normalize auth state before updating runtime indexes.
-	if r == nil || r.coreManager == nil {
-		return
-	}
-	r.cfgMu.RLock()
-	cfg := r.cfg
-	authDir := r.authDir
-	r.cfgMu.RUnlock()
-	if cfg == nil {
-		return
-	}
-
-	sctx := &synthesizer.SynthesisContext{
+	// Synthesize before touching the auth dir so an invalid payload never leaves a file behind.
+	auths, errSynthesize := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
 		Config:           cfg,
 		AuthDir:          authDir,
 		Now:              time.Now(),
 		IDGenerator:      synthesizer.NewStableIDGenerator(),
 		PluginAuthParser: r,
+	}, fullPath, []byte(rawJSON))
+	if errSynthesize != nil {
+		return "", fmt.Errorf("home runtime: parse token json: %w", errSynthesize)
 	}
 
-	auths := synthesizer.SynthesizeAuthFile(sctx, fullPath, data)
-	if len(auths) == 0 {
-		return
+	if errMk := os.MkdirAll(authDir, 0o755); errMk != nil {
+		return "", fmt.Errorf("home runtime: create auth dir: %w", errMk)
+	}
+
+	if _, errStat := os.Stat(fullPath); errStat != nil {
+		if !os.IsNotExist(errStat) {
+			return "", fmt.Errorf("home runtime: stat auth file: %w", errStat)
+		}
+		if errWrite := os.WriteFile(fullPath, []byte(rawJSON), 0o600); errWrite != nil {
+			return "", fmt.Errorf("home runtime: write auth file: %w", errWrite)
+		}
 	}
 
 	ctxSkipPersist := coreauth.WithSkipPersist(ctx)
-	for _, a := range auths {
-		r.applyCoreAuthAddOrUpdate(ctxSkipPersist, a)
+	for _, auth := range auths {
+		r.applyCoreAuthAddOrUpdate(ctxSkipPersist, auth)
 	}
+	return baseName, nil
 }
 
 func (r *Runtime) refreshAccessProviders() {

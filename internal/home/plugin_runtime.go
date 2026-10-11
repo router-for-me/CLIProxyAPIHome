@@ -229,6 +229,7 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	if auth == activeAuth && len(activeExcluded) == 0 {
 		activeExcluded = excluded
 	}
+	// Credential-level exclusions take priority over the global oauth-excluded-models config.
 	if activeAuth.Attributes != nil {
 		if val, ok := activeAuth.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
 			activeExcluded = strings.Split(val, ",")
