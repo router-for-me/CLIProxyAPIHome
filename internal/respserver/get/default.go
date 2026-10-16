@@ -12,8 +12,10 @@ import (
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"gorm.io/gorm"
 )
 
 var errRuntimeNotReady = errors.New("runtime not ready")
@@ -66,11 +68,28 @@ func handleDefaultModels(ctx context.Context, env dispatch.Env, jsonArg string) 
 	req.Header = parseHeaders(jsonArg)
 	req.URL.RawQuery = parseQuery(jsonArg).Encode()
 
-	if _, authErr := env.Runtime.AuthenticateHTTPRequest(ctx, req); authErr != nil {
+	authResult, authErr := env.Runtime.AuthenticateHTTPRequest(ctx, req)
+	if authErr != nil {
 		return dispatch.BulkString([]byte(buildAuthErrorJSON(authErr)))
 	}
 
-	payload, errBuild := buildModelsJSON(env)
+	// List only the models the client API key may dispatch to, so model-group
+	// scoped keys do not advertise models that dispatch would reject. A key
+	// without a database record (for example a non-key access provider) keeps
+	// the full list; dispatch remains the authoritative check.
+	var allowedModelIDs []string
+	if authResult != nil {
+		modelIDs, errAllowed := env.Runtime.AllowedModelIDsForAPIKey(ctx, authResult.Principal)
+		if errAllowed != nil && !errors.Is(errAllowed, gorm.ErrRecordNotFound) {
+			log.Warnf("models: resolve api key model groups: %v", errAllowed)
+			return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageModelsUnavailable)))
+		}
+		if errAllowed == nil {
+			allowedModelIDs = modelIDs
+		}
+	}
+
+	payload, errBuild := buildModelsJSON(env, allowedModelIDs)
 	if errBuild != nil {
 		return dispatch.BulkString([]byte(buildErrorJSON(errBuild.Error())))
 	}

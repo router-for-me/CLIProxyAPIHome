@@ -25,6 +25,7 @@ const (
 	MessageRequestRetryExceeded             = "request retry limit exceeded"
 	MessageUserCreditsInsufficient          = "insufficient user credits"
 	MessageUserPeriodLimitExceeded          = "period limit exceeded"
+	MessageModelsUnavailable                = "models temporarily unavailable"
 
 	MessageModelDoesNotExistFmt = "model %s does not exist"
 )

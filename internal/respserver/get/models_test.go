@@ -32,7 +32,7 @@ func TestBuildModelsJSONClaudeToolSearchCapability(t *testing.T) {
 	register("ts-codex", "codex", map[string]string{"api_key": "d", "plan_type": "pro"},
 		&registry.ModelInfo{ID: "m-codex"})
 
-	payload, errBuild := buildModelsJSON(dispatch.Env{Runtime: rt})
+	payload, errBuild := buildModelsJSON(dispatch.Env{Runtime: rt}, nil)
 	if errBuild != nil {
 		t.Fatalf("buildModelsJSON: %v", errBuild)
 	}

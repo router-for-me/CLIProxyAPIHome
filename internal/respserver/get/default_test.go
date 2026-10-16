@@ -20,6 +20,12 @@ import (
 
 func newGetTestRuntime(t *testing.T) *home.Runtime {
 	t.Helper()
+	rt, _ := newGetTestRuntimeWithRepository(t)
+	return rt
+}
+
+func newGetTestRuntimeWithRepository(t *testing.T) (*home.Runtime, *cluster.Repository) {
+	t.Helper()
 
 	ctx := context.Background()
 	db, errOpenSQLite := cluster.OpenSQLite(ctx, filepath.Join(t.TempDir(), "home.db"))
@@ -43,8 +49,9 @@ func newGetTestRuntime(t *testing.T) *home.Runtime {
 	if errRuntime != nil {
 		t.Fatalf("NewRuntime() error = %v", errRuntime)
 	}
-	rt.SetClusterAdapter(cluster.NewRuntimeAdapter(cluster.NewRepository(db), ""))
-	return rt
+	repo := cluster.NewRepository(db)
+	rt.SetClusterAdapter(cluster.NewRuntimeAdapter(repo, ""))
+	return rt, repo
 }
 
 func TestHandleDefaultGETPlainKeyUsesKV(t *testing.T) {

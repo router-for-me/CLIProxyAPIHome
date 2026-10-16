@@ -1067,6 +1067,21 @@ func concurrencyExcludedCandidates(opts coreauth.Options) []coreauth.ExcludedCon
 	return candidates
 }
 
+// AllowedModelIDsForAPIKey returns the model IDs an API key may call through its
+// model groups. A nil slice means the key is not model-scoped; a non-nil empty
+// slice means the key is scoped but currently allows no model.
+func (r *Runtime) AllowedModelIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" || r == nil || r.clusterAdapter == nil {
+		return nil, nil
+	}
+	store, ok := r.clusterAdapter.(modelScopedAuthStore)
+	if !ok || store == nil {
+		return nil, nil
+	}
+	return store.AllowedModelIDsForAPIKey(ctx, apiKey)
+}
+
 func (r *Runtime) allowedAuthIDsForAPIKey(ctx context.Context, apiKey string) ([]string, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" || r == nil || r.clusterAdapter == nil {

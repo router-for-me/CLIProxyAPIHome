@@ -25,7 +25,7 @@ func handleModels(ctx context.Context, env dispatch.Env, args []string) dispatch
 		return dispatch.Err("runtime not ready")
 	}
 
-	payload, errBuild := buildModelsJSON(env)
+	payload, errBuild := buildModelsJSON(env, nil)
 	if errBuild != nil {
 		return dispatch.Err(errBuild.Error())
 	}
@@ -33,10 +33,21 @@ func handleModels(ctx context.Context, env dispatch.Env, args []string) dispatch
 }
 
 // buildModelsJSON assembles the models payload grouped by provider bucket.
-// Authentication is the caller's responsibility.
-func buildModelsJSON(env dispatch.Env) (string, error) {
+// Authentication is the caller's responsibility. A nil allowedModelIDs keeps
+// every model; a non-nil slice (even empty) keeps only the listed model IDs,
+// matched the same way dispatch matches API key model groups.
+func buildModelsJSON(env dispatch.Env, allowedModelIDs []string) (string, error) {
 	if env.Runtime == nil || env.Runtime.CoreManager() == nil {
 		return "", errRuntimeNotReady
+	}
+	var allowed map[string]struct{}
+	if allowedModelIDs != nil {
+		allowed = make(map[string]struct{}, len(allowedModelIDs))
+		for _, modelID := range allowedModelIDs {
+			if key := modelListingKey(modelID); key != "" {
+				allowed[key] = struct{}{}
+			}
+		}
 	}
 
 	resolveGroupKey := func(auth *coreauth.Auth) string {
@@ -85,6 +96,11 @@ func buildModelsJSON(env dispatch.Env) (string, error) {
 		id := strings.TrimSpace(model.ID)
 		if id == "" {
 			return
+		}
+		if allowed != nil {
+			if _, ok := allowed[modelListingKey(id)]; !ok {
+				return
+			}
 		}
 		idKey := strings.ToLower(id)
 		b := buckets[groupKey]
@@ -148,6 +164,11 @@ func buildModelsJSON(env dispatch.Env) (string, error) {
 		out, _ = sjson.Set(out, key, models)
 	}
 	return out, nil
+}
+
+// modelListingKey normalizes a model ID like the dispatch model allowlist does.
+func modelListingKey(modelID string) string {
+	return strings.ToLower(coreauth.CanonicalModelID(modelID))
 }
 
 // claudeModelsGroupKey is the models payload bucket served by Claude credentials.
