@@ -10,6 +10,71 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestBuildModelsJSONUltrafast(t *testing.T) {
+	rt := newGetTestRuntime(t)
+	register := func(auth *coreauth.Auth, models ...*registry.ModelInfo) {
+		t.Helper()
+		if _, errRegister := rt.CoreManager().Register(t.Context(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, models)
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	}
+	shared := &registry.ModelInfo{ID: "gpt-6.1-sol"}
+	register(&coreauth.Auth{
+		ID: "ultrafast-pro", Provider: "codex", Status: coreauth.StatusActive,
+		Attributes: map[string]string{"plan_type": "pro"},
+	}, shared, &registry.ModelInfo{ID: "pro-only"}, &registry.ModelInfo{ID: "disabled-only"})
+	proMax := &coreauth.Auth{
+		ID: "ultrafast-promax", Provider: "codex", Status: coreauth.StatusActive,
+		Attributes: map[string]string{"plan_type": " PROMAX "},
+	}
+	register(proMax, shared, &registry.ModelInfo{ID: "team/gpt-6-astra"})
+	register(&coreauth.Auth{
+		ID: "ultrafast-disabled", Provider: "codex", Status: coreauth.StatusDisabled, Disabled: true,
+		Attributes: map[string]string{"plan_type": "promax"},
+	}, &registry.ModelInfo{ID: "disabled-only"})
+	register(&coreauth.Auth{
+		ID: "ultrafast-other-provider", Provider: "openai", Status: coreauth.StatusActive,
+		Attributes: map[string]string{"plan_type": "promax"},
+	}, shared)
+	assertAvailability := func(available bool) {
+		t.Helper()
+		payload, errBuild := buildModelsJSON(dispatch.Env{Runtime: rt})
+		if errBuild != nil {
+			t.Fatal(errBuild)
+		}
+		for _, id := range []string{"gpt-6.1-sol", "team/gpt-6-astra", "pro-only", "disabled-only"} {
+			want := available && (id == "gpt-6.1-sol" || id == "team/gpt-6-astra")
+			got := gjson.Get(payload, `codex-pro.#(id=="`+id+`").supports_ultrafast`)
+			if got.Bool() != want || (!want && got.Exists()) {
+				t.Errorf("%s supports_ultrafast = %s, want %v (omitted when false)", id, got.Raw, want)
+			}
+		}
+		if got := gjson.Get(payload, `openai.0.supports_ultrafast`); got.Exists() {
+			t.Errorf("non-Codex model carries supports_ultrafast: %s", got.Raw)
+		}
+	}
+	assertAvailability(true)
+	for _, tc := range []struct {
+		name   string
+		plan   string
+		status coreauth.Status
+	}{
+		{"disabled status", "promax", coreauth.StatusDisabled},
+		{"downgraded", "pro", coreauth.StatusActive},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			updated := proMax.Clone()
+			updated.Attributes["plan_type"], updated.Status = tc.plan, tc.status
+			if _, errUpdate := rt.CoreManager().Update(t.Context(), updated); errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+			assertAvailability(false)
+		})
+	}
+}
+
 func TestBuildModelsJSONClaudeToolSearchCapability(t *testing.T) {
 	rt := newGetTestRuntime(t)
 	webSearch := true
