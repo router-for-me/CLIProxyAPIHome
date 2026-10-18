@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	"github.com/tidwall/gjson"
@@ -12,6 +13,9 @@ import (
 
 func TestBuildModelsJSONUltrafast(t *testing.T) {
 	rt := newGetTestRuntime(t)
+	rt.CoreManager().SetOAuthModelAlias(map[string][]config.OAuthModelAlias{
+		"codex": {{Name: "gpt-6.1-sol", Alias: "sol-fast"}},
+	})
 	register := func(auth *coreauth.Auth, models ...*registry.ModelInfo) {
 		t.Helper()
 		if _, errRegister := rt.CoreManager().Register(t.Context(), auth); errRegister != nil {
@@ -27,9 +31,10 @@ func TestBuildModelsJSONUltrafast(t *testing.T) {
 	}, shared, &registry.ModelInfo{ID: "pro-only"}, &registry.ModelInfo{ID: "disabled-only"})
 	proMax := &coreauth.Auth{
 		ID: "ultrafast-promax", Provider: "codex", Status: coreauth.StatusActive,
+		Prefix:     "team",
 		Attributes: map[string]string{"plan_type": " PROMAX "},
 	}
-	register(proMax, shared, &registry.ModelInfo{ID: "team/gpt-6-astra"})
+	register(proMax, shared, &registry.ModelInfo{ID: "team/gpt-6-astra"}, &registry.ModelInfo{ID: "sol-fast"}, &registry.ModelInfo{ID: "team/sol-fast"})
 	register(&coreauth.Auth{
 		ID: "ultrafast-disabled", Provider: "codex", Status: coreauth.StatusDisabled, Disabled: true,
 		Attributes: map[string]string{"plan_type": "promax"},
@@ -44,11 +49,16 @@ func TestBuildModelsJSONUltrafast(t *testing.T) {
 		if errBuild != nil {
 			t.Fatal(errBuild)
 		}
-		for _, id := range []string{"gpt-6.1-sol", "team/gpt-6-astra", "pro-only", "disabled-only"} {
-			want := available && (id == "gpt-6.1-sol" || id == "team/gpt-6-astra")
+		for _, id := range []string{"gpt-6.1-sol", "team/gpt-6-astra", "sol-fast", "team/sol-fast", "pro-only", "disabled-only"} {
+			want := available && id != "pro-only" && id != "disabled-only"
 			got := gjson.Get(payload, `codex-pro.#(id=="`+id+`").supports_ultrafast`)
 			if got.Bool() != want || (!want && got.Exists()) {
 				t.Errorf("%s supports_ultrafast = %s, want %v (omitted when false)", id, got.Raw, want)
+			}
+		}
+		for _, id := range []string{"sol-fast", "team/sol-fast"} {
+			if got := gjson.Get(payload, `codex-pro.#(id=="`+id+`").metadata_model_id`).String(); got != "gpt-6.1-sol" {
+				t.Errorf("%s metadata_model_id = %q, want gpt-6.1-sol", id, got)
 			}
 		}
 		if got := gjson.Get(payload, `openai.0.supports_ultrafast`); got.Exists() {

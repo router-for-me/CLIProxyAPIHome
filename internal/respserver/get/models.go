@@ -70,7 +70,8 @@ func buildModelsJSON(env dispatch.Env) (string, error) {
 	}
 
 	type modelBucket struct {
-		byID map[string]*registry.ModelInfo
+		byID        map[string]*registry.ModelInfo
+		metadataIDs map[string]string
 		// toolSearch ANDs native tool search support across every credential
 		// that serves a model in the Claude bucket.
 		toolSearch map[string]bool
@@ -92,7 +93,10 @@ func buildModelsJSON(env dispatch.Env) (string, error) {
 		idKey := strings.ToLower(id)
 		b := buckets[groupKey]
 		if b == nil {
-			b = &modelBucket{byID: make(map[string]*registry.ModelInfo), toolSearch: make(map[string]bool), ultrafast: make(map[string]bool)}
+			b = &modelBucket{
+				byID: make(map[string]*registry.ModelInfo), metadataIDs: make(map[string]string),
+				toolSearch: make(map[string]bool), ultrafast: make(map[string]bool),
+			}
 			buckets[groupKey] = b
 		}
 		if groupKey == claudeModelsGroupKey {
@@ -102,9 +106,12 @@ func buildModelsJSON(env dispatch.Env) (string, error) {
 			}
 			b.toolSearch[idKey] = supported
 		}
-		if auth.Status != coreauth.StatusDisabled && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") &&
-			strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "promax") {
-			b.ultrafast[idKey] = true
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			eligible := auth.Status != coreauth.StatusDisabled && strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "promax")
+			if b.metadataIDs[idKey] == "" || eligible {
+				b.metadataIDs[idKey] = manager.ResolveExecutionModel(auth, id)
+			}
+			b.ultrafast[idKey] = b.ultrafast[idKey] || eligible
 		}
 		if _, exists := b.byID[idKey]; exists {
 			return
@@ -154,8 +161,13 @@ func buildModelsJSON(env dispatch.Env) (string, error) {
 		})
 		out, _ = sjson.Set(out, key, models)
 		for i, model := range models {
-			if b.ultrafast[strings.ToLower(strings.TrimSpace(model.ID))] {
-				out, _ = sjson.Set(out, key+"."+strconv.Itoa(i)+".supports_ultrafast", true)
+			idKey := strings.ToLower(strings.TrimSpace(model.ID))
+			path := key + "." + strconv.Itoa(i)
+			if metadataID := b.metadataIDs[idKey]; metadataID != "" && metadataID != model.ID {
+				out, _ = sjson.Set(out, path+".metadata_model_id", metadataID)
+			}
+			if b.ultrafast[idKey] {
+				out, _ = sjson.Set(out, path+".supports_ultrafast", true)
 			}
 		}
 	}
