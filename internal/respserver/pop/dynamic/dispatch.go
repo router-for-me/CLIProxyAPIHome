@@ -578,6 +578,9 @@ func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
 }
 
 func concurrencyErrorMessage(errorType string) string {
+	if errorType == "auth_unavailable" {
+		return "credential is unavailable"
+	}
 	if errorType == "credential_model_concurrency_exceeded" {
 		return "credential model concurrency limit exceeded"
 	}

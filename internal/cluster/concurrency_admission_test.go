@@ -276,3 +276,77 @@ func TestLockActiveConcurrencyLifetimeTxRejectsNonOwnerHome(t *testing.T) {
 		t.Fatalf("LockActiveConcurrencyLifetimeTx() error = %v, want %v", errTransaction, ErrConcurrencyNodeUnavailable)
 	}
 }
+
+func TestAdmitCredentialConcurrencyRejectsIneligibleAuth(t *testing.T) {
+	for _, state := range []string{"missing", "disabled", "retired"} {
+		for _, policy := range []string{"none", "unlimited", "limited"} {
+			t.Run(state+"/"+policy, func(t *testing.T) {
+				repo := newCredentialFoundationTestRepository(t)
+				seedConcurrencyAdmissionLifetime(t, repo, "fp-a", "home-a")
+				if state != "missing" {
+					seedConcurrencyAdmissionAuth(t, repo, "cred-1")
+					if state == "disabled" {
+						if errUpdate := repo.db.Model(&AuthRecord{}).Where("uuid = ?", "cred-1").Update("disabled", true).Error; errUpdate != nil {
+							t.Fatal(errUpdate)
+						}
+					} else if errRetire := repo.RetireProviderAuth(context.Background(), "cred-1"); errRetire != nil {
+						t.Fatal(errRetire)
+					}
+				}
+				if policy != "none" {
+					var limit *int64
+					if policy == "limited" {
+						limit = int64Pointer(2)
+					}
+					seedConcurrencyAdmissionPolicy(t, repo, "cred-1", limit, nil)
+				}
+				result, errAdmit := repo.AdmitCredentialConcurrency(context.Background(), ConcurrencyAdmissionRequest{
+					CredentialID: "cred-1", Model: "gpt", Lifetime: concurrencyAdmissionLifetime(t, repo, "fp-a", "home-a"), ProtocolVersion: 1,
+				})
+				var admissionErr *ConcurrencyAdmissionError
+				if !errors.As(errAdmit, &admissionErr) || admissionErr.Type != "auth_unavailable" || result.Accounted {
+					t.Fatalf("result=%#v error=%v", result, errAdmit)
+				}
+				if got := countConcurrencyAdmissionCounters(t, repo); got != 0 {
+					t.Fatalf("counter total = %d", got)
+				}
+			})
+		}
+	}
+}
+
+func TestAdmitCredentialConcurrencyReleaseAfterRetirement(t *testing.T) {
+	repo := newCredentialFoundationTestRepository(t)
+	seedConcurrencyAdmissionLifetime(t, repo, "fp-a", "home-a")
+	seedConcurrencyAdmissionAuth(t, repo, "cred-1")
+	seedConcurrencyAdmissionPolicy(t, repo, "cred-1", int64Pointer(2), map[string]int64{"gpt": 2})
+	lifetime := concurrencyAdmissionLifetime(t, repo, "fp-a", "home-a")
+	req := ConcurrencyAdmissionRequest{CredentialID: "cred-1", Model: "gpt", Lifetime: lifetime, ProtocolVersion: 1}
+	if result, errAdmit := repo.AdmitCredentialConcurrency(context.Background(), req); errAdmit != nil || !result.Accounted {
+		t.Fatalf("result=%#v error=%v", result, errAdmit)
+	}
+	if errRetire := repo.RetireProviderAuth(context.Background(), "cred-1"); errRetire != nil {
+		t.Fatal(errRetire)
+	}
+	if _, errAdmit := repo.AdmitCredentialConcurrency(context.Background(), req); !errors.Is(errAdmit, ErrConcurrencyAuthUnavailable) {
+		t.Fatalf("admission after retirement: %v", errAdmit)
+	}
+	if got := countConcurrencyAdmissionCounters(t, repo); got != 1 {
+		t.Fatalf("active counter = %d", got)
+	}
+	if errRelease := repo.ApplyConcurrencyRelease(context.Background(), ConcurrencyReleaseRequest{CredentialID: "cred-1", Model: "gpt", ReleaseSeq: 1, Lifetime: lifetime}); errRelease != nil {
+		t.Fatal(errRelease)
+	}
+	counter := loadReleaseCounter(t, repo, "cred-1", "gpt", "fp-a")
+	if counter.ActiveCount != 0 || counter.LastReleaseSeq != 1 {
+		t.Fatalf("counter=%#v", counter)
+	}
+	var policy CredentialConcurrencyPolicyRecord
+	if errFind := repo.db.First(&policy, "credential_id = ?", "cred-1").Error; errFind != nil || policy.Version != 1 || positiveLimit(policy.MaxInFlight) != 2 {
+		t.Fatalf("policy=%#v error=%v", policy, errFind)
+	}
+	var auth AuthRecord
+	if errFind := repo.db.Unscoped().First(&auth, "uuid = ?", "cred-1").Error; errFind != nil || !auth.DeletedAt.Valid || auth.Version != 2 {
+		t.Fatalf("auth=%#v error=%v", auth, errFind)
+	}
+}

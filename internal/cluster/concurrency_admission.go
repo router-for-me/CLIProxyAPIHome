@@ -17,6 +17,7 @@ import (
 )
 
 var (
+	ErrConcurrencyAuthUnavailable = errors.New("credential is unavailable")
 	ErrConcurrencyNodeUnavailable = errors.New("credential concurrency node is unavailable")
 	ErrConcurrencyCounterInvalid  = errors.New("credential concurrency counter is invalid")
 )
@@ -173,11 +174,24 @@ func (r *Repository) AdmitCredentialConcurrency(ctx context.Context, req Concurr
 		return result, errDB
 	}
 	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
-		if errLifetime := r.LockActiveConcurrencyLifetimeTx(ctx, tx, req.Lifetime); errLifetime != nil {
-			return newAdmissionError("concurrency_node_unavailable", errLifetime)
-		}
 		if errHook := recordConcurrencyContenderBackendPID(ctx, tx); errHook != nil {
 			return errHook
+		}
+		// Match policy activation's auth-before-Home order and serialize with
+		// native credential retirement, including admissions without a policy.
+		var auth AuthRecord
+		errAuth := tx.Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).First(&auth, "uuid = ?", credentialID).Error
+		if errors.Is(errAuth, gorm.ErrRecordNotFound) {
+			return newAdmissionError("auth_unavailable", ErrConcurrencyAuthUnavailable)
+		}
+		if errAuth != nil {
+			return newAdmissionError("concurrency_tracker_unavailable", errAuth)
+		}
+		if auth.Disabled || auth.DeletedAt.Valid {
+			return newAdmissionError("auth_unavailable", ErrConcurrencyAuthUnavailable)
+		}
+		if errLifetime := r.LockActiveConcurrencyLifetimeTx(ctx, tx, req.Lifetime); errLifetime != nil {
+			return newAdmissionError("concurrency_node_unavailable", errLifetime)
 		}
 		policy, models, errPolicy := lockConcurrencyPolicyTx(ctx, tx, credentialID)
 		if errPolicy != nil {

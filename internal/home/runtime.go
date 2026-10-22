@@ -1065,7 +1065,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 
 func concurrencyCandidateIneligible(admissionType string) bool {
 	switch admissionType {
-	case "credential_concurrency_exceeded", "credential_model_concurrency_exceeded", "concurrency_protocol_required":
+	case "auth_unavailable", "credential_concurrency_exceeded", "credential_model_concurrency_exceeded", "concurrency_protocol_required":
 		return true
 	default:
 		return false
