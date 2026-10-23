@@ -16,17 +16,27 @@ import (
 )
 
 type Handler struct {
-	repo                  *cluster.Repository
-	runtime               *home.Runtime
-	nodeIP                string
-	nodePort              int
-	heartbeatTimeout      time.Duration
-	forwardTLSConfig      *tls.Config
-	pluginStoreHTTPClient pluginstore.HTTPDoer
-	modelsDevHTTPClient   *http.Client
-	pluginStoreAuth       *pluginauth.Service
-	quotaRecollect        QuotaRecollectTrigger
-	heavyStatisticsSlots  chan struct{}
+	repo                    *cluster.Repository
+	runtime                 *home.Runtime
+	nodeIP                  string
+	nodePort                int
+	heartbeatTimeout        time.Duration
+	forwardTLSConfig        *tls.Config
+	pluginStoreHTTPClient   pluginstore.HTTPDoer
+	modelsDevHTTPClient     *http.Client
+	oauthHTTPClientOverride *http.Client
+	codexDeviceWorker       func(func())
+	pluginStoreAuth         *pluginauth.Service
+	quotaRecollect          QuotaRecollectTrigger
+	heavyStatisticsSlots    chan struct{}
+}
+
+func (h *Handler) runCodexDeviceWorker(work func()) {
+	if h.codexDeviceWorker != nil {
+		h.codexDeviceWorker(work)
+		return
+	}
+	go work()
 }
 
 // NewHandler creates a new handler.

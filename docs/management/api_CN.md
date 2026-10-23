@@ -2407,7 +2407,7 @@ Selector 字段：
 | Provider | 流程 |
 | --- | --- |
 | `claude` | Anthropic OAuth；启动参数使用 `claude`，不使用旧 `anthropic-auth-url` 的拼写。 |
-| `codex` | Codex OAuth。 |
+| `codex` | 默认使用 Codex 浏览器 OAuth；使用 `flow=device` 启动设备码登录。 |
 | `antigravity` | Antigravity OAuth。 |
 | `kimi` | 默认 Kimi 域名的设备授权流程。 |
 | `kimi-ai` | `kimi.ai` 的设备授权流程，凭证保留 `kimi-ai` provider/domain。 |
@@ -2427,6 +2427,23 @@ Selector 字段：
 ```
 
 Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。通过 `/oauth/status?state=...` 轮询完成状态。
+
+Codex 省略 `flow` 时保留现有浏览器流程。`flow=device` 返回 OpenAI 设备页面、一次性代码和 15 分钟有效期：
+
+```json
+{
+  "status": "ok",
+  "url": "https://auth.openai.com/codex/device",
+  "state": "oauth-state",
+  "flow": "device",
+  "user_code": "ABCD-EFGH",
+  "expires_in": 900
+}
+```
+
+响应不会包含私有字段 `device_auth_id`。Home 仅在成功写出响应后开始轮询。15 分钟期限覆盖设备码签发、轮询和 token 交换。通过 `/oauth/status?state=...` 查询完成状态；成功时仅返回 `{ "status": "ok" }`，不返回凭证 ID。设备授权会话的回调都会返回 `409`。后台任务保存在内存中，Home 重启后不会自动恢复。
+
+Codex 接受 `flow=device` 或 `flow=browser`；省略 `flow` 时使用 `browser`。其他 Codex flow 值返回 `400`，设备码请求失败返回 `502`。
 
 插件需在 `/plugins` 中满足 `supports_oauth: true`、`effective_enabled: true` 且 `oauth_provider` 非空。插件 provider key 由小写字母、数字、连字符组成；v8 插件收到的回调路由为 `/v8/management/oauth/callback`。缺少 provider 返回 `400 {"error":"provider is required"}`，未知或不可用 provider 返回 `404 {"error":"provider_not_found"}`。
 
@@ -2489,13 +2506,13 @@ Query 参数：
 | `provider` | 否 | 默认取 state 对应会话的 provider。内置回调兼容 `anthropic`/`claude`、`codex`/`openai`、`antigravity`/`anti-gravity`、`xai`/`x-ai`/`grok`、`devin`；插件会话使用其 `oauth_provider`。 |
 | `redirect_url` | 否，仅 POST | 完整回调 URL，用于补全缺失的 state、code 或 error。 |
 
-Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
+Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。Codex 设备授权会话也会在修改 session 或交换 code 之前拒绝 GET 和 POST 回调，并返回 `409`。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
 
 | 状态码 | error |
 | --- | --- |
 | `400` | `invalid body`、`invalid redirect_url`、`state is required`、`invalid state`、`code or error is required`、`unsupported provider`、`provider does not match state` |
 | `404` | `unknown or expired state` |
-| `409` | `oauth flow is not pending` |
+| `409` | `oauth flow is not pending`、`oauth callback is not supported for device flow` |
 | `500` | `oauth_session_failed` |
 
 ### POST `/oauth/import?provider=vertex`
