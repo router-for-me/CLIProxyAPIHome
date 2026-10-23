@@ -15,11 +15,18 @@ import (
 	cpaauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	log "github.com/sirupsen/logrus"
 )
 
 const oauthSessionSourcePlugin = "plugin"
+
+type pluginOAuthStatusRuntime interface {
+	HasPluginAuthProvider(string) bool
+	PollPluginLogin(context.Context, string, string, map[string]any) (pluginapi.AuthLoginPollResponse, bool, error)
+	PluginLoginAuths(pluginapi.AuthLoginPollResponse) ([]*coreauth.Auth, error)
+}
 
 type pluginManagementListResponse struct {
 	PluginsEnabled bool                        `json:"plugins_enabled"`
@@ -202,14 +209,14 @@ func (h *Handler) respondPluginAuthStatus(c *gin.Context, ctx context.Context, s
 		return false
 	}
 	provider := strings.ToLower(strings.TrimSpace(session.Provider))
-	if h == nil || h.runtime == nil || provider == "" || !h.runtime.HasPluginAuthProvider(provider) {
+	if h == nil || h.pluginOAuthStatus == nil || provider == "" || !h.pluginOAuthStatus.HasPluginAuthProvider(provider) {
 		c.JSON(http.StatusOK, gin.H{"status": "wait"})
 		return true
 	}
 
 	pollCtx, cancelPoll := h.oauthSessionContext(ctx, session.State, cluster.OAuthSessionTTL)
 	defer cancelPoll()
-	resp, handled, errPoll := h.runtime.PollPluginLogin(pluginAuthRequestContext(pollCtx, c), provider, session.State, pluginOAuthPollMetadata(data))
+	resp, handled, errPoll := h.pluginOAuthStatus.PollPluginLogin(pluginAuthRequestContext(pollCtx, c), provider, session.State, pluginOAuthPollMetadata(data))
 	// A remote cancellation may have won while the plugin was polling.
 	if current, errCurrent := h.repo.GetOAuthSession(ctx, session.State); errCurrent == nil && (current == nil || current.Status != "") {
 		h.GetAuthStatus(c)
@@ -234,7 +241,7 @@ func (h *Handler) respondPluginAuthStatus(c *gin.Context, ctx context.Context, s
 		_ = h.repo.SetOAuthSessionError(ctx, session.State, message)
 		c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 	case pluginapi.AuthLoginStatusSuccess:
-		auths, errAuths := h.runtime.PluginLoginAuths(resp)
+		auths, errAuths := h.pluginOAuthStatus.PluginLoginAuths(resp)
 		if errAuths != nil {
 			log.WithError(errAuths).WithField("provider", provider).Error("cluster plugin oauth: decode auth failed")
 			_ = h.repo.SetOAuthSessionError(ctx, session.State, "Authentication failed")
@@ -257,7 +264,7 @@ func (h *Handler) respondPluginAuthStatus(c *gin.Context, ctx context.Context, s
 			c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
 			return true
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		h.GetAuthStatus(c)
 	default:
 		c.JSON(http.StatusOK, gin.H{"status": "wait"})
 	}

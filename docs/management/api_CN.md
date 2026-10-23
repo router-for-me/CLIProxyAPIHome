@@ -2453,7 +2453,7 @@ Query 参数：
 输出示例：
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "auth_id": "credential-uuid", "auth_ids": ["credential-uuid"] }
 { "status": "wait" }
 { "status": "error", "error": "Authentication failed" }
 { "status": "error", "error": "unknown or expired state" }
@@ -2464,6 +2464,8 @@ Query 参数：
 对于插件 OAuth session，该接口会轮询 Home 已加载的插件。插件返回 success 后，Home 会把插件返回的 auth data 转成 DB-backed auth records，注册该 auth 的模型，完成 OAuth session，然后返回 `{ "status": "ok" }`。
 
 未传 `state` 时返回 `200 {"status":"ok"}`，不能据此确认登录成功。已取消的会话返回 `200 {"status":"error","error":"Authentication cancelled"}`；state 格式不合法时返回 `400`。
+
+完成的登录在同一个数据库事务中保存凭证 ID。`auth_ids` 包含本次登录保存的所有凭证 UUID，可直接用作渠道组明细的 `auth_id`。仅保存一个凭证时，响应还包含 `auth_id`。这些字段在后续轮询和其他 Home 节点上保持可用，直到完成记录的一分钟有效期结束。未提供 state、旧的完成记录、等待或失败的登录不会返回凭证 ID。插件登录可能返回多个凭证，此时省略单数 `auth_id`。完成记录只保留凭证 ID，不保留 PKCE 或 token 数据。
 
 ### GET/POST `/oauth/callback`
 

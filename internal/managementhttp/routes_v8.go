@@ -68,6 +68,7 @@ func managementV8Routes(legacy *RouteRegistry, sdk *cpasdkapi.Handler, home *clu
 		routes.Set(http.MethodGet, "/credentials", home.ListCredentialsV8)
 		routes.Set(http.MethodGet, "/credentials/models", home.GetCredentialModelsV8)
 		routes.Set(http.MethodGet, "/oauth/auth-url", home.StartOAuthV8)
+		routes.Set(http.MethodGet, "/oauth/status", home.GetAuthStatusV8)
 		routes.Set(http.MethodPost, "/oauth/import", home.ImportOAuthV8)
 		routes.Set(http.MethodDelete, "/oauth/session", home.CancelAuthSession)
 		routes.Set(http.MethodPost, "/credentials/refresh", home.RefreshAuthFiles)

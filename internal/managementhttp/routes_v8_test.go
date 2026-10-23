@@ -24,6 +24,9 @@ func TestManagementV8Routes(t *testing.T) {
 	registered := make(map[string]bool)
 	for _, route := range engine.Routes() {
 		registered[route.Method+" "+route.Path] = true
+		if route.Method == http.MethodGet && route.Path == "/v8/management/oauth/status" && !strings.Contains(route.Handler, "GetAuthStatusV8") {
+			t.Fatalf("v8 OAuth status must include saved credential IDs, got %s", route.Handler)
+		}
 	}
 	for _, route := range []string{
 		"GET /config", "PUT /config", "PATCH /config", "GET /config.yaml", "PUT /config.yaml", "DELETE /config/*path",
