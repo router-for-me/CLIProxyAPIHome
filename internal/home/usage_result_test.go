@@ -19,6 +19,19 @@ func newUsageResultTestRuntime(t *testing.T, auth *coreauth.Auth) *Runtime {
 	return &Runtime{coreManager: manager}
 }
 
+// NewUsageResultTestRuntime is the exported form of newUsageResultTestRuntime,
+// kept here (an internal `package home` test file) purely so an external
+// `package home_test` file can build a *Runtime for RecordUsagePayload
+// without needing access to the unexported coreManager field. This exists
+// for claude_usage_result_sanitize_path_test.go, which must live in
+// `package home_test` to import internal/cluster (internal/cluster imports
+// internal/home in production code, so an internal `package home` test file
+// importing internal/cluster would be a real import cycle -- verified, not
+// assumed).
+func NewUsageResultTestRuntime(t *testing.T, auth *coreauth.Auth) *Runtime {
+	return newUsageResultTestRuntime(t, auth)
+}
+
 func TestRecordUsagePayloadUsesModelAsUpstreamKey(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-model-auth",
