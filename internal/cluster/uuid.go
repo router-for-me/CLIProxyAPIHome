@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 )
 
 var clusterUUIDNamespace = []byte("0f6c4f02-df9f-4d8d-a383-0c6e4b7a9d43")
@@ -60,6 +62,36 @@ func DeterministicAPIKeyUUID(provider, baseURL, apiKeyHash, compatName, provider
 		canonicalLower(providerKey),
 	}, "\x00")
 	return deterministicUUID(input)
+}
+
+// EnsurePluginAuthIdentity gives a plugin-created auth the UUID identity Home stores.
+// Plugins return their own identifiers (for example "copilot-octocat.json"), while the
+// repository requires a UUID shared by ID and Index. The UUID is derived from the provider
+// and the plugin identifier, so logging in the same account again updates the same record.
+// The plugin identifier is kept as FileName when the plugin did not set one.
+func EnsurePluginAuthIdentity(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	id := strings.TrimSpace(auth.ID)
+	if isValidUUID(id) {
+		auth.ID = id
+		auth.Index = id
+		return
+	}
+	pluginID := id
+	if pluginID == "" {
+		pluginID = strings.TrimSpace(auth.FileName)
+	}
+	if pluginID == "" {
+		return
+	}
+	if strings.TrimSpace(auth.FileName) == "" {
+		auth.FileName = pluginID
+	}
+	uuid := deterministicUUID(strings.Join([]string{"plugin-auth", canonicalLower(auth.Provider), canonicalLower(pluginID)}, "\x00"))
+	auth.ID = uuid
+	auth.Index = uuid
 }
 
 // APIKeyHash handles an api key hash.
