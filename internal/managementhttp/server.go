@@ -689,8 +689,8 @@ func Build(configFilePath string, opts ...RouteOption) (*BuildResult, error) {
 	callback.Use(withBuildInfoHeaders())
 	if clusterEnabled {
 		callback.Use(clusterAvailabilityMiddleware(clusterOpt, handler))
-		callback.GET("/callback", clusterHandler.PostOAuthCallback)
-		callback.POST("/callback", clusterHandler.PostOAuthCallback)
+		callback.GET("/callback", clusterHandler.PostOAuthCallbackV8)
+		callback.POST("/callback", clusterHandler.PostOAuthCallbackV8)
 	} else {
 		callback.Use(refreshAndAvailabilityMiddleware(configFilePath, handler, authManager, tokenStore))
 		callback.GET("/callback", handler.GetOAuthCallback)

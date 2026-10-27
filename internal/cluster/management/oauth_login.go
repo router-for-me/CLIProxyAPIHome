@@ -370,7 +370,7 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 }
 
 // handleOAuthCallback handles an o auth callback.
-func (h *Handler) handleOAuthCallback(c *gin.Context) {
+func (h *Handler) handleOAuthCallback(c *gin.Context, rejectCodexDeviceFlow bool) {
 	// Resolve credential context before calling upstream OAuth services.
 	var req oauthCallbackRequest
 	if c.Request.Method == http.MethodGet {
@@ -389,23 +389,28 @@ func (h *Handler) handleOAuthCallback(c *gin.Context) {
 	state := strings.TrimSpace(req.State)
 	code := strings.TrimSpace(req.Code)
 	errorMessage := strings.TrimSpace(req.Error)
+	var redirectErr error
 	if rawRedirect := strings.TrimSpace(req.RedirectURL); rawRedirect != "" {
 		parsedURL, errParse := url.Parse(rawRedirect)
 		if errParse != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
-			return
-		}
-		query := parsedURL.Query()
-		if state == "" {
-			state = strings.TrimSpace(query.Get("state"))
-		}
-		if code == "" {
-			code = strings.TrimSpace(query.Get("code"))
-		}
-		if errorMessage == "" {
-			errorMessage = strings.TrimSpace(query.Get("error"))
+			if state == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
+				return
+			}
+			redirectErr = errParse
+		} else {
+			query := parsedURL.Query()
+			if state == "" {
+				state = strings.TrimSpace(query.Get("state"))
+			}
+			if code == "" {
+				code = strings.TrimSpace(query.Get("code"))
+			}
 			if errorMessage == "" {
-				errorMessage = strings.TrimSpace(query.Get("error_description"))
+				errorMessage = strings.TrimSpace(query.Get("error"))
+				if errorMessage == "" {
+					errorMessage = strings.TrimSpace(query.Get("error_description"))
+				}
 			}
 		}
 	}
@@ -415,14 +420,24 @@ func (h *Handler) handleOAuthCallback(c *gin.Context) {
 		return
 	}
 	if errState := validateOAuthState(state); errState != nil {
+		if redirectErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid state"})
 		return
 	}
-	if code == "" && errorMessage == "" {
+	if redirectErr != nil || (code == "" && errorMessage == "") {
+		if rejectCodexDeviceFlow && h.rejectCodexDeviceCallback(c, state) {
+			return
+		}
+		if redirectErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "code or error is required"})
 		return
 	}
-
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	session, errSession := h.repo.GetOAuthSession(ctx, state)
@@ -441,6 +456,10 @@ func (h *Handler) handleOAuthCallback(c *gin.Context) {
 	data, errData := cluster.OAuthSessionData(session)
 	if errData != nil {
 		respondError(c, http.StatusInternalServerError, "oauth_session_failed", errData)
+		return
+	}
+	if rejectCodexDeviceFlow && oauthSessionIsCodexDevice(session, data) {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "oauth callback is not supported for device flow"})
 		return
 	}
 
@@ -499,6 +518,30 @@ func (h *Handler) handleOAuthCallback(c *gin.Context) {
 
 	go h.processOAuthCallback(provider, state, code)
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) rejectCodexDeviceCallback(c *gin.Context, state string) bool {
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+	session, errSession := h.repo.GetOAuthSession(ctx, state)
+	if errSession != nil || session == nil {
+		return false
+	}
+	data, errData := cluster.OAuthSessionData(session)
+	if errData != nil || !oauthSessionIsCodexDevice(session, data) {
+		return false
+	}
+	message := "oauth callback is not supported for device flow"
+	if strings.TrimSpace(session.Status) != "" {
+		message = "oauth flow is not pending"
+	}
+	c.JSON(http.StatusConflict, gin.H{"status": "error", "error": message})
+	return true
+}
+
+func oauthSessionIsCodexDevice(session *cluster.OAuthSessionRecord, data map[string]any) bool {
+	return session != nil && strings.EqualFold(strings.TrimSpace(session.Provider), "codex") &&
+		strings.EqualFold(strings.TrimSpace(stringFromAny(data["flow"])), "device")
 }
 
 func respondOAuthSessionMergeError(c *gin.Context, errMerge error) {
@@ -721,6 +764,10 @@ func (h *Handler) exchangeAnthropicCallback(ctx context.Context, state, code str
 
 // exchangeCodexCallback handles an exchange codex callback.
 func (h *Handler) exchangeCodexCallback(ctx context.Context, code string, data map[string]any) error {
+	return h.exchangeCodexCallbackWithClient(ctx, h.oauthHTTPClient(), code, data)
+}
+
+func (h *Handler) exchangeCodexCallbackWithClient(ctx context.Context, client *http.Client, code string, data map[string]any) error {
 	// Validate request inputs before mutating persisted state.
 	pkce := pkceCodes{
 		CodeVerifier:  stringFromAny(data["code_verifier"]),
@@ -729,12 +776,19 @@ func (h *Handler) exchangeCodexCallback(ctx context.Context, code string, data m
 	if pkce.CodeVerifier == "" {
 		return fmt.Errorf("missing PKCE verifier")
 	}
+	if client == nil {
+		return fmt.Errorf("codex oauth HTTP client is required")
+	}
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", codex.ClientID)
 	form.Set("code", strings.TrimSpace(code))
-	form.Set("redirect_uri", codexRedirectURI)
+	redirectURI := codexRedirectURI
+	if strings.EqualFold(strings.TrimSpace(stringFromAny(data["flow"])), "device") {
+		redirectURI = codex.DeviceTokenExchangeRedirectURI
+	}
+	form.Set("redirect_uri", redirectURI)
 	form.Set("code_verifier", pkce.CodeVerifier)
 
 	req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, codex.TokenURL, strings.NewReader(form.Encode()))
@@ -744,7 +798,7 @@ func (h *Handler) exchangeCodexCallback(ctx context.Context, code string, data m
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, errDo := h.oauthHTTPClient().Do(req)
+	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return errDo
 	}
@@ -1358,6 +1412,9 @@ func (h *Handler) oauthConfig() *config.Config {
 
 // oauthHTTPClient handles an oauth http client.
 func (h *Handler) oauthHTTPClient() *http.Client {
+	if h != nil && h.oauthHTTPClientOverride != nil {
+		return h.oauthHTTPClientOverride
+	}
 	cfg := h.oauthConfig()
 	sdkCfg := cfg.SDKConfig
 	if strings.TrimSpace(sdkCfg.ProxyURL) == "" {
@@ -1438,7 +1495,11 @@ type oauthSessionStateKey struct{}
 // oauthSessionContext stops in-flight acquisition when another Home node cancels the session.
 // The database transaction remains the authority for credential persistence.
 func (h *Handler) oauthSessionContext(parent context.Context, state string, timeout time.Duration) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.WithValue(parent, oauthSessionStateKey{}, state), timeout)
+	return h.oauthSessionContextUntil(parent, state, time.Now().Add(timeout))
+}
+
+func (h *Handler) oauthSessionContextUntil(parent context.Context, state string, deadline time.Time) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithDeadline(context.WithValue(parent, oauthSessionStateKey{}, state), deadline)
 	session, errSession := h.repo.GetOAuthSession(ctx, state)
 	if errSession != nil || session == nil || session.Status != "" {
 		cancel()

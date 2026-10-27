@@ -2409,7 +2409,7 @@ Creates a provider login URL or device-flow session. Required query `provider` i
 | Provider | Flow |
 | --- | --- |
 | `claude` | Anthropic OAuth. The start endpoint uses `claude`, not the old `anthropic-auth-url` spelling. |
-| `codex` | Codex OAuth. |
+| `codex` | Codex browser OAuth by default; use `flow=device` for device-code sign-in. |
 | `antigravity` | Antigravity OAuth. |
 | `kimi` | Kimi device flow using the default Kimi domain. |
 | `kimi-ai` | Device flow using `kimi.ai`; credentials retain the `kimi-ai` provider/domain. |
@@ -2429,6 +2429,23 @@ Common response:
 ```
 
 Kimi, Kimi AI, and Meta return a verification URL and complete in Home's background device-flow worker. Meta also returns `user_code` when supplied by the upstream; if there is no complete verification URL, open `url` and enter that code. Poll `/oauth/status?state=...` to observe completion.
+
+For Codex, omit `flow` to keep the existing browser flow. `flow=device` returns the OpenAI device page, one-time code, and a 15-minute expiry:
+
+```json
+{
+  "status": "ok",
+  "url": "https://auth.openai.com/codex/device",
+  "state": "oauth-state",
+  "flow": "device",
+  "user_code": "ABCD-EFGH",
+  "expires_in": 900
+}
+```
+
+The response never includes the private `device_auth_id`. Home begins polling only after it writes the response successfully. The 15-minute deadline covers device-code issuance, polling, and token exchange. Poll `/oauth/status?state=...` for completion; it returns `{ "status": "ok" }` without a credential ID. Device-flow callbacks return `409`. The worker is in memory and does not resume after a Home restart.
+
+Codex accepts `flow=device` or `flow=browser`; omission selects `browser`. Other Codex flow values return `400`, and a failed device-code request returns `502`.
 
 Plugin providers must appear in `/plugins` with `supports_oauth: true`, `effective_enabled: true`, and a non-empty `oauth_provider`. Plugin provider keys are lowercase letters, digits, or hyphens; v8 plugins receive `/v8/management/oauth/callback` as their callback route. Missing provider returns `400 {"error":"provider is required"}`; unknown/unavailable providers return `404 {"error":"provider_not_found"}`.
 
@@ -2491,13 +2508,13 @@ This v8 endpoint does not require a management key. It validates the pending DB-
 | `provider` | no | Defaults to the provider stored with the state. Built-in callback aliases include `anthropic`/`claude`, `codex`/`openai`, `antigravity`/`anti-gravity`, `xai`/`x-ai`/`grok`, and `devin`. Plugin sessions use their `oauth_provider`. |
 | `redirect_url` | no; POST only | Full callback URL used to fill missing state, code, or error. |
 
-Kimi, Kimi AI, and Meta use device flow and are not completed by this callback. A provider inconsistent with the state is rejected. Success returns `200 {"status":"ok"}` to acknowledge acceptance; it does not prove token exchange is complete. Built-in code exchange runs in the background. Plugin callbacks save callback metadata, and `/oauth/status` polls the plugin and persists successful credentials.
+Kimi, Kimi AI, and Meta use device flow and are not completed by this callback. Codex device-flow sessions also reject both callback methods with `409` before changing the session or exchanging a code. A provider inconsistent with the state is rejected. Success returns `200 {"status":"ok"}` to acknowledge acceptance; it does not prove token exchange is complete. Built-in code exchange runs in the background. Plugin callbacks save callback metadata, and `/oauth/status` polls the plugin and persists successful credentials.
 
 | Status | Error |
 | --- | --- |
 | `400` | `invalid body`, `invalid redirect_url`, `state is required`, `invalid state`, `code or error is required`, `unsupported provider`, `provider does not match state` |
 | `404` | `unknown or expired state` |
-| `409` | `oauth flow is not pending` |
+| `409` | `oauth flow is not pending`, `oauth callback is not supported for device flow` |
 | `500` | `oauth_session_failed` |
 
 ### POST `/oauth/import?provider=vertex`
