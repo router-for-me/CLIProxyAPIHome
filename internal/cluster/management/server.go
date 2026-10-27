@@ -18,6 +18,7 @@ import (
 type Handler struct {
 	repo                  *cluster.Repository
 	runtime               *home.Runtime
+	pluginOAuthStatus     pluginOAuthStatusRuntime
 	nodeIP                string
 	nodePort              int
 	heartbeatTimeout      time.Duration
@@ -34,6 +35,7 @@ func NewHandler(repo *cluster.Repository, runtime *home.Runtime, nodeIP string, 
 	return &Handler{
 		repo:                 repo,
 		runtime:              runtime,
+		pluginOAuthStatus:    runtime,
 		nodeIP:               strings.TrimSpace(nodeIP),
 		nodePort:             nodePort,
 		heartbeatTimeout:     cluster.DefaultHeartbeatTimeout(),

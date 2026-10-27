@@ -2455,15 +2455,17 @@ Query parameters:
 Example responses:
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "auth_id": "credential-uuid", "auth_ids": ["credential-uuid"] }
 { "status": "wait" }
 { "status": "error", "error": "Authentication failed" }
 { "status": "error", "error": "unknown or expired state" }
 ```
 
-Unknown or expired state tokens return an error instead of being treated as completed. Completed sessions remain available as short-lived tombstones so the final poll can return `{ "status": "ok" }`; after the tombstone expires, the same state is treated as unknown.
+Unknown or expired state tokens return an error instead of being treated as completed. Completed sessions remain available as short-lived tombstones so the final poll can return success with the saved credential IDs; after the tombstone expires, the same state is treated as unknown.
 
-For plugin OAuth sessions, this route polls the Home-loaded plugin. When the plugin returns success, Home converts the returned auth data into DB-backed auth records, registers models for the auths, completes the OAuth session, and then returns `{ "status": "ok" }`.
+For plugin OAuth sessions, this route polls the Home-loaded plugin. When the plugin returns success, Home converts the returned auth data into DB-backed auth records, registers models for the auths, completes the OAuth session, and then returns success with the saved credential IDs.
+
+Completed logins return `auth_ids`, the UUIDs of all credentials saved by that login. When exactly one credential was saved, `auth_id` is also present. These IDs can be used as channel group detail `auth_id` values. Home stores the result in the same database transaction as the credentials, so later polls and other Home nodes return the same IDs until the one-minute completion record expires. Plugin logins can produce multiple credentials, in which case the singular `auth_id` is omitted. Missing state, older completion records, pending logins, and failed logins do not return IDs. Completion records retain only credential IDs, with PKCE and token data cleared.
 
 A missing `state` returns `200 {"status":"ok"}` and does not verify a login. A cancelled session returns `200 {"status":"error","error":"Authentication cancelled"}`. Invalid state syntax returns `400`.
 
