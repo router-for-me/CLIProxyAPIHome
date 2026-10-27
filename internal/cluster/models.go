@@ -341,7 +341,9 @@ type UserRecord struct {
 	SessionVersion   uint64     `gorm:"column:session_version;not null;default:0"`
 	Credits          float64    `gorm:"column:credits;not null;default:0"`
 	CreditsUnlimited bool       `gorm:"column:credits_unlimited;not null;default:false"`
-	Timezone         string     `gorm:"column:timezone;not null;default:Asia/Shanghai"`
+	// BillingMultiplier scales every charge for the user; NULL means 1.
+	BillingMultiplier *float64 `gorm:"column:billing_multiplier"`
+	Timezone          string   `gorm:"column:timezone;not null;default:Asia/Shanghai"`
 	// Period cost limits (null = disabled). Subject is user; all API keys inherit.
 	// window_mode_*: first_use (default; first billable charge opens a duration
 	// window, Claude/Codex-style session), sliding (rolling last-N duration),

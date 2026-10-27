@@ -1050,6 +1050,7 @@ Path 参数：
 | `password` | string | 否 | 非空明文会以 bcrypt hash 存储。已有合法 bcrypt hash 会原样保留，便于迁移。响应不返回密码材料，只返回 `password_set`。 |
 | `credits` | number | 否 | 用户点数余额；默认为 `0`。当客户端 API key 绑定到该用户且 credits `<= 0` 时，RESP `RPOP auth` 返回 `user_credits_insufficient`。对于计费工作流，优先使用 `/billing/balance-records/recharge` 和 `/billing/balance-records/deduct`，以便余额变更拥有分类账记录。 |
 | `credits_unlimited` | boolean | 否 | 为 `true` 时，派发忽略总 `credits` 余额，计费扣费也不减少余额；周期限额仍生效。默认 `false`。 |
+| `billing_multiplier` | number 或 null | 否 | 作用于该用户所有 API key 扣费的非负倍率（如 `0.8` 表示八折，`0` 表示免费）。`null` 表示清除，即按 `1` 计。非法值返回 `400`，code 为 `invalid_limit`。用户响应包含该值。 |
 | `timezone` | string | 否 | 自然日/周/月使用的 IANA 时区；默认 `Asia/Shanghai`。 |
 | `limit_5h_credits` | number/null | 否 | 5 小时 credits 限额。`null` 清除/关闭。`0` 立即不可用。 |
 | `window_mode_5h` | string | 否 | `first_use`（默认；别名 `fixed`）或 `sliding`。 |
@@ -1551,6 +1552,7 @@ Query 参数：
 | `provider` | string | 可选 provider 过滤。 |
 | `model` | string | 可选 model 过滤。 |
 | `cost_diagnostic` | string | 可选零费用诊断过滤：`unpriced_model`、`zero_price`，或 `any` 表示所有被标记的 charge。 |
+| `auth_index` | string | 可选的服务凭证精确过滤。 |
 | `limit` | integer | 可选分页大小；默认 `50`，最大 `200`。 |
 | `offset` | integer | 可选分页偏移；负数会规范化为 `0`。 |
 
@@ -1703,6 +1705,7 @@ Query 参数：
 | `image_output_price_per_million` | number 或 null | 图片输出 token 单价；`null` 回退到 output 单价。 |
 | `audio_input_price_per_million` | number 或 null | 音频输入 token 单价；`null` 回退到 input 单价。 |
 | `audio_output_price_per_million` | number 或 null | 音频输出 token 单价；`null` 回退到 output 单价。 |
+| `reasoning_effort_multipliers` | object 或 null | 规范化 reasoning effort 到 token 费用倍率的映射；usage 的 `reasoning_effort` 不在映射中时不乘倍率。 |
 | `source` | string | 价格来源。 |
 | `enabled` | boolean | 规则是否启用。 |
 | `note` | string | 操作备注。 |
@@ -1736,6 +1739,7 @@ Query 参数：
 | `image_output_price_per_million` | number 或 null | 否 | 可选非负图片输出单价；`PATCH` 时 `null` 表示清除。 |
 | `audio_input_price_per_million` | number 或 null | 否 | 可选非负音频输入单价；`PATCH` 时 `null` 表示清除。 |
 | `audio_output_price_per_million` | number 或 null | 否 | 可选非负音频输出单价；`PATCH` 时 `null` 表示清除。 |
+| `reasoning_effort_multipliers` | object | 否 | 可选的 reasoning effort（不区分大小写，如 `xhigh`）到非负 token 费用倍率的映射，不作用于每请求价格；`PATCH` 时 `{}` 表示清除。 |
 | `source` | string | 否 | 价格来源，例如 `manual`。 |
 | `enabled` | boolean | 否 | 规则是否启用；默认 `true`。 |
 | `note` | string | 否 | 操作备注。 |
@@ -1772,7 +1776,7 @@ Query 参数：
 
 返回 DB-backed 计费策略。`service_tier_source` 默认为 `request`，允许值为 `request` 或 `response`。`report_timezone` 必须是受支持的 IANA 时区，默认值为 `UTC`；当 Management Billing 请求未提供 `timezone` 覆盖时，它作为报表默认日历时区。修改该设置只影响后续报表的边界和分组，不会重新计算历史 charge、重写价格快照或改变余额。无论哪种 tier-source 模式，`auto`、`default` 和 `standard` 都按本地 Standard 价格 tier 匹配。
 
-`allow_unpriced_models` 默认为 `false`。为 `false` 时，用户所属 API key 请求的模型如果在任何 provider 下都没有启用的价格规则，dispatch 会返回 `model_not_found`（`model <id> has no configured price`）。价格全为 0 的规则也算已配置，因此显式免费的模型仍可调用。不属于用户的 API key 不受此限制。设为 `true` 后允许调用未配价模型，其扣费按 $0 记录并标记 `cost_diagnostic: unpriced_model`。管理员扣费响应还包含扣费时固化的字段：`billed_cache_read_tokens`、`billed_cache_write_tokens`、`billed_reasoning_tokens`（v2 完整核算下实际计价的 token 桶，旧版核算为 `null`），以及 `cost_breakdown`（`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`）。扣费金额、余额增减和余额在入库前统一量化到 8 位小数，因此 `cost_breakdown.total` 与 `amount` 一致。管理员扣费响应中的 `cost_diagnostic` 为空表示正常，`unpriced_model` 表示未命中任何价格规则，`zero_price` 表示命中规则但金额为 $0；同一值也写入 `price_snapshot.cost_diagnostic`。
+`allow_unpriced_models` 默认为 `false`。为 `false` 时，用户所属 API key 请求的模型如果在任何 provider 下都没有启用的价格规则，dispatch 会返回 `model_not_found`（`model <id> has no configured price`）。价格全为 0 的规则也算已配置，因此显式免费的模型仍可调用。不属于用户的 API key 不受此限制。设为 `true` 后允许调用未配价模型，其扣费按 $0 记录并标记 `cost_diagnostic: unpriced_model`。管理员扣费响应还包含扣费时固化的字段：`billed_cache_read_tokens`、`billed_cache_write_tokens`、`billed_reasoning_tokens`（v2 完整核算下实际计价的 token 桶，旧版核算为 `null`），以及 `cost_breakdown`（`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`）。扣费金额、余额增减和余额在入库前统一量化到 8 位小数，因此 `cost_breakdown.total` 与 `amount` 一致。管理员扣费响应还包含 `base_amount`（规则倍率后、用户 `billing_multiplier` 前的标价金额）、`billing_multiplier` 和 `auth_index`（服务凭证）。`amount = round(base_amount * billing_multiplier, 8)`。按 `auth_index` 汇总 `base_amount` 可衡量每个凭证的产出价值，不受客户折扣影响；`amount` 为实际收入。`cost_breakdown` 同样记录 `base_total`、`billing_multiplier` 和实际生效的 `reasoning_effort_multiplier`。管理员扣费响应中的 `cost_diagnostic` 为空表示正常，`unpriced_model` 表示未命中任何价格规则，`zero_price` 表示命中规则但金额为 $0；同一值也写入 `price_snapshot.cost_diagnostic`。
 
 ```json
 { "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }

@@ -62,13 +62,15 @@ type BillingModelPriceRecord struct {
 	CacheWritePricePerMillion float64 `gorm:"column:cache_write_price_per_million;not null;default:0"`
 	RequestPrice              float64 `gorm:"column:request_price;not null;default:0"`
 	BillingExtraPrices        `gorm:"embedded"`
-	Source                    string         `gorm:"column:source;not null;default:manual"`
-	Enabled                   bool           `gorm:"column:enabled;not null;index:idx_billing_model_price_enabled"`
-	Note                      string         `gorm:"column:note;type:text"`
-	CreatedAt                 time.Time      `gorm:"column:created_at"`
-	UpdatedAt                 time.Time      `gorm:"column:updated_at"`
-	Revision                  int64          `gorm:"column:revision;not null;default:1"`
-	DeletedAt                 gorm.DeletedAt `gorm:"column:deleted_at;index"`
+	// ReasoningEffortMultipliers maps a normalized reasoning effort to a token-cost multiplier.
+	ReasoningEffortMultipliers JSONB          `gorm:"column:reasoning_effort_multipliers"`
+	Source                     string         `gorm:"column:source;not null;default:manual"`
+	Enabled                    bool           `gorm:"column:enabled;not null;index:idx_billing_model_price_enabled"`
+	Note                       string         `gorm:"column:note;type:text"`
+	CreatedAt                  time.Time      `gorm:"column:created_at"`
+	UpdatedAt                  time.Time      `gorm:"column:updated_at"`
+	Revision                   int64          `gorm:"column:revision;not null;default:1"`
+	DeletedAt                  gorm.DeletedAt `gorm:"column:deleted_at;index"`
 }
 
 func (BillingModelPriceRecord) TableName() string { return "billing_model_price" }
@@ -88,29 +90,34 @@ type BillingBalanceRecord struct {
 func (BillingBalanceRecord) TableName() string { return "billing_balance_record" }
 
 type BillingChargeRecord struct {
-	ID               string  `gorm:"column:id;primaryKey;index:idx_billing_charge_time_order,priority:2,sort:desc"`
-	UsageID          uint    `gorm:"column:usage_id;not null;uniqueIndex"`
-	PayloadHash      string  `gorm:"column:payload_hash;not null;uniqueIndex"`
-	UserID           *uint   `gorm:"column:user_id;index:idx_billing_charge_user_time,priority:1"`
-	APIKeyID         *uint   `gorm:"column:api_key_id;index"`
-	APIKeyLabel      string  `gorm:"column:api_key_label"`
-	APIKeyMasked     string  `gorm:"column:api_key_masked"`
-	Provider         string  `gorm:"column:provider;index:idx_billing_charge_provider_model_time,priority:1"`
-	Model            string  `gorm:"column:model;index:idx_billing_charge_provider_model_time,priority:2"`
-	OriginalModel    string  `gorm:"column:original_model"`
-	ActualModel      string  `gorm:"column:actual_model"`
-	RequestID        string  `gorm:"column:request_id;index"`
-	Endpoint         string  `gorm:"column:endpoint;index"`
-	InputTokens      int64   `gorm:"column:input_tokens;not null;default:0"`
-	OutputTokens     int64   `gorm:"column:output_tokens;not null;default:0"`
-	CacheTokens      int64   `gorm:"column:cache_tokens;not null;default:0"`
-	Amount           float64 `gorm:"column:amount;not null;default:0"`
-	BalanceBefore    float64 `gorm:"column:balance_before;not null;default:0"`
-	BalanceAfter     float64 `gorm:"column:balance_after;not null;default:0"`
-	MatchedPriceRule string  `gorm:"column:matched_price_rule"`
-	CostDiagnostic   string  `gorm:"column:cost_diagnostic;not null;default:'';index"`
-	PriceSnapshot    JSONB   `gorm:"column:price_snapshot;not null"`
-	RequestSummary   string  `gorm:"column:request_summary;type:text"`
+	ID            string  `gorm:"column:id;primaryKey;index:idx_billing_charge_time_order,priority:2,sort:desc"`
+	UsageID       uint    `gorm:"column:usage_id;not null;uniqueIndex"`
+	PayloadHash   string  `gorm:"column:payload_hash;not null;uniqueIndex"`
+	UserID        *uint   `gorm:"column:user_id;index:idx_billing_charge_user_time,priority:1"`
+	APIKeyID      *uint   `gorm:"column:api_key_id;index"`
+	APIKeyLabel   string  `gorm:"column:api_key_label"`
+	APIKeyMasked  string  `gorm:"column:api_key_masked"`
+	Provider      string  `gorm:"column:provider;index:idx_billing_charge_provider_model_time,priority:1"`
+	Model         string  `gorm:"column:model;index:idx_billing_charge_provider_model_time,priority:2"`
+	OriginalModel string  `gorm:"column:original_model"`
+	ActualModel   string  `gorm:"column:actual_model"`
+	RequestID     string  `gorm:"column:request_id;index"`
+	Endpoint      string  `gorm:"column:endpoint;index"`
+	InputTokens   int64   `gorm:"column:input_tokens;not null;default:0"`
+	OutputTokens  int64   `gorm:"column:output_tokens;not null;default:0"`
+	CacheTokens   int64   `gorm:"column:cache_tokens;not null;default:0"`
+	Amount        float64 `gorm:"column:amount;not null;default:0"`
+	// BaseAmount is the list value before the user billing multiplier; summing it
+	// by AuthIndex values credential output independently of customer discounts.
+	BaseAmount        float64 `gorm:"column:base_amount;not null;default:0"`
+	BillingMultiplier float64 `gorm:"column:billing_multiplier;not null;default:1"`
+	AuthIndex         string  `gorm:"column:auth_index;not null;default:'';index"`
+	BalanceBefore     float64 `gorm:"column:balance_before;not null;default:0"`
+	BalanceAfter      float64 `gorm:"column:balance_after;not null;default:0"`
+	MatchedPriceRule  string  `gorm:"column:matched_price_rule"`
+	CostDiagnostic    string  `gorm:"column:cost_diagnostic;not null;default:'';index"`
+	PriceSnapshot     JSONB   `gorm:"column:price_snapshot;not null"`
+	RequestSummary    string  `gorm:"column:request_summary;type:text"`
 	// Display-only cache split filled by ListBillingCharges from the linked usage
 	// row's v2 token accounting; nil when the split is unknown.
 	CacheReadTokens  *int64 `gorm:"-"`
@@ -128,19 +135,20 @@ type BillingChargeRecord struct {
 func (BillingChargeRecord) TableName() string { return "billing_charge" }
 
 type BillingModelPriceUpdate struct {
-	Provider                  string
-	Model                     string
-	ServiceTier               string
-	MinInputTokens            int64
-	InputPricePerMillion      float64
-	OutputPricePerMillion     float64
-	CacheReadPricePerMillion  float64
-	CacheWritePricePerMillion float64
-	RequestPrice              float64
-	Extra                     BillingExtraPrices
-	Source                    string
-	Enabled                   bool
-	Note                      string
+	Provider                   string
+	Model                      string
+	ServiceTier                string
+	MinInputTokens             int64
+	InputPricePerMillion       float64
+	OutputPricePerMillion      float64
+	CacheReadPricePerMillion   float64
+	CacheWritePricePerMillion  float64
+	RequestPrice               float64
+	Extra                      BillingExtraPrices
+	ReasoningEffortMultipliers map[string]float64
+	Source                     string
+	Enabled                    bool
+	Note                       string
 }
 
 type BillingModelPricePatch struct {
@@ -153,6 +161,8 @@ type BillingModelPricePatch struct {
 	CacheReadPricePerMillion  *float64
 	CacheWritePricePerMillion *float64
 	RequestPrice              *float64
+	// ReasoningEffortMultipliers replaces the effort multiplier map; an empty map clears it.
+	ReasoningEffortMultipliers *map[string]float64
 	// Extra sets optional prices by field name; a present nil value clears the price.
 	Extra   map[string]*float64
 	Source  *string
@@ -243,6 +253,8 @@ type BillingChargeQuery struct {
 	UserID      *uint
 	Provider    string
 	Model       string
+	// AuthIndex filters charges by the serving credential.
+	AuthIndex string
 	// CostDiagnostic filters charges by diagnostic; "any" matches every non-empty diagnostic.
 	CostDiagnostic string
 	Limit          int
@@ -263,17 +275,18 @@ type BillingPriceSnapshot struct {
 	CacheWritePricePerMillion float64 `json:"cache_write_price_per_million"`
 	RequestPrice              float64 `json:"request_price"`
 	BillingExtraPrices
-	MatchedServiceTier   string `json:"matched_service_tier"`
-	MinInputTokens       int64  `json:"min_input_tokens"`
-	ContextInputTokens   int64  `json:"context_input_tokens"`
-	PriceModelSource     string `json:"price_model_source,omitempty"`
-	PriceMatch           string `json:"price_match,omitempty"`
-	RequestedServiceTier string `json:"requested_service_tier"`
-	ResponseServiceTier  string `json:"response_service_tier,omitempty"`
-	ServiceTierSource    string `json:"service_tier_source"`
-	EffectiveServiceTier string `json:"effective_service_tier"`
-	ResponseTierFallback bool   `json:"response_tier_fallback"`
-	CostDiagnostic       string `json:"cost_diagnostic,omitempty"`
+	ReasoningEffortMultipliers map[string]float64 `json:"reasoning_effort_multipliers,omitempty"`
+	MatchedServiceTier         string             `json:"matched_service_tier"`
+	MinInputTokens             int64              `json:"min_input_tokens"`
+	ContextInputTokens         int64              `json:"context_input_tokens"`
+	PriceModelSource           string             `json:"price_model_source,omitempty"`
+	PriceMatch                 string             `json:"price_match,omitempty"`
+	RequestedServiceTier       string             `json:"requested_service_tier"`
+	ResponseServiceTier        string             `json:"response_service_tier,omitempty"`
+	ServiceTierSource          string             `json:"service_tier_source"`
+	EffectiveServiceTier       string             `json:"effective_service_tier"`
+	ResponseTierFallback       bool               `json:"response_tier_fallback"`
+	CostDiagnostic             string             `json:"cost_diagnostic,omitempty"`
 }
 
 type BillingSettings struct {
@@ -335,25 +348,30 @@ func (r *Repository) CreateBillingModelPrice(ctx context.Context, update Billing
 	if errValidate := validateBillingModelPriceUpdate(update); errValidate != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBillingInvalidModelPrice, errValidate)
 	}
+	reasoningEffortMultipliers, errMultipliers := billingEffortMultipliersJSONB(update.ReasoningEffortMultipliers)
+	if errMultipliers != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBillingInvalidModelPrice, errMultipliers)
+	}
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
 	}
 	record := &BillingModelPriceRecord{
-		ID:                        billingID("price"),
-		Provider:                  strings.ToLower(strings.TrimSpace(update.Provider)),
-		Model:                     strings.TrimSpace(update.Model),
-		ServiceTier:               normalizeBillingPriceServiceTier(update.ServiceTier),
-		MinInputTokens:            update.MinInputTokens,
-		InputPricePerMillion:      update.InputPricePerMillion,
-		OutputPricePerMillion:     update.OutputPricePerMillion,
-		CacheReadPricePerMillion:  update.CacheReadPricePerMillion,
-		CacheWritePricePerMillion: update.CacheWritePricePerMillion,
-		RequestPrice:              update.RequestPrice,
-		BillingExtraPrices:        update.Extra,
-		Source:                    billingPriceSource(update.Source),
-		Enabled:                   update.Enabled,
-		Note:                      strings.TrimSpace(update.Note),
+		ID:                         billingID("price"),
+		Provider:                   strings.ToLower(strings.TrimSpace(update.Provider)),
+		Model:                      strings.TrimSpace(update.Model),
+		ServiceTier:                normalizeBillingPriceServiceTier(update.ServiceTier),
+		MinInputTokens:             update.MinInputTokens,
+		InputPricePerMillion:       update.InputPricePerMillion,
+		OutputPricePerMillion:      update.OutputPricePerMillion,
+		CacheReadPricePerMillion:   update.CacheReadPricePerMillion,
+		CacheWritePricePerMillion:  update.CacheWritePricePerMillion,
+		RequestPrice:               update.RequestPrice,
+		BillingExtraPrices:         update.Extra,
+		ReasoningEffortMultipliers: reasoningEffortMultipliers,
+		Source:                     billingPriceSource(update.Source),
+		Enabled:                    update.Enabled,
+		Note:                       strings.TrimSpace(update.Note),
 	}
 	if errCreate := db.WithContext(contextOrBackground(ctx)).Create(record).Error; errCreate != nil {
 		if isBillingModelPriceConflict(errCreate) {
@@ -728,10 +746,22 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		return errSnapshot
 	}
 	cost := billingChargeCost(usage, snapshot)
-	amount := cost.Total
-	if !billingUsageHasBillableActivity(usage, amount) {
+	if !billingUsageHasBillableActivity(usage, cost.Total) {
 		return nil
 	}
+
+	var userID *uint
+	if apiKey != nil {
+		userID = normalizeOptionalUserID(apiKey.UserID)
+	}
+	if userID != nil {
+		multiplier, errMultiplier := billingUserMultiplierTx(ctx, tx, *userID)
+		if errMultiplier != nil {
+			return errMultiplier
+		}
+		cost.applyBillingMultiplier(multiplier)
+	}
+	amount := cost.Total
 	snapshot.CostDiagnostic = billingCostDiagnostic(price, amount)
 	priceSnapshot, errPriceSnapshot := billingJSONB(snapshot)
 	if errPriceSnapshot != nil {
@@ -742,11 +772,6 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		return errCostBreakdown
 	}
 	cacheReadTokens, cacheWriteTokens, reasoningTokens := billingChargeTokenSplit(usage)
-
-	var userID *uint
-	if apiKey != nil {
-		userID = normalizeOptionalUserID(apiKey.UserID)
-	}
 
 	charge := &BillingChargeRecord{
 		ID:                     billingID("charge"),
@@ -770,6 +795,9 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		BilledReasoningTokens:  reasoningTokens,
 		CostBreakdown:          costBreakdown,
 		Amount:                 amount,
+		BaseAmount:             cost.BaseTotal,
+		BillingMultiplier:      cost.BillingMultiplier,
+		AuthIndex:              strings.TrimSpace(usage.AuthIndex),
 		MatchedPriceRule:       billingMatchedPriceRule(price),
 		CostDiagnostic:         snapshot.CostDiagnostic,
 		PriceSnapshot:          priceSnapshot,
@@ -834,6 +862,9 @@ func validateBillingModelPriceUpdate(update BillingModelPriceUpdate) error {
 			return fmt.Errorf("%s must be non-negative", name)
 		}
 	}
+	if errMultipliers := validateBillingEffortMultipliers(update.ReasoningEffortMultipliers); errMultipliers != nil {
+		return errMultipliers
+	}
 	return validateBillingExtraPrices(update.Extra.Values())
 }
 
@@ -873,6 +904,11 @@ func validateBillingModelPricePatch(patch BillingModelPricePatch) error {
 			return fmt.Errorf("%s must be non-negative", name)
 		}
 	}
+	if patch.ReasoningEffortMultipliers != nil {
+		if errMultipliers := validateBillingEffortMultipliers(*patch.ReasoningEffortMultipliers); errMultipliers != nil {
+			return errMultipliers
+		}
+	}
 	return validateBillingExtraPrices(patch.Extra)
 }
 
@@ -904,6 +940,10 @@ func billingModelPricePatchUpdates(patch BillingModelPricePatch) map[string]any 
 	}
 	if patch.RequestPrice != nil {
 		updates["request_price"] = *patch.RequestPrice
+	}
+	if patch.ReasoningEffortMultipliers != nil {
+		multipliers, _ := billingEffortMultipliersJSONB(*patch.ReasoningEffortMultipliers)
+		updates["reasoning_effort_multipliers"] = multipliers
 	}
 	for name, value := range patch.Extra {
 		if value == nil {
@@ -996,6 +1036,9 @@ func billingChargeQueryScope(scope *gorm.DB, query BillingChargeQuery) *gorm.DB 
 	}
 	if model := strings.TrimSpace(query.Model); model != "" {
 		scope = scope.Where(`"billing_charge"."model" LIKE ?`, "%"+model+"%")
+	}
+	if authIndex := strings.TrimSpace(query.AuthIndex); authIndex != "" {
+		scope = scope.Where(`"billing_charge"."auth_index" = ?`, authIndex)
 	}
 	switch diagnostic := strings.ToLower(strings.TrimSpace(query.CostDiagnostic)); diagnostic {
 	case "":
@@ -1383,24 +1426,25 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		}, nil
 	}
 	return price, BillingPriceSnapshot{
-		Provider:                  price.Provider,
-		Model:                     price.Model,
-		InputPricePerMillion:      price.InputPricePerMillion,
-		OutputPricePerMillion:     price.OutputPricePerMillion,
-		CacheReadPricePerMillion:  price.CacheReadPricePerMillion,
-		CacheWritePricePerMillion: price.CacheWritePricePerMillion,
-		RequestPrice:              price.RequestPrice,
-		BillingExtraPrices:        price.BillingExtraPrices,
-		MatchedServiceTier:        price.ServiceTier,
-		MinInputTokens:            price.MinInputTokens,
-		ContextInputTokens:        contextInputTokens,
-		PriceModelSource:          priceModelSource,
-		PriceMatch:                priceMatch,
-		RequestedServiceTier:      requestedTier,
-		ResponseServiceTier:       responseTierRaw,
-		ServiceTierSource:         settings.ServiceTierSource,
-		EffectiveServiceTier:      effectiveTier,
-		ResponseTierFallback:      responseFallback,
+		Provider:                   price.Provider,
+		Model:                      price.Model,
+		InputPricePerMillion:       price.InputPricePerMillion,
+		OutputPricePerMillion:      price.OutputPricePerMillion,
+		CacheReadPricePerMillion:   price.CacheReadPricePerMillion,
+		CacheWritePricePerMillion:  price.CacheWritePricePerMillion,
+		RequestPrice:               price.RequestPrice,
+		BillingExtraPrices:         price.BillingExtraPrices,
+		ReasoningEffortMultipliers: billingEffortMultipliersFromJSONB(price.ReasoningEffortMultipliers),
+		MatchedServiceTier:         price.ServiceTier,
+		MinInputTokens:             price.MinInputTokens,
+		ContextInputTokens:         contextInputTokens,
+		PriceModelSource:           priceModelSource,
+		PriceMatch:                 priceMatch,
+		RequestedServiceTier:       requestedTier,
+		ResponseServiceTier:        responseTierRaw,
+		ServiceTierSource:          settings.ServiceTierSource,
+		EffectiveServiceTier:       effectiveTier,
+		ResponseTierFallback:       responseFallback,
 	}, nil
 }
 
@@ -1462,7 +1506,13 @@ type BillingCostItem struct {
 type BillingCostBreakdown struct {
 	Request float64                    `json:"request,omitempty"`
 	Items   map[string]BillingCostItem `json:"items,omitempty"`
-	Total   float64                    `json:"total"`
+	// ReasoningEffortMultiplier scales the token cost (not the request price).
+	ReasoningEffort           string  `json:"reasoning_effort,omitempty"`
+	ReasoningEffortMultiplier float64 `json:"reasoning_effort_multiplier,omitempty"`
+	// BaseTotal is the list amount before the user billing multiplier.
+	BaseTotal         float64 `json:"base_total"`
+	BillingMultiplier float64 `json:"billing_multiplier"`
+	Total             float64 `json:"total"`
 }
 
 func (b *BillingCostBreakdown) add(name string, tokens int64, pricePerMillion float64) {
@@ -1478,8 +1528,23 @@ func (b *BillingCostBreakdown) add(name string, tokens int64, pricePerMillion fl
 }
 
 func (b *BillingCostBreakdown) finish(requestPrice float64) {
+	tokenCost := b.Total
+	if b.ReasoningEffortMultiplier > 0 {
+		tokenCost *= b.ReasoningEffortMultiplier
+	}
 	b.Request = requestPrice
-	b.Total = billingRoundAmount(b.Total + requestPrice)
+	b.BaseTotal = billingRoundAmount(tokenCost + requestPrice)
+	b.BillingMultiplier = 1
+	b.Total = b.BaseTotal
+}
+
+// applyBillingMultiplier scales the list amount by a customer multiplier.
+func (b *BillingCostBreakdown) applyBillingMultiplier(multiplier float64) {
+	if multiplier < 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		multiplier = 1
+	}
+	b.BillingMultiplier = multiplier
+	b.Total = billingRoundAmount(b.BaseTotal * multiplier)
 }
 
 func billingChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot) float64 {
@@ -1492,6 +1557,7 @@ func billingChargeCost(usage *UsageRecord, snapshot BillingPriceSnapshot) Billin
 	if usage == nil {
 		return cost
 	}
+	cost.ReasoningEffort, cost.ReasoningEffortMultiplier = billingEffortMultiplier(usage.Effort, snapshot.ReasoningEffortMultipliers)
 	breakdown := usageTokenBreakdownForRecord(usage)
 	if breakdown.Quality != UsageTokenAccountingQualityComplete {
 		billingLegacyChargeCost(&cost, usage, snapshot)

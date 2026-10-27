@@ -1051,6 +1051,7 @@ Example request:
 | `password` | string | no | Non-empty plaintext is stored as a bcrypt hash. Existing valid bcrypt hashes are preserved for migration. Responses do not return password material; they return `password_set`. |
 | `credits` | number | no | User credit balance. Defaults to `0`. When a client API key is bound to this user and credits are `<= 0`, RESP `RPOP auth` returns `user_credits_insufficient`. For billing workflows, prefer `/billing/balance-records/recharge` and `/billing/balance-records/deduct` so balance changes have ledger records. |
 | `credits_unlimited` | boolean | no | When `true`, dispatch ignores the total `credits` balance and billing charges do not deduct it. Period limits still apply. Defaults to `false`. |
+| `billing_multiplier` | number or null | no | Non-negative multiplier applied to every charge for the user's API keys (for example `0.8` for a 20% discount, `0` for free). `null` clears it, which means `1`. Invalid values return `400` with code `invalid_limit`. User responses include the stored value. |
 | `timezone` | string | no | IANA timezone for calendar windows; default `Asia/Shanghai`. |
 | `limit_5h_credits` | number/null | no | 5-hour credits limit. `null` clears/disables. `0` blocks immediately. |
 | `window_mode_5h` | string | no | `first_use` (default; alias `fixed`) or `sliding`. |
@@ -1552,10 +1553,13 @@ Query parameters:
 | `provider` | string | Optional provider filter. |
 | `model` | string | Optional model filter. |
 | `cost_diagnostic` | string | Optional zero-cost diagnostic filter: `unpriced_model`, `zero_price`, or `any` for every flagged charge. |
+| `auth_index` | string | Optional exact serving-credential filter. |
 | `limit` | integer | Optional page size. Default `50`, max `200`. |
 | `offset` | integer | Optional page offset. Negative values normalize to `0`. |
 
 Admin charge responses also include immutable charge-time fields: `billed_cache_read_tokens`, `billed_cache_write_tokens`, and `billed_reasoning_tokens` (the canonical buckets priced for complete v2 accounting, `null` for legacy accounting), and `cost_breakdown` (`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`). Charge amounts, balance deltas, and balances are quantized to 8 decimal places before they are stored, so `cost_breakdown.total` equals `amount`.
+
+Admin charge responses also include `base_amount` (the list value after rule multipliers and before the user `billing_multiplier`), `billing_multiplier`, and `auth_index` (the serving credential). `amount = round(base_amount * billing_multiplier, 8)`. Summing `base_amount` by `auth_index` values each credential's output independently of customer discounts, while `amount` is the revenue actually charged. `cost_breakdown` carries the same `base_total`, `billing_multiplier`, and the applied `reasoning_effort_multiplier`.
 
 Admin charge responses include `cost_diagnostic`. It is empty for normal charges, `unpriced_model` when billable usage matched no enabled price rule (billed at $0), and `zero_price` when it matched a rule whose prices produced $0. The same value is recorded as `price_snapshot.cost_diagnostic`.
 
@@ -1708,6 +1712,7 @@ Model price fields:
 | `image_output_price_per_million` | number or null | Price for image output tokens; `null` falls back to the output price. |
 | `audio_input_price_per_million` | number or null | Price for audio input tokens; `null` falls back to the input price. |
 | `audio_output_price_per_million` | number or null | Price for audio output tokens; `null` falls back to the output price. |
+| `reasoning_effort_multipliers` | object or null | Map from normalized reasoning effort to token-cost multiplier; usage whose `reasoning_effort` is absent from the map is not multiplied. |
 | `source` | string | Price source. |
 | `enabled` | boolean | Whether the rule is active. |
 | `note` | string | Operator note. |
@@ -1741,6 +1746,7 @@ Request body fields:
 | `image_output_price_per_million` | number or null | no | Optional non-negative image-output price. On `PATCH`, `null` clears it. |
 | `audio_input_price_per_million` | number or null | no | Optional non-negative audio-input price. On `PATCH`, `null` clears it. |
 | `audio_output_price_per_million` | number or null | no | Optional non-negative audio-output price. On `PATCH`, `null` clears it. |
+| `reasoning_effort_multipliers` | object | no | Optional map from reasoning effort (case-insensitive, for example `xhigh`) to a non-negative token-cost multiplier. The request price is not multiplied. On `PATCH`, `{}` clears it. |
 | `source` | string | no | Price source such as `manual`. |
 | `enabled` | boolean | no | Whether the rule is active. Defaults to `true`. |
 | `note` | string | no | Operator note. |

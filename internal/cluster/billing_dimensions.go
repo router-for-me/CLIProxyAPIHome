@@ -1,10 +1,15 @@
 package cluster
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
+	"strings"
 
 	"github.com/tidwall/gjson"
+	"gorm.io/gorm"
 )
 
 // Optional price dimensions. A NULL price falls back to its parent price so a
@@ -147,4 +152,69 @@ func clampBillingTokens(value int64, limit int64) int64 {
 		return limit
 	}
 	return value
+}
+
+// billingEffortMultiplier returns the normalized effort and its multiplier; a
+// missing entry returns 0, which leaves the token cost unchanged.
+func billingEffortMultiplier(effort string, multipliers map[string]float64) (string, float64) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" || len(multipliers) == 0 {
+		return "", 0
+	}
+	multiplier, ok := multipliers[effort]
+	if !ok {
+		return "", 0
+	}
+	return effort, multiplier
+}
+
+func validateBillingEffortMultipliers(multipliers map[string]float64) error {
+	for effort, multiplier := range multipliers {
+		if strings.TrimSpace(effort) == "" {
+			return fmt.Errorf("reasoning_effort_multipliers keys must be non-empty")
+		}
+		if multiplier < 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+			return fmt.Errorf("reasoning_effort_multipliers[%s] must be a non-negative number", effort)
+		}
+	}
+	return nil
+}
+
+// billingEffortMultipliersJSONB normalizes keys to lower case; an empty map stores NULL.
+func billingEffortMultipliersJSONB(multipliers map[string]float64) (JSONB, error) {
+	if errValidate := validateBillingEffortMultipliers(multipliers); errValidate != nil {
+		return nil, errValidate
+	}
+	if len(multipliers) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[string]float64, len(multipliers))
+	for effort, multiplier := range multipliers {
+		normalized[strings.ToLower(strings.TrimSpace(effort))] = multiplier
+	}
+	return billingJSONB(normalized)
+}
+
+func billingEffortMultipliersFromJSONB(raw JSONB) map[string]float64 {
+	if len(raw) == 0 {
+		return nil
+	}
+	multipliers := make(map[string]float64)
+	if errUnmarshal := json.Unmarshal(raw, &multipliers); errUnmarshal != nil {
+		return nil
+	}
+	return multipliers
+}
+
+// billingUserMultiplierTx returns the user's billing multiplier, defaulting to 1.
+func billingUserMultiplierTx(ctx context.Context, tx *gorm.DB, userID uint) (float64, error) {
+	user := &UserRecord{}
+	result := tx.WithContext(contextOrBackground(ctx)).Select("id", "billing_multiplier").Where("id = ?", userID).Limit(1).Find(user)
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected == 0 || user.BillingMultiplier == nil {
+		return 1, nil
+	}
+	return *user.BillingMultiplier, nil
 }
