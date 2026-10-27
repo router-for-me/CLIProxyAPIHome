@@ -159,9 +159,14 @@ func billingTokenDetailsForUsage(usage *UsageRecord) billingTokenDetails {
 		}
 		return 0
 	}
+	images := units("image_count")
+	// An images endpoint returns at least one image even when CPA omits the count.
+	if images == 0 && billingImagesEndpoint(usage.Endpoint) {
+		images = 1
+	}
 	return billingTokenDetails{
 		WebSearchCalls: units("web_search_requests"),
-		Images:         units("image_count"),
+		Images:         images,
 		CacheWrite1h:   first("cache_creation_1h_tokens", "cache_write_1h_tokens"),
 		CacheWrite12h:  first("cache_creation_12h_tokens", "cache_write_12h_tokens"),
 		ImageInput:     first("image_input_tokens"),

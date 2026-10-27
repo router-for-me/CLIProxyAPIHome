@@ -296,7 +296,11 @@ type BillingPriceSnapshot struct {
 	ServiceTierSource          string             `json:"service_tier_source"`
 	EffectiveServiceTier       string             `json:"effective_service_tier"`
 	ResponseTierFallback       bool               `json:"response_tier_fallback"`
-	CostDiagnostic             string             `json:"cost_diagnostic,omitempty"`
+	OutboundServiceTier        string             `json:"outbound_service_tier,omitempty"`
+	// FailedRequest marks a failed request billed for consumed tokens only.
+	FailedRequest  bool   `json:"failed_request,omitempty"`
+	FailStatusCode int    `json:"fail_status_code,omitempty"`
+	CostDiagnostic string `json:"cost_diagnostic,omitempty"`
 }
 
 type BillingSettings struct {
@@ -742,7 +746,9 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 	if usage == nil {
 		return fmt.Errorf("usage record is nil")
 	}
-	if usage.Failed {
+	// Failed requests are billed only for tokens the upstream reports as consumed,
+	// such as a client-cancelled (499) stream after prompt processing.
+	if usage.Failed && !billingUsageConsumedTokens(usage) {
 		return nil
 	}
 
@@ -755,6 +761,9 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 	price, snapshot, errSnapshot := billingPriceSnapshotForUsage(ctx, tx, usage)
 	if errSnapshot != nil {
 		return errSnapshot
+	}
+	if usage.Failed {
+		snapshot = billingFailedUsageSnapshot(usage, snapshot)
 	}
 	cost := billingChargeCost(usage, snapshot)
 	if !billingUsageHasBillableActivity(usage, cost.Total) {
@@ -1425,7 +1434,13 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 	}
 	requestedTier := normalizeBillingEffectiveServiceTier(usage.ServiceTier)
 	responseTierRaw := strings.TrimSpace(usage.ResponseServiceTier)
+	// CPA reports the tier of the final outbound request after config overrides.
+	// It is what the upstream was asked to serve, so it beats the client tier.
+	outboundTierRaw := billingOutboundServiceTier(usage)
 	effectiveTier := requestedTier
+	if outboundTierRaw != "" {
+		effectiveTier = normalizeBillingEffectiveServiceTier(outboundTierRaw)
+	}
 	responseFallback := false
 	if settings.ServiceTierSource == BillingServiceTierSourceResponse {
 		if responseTierRaw == "" {
@@ -1449,6 +1464,7 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 			ServiceTierSource:    settings.ServiceTierSource,
 			EffectiveServiceTier: effectiveTier,
 			ResponseTierFallback: responseFallback,
+			OutboundServiceTier:  outboundTierRaw,
 		}, nil
 	}
 	return price, BillingPriceSnapshot{
@@ -1472,6 +1488,7 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		ServiceTierSource:          settings.ServiceTierSource,
 		EffectiveServiceTier:       effectiveTier,
 		ResponseTierFallback:       responseFallback,
+		OutboundServiceTier:        outboundTierRaw,
 	}, nil
 }
 
