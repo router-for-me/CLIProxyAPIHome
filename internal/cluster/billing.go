@@ -1540,6 +1540,9 @@ type BillingCostBreakdown struct {
 	PricingExpr string `json:"pricing_expr,omitempty"`
 	// ExpressionError records a runtime expression failure that fell back to columns.
 	ExpressionError string `json:"expression_error,omitempty"`
+	// Surcharges are per-unit fees (web search calls, images); like the request
+	// price they are not scaled by the reasoning effort multiplier.
+	Surcharges float64 `json:"surcharges,omitempty"`
 	// BaseTotal is the list amount before the user billing multiplier.
 	BaseTotal         float64 `json:"base_total"`
 	BillingMultiplier float64 `json:"billing_multiplier"`
@@ -1558,13 +1561,32 @@ func (b *BillingCostBreakdown) add(name string, tokens int64, pricePerMillion fl
 	b.Total += cost
 }
 
+// addUnits records a per-unit surcharge item.
+func (b *BillingCostBreakdown) addUnits(name string, units int64, unitPrice *float64) {
+	if units <= 0 || unitPrice == nil {
+		return
+	}
+	if b.Items == nil {
+		b.Items = make(map[string]BillingCostItem)
+	}
+	cost := float64(units) * *unitPrice
+	b.Items[name] = BillingCostItem{Tokens: units, PricePerMillion: *unitPrice, Cost: cost}
+	b.Surcharges += cost
+}
+
+// addSurcharges bills per-unit counters with the rule's per-unit prices.
+func (b *BillingCostBreakdown) addSurcharges(details billingTokenDetails, snapshot BillingPriceSnapshot) {
+	b.addUnits("web_search_calls", details.WebSearchCalls, snapshot.WebSearchPricePerCall)
+	b.addUnits("images", details.Images, snapshot.ImagePricePerImage)
+}
+
 func (b *BillingCostBreakdown) finish(requestPrice float64) {
 	tokenCost := b.Total
 	if b.ReasoningEffortMultiplier > 0 {
 		tokenCost *= b.ReasoningEffortMultiplier
 	}
 	b.Request = requestPrice
-	b.BaseTotal = billingRoundAmount(tokenCost + requestPrice)
+	b.BaseTotal = billingRoundAmount(tokenCost + requestPrice + b.Surcharges)
 	b.BillingMultiplier = 1
 	b.Total = b.BaseTotal
 }
@@ -1605,10 +1627,13 @@ func billingChargeCost(usage *UsageRecord, snapshot BillingPriceSnapshot) Billin
 	breakdown := usageTokenBreakdownForRecord(usage)
 	if breakdown.Quality != UsageTokenAccountingQualityComplete {
 		billingLegacyChargeCost(&cost, usage, snapshot)
+		cost.addSurcharges(billingTokenDetailsForUsage(usage), snapshot)
 		cost.finish(snapshot.RequestPrice)
 		return cost
 	}
-	billingCompleteChargeCost(&cost, breakdown, billingTokenDetailsForUsage(usage), snapshot)
+	details := billingTokenDetailsForUsage(usage)
+	billingCompleteChargeCost(&cost, breakdown, details, snapshot)
+	cost.addSurcharges(details, snapshot)
 	cost.finish(snapshot.RequestPrice)
 	return cost
 }

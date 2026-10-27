@@ -30,6 +30,8 @@ type billingModelPriceRequest struct {
 	ImageOutputPrice           optionalJSONFloat   `json:"image_output_price_per_million"`
 	AudioInputPrice            optionalJSONFloat   `json:"audio_input_price_per_million"`
 	AudioOutputPrice           optionalJSONFloat   `json:"audio_output_price_per_million"`
+	WebSearchPrice             optionalJSONFloat   `json:"web_search_price_per_call"`
+	ImagePrice                 optionalJSONFloat   `json:"image_price_per_image"`
 	ReasoningEffortMultipliers *map[string]float64 `json:"reasoning_effort_multipliers"`
 	PricingExpr                *string             `json:"pricing_expr"`
 	Source                     *string             `json:"source"`
@@ -470,6 +472,8 @@ func billingExtraPricesFromRequest(body billingModelPriceRequest) map[string]*fl
 		cluster.BillingPriceImageOutput:   body.ImageOutputPrice,
 		cluster.BillingPriceAudioInput:    body.AudioInputPrice,
 		cluster.BillingPriceAudioOutput:   body.AudioOutputPrice,
+		cluster.BillingPriceWebSearchCall: body.WebSearchPrice,
+		cluster.BillingPriceImage:         body.ImagePrice,
 	} {
 		if !field.set {
 			continue
@@ -527,6 +531,8 @@ func billingModelPriceResponse(record *cluster.BillingModelPriceRecord) gin.H {
 		"image_output_price_per_million":    record.ImageOutputPricePerMillion,
 		"audio_input_price_per_million":     record.AudioInputPricePerMillion,
 		"audio_output_price_per_million":    record.AudioOutputPricePerMillion,
+		"web_search_price_per_call":         record.WebSearchPricePerCall,
+		"image_price_per_image":             record.ImagePricePerImage,
 		"reasoning_effort_multipliers":      record.ReasoningEffortMultipliers,
 		"pricing_expr":                      record.PricingExpr,
 		"source":                            record.Source,

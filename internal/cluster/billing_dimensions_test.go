@@ -107,3 +107,33 @@ func TestBillingModelPriceExtraPricesRoundTrip(t *testing.T) {
 		t.Fatal("unknown extra price was accepted")
 	}
 }
+
+func TestBillingPerUnitSurcharges(t *testing.T) {
+	t.Parallel()
+
+	webSearch, image := 0.01, 0.04
+	snapshot := BillingPriceSnapshot{InputPricePerMillion: 10, RequestPrice: 0.5}
+	snapshot.WebSearchPricePerCall = &webSearch
+	snapshot.ImagePricePerImage = &image
+	snapshot.ReasoningEffortMultipliers = map[string]float64{"high": 2}
+	usage := &UsageRecord{Provider: "openai", InputTokens: 1000000, TotalTokens: 1000000, Effort: "high",
+		TokensJSON: JSONB(`{"input_tokens":1000000,"total_tokens":1000000,"web_search_requests":3}`), PayloadJSON: JSONB(`{"image_count":2}`)}
+	cost := billingChargeCost(usage, snapshot)
+	// Surcharges and the request price are not scaled by the effort multiplier.
+	if want := billingRoundAmount(10*2 + 0.5 + 3*0.01 + 2*0.04); cost.Total != want {
+		t.Fatalf("total = %v, want %v (%+v)", cost.Total, want, cost)
+	}
+	if cost.Items["web_search_calls"].Tokens != 3 || cost.Items["images"].Tokens != 2 {
+		t.Fatalf("items = %+v", cost.Items)
+	}
+
+	// An expression that prices ws itself is not charged twice; ignored imgn still bills.
+	snapshot.PricingExpr = "p * 10 + ws * usd(0.02)"
+	exprCost := billingChargeCost(usage, snapshot)
+	if want := billingRoundAmount(10*2 + 3*0.02*2 + 2*0.04); exprCost.Total != want {
+		t.Fatalf("expression total = %v, want %v (%+v)", exprCost.Total, want, exprCost)
+	}
+	if _, ok := exprCost.Items["web_search_calls"]; ok {
+		t.Fatalf("expression charged web search twice: %+v", exprCost.Items)
+	}
+}

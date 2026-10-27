@@ -23,6 +23,9 @@ const (
 	BillingPriceImageOutput   = "image_output_price_per_million"
 	BillingPriceAudioInput    = "audio_input_price_per_million"
 	BillingPriceAudioOutput   = "audio_output_price_per_million"
+	// Per-unit surcharges in USD. They have no parent price, so NULL bills nothing.
+	BillingPriceWebSearchCall = "web_search_price_per_call"
+	BillingPriceImage         = "image_price_per_image"
 )
 
 // BillingExtraPrices holds optional per-dimension prices in USD per million tokens.
@@ -34,6 +37,8 @@ type BillingExtraPrices struct {
 	ImageOutputPricePerMillion   *float64 `gorm:"column:image_output_price_per_million" json:"image_output_price_per_million"`
 	AudioInputPricePerMillion    *float64 `gorm:"column:audio_input_price_per_million" json:"audio_input_price_per_million"`
 	AudioOutputPricePerMillion   *float64 `gorm:"column:audio_output_price_per_million" json:"audio_output_price_per_million"`
+	WebSearchPricePerCall        *float64 `gorm:"column:web_search_price_per_call" json:"web_search_price_per_call"`
+	ImagePricePerImage           *float64 `gorm:"column:image_price_per_image" json:"image_price_per_image"`
 }
 
 // BillingExtraPriceNames returns the optional price field names in stable order.
@@ -46,6 +51,8 @@ func BillingExtraPriceNames() []string {
 		BillingPriceImageOutput,
 		BillingPriceAudioInput,
 		BillingPriceAudioOutput,
+		BillingPriceWebSearchCall,
+		BillingPriceImage,
 	}
 }
 
@@ -58,12 +65,14 @@ func (p *BillingExtraPrices) fieldPointers() map[string]**float64 {
 		BillingPriceImageOutput:   &p.ImageOutputPricePerMillion,
 		BillingPriceAudioInput:    &p.AudioInputPricePerMillion,
 		BillingPriceAudioOutput:   &p.AudioOutputPricePerMillion,
+		BillingPriceWebSearchCall: &p.WebSearchPricePerCall,
+		BillingPriceImage:         &p.ImagePricePerImage,
 	}
 }
 
 // Values returns the optional prices keyed by field name; unset prices are nil.
 func (p BillingExtraPrices) Values() map[string]*float64 {
-	out := make(map[string]*float64, 7)
+	out := make(map[string]*float64, 9)
 	for name, field := range p.fieldPointers() {
 		out[name] = *field
 	}
@@ -119,28 +128,46 @@ type billingTokenDetails struct {
 	ImageOutput   int64
 	AudioInput    int64
 	AudioOutput   int64
+	// Per-unit counters reported in the tokens object or at the payload top level.
+	WebSearchCalls int64
+	Images         int64
 }
 
 func billingTokenDetailsForUsage(usage *UsageRecord) billingTokenDetails {
-	if usage == nil || len(usage.TokensJSON) == 0 {
+	if usage == nil {
 		return billingTokenDetails{}
 	}
 	raw := string(usage.TokensJSON)
+	payload := string(usage.PayloadJSON)
 	first := func(paths ...string) int64 {
 		for _, path := range paths {
-			if value := gjson.Get(raw, path); value.Exists() {
+			if value := gjson.Get(raw, path); raw != "" && value.Exists() {
 				return value.Int()
 			}
 		}
 		return 0
 	}
+	units := func(path string) int64 {
+		if value := first(path); value > 0 {
+			return value
+		}
+		if payload == "" {
+			return 0
+		}
+		if value := gjson.Get(payload, path).Int(); value > 0 {
+			return value
+		}
+		return 0
+	}
 	return billingTokenDetails{
-		CacheWrite1h:  first("cache_creation_1h_tokens", "cache_write_1h_tokens"),
-		CacheWrite12h: first("cache_creation_12h_tokens", "cache_write_12h_tokens"),
-		ImageInput:    first("image_input_tokens"),
-		ImageOutput:   first("image_output_tokens"),
-		AudioInput:    first("audio_input_tokens"),
-		AudioOutput:   first("audio_output_tokens"),
+		WebSearchCalls: units("web_search_requests"),
+		Images:         units("image_count"),
+		CacheWrite1h:   first("cache_creation_1h_tokens", "cache_write_1h_tokens"),
+		CacheWrite12h:  first("cache_creation_12h_tokens", "cache_write_12h_tokens"),
+		ImageInput:     first("image_input_tokens"),
+		ImageOutput:    first("image_output_tokens"),
+		AudioInput:     first("audio_input_tokens"),
+		AudioOutput:    first("audio_output_tokens"),
 	}
 }
 

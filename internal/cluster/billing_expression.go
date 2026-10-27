@@ -11,9 +11,12 @@ import (
 // accounting carves detail buckets out of their parents; legacy accounting only
 // exposes input, cache, and output buckets.
 func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
+	unitDetails := billingTokenDetailsForUsage(usage)
 	numbers := map[string]float64{
-		billingexpr.VarRequest:       1,
-		billingexpr.VarContextLength: float64(billingContextInputTokens(usage)),
+		billingexpr.VarRequest:        1,
+		billingexpr.VarContextLength:  float64(billingContextInputTokens(usage)),
+		billingexpr.VarWebSearchCalls: float64(unitDetails.WebSearchCalls),
+		billingexpr.VarImages:         float64(unitDetails.Images),
 	}
 	breakdown := usageTokenBreakdownForRecord(usage)
 	if breakdown.Quality != UsageTokenAccountingQualityComplete {
@@ -80,7 +83,7 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 	}
 	// Record the folded buckets for audit; their cost is carried by the expression item.
 	for name, tokens := range numbers {
-		if name == billingexpr.VarRequest || name == billingexpr.VarContextLength || tokens <= 0 {
+		if name == billingexpr.VarRequest || name == billingexpr.VarContextLength || name == billingexpr.VarWebSearchCalls || name == billingexpr.VarImages || tokens <= 0 {
 			continue
 		}
 		if cost.Items == nil {
@@ -92,6 +95,15 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 		cost.Items = make(map[string]BillingCostItem)
 	}
 	cost.Items["expression"] = BillingCostItem{Cost: amount}
+	// Per-unit counters the expression ignores still bill at the rule's unit prices.
+	details := billingTokenDetailsForUsage(usage)
+	if program.Uses(billingexpr.VarWebSearchCalls) {
+		details.WebSearchCalls = 0
+	}
+	if program.Uses(billingexpr.VarImages) {
+		details.Images = 0
+	}
+	cost.addSurcharges(details, snapshot)
 	cost.Total = amount
 	cost.PricingExpr = program.Source()
 	return nil

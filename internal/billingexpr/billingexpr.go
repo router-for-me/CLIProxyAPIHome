@@ -35,6 +35,8 @@ const (
 	VarAudioOutput    = "ao"    // audio output
 	VarContextLength  = "len"   // full prompt context, for conditions only
 	VarRequest        = "req"   // always 1; "req * usd(0.01)" bills per request
+	VarWebSearchCalls = "ws"    // web search calls; bill with "ws * usd(0.01)"
+	VarImages         = "imgn"  // generated images; bill with "imgn * usd(0.04)"
 	VarTier           = "tier"
 	VarEffort         = "effort"
 	VarModel          = "model"
@@ -48,6 +50,7 @@ var numberVars = map[string]struct{}{
 	VarInput: {}, VarOutput: {}, VarReasoning: {}, VarCacheRead: {}, VarCacheWrite: {},
 	VarCacheWrite1h: {}, VarCacheWrite12h: {}, VarImageInput: {}, VarImageOutput: {},
 	VarAudioInput: {}, VarAudioOutput: {}, VarContextLength: {}, VarRequest: {},
+	VarWebSearchCalls: {}, VarImages: {},
 }
 
 var stringVars = map[string]struct{}{
@@ -132,6 +135,8 @@ func Validate(source string) error {
 		sample.Numbers[name] = defaultSampleSize
 	}
 	sample.Numbers[VarRequest] = 1
+	sample.Numbers[VarWebSearchCalls] = 1
+	sample.Numbers[VarImages] = 1
 	for name := range stringVars {
 		sample.Strings[name] = ""
 	}

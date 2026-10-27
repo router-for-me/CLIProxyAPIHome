@@ -1705,6 +1705,8 @@ Query 参数：
 | `image_output_price_per_million` | number 或 null | 图片输出 token 单价；`null` 回退到 output 单价。 |
 | `audio_input_price_per_million` | number 或 null | 音频输入 token 单价；`null` 回退到 input 单价。 |
 | `audio_output_price_per_million` | number 或 null | 音频输出 token 单价；`null` 回退到 output 单价。 |
+| `web_search_price_per_call` | number 或 null | 每次联网搜索的美元价格；`null` 表示不收费。 |
+| `image_price_per_image` | number 或 null | 每张生成图片的美元价格；`null` 表示不收费。 |
 | `reasoning_effort_multipliers` | object 或 null | 规范化 reasoning effort 到 token 费用倍率的映射；usage 的 `reasoning_effort` 不在映射中时不乘倍率。 |
 | `source` | string | 价格来源。 |
 | `enabled` | boolean | 规则是否启用。 |
@@ -1714,6 +1716,8 @@ Query 参数：
 | `revision` | integer | 用于导入并发冲突检测的单调递增规则版本。 |
 
 可选维度单价作用于从 v2 规范桶中拆出的子桶，因此总 token 数不变：`cache_write_1h`/`cache_write_12h` 来自 cache-write 桶，`image_input`/`audio_input` 来自未缓存输入，`reasoning` 来自输出，`image_output`/`audio_output` 来自非思考输出。Home 从 usage 的 `tokens` 对象读取可选计数 `cache_creation_1h_tokens`（别名 `cache_write_1h_tokens`）、`cache_creation_12h_tokens`（别名 `cache_write_12h_tokens`）、`image_input_tokens`、`image_output_tokens`、`audio_input_tokens`、`audio_output_tokens`，并将每项截断到其父桶。CPA 未上报某计数时该子桶为空，按父桶单价计费。显式 `0` 表示该子桶免费；`null` 不会导致少收。
+
+按次附加费使用 `web_search_requests` 与 `image_count` 计数，读取自 usage 的 `tokens` 对象或 payload 顶层，在 `cost_breakdown` 中以 `count * 单价` 记为 `web_search_calls`、`images` 项，与 `request_price` 一样直接累加，不乘 `reasoning_effort_multipliers`。未配置单价时不收费。CPA 当前尚未上报这些计数，在其上报前这些子项为空。
 
 #### 价格表达式
 
@@ -1731,6 +1735,7 @@ Query 参数：
 | `img`、`imgo`、`ai`、`ao` | 图片输入、图片输出、音频输入、音频输出 token。 |
 | `len` | 完整提示上下文（未缓存 + 缓存读 + 缓存写），用于条件判断。 |
 | `req` | 恒为 `1`。 |
+| `ws`、`imgn` | 联网搜索次数、生成图片张数。表达式未引用时，仍按规则的按次单价收费。 |
 | `tier`、`effort`、`model`、`provider`、`endpoint` | 生效 service tier、reasoning effort、实际模型、provider、endpoint 字符串；字符串 `==`/`!=` 不区分大小写。 |
 | `hour(tz)`、`minute(tz)`、`weekday(tz)` | usage 时间在 IANA 时区字面量下的值（默认 `UTC`）；`weekday` 中周日为 `0`。 |
 | `min(...)`、`max(...)`、`usd(x)`、`contains(s, sub)` | 辅助函数。 |
@@ -1763,6 +1768,8 @@ Query 参数：
 | `image_output_price_per_million` | number 或 null | 否 | 可选非负图片输出单价；`PATCH` 时 `null` 表示清除。 |
 | `audio_input_price_per_million` | number 或 null | 否 | 可选非负音频输入单价；`PATCH` 时 `null` 表示清除。 |
 | `audio_output_price_per_million` | number 或 null | 否 | 可选非负音频输出单价；`PATCH` 时 `null` 表示清除。 |
+| `web_search_price_per_call` | number 或 null | 否 | 可选非负每次联网搜索美元价格；`PATCH` 时 `null` 表示清除。 |
+| `image_price_per_image` | number 或 null | 否 | 可选非负每张图片美元价格；`PATCH` 时 `null` 表示清除。 |
 | `reasoning_effort_multipliers` | object | 否 | 可选的 reasoning effort（不区分大小写，如 `xhigh`）到非负 token 费用倍率的映射，不作用于每请求价格；`PATCH` 时 `{}` 表示清除。 |
 | `pricing_expr` | string | 否 | 可选价格表达式，替代价格列，详见“价格表达式”；`PATCH` 时 `""` 表示清除。 |
 | `source` | string | 否 | 价格来源，例如 `manual`。 |

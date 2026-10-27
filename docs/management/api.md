@@ -1712,6 +1712,8 @@ Model price fields:
 | `image_output_price_per_million` | number or null | Price for image output tokens; `null` falls back to the output price. |
 | `audio_input_price_per_million` | number or null | Price for audio input tokens; `null` falls back to the input price. |
 | `audio_output_price_per_million` | number or null | Price for audio output tokens; `null` falls back to the output price. |
+| `web_search_price_per_call` | number or null | USD per web search call; `null` bills nothing. |
+| `image_price_per_image` | number or null | USD per generated image; `null` bills nothing. |
 | `reasoning_effort_multipliers` | object or null | Map from normalized reasoning effort to token-cost multiplier; usage whose `reasoning_effort` is absent from the map is not multiplied. |
 | `source` | string | Price source. |
 | `enabled` | boolean | Whether the rule is active. |
@@ -1721,6 +1723,8 @@ Model price fields:
 | `revision` | integer | Monotonic rule revision used by import conflict detection. |
 
 Optional dimension prices apply to sub-buckets carved out of the canonical v2 buckets, so totals never change: `cache_write_1h`/`cache_write_12h` come from the cache-write bucket, `image_input`/`audio_input` from uncached input, `reasoning` from output, and `image_output`/`audio_output` from non-reasoning output. Home reads the optional counters `cache_creation_1h_tokens` (alias `cache_write_1h_tokens`), `cache_creation_12h_tokens` (alias `cache_write_12h_tokens`), `image_input_tokens`, `image_output_tokens`, `audio_input_tokens`, and `audio_output_tokens` from the usage `tokens` object and clamps each to its parent bucket. When CPA does not report a counter, its bucket is empty and the parent price applies. An explicit `0` bills the bucket as free; `null` never undercharges.
+
+Per-unit surcharges use the counters `web_search_requests` and `image_count`, read from the usage `tokens` object or the payload top level. They are billed as `count * unit_price` items (`web_search_calls`, `images`) in `cost_breakdown`, added like `request_price`, and not scaled by `reasoning_effort_multipliers`. With no unit price configured they bill nothing. CPA does not report these counters yet, so they stay empty until it does.
 
 #### Pricing expressions
 
@@ -1738,6 +1742,7 @@ The expression evaluates to USD per million tokens: each token variable is multi
 | `img`, `imgo`, `ai`, `ao` | Image input, image output, audio input, and audio output tokens. |
 | `len` | Full prompt context (`uncached + cache read + cache write`), for conditions. |
 | `req` | Always `1`. |
+| `ws`, `imgn` | Web search calls and generated images. When the expression does not reference one, the rule's per-unit price still applies to it. |
 | `tier`, `effort`, `model`, `provider`, `endpoint` | Effective service tier, reasoning effort, executed model, provider, and endpoint strings. String `==` and `!=` are case-insensitive. |
 | `hour(tz)`, `minute(tz)`, `weekday(tz)` | Usage time in an IANA timezone literal (default `UTC`); `weekday` is `0` for Sunday. |
 | `min(...)`, `max(...)`, `usd(x)`, `contains(s, sub)` | Helpers. |
@@ -1770,6 +1775,8 @@ Request body fields:
 | `image_output_price_per_million` | number or null | no | Optional non-negative image-output price. On `PATCH`, `null` clears it. |
 | `audio_input_price_per_million` | number or null | no | Optional non-negative audio-input price. On `PATCH`, `null` clears it. |
 | `audio_output_price_per_million` | number or null | no | Optional non-negative audio-output price. On `PATCH`, `null` clears it. |
+| `web_search_price_per_call` | number or null | no | Optional non-negative USD per web search call. On `PATCH`, `null` clears it. |
+| `image_price_per_image` | number or null | no | Optional non-negative USD per generated image. On `PATCH`, `null` clears it. |
 | `reasoning_effort_multipliers` | object | no | Optional map from reasoning effort (case-insensitive, for example `xhigh`) to a non-negative token-cost multiplier. The request price is not multiplied. On `PATCH`, `{}` clears it. |
 | `pricing_expr` | string | no | Optional pricing expression that replaces the price columns. See Pricing expressions. On `PATCH`, `""` clears it. |
 | `source` | string | no | Price source such as `manual`. |
