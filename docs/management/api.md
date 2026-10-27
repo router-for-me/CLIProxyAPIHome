@@ -1578,7 +1578,7 @@ Response shape:
       "request_id": "req_xxx",
       "endpoint": "/v1/chat/completions",
       "matched_price_rule": "openai:gpt-5.5:priority:272001",
-      "price_snapshot": { "request_price": 0, "input_price_per_million": 2.5, "matched_service_tier": "priority", "min_input_tokens": 272001, "requested_service_tier": "priority", "response_service_tier": "default", "service_tier_source": "request", "effective_service_tier": "priority", "response_tier_fallback": false },
+      "price_snapshot": { "request_price": 0, "input_price_per_million": 2.5, "matched_service_tier": "priority", "min_input_tokens": 272001, "context_input_tokens": 300000, "price_model_source": "model", "requested_service_tier": "priority", "response_service_tier": "default", "service_tier_source": "request", "effective_service_tier": "priority", "response_tier_fallback": false },
       "cache_read_tokens": 0,
       "cache_write_tokens": 0
     }
@@ -1672,7 +1672,7 @@ Response:
 
 Lists model price rules.
 
-The response always includes `price_rule_schema_version: 2`, including when `items` is empty. Rules match exact normalized service tiers before the `*` compatibility wildcard, then select the greatest `min_input_tokens` not exceeding the usage record's original input-token count.
+The response always includes `price_rule_schema_version: 2`, including when `items` is empty. Rules match exact normalized service tiers before the `*` compatibility wildcard, then select the greatest `min_input_tokens` not exceeding the usage record's full prompt context (uncached input plus cache-read and cache-write tokens). Lookup uses the executed `model` first; when no enabled rule exists for it, Home retries with the client-requested `alias` before falling back to `default:zero`.
 
 Query parameters:
 
@@ -1770,7 +1770,7 @@ Partially updates billing settings. Both fields are optional. In `response` mode
 
 OpenAI defines an omitted `service_tier` as `auto`; `auto` is represented internally by Home and is not a literal Codex backend request value. See the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) and [Responses Create reference](https://developers.openai.com/api/reference/resources/responses/methods/create). Home stores the request `service_tier` and optional upstream `response_service_tier` so later billing policy can switch sources without re-ingesting usage. The default `request` source bills from `service_tier` (client-requested tier). In `response` mode, Home uses `response_service_tier` when present and falls back to the request tier when the upstream omits it. `auto`, `default`, and `standard` map to the local Standard price tier; configure `flex` or `priority` rules when those tiers are used.
 
-Charge `price_snapshot` audit data includes `requested_service_tier`, optional `response_service_tier`, `service_tier_source`, `effective_service_tier`, `response_tier_fallback`, `matched_service_tier`, and `min_input_tokens`. Context-band selection uses the original total input count. In the OpenAI Responses protocol, `input_tokens` includes both cache-read and cache-write tokens. Home removes cache-read tokens from ordinary input before applying the cache-read price. When `cache_write_price_per_million` is positive, Home also removes cache-write tokens from ordinary input before applying that separate price; when the price is zero or omitted, those cache-write tokens remain billed as ordinary input. In the Anthropic Messages protocol, `input_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` are independent buckets, so Home prices them independently without subtracting either cache bucket from input. Cache-field compatibility backfills update usage counters only; existing immutable `billing_charge` snapshots and balances are not repriced automatically, so historical corrections require an explicit audited balance adjustment.
+Charge `price_snapshot` audit data includes `requested_service_tier`, optional `response_service_tier`, `service_tier_source`, `effective_service_tier`, `response_tier_fallback`, `matched_service_tier`, `min_input_tokens`, `context_input_tokens`, and `price_model_source` (`model` or `alias`, omitted when no rule matched). Context-band selection uses `context_input_tokens`, the full prompt context including cache-read and cache-write tokens, so Anthropic usage with large cache hits selects the same band as an equivalent uncached prompt. In the OpenAI Responses protocol, `input_tokens` includes both cache-read and cache-write tokens. Home removes cache-read tokens from ordinary input before applying the cache-read price. When `cache_write_price_per_million` is positive, Home also removes cache-write tokens from ordinary input before applying that separate price; when the price is zero or omitted, those cache-write tokens remain billed as ordinary input. In the Anthropic Messages protocol, `input_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` are independent buckets, so Home prices them independently without subtracting either cache bucket from input. Cache-field compatibility backfills update usage counters only; existing immutable `billing_charge` snapshots and balances are not repriced automatically, so historical corrections require an explicit audited balance adjustment.
 
 ### POST `/billing/model-prices/import/preview`
 

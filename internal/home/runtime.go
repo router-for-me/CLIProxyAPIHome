@@ -60,8 +60,9 @@ type Runtime struct {
 	clusterRefresh          func(context.Context, string, string) ([]byte, error)
 	originalStore           coreauth.Store
 
-	clusterUsageQueueMu sync.Mutex
-	clusterUsageQueue   *usagePayloadQueue
+	clusterUsageQueueMu    sync.Mutex
+	clusterUsageQueue      *usagePayloadQueue
+	clusterUsageWriterDone chan struct{}
 
 	cancel context.CancelFunc
 
@@ -545,10 +546,13 @@ func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string
 	}
 	queue := r.getClusterUsageQueue()
 	if queue == nil {
-		return true, nil
+		// Report not persisted so the caller keeps the payload in the fallback usage log.
+		log.Warn("cluster usage queue is unavailable; falling back to usage log")
+		return false, nil
 	}
 	if ok := queue.Push(payload, receivedAt); !ok {
-		log.Warnf("cluster usage queue is stopped; accepting usage without persistence")
+		log.Warn("cluster usage queue is stopped; falling back to usage log")
+		return false, nil
 	}
 	return true, nil
 }

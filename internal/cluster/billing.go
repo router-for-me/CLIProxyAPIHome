@@ -32,8 +32,10 @@ const (
 	billingSettingsKVKey             = "billing.settings"
 
 	billingIDRandomBytes    = 12
-	billingCreditMaxRetries = 5
 	billingOverviewTopLimit = 10
+
+	billingPriceModelSourceModel = "model"
+	billingPriceModelSourceAlias = "alias"
 )
 
 var (
@@ -241,6 +243,8 @@ type BillingPriceSnapshot struct {
 	RequestPrice              float64 `json:"request_price"`
 	MatchedServiceTier        string  `json:"matched_service_tier"`
 	MinInputTokens            int64   `json:"min_input_tokens"`
+	ContextInputTokens        int64   `json:"context_input_tokens"`
+	PriceModelSource          string  `json:"price_model_source,omitempty"`
 	RequestedServiceTier      string  `json:"requested_service_tier"`
 	ResponseServiceTier       string  `json:"response_service_tier,omitempty"`
 	ServiceTierSource         string  `json:"service_tier_source"`
@@ -875,28 +879,34 @@ func billingApplyUserCreditDeltaTx(ctx context.Context, tx *gorm.DB, userID uint
 		return 0, 0, fmt.Errorf("user id is required")
 	}
 	ctx = contextOrBackground(ctx)
-	for attempt := 0; attempt < billingCreditMaxRetries; attempt++ {
-		user := &UserRecord{}
-		if errFirst := tx.WithContext(ctx).Select("id", "credits", "credits_unlimited").Where("id = ?", userID).First(user).Error; errFirst != nil {
-			return 0, 0, errFirst
-		}
-		balanceBefore := user.Credits
-		balanceAfter := balanceBefore + delta
-		if delta == 0 || user.CreditsUnlimited {
-			return balanceBefore, balanceBefore, nil
-		}
-		update := tx.WithContext(ctx).
-			Model(&UserRecord{}).
-			Where("id = ? AND credits = ?", userID, balanceBefore).
-			Update("credits", balanceAfter)
-		if update.Error != nil {
-			return 0, 0, update.Error
-		}
-		if update.RowsAffected == 1 {
-			return balanceBefore, balanceAfter, nil
-		}
+	user := &UserRecord{}
+	if errFirst := tx.WithContext(ctx).Select("id", "credits", "credits_unlimited").Where("id = ?", userID).First(user).Error; errFirst != nil {
+		return 0, 0, errFirst
 	}
-	return 0, 0, fmt.Errorf("update user credits conflict after %d retries", billingCreditMaxRetries)
+	if delta == 0 || user.CreditsUnlimited {
+		return user.Credits, user.Credits, nil
+	}
+	// Apply the delta inside SQL so concurrent writers serialize on the row lock
+	// instead of retrying an exact float comparison that can exhaust under load.
+	updated := &UserRecord{ID: userID}
+	update := tx.WithContext(ctx).
+		Model(updated).
+		Clauses(clause.Returning{Columns: []clause.Column{{Name: "credits"}}}).
+		Where("credits_unlimited = ?", false).
+		Update("credits", gorm.Expr("credits + ?", delta))
+	if update.Error != nil {
+		return 0, 0, update.Error
+	}
+	if update.RowsAffected == 0 {
+		// The user switched to unlimited credits after the first read.
+		current := &UserRecord{}
+		if errCurrent := tx.WithContext(ctx).Select("id", "credits").Where("id = ?", userID).First(current).Error; errCurrent != nil {
+			return 0, 0, errCurrent
+		}
+		return current.Credits, current.Credits, nil
+	}
+	balanceAfter := updated.Credits
+	return balanceAfter - delta, balanceAfter, nil
 }
 
 func billingChargeQueryScope(scope *gorm.DB, query BillingChargeQuery) *gorm.DB {
@@ -1281,29 +1291,25 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 			effectiveTier = normalizeBillingEffectiveServiceTier(responseTierRaw)
 		}
 	}
-	price := &BillingModelPriceRecord{}
-	result := tx.WithContext(contextOrBackground(ctx)).
-		Where("provider = ? AND model = ? AND enabled = ? AND service_tier = ? AND min_input_tokens <= ?", provider, model, true, effectiveTier, usage.InputTokens).
-		Order("min_input_tokens DESC, id ASC").
-		Limit(1).
-		Find(price)
-	if result.Error != nil {
-		return nil, BillingPriceSnapshot{}, result.Error
-	}
-	if result.RowsAffected == 0 {
-		result = tx.WithContext(contextOrBackground(ctx)).
-			Where("provider = ? AND model = ? AND enabled = ? AND service_tier = ? AND min_input_tokens <= ?", provider, model, true, BillingServiceTierWildcard, usage.InputTokens).
-			Order("min_input_tokens DESC, id ASC").
-			Limit(1).
-			Find(price)
-		if result.Error != nil {
-			return nil, BillingPriceSnapshot{}, result.Error
+	contextInputTokens := billingContextInputTokens(usage)
+	var price *BillingModelPriceRecord
+	priceModelSource := ""
+	for _, candidate := range billingPriceModelCandidates(usage) {
+		found, errFind := billingFindPriceRule(ctx, tx, provider, candidate.model, effectiveTier, contextInputTokens)
+		if errFind != nil {
+			return nil, BillingPriceSnapshot{}, errFind
+		}
+		if found != nil {
+			price = found
+			priceModelSource = candidate.source
+			break
 		}
 	}
-	if result.RowsAffected == 0 {
+	if price == nil {
 		return nil, BillingPriceSnapshot{
 			Provider:             provider,
 			Model:                model,
+			ContextInputTokens:   contextInputTokens,
 			RequestedServiceTier: requestedTier,
 			ResponseServiceTier:  responseTierRaw,
 			ServiceTierSource:    settings.ServiceTierSource,
@@ -1321,12 +1327,78 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		RequestPrice:              price.RequestPrice,
 		MatchedServiceTier:        price.ServiceTier,
 		MinInputTokens:            price.MinInputTokens,
+		ContextInputTokens:        contextInputTokens,
+		PriceModelSource:          priceModelSource,
 		RequestedServiceTier:      requestedTier,
 		ResponseServiceTier:       responseTierRaw,
 		ServiceTierSource:         settings.ServiceTierSource,
 		EffectiveServiceTier:      effectiveTier,
 		ResponseTierFallback:      responseFallback,
 	}, nil
+}
+
+type billingPriceModelCandidate struct {
+	model  string
+	source string
+}
+
+// billingPriceModelCandidates lists price lookup models: the executed model first,
+// then the client-requested alias when it differs.
+func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidate {
+	model := strings.TrimSpace(usage.Model)
+	candidates := []billingPriceModelCandidate{{model: model, source: billingPriceModelSourceModel}}
+	if alias := strings.TrimSpace(usage.Alias); alias != "" && alias != model {
+		candidates = append(candidates, billingPriceModelCandidate{model: alias, source: billingPriceModelSourceAlias})
+	}
+	return candidates
+}
+
+// billingFindPriceRule returns the best enabled rule for one model, preferring an
+// exact service tier over the wildcard tier. It returns nil when no rule matches.
+func billingFindPriceRule(ctx context.Context, tx *gorm.DB, provider, model, tier string, contextInputTokens int64) (*BillingModelPriceRecord, error) {
+	if model == "" {
+		return nil, nil
+	}
+	for _, candidateTier := range []string{tier, BillingServiceTierWildcard} {
+		price := &BillingModelPriceRecord{}
+		result := tx.WithContext(contextOrBackground(ctx)).
+			Where("provider = ? AND model = ? AND enabled = ? AND service_tier = ? AND min_input_tokens <= ?", provider, model, true, candidateTier, contextInputTokens).
+			Order("min_input_tokens DESC, id ASC").
+			Limit(1).
+			Find(price)
+		if result.Error != nil {
+			return nil, result.Error
+		}
+		if result.RowsAffected > 0 {
+			return price, nil
+		}
+		if candidateTier == BillingServiceTierWildcard {
+			break
+		}
+	}
+	return nil, nil
+}
+
+// billingContextInputTokens returns the full prompt context used for context-band
+// matching: uncached input plus cache reads and cache writes. Claude-style usage
+// reports cache tokens outside input_tokens, so raw input_tokens undercounts it.
+func billingContextInputTokens(usage *UsageRecord) int64 {
+	if usage == nil {
+		return 0
+	}
+	breakdown := usageTokenBreakdownForRecord(usage)
+	if breakdown.Quality == UsageTokenAccountingQualityComplete {
+		return breakdown.Input.TotalTokens
+	}
+	inputTokens := usage.InputTokens
+	if !billingCacheTokensIncludedInInput(usage) {
+		cacheReadTokens := normalizedUsageCacheReadTokens(usage.Provider, usage.ExecutorType, usage.CachedTokens, usage.CacheReadTokens, usage.CacheReadTokensPresent)
+		inputTokens += cacheReadTokens + usage.CacheCreationTokens
+	}
+	if inputTokens < 0 {
+		return 0
+	}
+	return inputTokens
 }
 
 func billingChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot) float64 {
