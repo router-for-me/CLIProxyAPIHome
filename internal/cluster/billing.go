@@ -51,16 +51,17 @@ var (
 )
 
 type BillingModelPriceRecord struct {
-	ID                        string         `gorm:"column:id;primaryKey"`
-	Provider                  string         `gorm:"column:provider;not null;index:idx_billing_model_price_lookup,priority:1"`
-	Model                     string         `gorm:"column:model;not null;index:idx_billing_model_price_lookup,priority:2"`
-	ServiceTier               string         `gorm:"column:service_tier;not null;default:*"`
-	MinInputTokens            int64          `gorm:"column:min_input_tokens;not null;default:0"`
-	InputPricePerMillion      float64        `gorm:"column:input_price_per_million;not null;default:0"`
-	OutputPricePerMillion     float64        `gorm:"column:output_price_per_million;not null;default:0"`
-	CacheReadPricePerMillion  float64        `gorm:"column:cache_read_price_per_million;not null;default:0"`
-	CacheWritePricePerMillion float64        `gorm:"column:cache_write_price_per_million;not null;default:0"`
-	RequestPrice              float64        `gorm:"column:request_price;not null;default:0"`
+	ID                        string  `gorm:"column:id;primaryKey"`
+	Provider                  string  `gorm:"column:provider;not null;index:idx_billing_model_price_lookup,priority:1"`
+	Model                     string  `gorm:"column:model;not null;index:idx_billing_model_price_lookup,priority:2"`
+	ServiceTier               string  `gorm:"column:service_tier;not null;default:*"`
+	MinInputTokens            int64   `gorm:"column:min_input_tokens;not null;default:0"`
+	InputPricePerMillion      float64 `gorm:"column:input_price_per_million;not null;default:0"`
+	OutputPricePerMillion     float64 `gorm:"column:output_price_per_million;not null;default:0"`
+	CacheReadPricePerMillion  float64 `gorm:"column:cache_read_price_per_million;not null;default:0"`
+	CacheWritePricePerMillion float64 `gorm:"column:cache_write_price_per_million;not null;default:0"`
+	RequestPrice              float64 `gorm:"column:request_price;not null;default:0"`
+	BillingExtraPrices        `gorm:"embedded"`
 	Source                    string         `gorm:"column:source;not null;default:manual"`
 	Enabled                   bool           `gorm:"column:enabled;not null;index:idx_billing_model_price_enabled"`
 	Note                      string         `gorm:"column:note;type:text"`
@@ -136,6 +137,7 @@ type BillingModelPriceUpdate struct {
 	CacheReadPricePerMillion  float64
 	CacheWritePricePerMillion float64
 	RequestPrice              float64
+	Extra                     BillingExtraPrices
 	Source                    string
 	Enabled                   bool
 	Note                      string
@@ -151,9 +153,11 @@ type BillingModelPricePatch struct {
 	CacheReadPricePerMillion  *float64
 	CacheWritePricePerMillion *float64
 	RequestPrice              *float64
-	Source                    *string
-	Enabled                   *bool
-	Note                      *string
+	// Extra sets optional prices by field name; a present nil value clears the price.
+	Extra   map[string]*float64
+	Source  *string
+	Enabled *bool
+	Note    *string
 }
 
 type BillingBalanceUpdate struct {
@@ -258,16 +262,17 @@ type BillingPriceSnapshot struct {
 	CacheReadPricePerMillion  float64 `json:"cache_read_price_per_million"`
 	CacheWritePricePerMillion float64 `json:"cache_write_price_per_million"`
 	RequestPrice              float64 `json:"request_price"`
-	MatchedServiceTier        string  `json:"matched_service_tier"`
-	MinInputTokens            int64   `json:"min_input_tokens"`
-	ContextInputTokens        int64   `json:"context_input_tokens"`
-	PriceModelSource          string  `json:"price_model_source,omitempty"`
-	RequestedServiceTier      string  `json:"requested_service_tier"`
-	ResponseServiceTier       string  `json:"response_service_tier,omitempty"`
-	ServiceTierSource         string  `json:"service_tier_source"`
-	EffectiveServiceTier      string  `json:"effective_service_tier"`
-	ResponseTierFallback      bool    `json:"response_tier_fallback"`
-	CostDiagnostic            string  `json:"cost_diagnostic,omitempty"`
+	BillingExtraPrices
+	MatchedServiceTier   string `json:"matched_service_tier"`
+	MinInputTokens       int64  `json:"min_input_tokens"`
+	ContextInputTokens   int64  `json:"context_input_tokens"`
+	PriceModelSource     string `json:"price_model_source,omitempty"`
+	RequestedServiceTier string `json:"requested_service_tier"`
+	ResponseServiceTier  string `json:"response_service_tier,omitempty"`
+	ServiceTierSource    string `json:"service_tier_source"`
+	EffectiveServiceTier string `json:"effective_service_tier"`
+	ResponseTierFallback bool   `json:"response_tier_fallback"`
+	CostDiagnostic       string `json:"cost_diagnostic,omitempty"`
 }
 
 type BillingSettings struct {
@@ -344,6 +349,7 @@ func (r *Repository) CreateBillingModelPrice(ctx context.Context, update Billing
 		CacheReadPricePerMillion:  update.CacheReadPricePerMillion,
 		CacheWritePricePerMillion: update.CacheWritePricePerMillion,
 		RequestPrice:              update.RequestPrice,
+		BillingExtraPrices:        update.Extra,
 		Source:                    billingPriceSource(update.Source),
 		Enabled:                   update.Enabled,
 		Note:                      strings.TrimSpace(update.Note),
@@ -824,7 +830,7 @@ func validateBillingModelPriceUpdate(update BillingModelPriceUpdate) error {
 			return fmt.Errorf("%s must be non-negative", name)
 		}
 	}
-	return nil
+	return validateBillingExtraPrices(update.Extra.Values())
 }
 
 func validateBillingModelPricePatch(patch BillingModelPricePatch) error {
@@ -853,7 +859,7 @@ func validateBillingModelPricePatch(patch BillingModelPricePatch) error {
 			return fmt.Errorf("%s must be non-negative", name)
 		}
 	}
-	return nil
+	return validateBillingExtraPrices(patch.Extra)
 }
 
 func billingModelPricePatchUpdates(patch BillingModelPricePatch) map[string]any {
@@ -884,6 +890,13 @@ func billingModelPricePatchUpdates(patch BillingModelPricePatch) map[string]any 
 	}
 	if patch.RequestPrice != nil {
 		updates["request_price"] = *patch.RequestPrice
+	}
+	for name, value := range patch.Extra {
+		if value == nil {
+			updates[name] = nil
+			continue
+		}
+		updates[name] = *value
 	}
 	if patch.Source != nil {
 		updates["source"] = billingPriceSource(*patch.Source)
@@ -1372,6 +1385,7 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		CacheReadPricePerMillion:  price.CacheReadPricePerMillion,
 		CacheWritePricePerMillion: price.CacheWritePricePerMillion,
 		RequestPrice:              price.RequestPrice,
+		BillingExtraPrices:        price.BillingExtraPrices,
 		MatchedServiceTier:        price.ServiceTier,
 		MinInputTokens:            price.MinInputTokens,
 		ContextInputTokens:        contextInputTokens,
@@ -1504,20 +1518,56 @@ func billingChargeCost(usage *UsageRecord, snapshot BillingPriceSnapshot) Billin
 		cost.finish(snapshot.RequestPrice)
 		return cost
 	}
-	inputTokens := breakdown.Input.UncachedTokens
-	cacheWriteTokens := breakdown.Input.CacheWriteTokens
-	// A zero cache-write rate means the write bucket keeps the ordinary input
-	// price, matching the existing billing contract without provider branching.
-	if snapshot.CacheWritePricePerMillion <= 0 {
-		inputTokens += cacheWriteTokens
-		cacheWriteTokens = 0
-	}
-	cost.add("input", inputTokens, snapshot.InputPricePerMillion)
-	cost.add("cache_read", breakdown.Input.CacheReadTokens, snapshot.CacheReadPricePerMillion)
-	cost.add("cache_write", cacheWriteTokens, snapshot.CacheWritePricePerMillion)
-	cost.add("output", breakdown.Output.TotalTokens, snapshot.OutputPricePerMillion)
+	billingCompleteChargeCost(&cost, breakdown, billingTokenDetailsForUsage(usage), snapshot)
 	cost.finish(snapshot.RequestPrice)
 	return cost
+}
+
+// billingCompleteChargeCost prices complete v2 accounting. Optional detail buckets
+// are carved out of their canonical parent bucket, so totals never change and
+// unset detail prices fall back to the parent price.
+func billingCompleteChargeCost(cost *BillingCostBreakdown, breakdown UsageTokenBreakdown, details billingTokenDetails, snapshot BillingPriceSnapshot) {
+	uncached := breakdown.Input.UncachedTokens
+	cacheWrite := breakdown.Input.CacheWriteTokens
+	cacheWrite1h := clampBillingTokens(details.CacheWrite1h, cacheWrite)
+	cacheWrite12h := clampBillingTokens(details.CacheWrite12h, cacheWrite-cacheWrite1h)
+	cacheWrite5m := cacheWrite - cacheWrite1h - cacheWrite12h
+	imageInput := clampBillingTokens(details.ImageInput, uncached)
+	audioInput := clampBillingTokens(details.AudioInput, uncached-imageInput)
+	textInput := uncached - imageInput - audioInput
+
+	// A zero cache-write rate means the 5m write bucket keeps the ordinary input
+	// price, matching the existing billing contract without provider branching.
+	cacheWritePrice := snapshot.CacheWritePricePerMillion
+	if cacheWritePrice <= 0 {
+		textInput += cacheWrite5m
+		cacheWrite5m = 0
+		cacheWritePrice = snapshot.InputPricePerMillion
+	}
+	cacheWrite1hPrice := billingPriceOr(snapshot.CacheWrite1hPricePerMillion, cacheWritePrice)
+	cacheWrite12hPrice := billingPriceOr(snapshot.CacheWrite12hPricePerMillion, cacheWrite1hPrice)
+
+	reasoning := breakdown.Output.ReasoningTokens
+	nonReasoning := breakdown.Output.NonReasoningTokens
+	imageOutput := clampBillingTokens(details.ImageOutput, nonReasoning)
+	audioOutput := clampBillingTokens(details.AudioOutput, nonReasoning-imageOutput)
+	textOutput := nonReasoning - imageOutput - audioOutput
+	if snapshot.ReasoningPricePerMillion == nil {
+		textOutput += reasoning
+		reasoning = 0
+	}
+
+	cost.add("input", textInput, snapshot.InputPricePerMillion)
+	cost.add("image_input", imageInput, billingPriceOr(snapshot.ImageInputPricePerMillion, snapshot.InputPricePerMillion))
+	cost.add("audio_input", audioInput, billingPriceOr(snapshot.AudioInputPricePerMillion, snapshot.InputPricePerMillion))
+	cost.add("cache_read", breakdown.Input.CacheReadTokens, snapshot.CacheReadPricePerMillion)
+	cost.add("cache_write", cacheWrite5m, snapshot.CacheWritePricePerMillion)
+	cost.add("cache_write_1h", cacheWrite1h, cacheWrite1hPrice)
+	cost.add("cache_write_12h", cacheWrite12h, cacheWrite12hPrice)
+	cost.add("output", textOutput, snapshot.OutputPricePerMillion)
+	cost.add("reasoning", reasoning, billingPriceOr(snapshot.ReasoningPricePerMillion, snapshot.OutputPricePerMillion))
+	cost.add("image_output", imageOutput, billingPriceOr(snapshot.ImageOutputPricePerMillion, snapshot.OutputPricePerMillion))
+	cost.add("audio_output", audioOutput, billingPriceOr(snapshot.AudioOutputPricePerMillion, snapshot.OutputPricePerMillion))
 }
 
 func billingLegacyChargeCost(cost *BillingCostBreakdown, usage *UsageRecord, snapshot BillingPriceSnapshot) {

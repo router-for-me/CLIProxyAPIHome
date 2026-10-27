@@ -160,7 +160,7 @@ func (index modelPriceIndex) pricingFor(modelID string, providers []string) gin.
 // bookkeeping about how a price came to exist, not part of the quote, and the
 // user contract puts them out of bounds.
 func modelPriceRungResponse(record cluster.BillingModelPriceRecord) gin.H {
-	return gin.H{
+	rung := gin.H{
 		"min_input_tokens":              record.MinInputTokens,
 		"input_price_per_million":       record.InputPricePerMillion,
 		"output_price_per_million":      record.OutputPricePerMillion,
@@ -168,4 +168,12 @@ func modelPriceRungResponse(record cluster.BillingModelPriceRecord) gin.H {
 		"cache_write_price_per_million": record.CacheWritePricePerMillion,
 		"request_price":                 record.RequestPrice,
 	}
+	// Optional dimensions are quoted only when configured; an unset one bills at
+	// its parent price, which the rung already shows.
+	for name, value := range record.Values() {
+		if value != nil {
+			rung[name] = *value
+		}
+	}
+	return rung
 }

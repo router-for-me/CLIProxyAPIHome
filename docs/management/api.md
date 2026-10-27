@@ -1701,12 +1701,21 @@ Model price fields:
 | `cache_read_price_per_million` | number | Cache-read token price. |
 | `cache_write_price_per_million` | number | Cache-write token price. |
 | `request_price` | number | Per-request price. |
+| `cache_write_1h_price_per_million` | number or null | Price for 1-hour cache writes; `null` falls back to the cache-write price (or input price when that is zero). |
+| `cache_write_12h_price_per_million` | number or null | Price for 12-hour cache writes; `null` falls back to the 1-hour cache-write price. |
+| `reasoning_price_per_million` | number or null | Price for reasoning output tokens; `null` bills them at the output price. |
+| `image_input_price_per_million` | number or null | Price for image input tokens; `null` falls back to the input price. |
+| `image_output_price_per_million` | number or null | Price for image output tokens; `null` falls back to the output price. |
+| `audio_input_price_per_million` | number or null | Price for audio input tokens; `null` falls back to the input price. |
+| `audio_output_price_per_million` | number or null | Price for audio output tokens; `null` falls back to the output price. |
 | `source` | string | Price source. |
 | `enabled` | boolean | Whether the rule is active. |
 | `note` | string | Operator note. |
 | `created_at` | string | Creation time. |
 | `updated_at` | string | Last update time. |
 | `revision` | integer | Monotonic rule revision used by import conflict detection. |
+
+Optional dimension prices apply to sub-buckets carved out of the canonical v2 buckets, so totals never change: `cache_write_1h`/`cache_write_12h` come from the cache-write bucket, `image_input`/`audio_input` from uncached input, `reasoning` from output, and `image_output`/`audio_output` from non-reasoning output. Home reads the optional counters `cache_creation_1h_tokens` (alias `cache_write_1h_tokens`), `cache_creation_12h_tokens` (alias `cache_write_12h_tokens`), `image_input_tokens`, `image_output_tokens`, `audio_input_tokens`, and `audio_output_tokens` from the usage `tokens` object and clamps each to its parent bucket. When CPA does not report a counter, its bucket is empty and the parent price applies. An explicit `0` bills the bucket as free; `null` never undercharges.
 
 ### POST `/billing/model-prices`
 
@@ -1725,6 +1734,13 @@ Request body fields:
 | `cache_read_price_per_million` | number | no | Non-negative cache-read token price. |
 | `cache_write_price_per_million` | number | no | Non-negative cache-write token price. |
 | `request_price` | number | no | Non-negative per-request price. |
+| `cache_write_1h_price_per_million` | number or null | no | Optional non-negative 1-hour cache-write price. On `PATCH`, `null` clears it. |
+| `cache_write_12h_price_per_million` | number or null | no | Optional non-negative 12-hour cache-write price. On `PATCH`, `null` clears it. |
+| `reasoning_price_per_million` | number or null | no | Optional non-negative reasoning-output price. On `PATCH`, `null` clears it. |
+| `image_input_price_per_million` | number or null | no | Optional non-negative image-input price. On `PATCH`, `null` clears it. |
+| `image_output_price_per_million` | number or null | no | Optional non-negative image-output price. On `PATCH`, `null` clears it. |
+| `audio_input_price_per_million` | number or null | no | Optional non-negative audio-input price. On `PATCH`, `null` clears it. |
+| `audio_output_price_per_million` | number or null | no | Optional non-negative audio-output price. On `PATCH`, `null` clears it. |
 | `source` | string | no | Price source such as `manual`. |
 | `enabled` | boolean | no | Whether the rule is active. Defaults to `true`. |
 | `note` | string | no | Operator note. |

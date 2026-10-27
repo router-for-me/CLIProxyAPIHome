@@ -1696,12 +1696,21 @@ Query 参数：
 | `cache_read_price_per_million` | number | Cache-read token 价格。 |
 | `cache_write_price_per_million` | number | Cache-write token 价格。 |
 | `request_price` | number | 每请求价格。 |
+| `cache_write_1h_price_per_million` | number 或 null | 1 小时缓存写入单价；`null` 回退到 cache-write 单价（其为 0 时回退到 input 单价）。 |
+| `cache_write_12h_price_per_million` | number 或 null | 12 小时缓存写入单价；`null` 回退到 1 小时缓存写入单价。 |
+| `reasoning_price_per_million` | number 或 null | 思考输出 token 单价；`null` 按 output 单价计费。 |
+| `image_input_price_per_million` | number 或 null | 图片输入 token 单价；`null` 回退到 input 单价。 |
+| `image_output_price_per_million` | number 或 null | 图片输出 token 单价；`null` 回退到 output 单价。 |
+| `audio_input_price_per_million` | number 或 null | 音频输入 token 单价；`null` 回退到 input 单价。 |
+| `audio_output_price_per_million` | number 或 null | 音频输出 token 单价；`null` 回退到 output 单价。 |
 | `source` | string | 价格来源。 |
 | `enabled` | boolean | 规则是否启用。 |
 | `note` | string | 操作备注。 |
 | `created_at` | string | 创建时间。 |
 | `updated_at` | string | 最近更新时间。 |
 | `revision` | integer | 用于导入并发冲突检测的单调递增规则版本。 |
+
+可选维度单价作用于从 v2 规范桶中拆出的子桶，因此总 token 数不变：`cache_write_1h`/`cache_write_12h` 来自 cache-write 桶，`image_input`/`audio_input` 来自未缓存输入，`reasoning` 来自输出，`image_output`/`audio_output` 来自非思考输出。Home 从 usage 的 `tokens` 对象读取可选计数 `cache_creation_1h_tokens`（别名 `cache_write_1h_tokens`）、`cache_creation_12h_tokens`（别名 `cache_write_12h_tokens`）、`image_input_tokens`、`image_output_tokens`、`audio_input_tokens`、`audio_output_tokens`，并将每项截断到其父桶。CPA 未上报某计数时该子桶为空，按父桶单价计费。显式 `0` 表示该子桶免费；`null` 不会导致少收。
 
 ### POST `/billing/model-prices`
 
@@ -1720,6 +1729,13 @@ Query 参数：
 | `cache_read_price_per_million` | number | 否 | 非负 cache-read token 价格。 |
 | `cache_write_price_per_million` | number | 否 | 非负 cache-write token 价格。 |
 | `request_price` | number | 否 | 非负每请求价格。 |
+| `cache_write_1h_price_per_million` | number 或 null | 否 | 可选非负 1 小时缓存写入单价；`PATCH` 时 `null` 表示清除。 |
+| `cache_write_12h_price_per_million` | number 或 null | 否 | 可选非负 12 小时缓存写入单价；`PATCH` 时 `null` 表示清除。 |
+| `reasoning_price_per_million` | number 或 null | 否 | 可选非负思考输出单价；`PATCH` 时 `null` 表示清除。 |
+| `image_input_price_per_million` | number 或 null | 否 | 可选非负图片输入单价；`PATCH` 时 `null` 表示清除。 |
+| `image_output_price_per_million` | number 或 null | 否 | 可选非负图片输出单价；`PATCH` 时 `null` 表示清除。 |
+| `audio_input_price_per_million` | number 或 null | 否 | 可选非负音频输入单价；`PATCH` 时 `null` 表示清除。 |
+| `audio_output_price_per_million` | number 或 null | 否 | 可选非负音频输出单价；`PATCH` 时 `null` 表示清除。 |
 | `source` | string | 否 | 价格来源，例如 `manual`。 |
 | `enabled` | boolean | 否 | 规则是否启用；默认 `true`。 |
 | `note` | string | 否 | 操作备注。 |

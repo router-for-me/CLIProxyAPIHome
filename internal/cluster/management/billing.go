@@ -14,18 +14,25 @@ import (
 )
 
 type billingModelPriceRequest struct {
-	Provider                  *string  `json:"provider"`
-	Model                     *string  `json:"model"`
-	ServiceTier               *string  `json:"service_tier"`
-	MinInputTokens            *int64   `json:"min_input_tokens"`
-	InputPricePerMillion      *float64 `json:"input_price_per_million"`
-	OutputPricePerMillion     *float64 `json:"output_price_per_million"`
-	CacheReadPricePerMillion  *float64 `json:"cache_read_price_per_million"`
-	CacheWritePricePerMillion *float64 `json:"cache_write_price_per_million"`
-	RequestPrice              *float64 `json:"request_price"`
-	Source                    *string  `json:"source"`
-	Enabled                   *bool    `json:"enabled"`
-	Note                      *string  `json:"note"`
+	Provider                  *string           `json:"provider"`
+	Model                     *string           `json:"model"`
+	ServiceTier               *string           `json:"service_tier"`
+	MinInputTokens            *int64            `json:"min_input_tokens"`
+	InputPricePerMillion      *float64          `json:"input_price_per_million"`
+	OutputPricePerMillion     *float64          `json:"output_price_per_million"`
+	CacheReadPricePerMillion  *float64          `json:"cache_read_price_per_million"`
+	CacheWritePricePerMillion *float64          `json:"cache_write_price_per_million"`
+	RequestPrice              *float64          `json:"request_price"`
+	CacheWrite1hPrice         optionalJSONFloat `json:"cache_write_1h_price_per_million"`
+	CacheWrite12hPrice        optionalJSONFloat `json:"cache_write_12h_price_per_million"`
+	ReasoningPrice            optionalJSONFloat `json:"reasoning_price_per_million"`
+	ImageInputPrice           optionalJSONFloat `json:"image_input_price_per_million"`
+	ImageOutputPrice          optionalJSONFloat `json:"image_output_price_per_million"`
+	AudioInputPrice           optionalJSONFloat `json:"audio_input_price_per_million"`
+	AudioOutputPrice          optionalJSONFloat `json:"audio_output_price_per_million"`
+	Source                    *string           `json:"source"`
+	Enabled                   *bool             `json:"enabled"`
+	Note                      *string           `json:"note"`
 }
 
 type billingSettingsRequest struct {
@@ -338,6 +345,19 @@ func billingModelPriceUpdateFromRequest(c *gin.Context, body billingModelPriceRe
 	if body.Enabled != nil {
 		update.Enabled = *body.Enabled
 	}
+	for name, value := range billingExtraPricesFromRequest(body) {
+		if value == nil {
+			continue
+		}
+		if *value < 0 {
+			respondError(c, http.StatusBadRequest, "invalid_body", fmt.Errorf("%s must be non-negative", name))
+			return update, false
+		}
+		if errSet := update.Extra.Set(name, value); errSet != nil {
+			respondError(c, http.StatusBadRequest, "invalid_body", errSet)
+			return update, false
+		}
+	}
 	if update.Provider == "" {
 		respondError(c, http.StatusBadRequest, "invalid_body", fmt.Errorf("provider is required"))
 		return update, false
@@ -409,6 +429,15 @@ func billingModelPricePatchFromRequest(c *gin.Context, body billingModelPriceReq
 	patch.CacheReadPricePerMillion = body.CacheReadPricePerMillion
 	patch.CacheWritePricePerMillion = body.CacheWritePricePerMillion
 	patch.RequestPrice = body.RequestPrice
+	if extra := billingExtraPricesFromRequest(body); len(extra) > 0 {
+		for name, value := range extra {
+			if value != nil && *value < 0 {
+				respondError(c, http.StatusBadRequest, "invalid_body", fmt.Errorf("%s must be non-negative", name))
+				return patch, false
+			}
+		}
+		patch.Extra = extra
+	}
 	if body.Source != nil {
 		source := strings.TrimSpace(*body.Source)
 		patch.Source = &source
@@ -419,6 +448,32 @@ func billingModelPricePatchFromRequest(c *gin.Context, body billingModelPriceReq
 		patch.Note = &note
 	}
 	return patch, true
+}
+
+// billingExtraPricesFromRequest returns the optional prices present in the body;
+// a present JSON null maps to a nil value so a patch can clear the price.
+func billingExtraPricesFromRequest(body billingModelPriceRequest) map[string]*float64 {
+	out := make(map[string]*float64)
+	for name, field := range map[string]optionalJSONFloat{
+		cluster.BillingPriceCacheWrite1h:  body.CacheWrite1hPrice,
+		cluster.BillingPriceCacheWrite12h: body.CacheWrite12hPrice,
+		cluster.BillingPriceReasoning:     body.ReasoningPrice,
+		cluster.BillingPriceImageInput:    body.ImageInputPrice,
+		cluster.BillingPriceImageOutput:   body.ImageOutputPrice,
+		cluster.BillingPriceAudioInput:    body.AudioInputPrice,
+		cluster.BillingPriceAudioOutput:   body.AudioOutputPrice,
+	} {
+		if !field.set {
+			continue
+		}
+		if field.clear {
+			out[name] = nil
+			continue
+		}
+		value := field.value
+		out[name] = &value
+	}
+	return out
 }
 
 func billingStringValue(value *string) string {
@@ -447,22 +502,29 @@ func billingModelPriceResponse(record *cluster.BillingModelPriceRecord) gin.H {
 		return gin.H{}
 	}
 	return gin.H{
-		"id":                            record.ID,
-		"provider":                      record.Provider,
-		"model":                         record.Model,
-		"service_tier":                  record.ServiceTier,
-		"min_input_tokens":              record.MinInputTokens,
-		"input_price_per_million":       record.InputPricePerMillion,
-		"output_price_per_million":      record.OutputPricePerMillion,
-		"cache_read_price_per_million":  record.CacheReadPricePerMillion,
-		"cache_write_price_per_million": record.CacheWritePricePerMillion,
-		"request_price":                 record.RequestPrice,
-		"source":                        record.Source,
-		"enabled":                       record.Enabled,
-		"note":                          record.Note,
-		"created_at":                    record.CreatedAt,
-		"updated_at":                    record.UpdatedAt,
-		"revision":                      record.Revision,
+		"id":                                record.ID,
+		"provider":                          record.Provider,
+		"model":                             record.Model,
+		"service_tier":                      record.ServiceTier,
+		"min_input_tokens":                  record.MinInputTokens,
+		"input_price_per_million":           record.InputPricePerMillion,
+		"output_price_per_million":          record.OutputPricePerMillion,
+		"cache_read_price_per_million":      record.CacheReadPricePerMillion,
+		"cache_write_price_per_million":     record.CacheWritePricePerMillion,
+		"request_price":                     record.RequestPrice,
+		"cache_write_1h_price_per_million":  record.CacheWrite1hPricePerMillion,
+		"cache_write_12h_price_per_million": record.CacheWrite12hPricePerMillion,
+		"reasoning_price_per_million":       record.ReasoningPricePerMillion,
+		"image_input_price_per_million":     record.ImageInputPricePerMillion,
+		"image_output_price_per_million":    record.ImageOutputPricePerMillion,
+		"audio_input_price_per_million":     record.AudioInputPricePerMillion,
+		"audio_output_price_per_million":    record.AudioOutputPricePerMillion,
+		"source":                            record.Source,
+		"enabled":                           record.Enabled,
+		"note":                              record.Note,
+		"created_at":                        record.CreatedAt,
+		"updated_at":                        record.UpdatedAt,
+		"revision":                          record.Revision,
 	}
 }
 
