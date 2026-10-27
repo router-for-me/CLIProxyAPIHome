@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -107,5 +108,53 @@ func TestBillingChargeRecordsCostDiagnostics(t *testing.T) {
 	unpriced, errUnpriced := repo.ListBillingCharges(ctx, BillingChargeQuery{CostDiagnostic: BillingCostDiagnosticUnpricedModel, Limit: 10})
 	if errUnpriced != nil || unpriced.Total != 1 || unpriced.Records[0].Model != "unpriced-model" {
 		t.Fatalf("unpriced filter = %+v err = %v", unpriced, errUnpriced)
+	}
+}
+
+func TestBillingChargeQuantizesAndItemizesCost(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	username := "itemized@example.com"
+	credits := 1.0
+	user, errCreateUser := repo.CreateUser(ctx, UserUpdate{Username: &username, Credits: &credits})
+	if errCreateUser != nil {
+		t.Fatalf("CreateUser() error = %v", errCreateUser)
+	}
+	clientKey := "itemized-key"
+	if _, errCreateKey := repo.CreateAPIKeyForUser(ctx, user.ID, APIKeyUserUpdate{APIKey: &clientKey}); errCreateKey != nil {
+		t.Fatalf("CreateAPIKeyForUser() error = %v", errCreateKey)
+	}
+	if _, errCreate := repo.CreateBillingModelPrice(ctx, BillingModelPriceUpdate{Provider: "codex", Model: "gpt-5.5", InputPricePerMillion: 1.25, OutputPricePerMillion: 10, CacheReadPricePerMillion: 0.125, Enabled: true}); errCreate != nil {
+		t.Fatalf("CreateBillingModelPrice() error = %v", errCreate)
+	}
+	// 1 uncached input token at $1.25/M costs 0.00000125; 1 cache read at $0.125/M costs 0.000000125.
+	payload := `{"timestamp":"2026-06-10T01:02:03Z","provider":"codex","executor_type":"CodexExecutor","model":"gpt-5.5","api_key":"itemized-key","request_id":"req-itemized","tokens":{"input_tokens":2,"output_tokens":3,"reasoning_tokens":1,"cache_read_tokens":1,"cache_read_tokens_present":true,"total_tokens":5}}`
+	if _, errUsage := repo.AppendUsage(ctx, payload, "192.0.2.10"); errUsage != nil {
+		t.Fatalf("AppendUsage() error = %v", errUsage)
+	}
+	charges, errCharges := repo.ListBillingCharges(ctx, BillingChargeQuery{UserID: &user.ID, Limit: 10})
+	if errCharges != nil || len(charges.Records) != 1 {
+		t.Fatalf("ListBillingCharges() = %+v err = %v", charges, errCharges)
+	}
+	charge := charges.Records[0]
+	// Raw total 0.000031375 rounds to 8 decimals.
+	if charge.Amount != 0.00003138 {
+		t.Fatalf("amount = %.12f, want 0.00003138", charge.Amount)
+	}
+	if charge.BalanceAfter != 0.99996862 {
+		t.Fatalf("balance_after = %.12f, want 0.99996862", charge.BalanceAfter)
+	}
+	if charge.BilledCacheReadTokens == nil || *charge.BilledCacheReadTokens != 1 || charge.BilledReasoningTokens == nil || *charge.BilledReasoningTokens != 1 || charge.BilledCacheWriteTokens == nil || *charge.BilledCacheWriteTokens != 0 {
+		t.Fatalf("billed tokens = %v/%v/%v", charge.BilledCacheReadTokens, charge.BilledCacheWriteTokens, charge.BilledReasoningTokens)
+	}
+	var cost BillingCostBreakdown
+	if errUnmarshal := json.Unmarshal(charge.CostBreakdown, &cost); errUnmarshal != nil {
+		t.Fatalf("cost_breakdown = %s err = %v", charge.CostBreakdown, errUnmarshal)
+	}
+	if cost.Total != charge.Amount || cost.Items["input"].Tokens != 1 || cost.Items["cache_read"].Tokens != 1 || cost.Items["output"].Tokens != 3 {
+		t.Fatalf("cost_breakdown = %+v", cost)
 	}
 }

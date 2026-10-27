@@ -1555,6 +1555,8 @@ Query parameters:
 | `limit` | integer | Optional page size. Default `50`, max `200`. |
 | `offset` | integer | Optional page offset. Negative values normalize to `0`. |
 
+Admin charge responses also include immutable charge-time fields: `billed_cache_read_tokens`, `billed_cache_write_tokens`, and `billed_reasoning_tokens` (the canonical buckets priced for complete v2 accounting, `null` for legacy accounting), and `cost_breakdown` (`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`). Charge amounts, balance deltas, and balances are quantized to 8 decimal places before they are stored, so `cost_breakdown.total` equals `amount`.
+
 Admin charge responses include `cost_diagnostic`. It is empty for normal charges, `unpriced_model` when billable usage matched no enabled price rule (billed at $0), and `zero_price` when it matched a rule whose prices produced $0. The same value is recorded as `price_snapshot.cost_diagnostic`.
 
 Response shape:

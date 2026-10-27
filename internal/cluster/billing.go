@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -111,9 +112,16 @@ type BillingChargeRecord struct {
 	RequestSummary   string  `gorm:"column:request_summary;type:text"`
 	// Display-only cache split filled by ListBillingCharges from the linked usage
 	// row's v2 token accounting; nil when the split is unknown.
-	CacheReadTokens  *int64    `gorm:"-"`
-	CacheWriteTokens *int64    `gorm:"-"`
-	CreatedAt        time.Time `gorm:"column:created_at;not null;index:idx_billing_charge_time_order,priority:1,sort:desc;index:idx_billing_charge_user_time,priority:2,sort:desc;index:idx_billing_charge_provider_model_time,priority:3,sort:desc"`
+	CacheReadTokens  *int64 `gorm:"-"`
+	CacheWriteTokens *int64 `gorm:"-"`
+	// Billed* buckets are the canonical token counts priced at charge time; they
+	// stay NULL for legacy accounting and are immutable like the amount.
+	BilledCacheReadTokens  *int64 `gorm:"column:billed_cache_read_tokens"`
+	BilledCacheWriteTokens *int64 `gorm:"column:billed_cache_write_tokens"`
+	BilledReasoningTokens  *int64 `gorm:"column:billed_reasoning_tokens"`
+	// CostBreakdown itemizes the amount by priced token bucket.
+	CostBreakdown JSONB     `gorm:"column:cost_breakdown"`
+	CreatedAt     time.Time `gorm:"column:created_at;not null;index:idx_billing_charge_time_order,priority:1,sort:desc;index:idx_billing_charge_user_time,priority:2,sort:desc;index:idx_billing_charge_provider_model_time,priority:3,sort:desc"`
 }
 
 func (BillingChargeRecord) TableName() string { return "billing_charge" }
@@ -426,6 +434,7 @@ func (r *Repository) ApplyBillingBalanceRecord(ctx context.Context, update Billi
 	if update.UserID == 0 {
 		return nil, fmt.Errorf("user id is required")
 	}
+	update.Amount = billingRoundAmount(update.Amount)
 	if update.Amount <= 0 {
 		return nil, fmt.Errorf("amount must be positive")
 	}
@@ -711,7 +720,8 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 	if errSnapshot != nil {
 		return errSnapshot
 	}
-	amount := billingChargeAmount(usage, snapshot)
+	cost := billingChargeCost(usage, snapshot)
+	amount := cost.Total
 	if !billingUsageHasBillableActivity(usage, amount) {
 		return nil
 	}
@@ -720,6 +730,11 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 	if errPriceSnapshot != nil {
 		return errPriceSnapshot
 	}
+	costBreakdown, errCostBreakdown := billingJSONB(cost)
+	if errCostBreakdown != nil {
+		return errCostBreakdown
+	}
+	cacheReadTokens, cacheWriteTokens, reasoningTokens := billingChargeTokenSplit(usage)
 
 	var userID *uint
 	if apiKey != nil {
@@ -727,27 +742,31 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 	}
 
 	charge := &BillingChargeRecord{
-		ID:               billingID("charge"),
-		UsageID:          usage.ID,
-		PayloadHash:      payloadHash,
-		UserID:           userID,
-		APIKeyID:         billingAPIKeyID(apiKey),
-		APIKeyLabel:      billingAPIKeyLabel(apiKey),
-		APIKeyMasked:     maskBillingAPIKey(usage.APIKey),
-		Provider:         strings.ToLower(strings.TrimSpace(usage.Provider)),
-		Model:            strings.TrimSpace(usage.Model),
-		OriginalModel:    firstNonEmptyBillingString(usage.Alias, usage.Model),
-		ActualModel:      strings.TrimSpace(usage.Model),
-		RequestID:        strings.TrimSpace(usage.RequestID),
-		Endpoint:         strings.TrimSpace(usage.Endpoint),
-		InputTokens:      usage.InputTokens,
-		OutputTokens:     usage.OutputTokens,
-		CacheTokens:      billingCacheTokens(usage),
-		Amount:           amount,
-		MatchedPriceRule: billingMatchedPriceRule(price),
-		CostDiagnostic:   snapshot.CostDiagnostic,
-		PriceSnapshot:    priceSnapshot,
-		CreatedAt:        usage.Timestamp.UTC(),
+		ID:                     billingID("charge"),
+		UsageID:                usage.ID,
+		PayloadHash:            payloadHash,
+		UserID:                 userID,
+		APIKeyID:               billingAPIKeyID(apiKey),
+		APIKeyLabel:            billingAPIKeyLabel(apiKey),
+		APIKeyMasked:           maskBillingAPIKey(usage.APIKey),
+		Provider:               strings.ToLower(strings.TrimSpace(usage.Provider)),
+		Model:                  strings.TrimSpace(usage.Model),
+		OriginalModel:          firstNonEmptyBillingString(usage.Alias, usage.Model),
+		ActualModel:            strings.TrimSpace(usage.Model),
+		RequestID:              strings.TrimSpace(usage.RequestID),
+		Endpoint:               strings.TrimSpace(usage.Endpoint),
+		InputTokens:            usage.InputTokens,
+		OutputTokens:           usage.OutputTokens,
+		CacheTokens:            billingCacheTokens(usage),
+		BilledCacheReadTokens:  cacheReadTokens,
+		BilledCacheWriteTokens: cacheWriteTokens,
+		BilledReasoningTokens:  reasoningTokens,
+		CostBreakdown:          costBreakdown,
+		Amount:                 amount,
+		MatchedPriceRule:       billingMatchedPriceRule(price),
+		CostDiagnostic:         snapshot.CostDiagnostic,
+		PriceSnapshot:          priceSnapshot,
+		CreatedAt:              usage.Timestamp.UTC(),
 	}
 	insert := tx.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "payload_hash"}},
@@ -899,6 +918,7 @@ func billingApplyUserCreditDeltaTx(ctx context.Context, tx *gorm.DB, userID uint
 		return 0, 0, fmt.Errorf("user id is required")
 	}
 	ctx = contextOrBackground(ctx)
+	delta = billingRoundAmount(delta)
 	user := &UserRecord{}
 	if errFirst := tx.WithContext(ctx).Select("id", "credits", "credits_unlimited").Where("id = ?", userID).First(user).Error; errFirst != nil {
 		return 0, 0, errFirst
@@ -913,7 +933,7 @@ func billingApplyUserCreditDeltaTx(ctx context.Context, tx *gorm.DB, userID uint
 		Model(updated).
 		Clauses(clause.Returning{Columns: []clause.Column{{Name: "credits"}}}).
 		Where("credits_unlimited = ?", false).
-		Update("credits", gorm.Expr("credits + ?", delta))
+		Update("credits", gorm.Expr("ROUND(CAST(credits AS NUMERIC) + CAST(? AS NUMERIC), 8)", delta))
 	if update.Error != nil {
 		return 0, 0, update.Error
 	}
@@ -926,7 +946,7 @@ func billingApplyUserCreditDeltaTx(ctx context.Context, tx *gorm.DB, userID uint
 		return current.Credits, current.Credits, nil
 	}
 	balanceAfter := updated.Credits
-	return balanceAfter - delta, balanceAfter, nil
+	return billingRoundAmount(balanceAfter - delta), balanceAfter, nil
 }
 
 func billingChargeQueryScope(scope *gorm.DB, query BillingChargeQuery) *gorm.DB {
@@ -1428,16 +1448,63 @@ func billingContextInputTokens(usage *UsageRecord) int64 {
 	return inputTokens
 }
 
+// billingAmountScale quantizes money to 8 decimal places before it is stored so
+// balances and charge sums stay reconcilable across SQLite and PostgreSQL.
+const billingAmountScale = 1e8
+
+// billingRoundAmount rounds a USD amount to 8 decimal places.
+func billingRoundAmount(value float64) float64 {
+	return math.Round(value*billingAmountScale) / billingAmountScale
+}
+
+// BillingCostItem is one priced token bucket of a charge.
+type BillingCostItem struct {
+	Tokens          int64   `json:"tokens"`
+	PricePerMillion float64 `json:"price_per_million"`
+	Cost            float64 `json:"cost"`
+}
+
+// BillingCostBreakdown itemizes how a charge amount was computed.
+type BillingCostBreakdown struct {
+	Request float64                    `json:"request,omitempty"`
+	Items   map[string]BillingCostItem `json:"items,omitempty"`
+	Total   float64                    `json:"total"`
+}
+
+func (b *BillingCostBreakdown) add(name string, tokens int64, pricePerMillion float64) {
+	if tokens <= 0 {
+		return
+	}
+	if b.Items == nil {
+		b.Items = make(map[string]BillingCostItem)
+	}
+	cost := float64(tokens) * pricePerMillion / 1000000
+	b.Items[name] = BillingCostItem{Tokens: tokens, PricePerMillion: pricePerMillion, Cost: cost}
+	b.Total += cost
+}
+
+func (b *BillingCostBreakdown) finish(requestPrice float64) {
+	b.Request = requestPrice
+	b.Total = billingRoundAmount(b.Total + requestPrice)
+}
+
 func billingChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot) float64 {
+	return billingChargeCost(usage, snapshot).Total
+}
+
+// billingChargeCost prices usage against a snapshot and returns the itemized cost.
+func billingChargeCost(usage *UsageRecord, snapshot BillingPriceSnapshot) BillingCostBreakdown {
+	cost := BillingCostBreakdown{}
 	if usage == nil {
-		return 0
+		return cost
 	}
 	breakdown := usageTokenBreakdownForRecord(usage)
 	if breakdown.Quality != UsageTokenAccountingQualityComplete {
-		return billingLegacyChargeAmount(usage, snapshot)
+		billingLegacyChargeCost(&cost, usage, snapshot)
+		cost.finish(snapshot.RequestPrice)
+		return cost
 	}
 	inputTokens := breakdown.Input.UncachedTokens
-	cacheReadTokens := breakdown.Input.CacheReadTokens
 	cacheWriteTokens := breakdown.Input.CacheWriteTokens
 	// A zero cache-write rate means the write bucket keeps the ordinary input
 	// price, matching the existing billing contract without provider branching.
@@ -1445,14 +1512,15 @@ func billingChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot) floa
 		inputTokens += cacheWriteTokens
 		cacheWriteTokens = 0
 	}
-	return snapshot.RequestPrice +
-		float64(inputTokens)*snapshot.InputPricePerMillion/1000000 +
-		float64(breakdown.Output.TotalTokens)*snapshot.OutputPricePerMillion/1000000 +
-		float64(cacheReadTokens)*snapshot.CacheReadPricePerMillion/1000000 +
-		float64(cacheWriteTokens)*snapshot.CacheWritePricePerMillion/1000000
+	cost.add("input", inputTokens, snapshot.InputPricePerMillion)
+	cost.add("cache_read", breakdown.Input.CacheReadTokens, snapshot.CacheReadPricePerMillion)
+	cost.add("cache_write", cacheWriteTokens, snapshot.CacheWritePricePerMillion)
+	cost.add("output", breakdown.Output.TotalTokens, snapshot.OutputPricePerMillion)
+	cost.finish(snapshot.RequestPrice)
+	return cost
 }
 
-func billingLegacyChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot) float64 {
+func billingLegacyChargeCost(cost *BillingCostBreakdown, usage *UsageRecord, snapshot BillingPriceSnapshot) {
 	inputTokens := usage.InputTokens
 	cacheReadTokens := normalizedUsageCacheReadTokens(usage.Provider, usage.ExecutorType, usage.CachedTokens, usage.CacheReadTokens, usage.CacheReadTokensPresent)
 	cacheWriteTokens := usage.CacheCreationTokens
@@ -1468,11 +1536,23 @@ func billingLegacyChargeAmount(usage *UsageRecord, snapshot BillingPriceSnapshot
 	if snapshot.CacheWritePricePerMillion <= 0 {
 		cacheWriteTokens = 0
 	}
-	return snapshot.RequestPrice +
-		float64(inputTokens)*snapshot.InputPricePerMillion/1000000 +
-		float64(usage.OutputTokens)*snapshot.OutputPricePerMillion/1000000 +
-		float64(cacheReadTokens)*snapshot.CacheReadPricePerMillion/1000000 +
-		float64(cacheWriteTokens)*snapshot.CacheWritePricePerMillion/1000000
+	cost.add("input", inputTokens, snapshot.InputPricePerMillion)
+	cost.add("cache_read", cacheReadTokens, snapshot.CacheReadPricePerMillion)
+	cost.add("cache_write", cacheWriteTokens, snapshot.CacheWritePricePerMillion)
+	cost.add("output", usage.OutputTokens, snapshot.OutputPricePerMillion)
+}
+
+// billingChargeTokenSplit returns the canonical cache and reasoning buckets for
+// complete v2 accounting, or nil values when the split is unknown.
+func billingChargeTokenSplit(usage *UsageRecord) (*int64, *int64, *int64) {
+	breakdown := usageTokenBreakdownForRecord(usage)
+	if breakdown.Quality != UsageTokenAccountingQualityComplete {
+		return nil, nil, nil
+	}
+	cacheRead := breakdown.Input.CacheReadTokens
+	cacheWrite := breakdown.Input.CacheWriteTokens
+	reasoning := breakdown.Output.ReasoningTokens
+	return &cacheRead, &cacheWrite, &reasoning
 }
 
 // billingCacheTokensIncludedInInput reports whether cache read/write counts are
