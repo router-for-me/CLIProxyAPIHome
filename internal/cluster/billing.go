@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -36,6 +37,11 @@ const (
 
 	billingPriceModelSourceModel = "model"
 	billingPriceModelSourceAlias = "alias"
+
+	// BillingCostDiagnosticUnpricedModel marks a charge whose usage matched no enabled price rule.
+	BillingCostDiagnosticUnpricedModel = "unpriced_model"
+	// BillingCostDiagnosticZeroPrice marks billable usage that matched a rule but cost nothing.
+	BillingCostDiagnosticZeroPrice = "zero_price"
 )
 
 var (
@@ -100,6 +106,7 @@ type BillingChargeRecord struct {
 	BalanceBefore    float64 `gorm:"column:balance_before;not null;default:0"`
 	BalanceAfter     float64 `gorm:"column:balance_after;not null;default:0"`
 	MatchedPriceRule string  `gorm:"column:matched_price_rule"`
+	CostDiagnostic   string  `gorm:"column:cost_diagnostic;not null;default:'';index"`
 	PriceSnapshot    JSONB   `gorm:"column:price_snapshot;not null"`
 	RequestSummary   string  `gorm:"column:request_summary;type:text"`
 	// Display-only cache split filled by ListBillingCharges from the linked usage
@@ -224,8 +231,10 @@ type BillingChargeQuery struct {
 	UserID      *uint
 	Provider    string
 	Model       string
-	Limit       int
-	Offset      int
+	// CostDiagnostic filters charges by diagnostic; "any" matches every non-empty diagnostic.
+	CostDiagnostic string
+	Limit          int
+	Offset         int
 }
 
 type BillingChargeResult struct {
@@ -250,16 +259,22 @@ type BillingPriceSnapshot struct {
 	ServiceTierSource         string  `json:"service_tier_source"`
 	EffectiveServiceTier      string  `json:"effective_service_tier"`
 	ResponseTierFallback      bool    `json:"response_tier_fallback"`
+	CostDiagnostic            string  `json:"cost_diagnostic,omitempty"`
 }
 
 type BillingSettings struct {
 	ServiceTierSource string `json:"service_tier_source"`
 	ReportTimezone    string `json:"report_timezone"`
+	// AllowUnpricedModels lets user-owned API keys call models without any enabled
+	// price rule. It defaults to false so a missing rule never silently bills $0;
+	// an explicit rule with zero prices is still allowed.
+	AllowUnpricedModels bool `json:"allow_unpriced_models"`
 }
 
 type BillingSettingsPatch struct {
-	ServiceTierSource *string
-	ReportTimezone    *string
+	ServiceTierSource   *string
+	ReportTimezone      *string
+	AllowUnpricedModels *bool
 }
 
 func (r *Repository) GetBillingSettings(ctx context.Context) (BillingSettings, error) {
@@ -288,6 +303,9 @@ func (r *Repository) UpdateBillingSettings(ctx context.Context, patch BillingSet
 			return BillingSettings{}, errTimezone
 		}
 		settings.ReportTimezone = timezone
+	}
+	if patch.AllowUnpricedModels != nil {
+		settings.AllowUnpricedModels = *patch.AllowUnpricedModels
 	}
 	raw, errMarshal := json.Marshal(settings)
 	if errMarshal != nil {
@@ -697,6 +715,7 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 	if !billingUsageHasBillableActivity(usage, amount) {
 		return nil
 	}
+	snapshot.CostDiagnostic = billingCostDiagnostic(price, amount)
 	priceSnapshot, errPriceSnapshot := billingJSONB(snapshot)
 	if errPriceSnapshot != nil {
 		return errPriceSnapshot
@@ -726,6 +745,7 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		CacheTokens:      billingCacheTokens(usage),
 		Amount:           amount,
 		MatchedPriceRule: billingMatchedPriceRule(price),
+		CostDiagnostic:   snapshot.CostDiagnostic,
 		PriceSnapshot:    priceSnapshot,
 		CreatedAt:        usage.Timestamp.UTC(),
 	}
@@ -929,6 +949,13 @@ func billingChargeQueryScope(scope *gorm.DB, query BillingChargeQuery) *gorm.DB 
 	}
 	if model := strings.TrimSpace(query.Model); model != "" {
 		scope = scope.Where(`"billing_charge"."model" LIKE ?`, "%"+model+"%")
+	}
+	switch diagnostic := strings.ToLower(strings.TrimSpace(query.CostDiagnostic)); diagnostic {
+	case "":
+	case "any":
+		scope = scope.Where(`"billing_charge"."cost_diagnostic" <> ''`)
+	default:
+		scope = scope.Where(`"billing_charge"."cost_diagnostic" = ?`, diagnostic)
 	}
 	return scope
 }
@@ -1503,6 +1530,63 @@ func billingAPIKeyLabel(record *APIKeyRecord) string {
 		return ""
 	}
 	return fmt.Sprintf("api-key-%d", record.ID)
+}
+
+// billingCostDiagnostic explains why billable usage produced no charge.
+func billingCostDiagnostic(price *BillingModelPriceRecord, amount float64) string {
+	if price == nil {
+		return BillingCostDiagnosticUnpricedModel
+	}
+	if amount == 0 {
+		return BillingCostDiagnosticZeroPrice
+	}
+	return ""
+}
+
+// billingModelHasEnabledPrice reports whether any enabled price rule names the model.
+// Provider is not known before dispatch selects a credential, so any provider counts.
+func billingModelHasEnabledPrice(ctx context.Context, db *gorm.DB, model string) (bool, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false, nil
+	}
+	var count int64
+	if errCount := db.WithContext(contextOrBackground(ctx)).
+		Model(&BillingModelPriceRecord{}).
+		Where("enabled = ? AND LOWER(model) = ?", true, strings.ToLower(model)).
+		Limit(1).
+		Count(&count).Error; errCount != nil {
+		return false, errCount
+	}
+	return count > 0, nil
+}
+
+// ensureAPIKeyModelPriced rejects dispatch for user-owned API keys when the requested
+// model has no enabled price rule, unless unpriced models are explicitly allowed.
+func ensureAPIKeyModelPriced(ctx context.Context, db *gorm.DB, record *APIKeyRecord, model string) error {
+	if record == nil || normalizeOptionalUserID(record.UserID) == nil {
+		return nil
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	settings, errSettings := billingSettingsFromDB(ctx, db)
+	if errSettings != nil {
+		return errSettings
+	}
+	if settings.AllowUnpricedModels {
+		return nil
+	}
+	priced, errPriced := billingModelHasEnabledPrice(ctx, db, model)
+	if errPriced != nil {
+		return errPriced
+	}
+	if priced {
+		return nil
+	}
+	// CPA maps model_not_found to a non-retryable client error.
+	return fmt.Errorf("%s: %s", homeerrors.TypeModelNotFound, fmt.Sprintf(homeerrors.MessageModelPriceNotConfiguredFmt, model))
 }
 
 func billingMatchedPriceRule(record *BillingModelPriceRecord) string {

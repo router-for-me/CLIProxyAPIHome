@@ -26,5 +26,6 @@ const (
 	MessageUserCreditsInsufficient          = "insufficient user credits"
 	MessageUserPeriodLimitExceeded          = "period limit exceeded"
 
-	MessageModelDoesNotExistFmt = "model %s does not exist"
+	MessageModelDoesNotExistFmt       = "model %s does not exist"
+	MessageModelPriceNotConfiguredFmt = "model %s has no configured price"
 )

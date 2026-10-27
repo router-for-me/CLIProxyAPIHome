@@ -1551,8 +1551,11 @@ Query parameters:
 | `user_id` | integer | Optional exact user ID filter. Alias: `uid`. |
 | `provider` | string | Optional provider filter. |
 | `model` | string | Optional model filter. |
+| `cost_diagnostic` | string | Optional zero-cost diagnostic filter: `unpriced_model`, `zero_price`, or `any` for every flagged charge. |
 | `limit` | integer | Optional page size. Default `50`, max `200`. |
 | `offset` | integer | Optional page offset. Negative values normalize to `0`. |
+
+Admin charge responses include `cost_diagnostic`. It is empty for normal charges, `unpriced_model` when billable usage matched no enabled price rule (billed at $0), and `zero_price` when it matched a rule whose prices produced $0. The same value is recorded as `price_snapshot.cost_diagnostic`.
 
 Response shape:
 
@@ -1756,13 +1759,15 @@ Response:
 
 Returns the DB-backed billing policy. `service_tier_source` is `request` by default and may be `request` or `response`. `report_timezone` is a supported IANA timezone and defaults to `UTC`; it is the default calendar timezone for Management Billing reports when a request does not provide a `timezone` override. Changing it affects future report boundaries and grouping only. It does not reprice historical charges, rewrite price snapshots, or change balances. In either tier-source mode, `auto`, `default`, and `standard` match the local Standard price tier.
 
+`allow_unpriced_models` defaults to `false`. While false, dispatch for a user-owned API key fails with `model_not_found` (`model <id> has no configured price`) when no enabled price rule names the requested model for any provider. A rule whose prices are all zero counts as configured, so explicitly free models remain callable. API keys that are not owned by a user are not gated. Set it to `true` to allow unpriced models; their charges are recorded at $0 with `cost_diagnostic: unpriced_model`.
+
 ```json
-{ "service_tier_source": "request", "report_timezone": "UTC" }
+{ "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
 ```
 
 ### PATCH `/billing/settings`
 
-Partially updates billing settings. Both fields are optional. In `response` mode, a missing response tier falls back to the request tier and records that fallback in the charge price snapshot. Invalid tier-source values or unsupported timezone names return `400 invalid_body`.
+Partially updates billing settings. All fields are optional. In `response` mode, a missing response tier falls back to the request tier and records that fallback in the charge price snapshot. Invalid tier-source values or unsupported timezone names return `400 invalid_body`.
 
 ```json
 { "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }

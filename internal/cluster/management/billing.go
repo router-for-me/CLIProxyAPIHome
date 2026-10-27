@@ -29,8 +29,9 @@ type billingModelPriceRequest struct {
 }
 
 type billingSettingsRequest struct {
-	ServiceTierSource *string `json:"service_tier_source"`
-	ReportTimezone    *string `json:"report_timezone"`
+	ServiceTierSource   *string `json:"service_tier_source"`
+	ReportTimezone      *string `json:"report_timezone"`
+	AllowUnpricedModels *bool   `json:"allow_unpriced_models"`
 }
 
 type billingBalanceRequest struct {
@@ -265,8 +266,9 @@ func (h *Handler) UpdateBillingSettings(c *gin.Context) {
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	settings, errSettings := h.repo.UpdateBillingSettings(ctx, cluster.BillingSettingsPatch{
-		ServiceTierSource: body.ServiceTierSource,
-		ReportTimezone:    body.ReportTimezone,
+		ServiceTierSource:   body.ServiceTierSource,
+		ReportTimezone:      body.ReportTimezone,
+		AllowUnpricedModels: body.AllowUnpricedModels,
 	})
 	if errSettings != nil {
 		if strings.Contains(errSettings.Error(), "service_tier_source") || strings.Contains(errSettings.Error(), "report_timezone") {
@@ -489,6 +491,7 @@ func billingChargeResponse(record *cluster.BillingChargeRecord, admin bool) gin.
 		response["endpoint"] = record.Endpoint
 		response["balance_before"] = record.BalanceBefore
 		response["matched_price_rule"] = record.MatchedPriceRule
+		response["cost_diagnostic"] = record.CostDiagnostic
 		response["price_snapshot"] = record.PriceSnapshot
 		response["cache_read_tokens"] = record.CacheReadTokens
 		response["cache_write_tokens"] = record.CacheWriteTokens
@@ -593,14 +596,15 @@ func billingChargeQueryFromRequest(c *gin.Context, defaultTimezone string) (clus
 		return cluster.BillingChargeQuery{}, false
 	}
 	return cluster.BillingChargeQuery{
-		From:        from,
-		ToExclusive: to,
-		UserText:    firstNonEmptyQuery(c, "user", "user_text", "username"),
-		UserID:      userID,
-		Provider:    firstNonEmptyQuery(c, "provider"),
-		Model:       firstNonEmptyQuery(c, "model"),
-		Limit:       limit,
-		Offset:      offset,
+		From:           from,
+		ToExclusive:    to,
+		UserText:       firstNonEmptyQuery(c, "user", "user_text", "username"),
+		UserID:         userID,
+		Provider:       firstNonEmptyQuery(c, "provider"),
+		Model:          firstNonEmptyQuery(c, "model"),
+		CostDiagnostic: firstNonEmptyQuery(c, "cost_diagnostic"),
+		Limit:          limit,
+		Offset:         offset,
 	}, true
 }
 

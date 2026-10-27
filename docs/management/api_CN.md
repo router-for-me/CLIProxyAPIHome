@@ -1550,6 +1550,7 @@ Query 参数：
 | `user_id` | integer | 可选精确用户 ID 过滤；别名：`uid`。 |
 | `provider` | string | 可选 provider 过滤。 |
 | `model` | string | 可选 model 过滤。 |
+| `cost_diagnostic` | string | 可选零费用诊断过滤：`unpriced_model`、`zero_price`，或 `any` 表示所有被标记的 charge。 |
 | `limit` | integer | 可选分页大小；默认 `50`，最大 `200`。 |
 | `offset` | integer | 可选分页偏移；负数会规范化为 `0`。 |
 
@@ -1755,13 +1756,15 @@ Query 参数：
 
 返回 DB-backed 计费策略。`service_tier_source` 默认为 `request`，允许值为 `request` 或 `response`。`report_timezone` 必须是受支持的 IANA 时区，默认值为 `UTC`；当 Management Billing 请求未提供 `timezone` 覆盖时，它作为报表默认日历时区。修改该设置只影响后续报表的边界和分组，不会重新计算历史 charge、重写价格快照或改变余额。无论哪种 tier-source 模式，`auto`、`default` 和 `standard` 都按本地 Standard 价格 tier 匹配。
 
+`allow_unpriced_models` 默认为 `false`。为 `false` 时，用户所属 API key 请求的模型如果在任何 provider 下都没有启用的价格规则，dispatch 会返回 `model_not_found`（`model <id> has no configured price`）。价格全为 0 的规则也算已配置，因此显式免费的模型仍可调用。不属于用户的 API key 不受此限制。设为 `true` 后允许调用未配价模型，其扣费按 $0 记录并标记 `cost_diagnostic: unpriced_model`。管理员扣费响应中的 `cost_diagnostic` 为空表示正常，`unpriced_model` 表示未命中任何价格规则，`zero_price` 表示命中规则但金额为 $0；同一值也写入 `price_snapshot.cost_diagnostic`。
+
 ```json
-{ "service_tier_source": "request", "report_timezone": "UTC" }
+{ "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
 ```
 
 ### PATCH `/billing/settings`
 
-局部更新计费设置。两个字段均为可选。在 `response` 模式下，如果 response tier 缺失，会回退到 request tier，并在扣费价格快照中记录该回退。非法 tier-source 值或不支持的时区名称返回 `400 invalid_body`。
+局部更新计费设置。所有字段均为可选。在 `response` 模式下，如果 response tier 缺失，会回退到 request tier，并在扣费价格快照中记录该回退。非法 tier-source 值或不支持的时区名称返回 `400 invalid_body`。
 
 ```json
 { "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
