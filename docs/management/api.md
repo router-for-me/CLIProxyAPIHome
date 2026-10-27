@@ -1722,6 +1722,30 @@ Model price fields:
 
 Optional dimension prices apply to sub-buckets carved out of the canonical v2 buckets, so totals never change: `cache_write_1h`/`cache_write_12h` come from the cache-write bucket, `image_input`/`audio_input` from uncached input, `reasoning` from output, and `image_output`/`audio_output` from non-reasoning output. Home reads the optional counters `cache_creation_1h_tokens` (alias `cache_write_1h_tokens`), `cache_creation_12h_tokens` (alias `cache_write_12h_tokens`), `image_input_tokens`, `image_output_tokens`, `audio_input_tokens`, and `audio_output_tokens` from the usage `tokens` object and clamps each to its parent bucket. When CPA does not report a counter, its bucket is empty and the parent price applies. An explicit `0` bills the bucket as free; `null` never undercharges.
 
+#### Pricing expressions
+
+`pricing_expr` (string, optional) replaces every price column of the rule, including `request_price` and the optional dimensions. An empty string clears it. Rule matching (provider, model, service tier, and `min_input_tokens`) is unchanged; `reasoning_effort_multipliers` and the user `billing_multiplier` still apply to the result.
+
+The expression evaluates to USD per million tokens: each token variable is multiplied by a `$/1M` coefficient, so `p * 3 + c * 15` bills $3/M uncached input and $15/M output. `usd(x)` adds a fixed USD amount, for example `req * usd(0.01)` per request.
+
+| Name | Meaning |
+| --- | --- |
+| `p` | Uncached text input tokens. |
+| `c` | Non-reasoning text output tokens. |
+| `r` | Reasoning output tokens. |
+| `cr` | Cache-read tokens. |
+| `cc`, `cc1h`, `cc12h` | 5-minute, 1-hour, and 12-hour cache-write tokens. |
+| `img`, `imgo`, `ai`, `ao` | Image input, image output, audio input, and audio output tokens. |
+| `len` | Full prompt context (`uncached + cache read + cache write`), for conditions. |
+| `req` | Always `1`. |
+| `tier`, `effort`, `model`, `provider`, `endpoint` | Effective service tier, reasoning effort, executed model, provider, and endpoint strings. String `==` and `!=` are case-insensitive. |
+| `hour(tz)`, `minute(tz)`, `weekday(tz)` | Usage time in an IANA timezone literal (default `UTC`); `weekday` is `0` for Sunday. |
+| `min(...)`, `max(...)`, `usd(x)`, `contains(s, sub)` | Helpers. |
+
+Operators are `+ - * /`, comparisons, `&& || !`, and `cond ? a : b`. Example: `len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`. Peak pricing example: `(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`.
+
+Unreferenced token buckets fold into their parent before evaluation so no reported token is dropped: `cc12h` into `cc1h` (or `cc`), `cc1h` into `cc`, `cc`, `cr`, `img`, and `ai` into `p`, and `imgo`, `ao`, and `r` into `c`. To bill a bucket as free, reference it explicitly, for example `cr * 0`. Saving validates syntax, variable and function names, timezone literals, and a sample evaluation that must return a finite non-negative number; invalid expressions return `400 invalid_body`. If evaluation fails at charge time (for example division by zero), Home bills with the rule's price columns and sets `cost_diagnostic: pricing_expr_error` with `cost_breakdown.expression_error`. Successful charges record `price_snapshot.pricing_expr`, `cost_breakdown.pricing_expr`, the folded token counts as `expr:<name>` items, and the result as the `expression` item. User price ladders include `pricing_expr` on rungs that use it.
+
 ### POST `/billing/model-prices`
 
 Creates a model price rule. Omitted price values default to `0`, and `enabled` defaults to `true`.
@@ -1747,6 +1771,7 @@ Request body fields:
 | `audio_input_price_per_million` | number or null | no | Optional non-negative audio-input price. On `PATCH`, `null` clears it. |
 | `audio_output_price_per_million` | number or null | no | Optional non-negative audio-output price. On `PATCH`, `null` clears it. |
 | `reasoning_effort_multipliers` | object | no | Optional map from reasoning effort (case-insensitive, for example `xhigh`) to a non-negative token-cost multiplier. The request price is not multiplied. On `PATCH`, `{}` clears it. |
+| `pricing_expr` | string | no | Optional pricing expression that replaces the price columns. See Pricing expressions. On `PATCH`, `""` clears it. |
 | `source` | string | no | Price source such as `manual`. |
 | `enabled` | boolean | no | Whether the rule is active. Defaults to `true`. |
 | `note` | string | no | Operator note. |

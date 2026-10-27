@@ -1715,6 +1715,30 @@ Query 参数：
 
 可选维度单价作用于从 v2 规范桶中拆出的子桶，因此总 token 数不变：`cache_write_1h`/`cache_write_12h` 来自 cache-write 桶，`image_input`/`audio_input` 来自未缓存输入，`reasoning` 来自输出，`image_output`/`audio_output` 来自非思考输出。Home 从 usage 的 `tokens` 对象读取可选计数 `cache_creation_1h_tokens`（别名 `cache_write_1h_tokens`）、`cache_creation_12h_tokens`（别名 `cache_write_12h_tokens`）、`image_input_tokens`、`image_output_tokens`、`audio_input_tokens`、`audio_output_tokens`，并将每项截断到其父桶。CPA 未上报某计数时该子桶为空，按父桶单价计费。显式 `0` 表示该子桶免费；`null` 不会导致少收。
 
+#### 价格表达式
+
+`pricing_expr`（string，可选）设置后会替代该规则的全部价格列，包括 `request_price` 和可选维度单价；空字符串表示清除。规则匹配（provider、model、service tier、`min_input_tokens`）不变；`reasoning_effort_multipliers` 和用户 `billing_multiplier` 仍作用于计算结果。
+
+表达式的结果单位为“美元/百万 token”：每个 token 变量乘以 `$/1M` 系数，例如 `p * 3 + c * 15` 表示未缓存输入 $3/M、输出 $15/M。`usd(x)` 表示固定美元金额，例如 `req * usd(0.01)` 为每请求收费。
+
+| 名称 | 含义 |
+| --- | --- |
+| `p` | 未缓存文本输入 token。 |
+| `c` | 非思考文本输出 token。 |
+| `r` | 思考输出 token。 |
+| `cr` | 缓存读取 token。 |
+| `cc`、`cc1h`、`cc12h` | 5 分钟、1 小时、12 小时缓存写入 token。 |
+| `img`、`imgo`、`ai`、`ao` | 图片输入、图片输出、音频输入、音频输出 token。 |
+| `len` | 完整提示上下文（未缓存 + 缓存读 + 缓存写），用于条件判断。 |
+| `req` | 恒为 `1`。 |
+| `tier`、`effort`、`model`、`provider`、`endpoint` | 生效 service tier、reasoning effort、实际模型、provider、endpoint 字符串；字符串 `==`/`!=` 不区分大小写。 |
+| `hour(tz)`、`minute(tz)`、`weekday(tz)` | usage 时间在 IANA 时区字面量下的值（默认 `UTC`）；`weekday` 中周日为 `0`。 |
+| `min(...)`、`max(...)`、`usd(x)`、`contains(s, sub)` | 辅助函数。 |
+
+支持 `+ - * /`、比较运算、`&& || !` 以及 `cond ? a : b`。示例：`len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`；峰谷示例：`(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`。
+
+表达式未引用的 token 桶会在求值前并入父桶，保证不漏计：`cc12h` 并入 `cc1h`（或 `cc`），`cc1h` 并入 `cc`，`cc`、`cr`、`img`、`ai` 并入 `p`，`imgo`、`ao`、`r` 并入 `c`。如需某桶免费，需显式引用，例如 `cr * 0`。保存时会校验语法、变量与函数名、时区字面量，并用样例数据求值，结果必须为有限非负数，否则返回 `400 invalid_body`。扣费时若求值失败（如除零），Home 改用规则价格列计费并标记 `cost_diagnostic: pricing_expr_error`，错误写入 `cost_breakdown.expression_error`。成功的扣费会记录 `price_snapshot.pricing_expr`、`cost_breakdown.pricing_expr`、并桶后的 token 数（`expr:<name>` 项）以及结果（`expression` 项）。用户价格阶梯在使用表达式的档位上返回 `pricing_expr`。
+
 ### POST `/billing/model-prices`
 
 创建模型价格规则。省略的价格字段默认为 `0`，`enabled` 默认为 `true`。
@@ -1740,6 +1764,7 @@ Query 参数：
 | `audio_input_price_per_million` | number 或 null | 否 | 可选非负音频输入单价；`PATCH` 时 `null` 表示清除。 |
 | `audio_output_price_per_million` | number 或 null | 否 | 可选非负音频输出单价；`PATCH` 时 `null` 表示清除。 |
 | `reasoning_effort_multipliers` | object | 否 | 可选的 reasoning effort（不区分大小写，如 `xhigh`）到非负 token 费用倍率的映射，不作用于每请求价格；`PATCH` 时 `{}` 表示清除。 |
+| `pricing_expr` | string | 否 | 可选价格表达式，替代价格列，详见“价格表达式”；`PATCH` 时 `""` 表示清除。 |
 | `source` | string | 否 | 价格来源，例如 `manual`。 |
 | `enabled` | boolean | 否 | 规则是否启用；默认 `true`。 |
 | `note` | string | 否 | 操作备注。 |

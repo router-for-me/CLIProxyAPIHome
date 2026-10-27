@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/billingexpr"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -43,6 +44,9 @@ const (
 	BillingCostDiagnosticUnpricedModel = "unpriced_model"
 	// BillingCostDiagnosticZeroPrice marks billable usage that matched a rule but cost nothing.
 	BillingCostDiagnosticZeroPrice = "zero_price"
+	// BillingCostDiagnosticPricingExprError marks a charge whose pricing expression
+	// failed at runtime and fell back to the rule's price columns.
+	BillingCostDiagnosticPricingExprError = "pricing_expr_error"
 )
 
 var (
@@ -63,14 +67,16 @@ type BillingModelPriceRecord struct {
 	RequestPrice              float64 `gorm:"column:request_price;not null;default:0"`
 	BillingExtraPrices        `gorm:"embedded"`
 	// ReasoningEffortMultipliers maps a normalized reasoning effort to a token-cost multiplier.
-	ReasoningEffortMultipliers JSONB          `gorm:"column:reasoning_effort_multipliers"`
-	Source                     string         `gorm:"column:source;not null;default:manual"`
-	Enabled                    bool           `gorm:"column:enabled;not null;index:idx_billing_model_price_enabled"`
-	Note                       string         `gorm:"column:note;type:text"`
-	CreatedAt                  time.Time      `gorm:"column:created_at"`
-	UpdatedAt                  time.Time      `gorm:"column:updated_at"`
-	Revision                   int64          `gorm:"column:revision;not null;default:1"`
-	DeletedAt                  gorm.DeletedAt `gorm:"column:deleted_at;index"`
+	ReasoningEffortMultipliers JSONB `gorm:"column:reasoning_effort_multipliers"`
+	// PricingExpr, when set, replaces the price columns (including request_price).
+	PricingExpr string         `gorm:"column:pricing_expr;type:text"`
+	Source      string         `gorm:"column:source;not null;default:manual"`
+	Enabled     bool           `gorm:"column:enabled;not null;index:idx_billing_model_price_enabled"`
+	Note        string         `gorm:"column:note;type:text"`
+	CreatedAt   time.Time      `gorm:"column:created_at"`
+	UpdatedAt   time.Time      `gorm:"column:updated_at"`
+	Revision    int64          `gorm:"column:revision;not null;default:1"`
+	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at;index"`
 }
 
 func (BillingModelPriceRecord) TableName() string { return "billing_model_price" }
@@ -146,6 +152,7 @@ type BillingModelPriceUpdate struct {
 	RequestPrice               float64
 	Extra                      BillingExtraPrices
 	ReasoningEffortMultipliers map[string]float64
+	PricingExpr                string
 	Source                     string
 	Enabled                    bool
 	Note                       string
@@ -163,6 +170,8 @@ type BillingModelPricePatch struct {
 	RequestPrice              *float64
 	// ReasoningEffortMultipliers replaces the effort multiplier map; an empty map clears it.
 	ReasoningEffortMultipliers *map[string]float64
+	// PricingExpr sets the pricing expression; an empty string clears it.
+	PricingExpr *string
 	// Extra sets optional prices by field name; a present nil value clears the price.
 	Extra   map[string]*float64
 	Source  *string
@@ -276,6 +285,7 @@ type BillingPriceSnapshot struct {
 	RequestPrice              float64 `json:"request_price"`
 	BillingExtraPrices
 	ReasoningEffortMultipliers map[string]float64 `json:"reasoning_effort_multipliers,omitempty"`
+	PricingExpr                string             `json:"pricing_expr,omitempty"`
 	MatchedServiceTier         string             `json:"matched_service_tier"`
 	MinInputTokens             int64              `json:"min_input_tokens"`
 	ContextInputTokens         int64              `json:"context_input_tokens"`
@@ -369,6 +379,7 @@ func (r *Repository) CreateBillingModelPrice(ctx context.Context, update Billing
 		RequestPrice:               update.RequestPrice,
 		BillingExtraPrices:         update.Extra,
 		ReasoningEffortMultipliers: reasoningEffortMultipliers,
+		PricingExpr:                strings.TrimSpace(update.PricingExpr),
 		Source:                     billingPriceSource(update.Source),
 		Enabled:                    update.Enabled,
 		Note:                       strings.TrimSpace(update.Note),
@@ -762,7 +773,7 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		cost.applyBillingMultiplier(multiplier)
 	}
 	amount := cost.Total
-	snapshot.CostDiagnostic = billingCostDiagnostic(price, amount)
+	snapshot.CostDiagnostic = billingCostDiagnostic(price, cost)
 	priceSnapshot, errPriceSnapshot := billingJSONB(snapshot)
 	if errPriceSnapshot != nil {
 		return errPriceSnapshot
@@ -865,6 +876,11 @@ func validateBillingModelPriceUpdate(update BillingModelPriceUpdate) error {
 	if errMultipliers := validateBillingEffortMultipliers(update.ReasoningEffortMultipliers); errMultipliers != nil {
 		return errMultipliers
 	}
+	if expression := strings.TrimSpace(update.PricingExpr); expression != "" {
+		if errExpr := billingexpr.Validate(expression); errExpr != nil {
+			return fmt.Errorf("pricing_expr: %v", errExpr)
+		}
+	}
 	return validateBillingExtraPrices(update.Extra.Values())
 }
 
@@ -909,6 +925,13 @@ func validateBillingModelPricePatch(patch BillingModelPricePatch) error {
 			return errMultipliers
 		}
 	}
+	if patch.PricingExpr != nil {
+		if expression := strings.TrimSpace(*patch.PricingExpr); expression != "" {
+			if errExpr := billingexpr.Validate(expression); errExpr != nil {
+				return fmt.Errorf("pricing_expr: %v", errExpr)
+			}
+		}
+	}
 	return validateBillingExtraPrices(patch.Extra)
 }
 
@@ -944,6 +967,9 @@ func billingModelPricePatchUpdates(patch BillingModelPricePatch) map[string]any 
 	if patch.ReasoningEffortMultipliers != nil {
 		multipliers, _ := billingEffortMultipliersJSONB(*patch.ReasoningEffortMultipliers)
 		updates["reasoning_effort_multipliers"] = multipliers
+	}
+	if patch.PricingExpr != nil {
+		updates["pricing_expr"] = strings.TrimSpace(*patch.PricingExpr)
 	}
 	for name, value := range patch.Extra {
 		if value == nil {
@@ -1435,6 +1461,7 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		RequestPrice:               price.RequestPrice,
 		BillingExtraPrices:         price.BillingExtraPrices,
 		ReasoningEffortMultipliers: billingEffortMultipliersFromJSONB(price.ReasoningEffortMultipliers),
+		PricingExpr:                price.PricingExpr,
 		MatchedServiceTier:         price.ServiceTier,
 		MinInputTokens:             price.MinInputTokens,
 		ContextInputTokens:         contextInputTokens,
@@ -1509,6 +1536,10 @@ type BillingCostBreakdown struct {
 	// ReasoningEffortMultiplier scales the token cost (not the request price).
 	ReasoningEffort           string  `json:"reasoning_effort,omitempty"`
 	ReasoningEffortMultiplier float64 `json:"reasoning_effort_multiplier,omitempty"`
+	// PricingExpr is set when the amount came from the rule's pricing expression.
+	PricingExpr string `json:"pricing_expr,omitempty"`
+	// ExpressionError records a runtime expression failure that fell back to columns.
+	ExpressionError string `json:"expression_error,omitempty"`
 	// BaseTotal is the list amount before the user billing multiplier.
 	BaseTotal         float64 `json:"base_total"`
 	BillingMultiplier float64 `json:"billing_multiplier"`
@@ -1558,6 +1589,19 @@ func billingChargeCost(usage *UsageRecord, snapshot BillingPriceSnapshot) Billin
 		return cost
 	}
 	cost.ReasoningEffort, cost.ReasoningEffortMultiplier = billingEffortMultiplier(usage.Effort, snapshot.ReasoningEffortMultipliers)
+	if expression := strings.TrimSpace(snapshot.PricingExpr); expression != "" {
+		errExpr := billingExpressionChargeCost(&cost, usage, snapshot, expression)
+		if errExpr == nil {
+			cost.finish(0)
+			return cost
+		}
+		// A runtime failure falls back to the price columns and is flagged.
+		cost = BillingCostBreakdown{
+			ReasoningEffort:           cost.ReasoningEffort,
+			ReasoningEffortMultiplier: cost.ReasoningEffortMultiplier,
+			ExpressionError:           errExpr.Error(),
+		}
+	}
 	breakdown := usageTokenBreakdownForRecord(usage)
 	if breakdown.Quality != UsageTokenAccountingQualityComplete {
 		billingLegacyChargeCost(&cost, usage, snapshot)
@@ -1709,9 +1753,13 @@ func billingAPIKeyLabel(record *APIKeyRecord) string {
 }
 
 // billingCostDiagnostic explains why billable usage produced no charge.
-func billingCostDiagnostic(price *BillingModelPriceRecord, amount float64) string {
+func billingCostDiagnostic(price *BillingModelPriceRecord, cost BillingCostBreakdown) string {
+	amount := cost.Total
 	if price == nil {
 		return BillingCostDiagnosticUnpricedModel
+	}
+	if cost.ExpressionError != "" {
+		return BillingCostDiagnosticPricingExprError
 	}
 	if amount == 0 {
 		return BillingCostDiagnosticZeroPrice

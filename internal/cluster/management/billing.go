@@ -31,6 +31,7 @@ type billingModelPriceRequest struct {
 	AudioInputPrice            optionalJSONFloat   `json:"audio_input_price_per_million"`
 	AudioOutputPrice           optionalJSONFloat   `json:"audio_output_price_per_million"`
 	ReasoningEffortMultipliers *map[string]float64 `json:"reasoning_effort_multipliers"`
+	PricingExpr                *string             `json:"pricing_expr"`
 	Source                     *string             `json:"source"`
 	Enabled                    *bool               `json:"enabled"`
 	Note                       *string             `json:"note"`
@@ -349,6 +350,7 @@ func billingModelPriceUpdateFromRequest(c *gin.Context, body billingModelPriceRe
 	if body.ReasoningEffortMultipliers != nil {
 		update.ReasoningEffortMultipliers = *body.ReasoningEffortMultipliers
 	}
+	update.PricingExpr = strings.TrimSpace(billingStringValue(body.PricingExpr))
 	for name, value := range billingExtraPricesFromRequest(body) {
 		if value == nil {
 			continue
@@ -434,6 +436,7 @@ func billingModelPricePatchFromRequest(c *gin.Context, body billingModelPriceReq
 	patch.CacheWritePricePerMillion = body.CacheWritePricePerMillion
 	patch.RequestPrice = body.RequestPrice
 	patch.ReasoningEffortMultipliers = body.ReasoningEffortMultipliers
+	patch.PricingExpr = body.PricingExpr
 	if extra := billingExtraPricesFromRequest(body); len(extra) > 0 {
 		for name, value := range extra {
 			if value != nil && *value < 0 {
@@ -525,6 +528,7 @@ func billingModelPriceResponse(record *cluster.BillingModelPriceRecord) gin.H {
 		"audio_input_price_per_million":     record.AudioInputPricePerMillion,
 		"audio_output_price_per_million":    record.AudioOutputPricePerMillion,
 		"reasoning_effort_multipliers":      record.ReasoningEffortMultipliers,
+		"pricing_expr":                      record.PricingExpr,
 		"source":                            record.Source,
 		"enabled":                           record.Enabled,
 		"note":                              record.Note,

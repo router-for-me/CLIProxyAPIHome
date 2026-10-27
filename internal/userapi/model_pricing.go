@@ -175,5 +175,9 @@ func modelPriceRungResponse(record cluster.BillingModelPriceRecord) gin.H {
 			rung[name] = *value
 		}
 	}
+	// A pricing expression replaces the column prices for this rung.
+	if expression := strings.TrimSpace(record.PricingExpr); expression != "" {
+		rung["pricing_expr"] = expression
+	}
 	return rung
 }
