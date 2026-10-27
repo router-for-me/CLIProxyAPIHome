@@ -267,6 +267,7 @@ type BillingPriceSnapshot struct {
 	MinInputTokens       int64  `json:"min_input_tokens"`
 	ContextInputTokens   int64  `json:"context_input_tokens"`
 	PriceModelSource     string `json:"price_model_source,omitempty"`
+	PriceMatch           string `json:"price_match,omitempty"`
 	RequestedServiceTier string `json:"requested_service_tier"`
 	ResponseServiceTier  string `json:"response_service_tier,omitempty"`
 	ServiceTierSource    string `json:"service_tier_source"`
@@ -813,6 +814,9 @@ func validateBillingModelPriceUpdate(update BillingModelPriceUpdate) error {
 	if strings.TrimSpace(update.Model) == "" {
 		return fmt.Errorf("model is required")
 	}
+	if errPattern := validateBillingPricePattern(update.Provider, update.Model); errPattern != nil {
+		return errPattern
+	}
 	if errTier := validateBillingPriceServiceTier(update.ServiceTier); errTier != nil {
 		return errTier
 	}
@@ -839,6 +843,16 @@ func validateBillingModelPricePatch(patch BillingModelPricePatch) error {
 	}
 	if patch.Model != nil && strings.TrimSpace(*patch.Model) == "" {
 		return fmt.Errorf("model is required")
+	}
+	if patch.Provider != nil {
+		if errPattern := validateBillingPricePattern(*patch.Provider, "model"); errPattern != nil {
+			return errPattern
+		}
+	}
+	if patch.Model != nil {
+		if errPattern := validateBillingPricePattern("provider", *patch.Model); errPattern != nil {
+			return errPattern
+		}
 	}
 	if patch.ServiceTier != nil {
 		if errTier := validateBillingPriceServiceTier(*patch.ServiceTier); errTier != nil {
@@ -1352,18 +1366,9 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		}
 	}
 	contextInputTokens := billingContextInputTokens(usage)
-	var price *BillingModelPriceRecord
-	priceModelSource := ""
-	for _, candidate := range billingPriceModelCandidates(usage) {
-		found, errFind := billingFindPriceRule(ctx, tx, provider, candidate.model, effectiveTier, contextInputTokens)
-		if errFind != nil {
-			return nil, BillingPriceSnapshot{}, errFind
-		}
-		if found != nil {
-			price = found
-			priceModelSource = candidate.source
-			break
-		}
+	price, priceModelSource, priceMatch, errFind := billingFindPrice(ctx, tx, provider, billingPriceModelCandidates(usage), effectiveTier, contextInputTokens)
+	if errFind != nil {
+		return nil, BillingPriceSnapshot{}, errFind
 	}
 	if price == nil {
 		return nil, BillingPriceSnapshot{
@@ -1390,6 +1395,7 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		MinInputTokens:            price.MinInputTokens,
 		ContextInputTokens:        contextInputTokens,
 		PriceModelSource:          priceModelSource,
+		PriceMatch:                priceMatch,
 		RequestedServiceTier:      requestedTier,
 		ResponseServiceTier:       responseTierRaw,
 		ServiceTierSource:         settings.ServiceTierSource,
@@ -1412,32 +1418,6 @@ func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidat
 		candidates = append(candidates, billingPriceModelCandidate{model: alias, source: billingPriceModelSourceAlias})
 	}
 	return candidates
-}
-
-// billingFindPriceRule returns the best enabled rule for one model, preferring an
-// exact service tier over the wildcard tier. It returns nil when no rule matches.
-func billingFindPriceRule(ctx context.Context, tx *gorm.DB, provider, model, tier string, contextInputTokens int64) (*BillingModelPriceRecord, error) {
-	if model == "" {
-		return nil, nil
-	}
-	for _, candidateTier := range []string{tier, BillingServiceTierWildcard} {
-		price := &BillingModelPriceRecord{}
-		result := tx.WithContext(contextOrBackground(ctx)).
-			Where("provider = ? AND model = ? AND enabled = ? AND service_tier = ? AND min_input_tokens <= ?", provider, model, true, candidateTier, contextInputTokens).
-			Order("min_input_tokens DESC, id ASC").
-			Limit(1).
-			Find(price)
-		if result.Error != nil {
-			return nil, result.Error
-		}
-		if result.RowsAffected > 0 {
-			return price, nil
-		}
-		if candidateTier == BillingServiceTierWildcard {
-			break
-		}
-	}
-	return nil, nil
 }
 
 // billingContextInputTokens returns the full prompt context used for context-band
@@ -1680,15 +1660,20 @@ func billingModelHasEnabledPrice(ctx context.Context, db *gorm.DB, model string)
 	if model == "" {
 		return false, nil
 	}
-	var count int64
-	if errCount := db.WithContext(contextOrBackground(ctx)).
+	var models []string
+	if errFind := db.WithContext(contextOrBackground(ctx)).
 		Model(&BillingModelPriceRecord{}).
-		Where("enabled = ? AND LOWER(model) = ?", true, strings.ToLower(model)).
-		Limit(1).
-		Count(&count).Error; errCount != nil {
-		return false, errCount
+		Where("enabled = ? AND (LOWER(model) = ? OR model LIKE ?)", true, strings.ToLower(model), "%"+billingModelWildcard).
+		Distinct().
+		Pluck("model", &models).Error; errFind != nil {
+		return false, errFind
 	}
-	return count > 0, nil
+	for _, ruleModel := range models {
+		if billingModelMatches(ruleModel, model, false) || billingModelMatches(ruleModel, model, true) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ensureAPIKeyModelPriced rejects dispatch for user-owned API keys when the requested

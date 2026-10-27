@@ -1677,7 +1677,7 @@ Response:
 
 Lists model price rules.
 
-The response always includes `price_rule_schema_version: 2`, including when `items` is empty. Rules match exact normalized service tiers before the `*` compatibility wildcard, then select the greatest `min_input_tokens` not exceeding the usage record's full prompt context (uncached input plus cache-read and cache-write tokens). Lookup uses the executed `model` first; when no enabled rule exists for it, Home retries with the client-requested `alias` before falling back to `default:zero`.
+The response always includes `price_rule_schema_version: 2`, including when `items` is empty. Rules match exact normalized service tiers before the `*` compatibility wildcard, then select the greatest `min_input_tokens` not exceeding the usage record's full prompt context (uncached input plus cache-read and cache-write tokens). Rule `provider` may be `*` to match every provider, and rule `model` may end with a single `*` to match by case-insensitive prefix (for example `gemini-3.5-*`, or `*` for every model); a `*` anywhere else is rejected with `400 invalid_body`. Model comparison is case-insensitive. Lookup tries the executed `model` and then the client-requested `alias` at each specificity level, most specific first: exact provider and exact model, exact provider and the longest matching model pattern, `*` provider and exact model, then `*` provider and the longest matching pattern. An exact alias therefore beats a model pattern. When nothing matches, the charge uses `default:zero`. `price_snapshot.price_match` records the level (`exact`, `model_pattern`, `any_provider`, or `any_provider_model_pattern`). The unpriced-model dispatch gate accepts exact and pattern rules.
 
 Query parameters:
 

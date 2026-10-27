@@ -1672,7 +1672,7 @@ Query 参数：
 
 列出模型价格规则。
 
-响应始终包含 `price_rule_schema_version: 2`，即使 `items` 为空。规则先匹配规范化后的精确 service tier，再回退到兼容通配符 `*`，然后选择不大于 usage 完整提示上下文（未缓存 input + cache-read + cache-write token）的最大 `min_input_tokens`。查价先使用实际执行的 `model`；该模型没有启用规则时，Home 会改用客户端请求的 `alias` 再查一次，仍未命中才回退为 `default:zero`。
+响应始终包含 `price_rule_schema_version: 2`，即使 `items` 为空。规则先匹配规范化后的精确 service tier，再回退到兼容通配符 `*`，然后选择不大于 usage 完整提示上下文（未缓存 input + cache-read + cache-write token）的最大 `min_input_tokens`。规则的 `provider` 可以为 `*` 以匹配所有 provider，`model` 可以以单个 `*` 结尾进行不区分大小写的前缀匹配（如 `gemini-3.5-*`，或 `*` 匹配所有模型）；`*` 出现在其他位置会返回 `400 invalid_body`。模型比较不区分大小写。查价按特异性从高到低逐级尝试实际执行的 `model` 和客户端请求的 `alias`：精确 provider + 精确模型、精确 provider + 最长匹配模式、`*` provider + 精确模型、`*` provider + 最长匹配模式。因此精确 alias 优先于模型通配。全部未命中时扣费使用 `default:zero`。`price_snapshot.price_match` 记录命中级别（`exact`、`model_pattern`、`any_provider`、`any_provider_model_pattern`）。未配价 dispatch 拦截同样接受精确与通配规则。
 
 查询参数：
 
