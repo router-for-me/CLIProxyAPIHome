@@ -38,7 +38,10 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 		return nil, errDSN
 	}
 
-	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(cfg.SlowQueryThreshold))
+	gormConfig := databaseGORMConfig(cfg.SlowQueryThreshold)
+	// Use the context-aware ping below instead of GORM's background ping.
+	gormConfig.DisableAutomaticPing = true
+	db, errOpen := gorm.Open(postgres.Open(dsn), gormConfig)
 	if errOpen != nil {
 		return nil, errOpen
 	}
