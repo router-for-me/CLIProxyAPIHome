@@ -378,7 +378,7 @@ func appendClaudeWindow(windows []cluster.QuotaWindow, id string, label *string,
 	if input == nil || input.Utilization == nil || math.IsNaN(*input.Utilization) || math.IsInf(*input.Utilization, 0) || *input.Utilization < 0 {
 		return windows
 	}
-	usedRatio := normalizedProviderRatio(*input.Utilization)
+	usedRatio := claudeUtilizationRatio(*input.Utilization)
 	remainingRatio := 1 - usedRatio
 	used, remaining, limit := usedRatio*100, remainingRatio*100, float64(100)
 	window := cluster.QuotaWindow{ID: id, Label: label, Scope: scope, ScopeID: scopeID, Mode: "rolling", Status: quotaProbeStatus(remainingRatio), Unit: "percentage", Used: &used, Remaining: &remaining, Limit: &limit, UsedRatio: &usedRatio, RemainingRatio: &remainingRatio, PeriodUnit: periodUnit, Source: "active_probe", ObservedAt: observedAt, Priority: priority}
@@ -405,7 +405,7 @@ func claudeExtraUsageWindow(input *claudeExtraUsage, observedAt time.Time) (clus
 		window.UsedRatio, window.RemainingRatio = &usedRatio, &remainingRatio
 		window.Status = quotaProbeStatus(remainingRatio)
 	} else if input.Utilization != nil {
-		usedRatio := normalizedProviderRatio(*input.Utilization)
+		usedRatio := claudeUtilizationRatio(*input.Utilization)
 		remainingRatio := 1 - usedRatio
 		window.UsedRatio, window.RemainingRatio = &usedRatio, &remainingRatio
 		window.Status = quotaProbeStatus(remainingRatio)
@@ -965,11 +965,10 @@ func parseXAIWeeklyWindow(body []byte, observedAt time.Time) (cluster.QuotaWindo
 	return window, true
 }
 
-func normalizedProviderRatio(value float64) float64 {
-	if value > 1 {
-		value /= 100
-	}
-	return math.Max(0, math.Min(1, value))
+// claudeUtilizationRatio converts a Claude utilization percentage (0-100) to a
+// ratio. Claude always reports percentages, so 1 means 1%, not 100%.
+func claudeUtilizationRatio(value float64) float64 {
+	return math.Max(0, math.Min(1, value/100))
 }
 
 func normalizeWindowValues(window *cluster.QuotaWindow) {

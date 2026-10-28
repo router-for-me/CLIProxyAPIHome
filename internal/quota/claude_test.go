@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -160,6 +161,40 @@ func TestClaudePartialRefreshPreservesPlanAndReplacesResetObservation(t *testing
 				}
 			} else if item.ResetCredits != nil {
 				t.Fatalf("old reset count still presented as current: %+v", item.ResetCredits)
+			}
+		})
+	}
+}
+
+func TestParseClaudeUsageWindowsTreatsUtilizationAsPercent(t *testing.T) {
+	observedAt := time.Date(2026, 10, 28, 9, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		utilization string
+		usedRatio   float64
+		status      string
+	}{
+		{"0", 0, "healthy"},
+		{"0.5", 0.005, "healthy"},
+		{"1", 0.01, "healthy"},
+		{"1.0", 0.01, "healthy"},
+		{"17", 0.17, "healthy"},
+		{"100", 1, "exhausted"},
+		{"150", 1, "exhausted"},
+	} {
+		t.Run(test.utilization, func(t *testing.T) {
+			body := `{"five_hour":{"utilization":` + test.utilization + `,"resets_at":"2026-10-28T12:40:00Z"}}`
+			windows, errParse := parseClaudeUsageWindows([]byte(body), observedAt)
+			if errParse != nil {
+				t.Fatalf("parse: %v", errParse)
+			}
+			if len(windows) != 1 || windows[0].UsedRatio == nil {
+				t.Fatalf("windows = %+v, want one window with a used ratio", windows)
+			}
+			if got := *windows[0].UsedRatio; math.Abs(got-test.usedRatio) > 1e-9 {
+				t.Fatalf("used ratio = %v, want %v", got, test.usedRatio)
+			}
+			if windows[0].Status != test.status {
+				t.Fatalf("status = %q, want %q", windows[0].Status, test.status)
 			}
 		})
 	}
