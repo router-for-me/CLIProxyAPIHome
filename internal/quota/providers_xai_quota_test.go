@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -217,6 +218,146 @@ func TestParseXAIWeeklyWindowRejectsMonthlyPeriodAndMissingUsage(t *testing.T) {
 	missing := []byte(`{"config":{"monthlyLimit":15000,"used":100}}`)
 	if window, ok := parseXAIWeeklyWindow(missing, now); ok {
 		t.Fatalf("payload without credit usage must not become a weekly window: %+v", window)
+	}
+}
+
+func TestParseXAIWeeklyWindowAcceptsMissingUsageWithWeeklyPeriod(t *testing.T) {
+	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
+	body := []byte(`{
+		"config": {
+			"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "start": "2026-07-16T00:00:00Z", "end": "2026-07-23T00:00:00Z"},
+			"onDemandCap": {"val": 0},
+			"isUnifiedBillingUser": true
+		}
+	}`)
+	window, ok := parseXAIWeeklyWindow(body, now)
+	if !ok {
+		t.Fatal("parseXAIWeeklyWindow() rejected a weekly period without creditUsagePercent")
+	}
+	if window.ID != "xai-weekly-usage" || window.Limit == nil || *window.Limit != 100 || window.Used == nil || *window.Used != 0 || window.Status != "healthy" {
+		t.Fatalf("unexpected weekly window: %+v", window)
+	}
+	if window.ResetAt == nil || !window.ResetAt.Equal(time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("unexpected weekly reset: %+v", window.ResetAt)
+	}
+}
+
+func TestXAIProfileRequestURLAddsSubscriptionInclude(t *testing.T) {
+	got := xaiProfileRequestURL(xaiProfileURL)
+	if got != xaiProfileURL+"?include=subscription" {
+		t.Fatalf("xaiProfileRequestURL() = %q", got)
+	}
+	derived := xaiProfileRequestURL(xaiProfileURLFromBillingURL("http://127.0.0.1:8327/v1/billing"))
+	if !strings.HasPrefix(derived, "http://127.0.0.1:8327/v1/user?") || !strings.Contains(derived, "include=subscription") {
+		t.Fatalf("derived profile URL = %q", derived)
+	}
+}
+
+func TestParseXAISubscriptionTier(t *testing.T) {
+	tests := []struct {
+		body        string
+		wantTier    string
+		wantKnown   bool
+		wantPaid    bool
+		wantPlan    string
+		wantPremium bool
+	}{
+		{body: `{"subscriptionTier":"SuperGrokPlus"}`, wantTier: "SuperGrokPlus", wantKnown: true, wantPaid: true, wantPlan: "SuperGrok Plus"},
+		{body: `{"subscriptionTier":"SuperGrokHeavy"}`, wantTier: "SuperGrokHeavy", wantKnown: true, wantPaid: true, wantPlan: "SuperGrok Heavy", wantPremium: true},
+		{body: `{"subscriptionTier":null}`, wantTier: "", wantKnown: true, wantPaid: false},
+		{body: `{"subscriptionTier":"Free"}`, wantTier: "Free", wantKnown: true, wantPaid: false},
+		{body: `{"email":"a@b.c"}`, wantTier: "", wantKnown: false, wantPaid: false},
+		{body: `not-json`, wantTier: "", wantKnown: false, wantPaid: false},
+	}
+	for _, test := range tests {
+		tier, known := parseXAISubscriptionTier([]byte(test.body))
+		if tier != test.wantTier || known != test.wantKnown {
+			t.Fatalf("parseXAISubscriptionTier(%s) = %q, %v; want %q, %v", test.body, tier, known, test.wantTier, test.wantKnown)
+		}
+		if paid := xaiTierPaid(tier); paid != test.wantPaid {
+			t.Fatalf("xaiTierPaid(%q) = %v; want %v", tier, paid, test.wantPaid)
+		}
+		plan := xaiPlanFromSubscriptionTier(tier)
+		if test.wantPlan == "" {
+			if plan != nil {
+				t.Fatalf("xaiPlanFromSubscriptionTier(%q) = %+v; want nil", tier, plan)
+			}
+			continue
+		}
+		if plan == nil || plan.Name != test.wantPlan || plan.Premium != test.wantPremium {
+			t.Fatalf("xaiPlanFromSubscriptionTier(%q) = %+v; want %q premium=%v", tier, plan, test.wantPlan, test.wantPremium)
+		}
+	}
+}
+
+func TestCollectorXAIFreeAccountHasNoWeeklyQuota(t *testing.T) {
+	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 10, 22, 8, 0, 0, 0, time.UTC)
+	seedCollectorProviderAuth(t, repo, "xai-free", "xai", map[string]any{"type": "xai", "access_token": "xai-secret"})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasPrefix(request.URL.Path, "/v1/user"):
+			if request.URL.Query().Get("include") != "subscription" {
+				t.Errorf("profile include = %q, want subscription", request.URL.Query().Get("include"))
+			}
+			_, _ = w.Write([]byte(`{"email":"free@example.com","subscriptionTier":null}`))
+		case request.URL.Query().Get("format") == "credits":
+			_, _ = w.Write([]byte(`{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-22T00:00:00Z","end":"2026-10-29T00:00:00Z"}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"config":{"monthlyLimit":0,"used":0,"onDemandCap":0}}`))
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{Owner: "home-a", XAIBillingURL: server.URL, Now: func() time.Time { return now }})
+	collector.collect(context.Background())
+
+	item, errGet := repo.GetQuotaCredential(context.Background(), "xai-free", now.Add(time.Minute))
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if len(item.Windows) != 0 || item.Plan != nil {
+		t.Fatalf("free account got windows=%+v plan=%+v", item.Windows, item.Plan)
+	}
+	if item.CollectionStatus != "failed" || item.Error == nil || item.Error.Code != "UPSTREAM_RESPONSE_INVALID" {
+		t.Fatalf("free account collection = %q error=%+v; want failed without usable quota", item.CollectionStatus, item.Error)
+	}
+}
+
+func TestCollectorSuperGrokPlusZeroUsageWeeklyQuota(t *testing.T) {
+	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 10, 22, 8, 0, 0, 0, time.UTC)
+	seedCollectorProviderAuth(t, repo, "xai-plus", "xai", map[string]any{"type": "xai", "access_token": "xai-secret"})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case strings.HasPrefix(request.URL.Path, "/v1/user"):
+			if request.URL.Query().Get("include") != "subscription" {
+				t.Errorf("profile include = %q, want subscription", request.URL.Query().Get("include"))
+			}
+			_, _ = w.Write([]byte(`{"email":"plus@example.com","subscriptionTier":"SuperGrokPlus"}`))
+		case request.URL.Query().Get("format") == "credits":
+			_, _ = w.Write([]byte(`{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-22T11:26:03Z","end":"2026-10-29T11:26:03Z"},"isUnifiedBillingUser":true}}`))
+		default:
+			_, _ = w.Write([]byte(`{"config":{"monthlyLimit":0,"used":0,"onDemandCap":0}}`))
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{Owner: "home-a", XAIBillingURL: server.URL, Now: func() time.Time { return now }})
+	collector.collect(context.Background())
+
+	item, errGet := repo.GetQuotaCredential(context.Background(), "xai-plus", now.Add(time.Minute))
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if item.CollectionStatus != "success" || item.QuotaStatus != "healthy" {
+		t.Fatalf("paid account collection = %q/%q error=%+v", item.QuotaStatus, item.CollectionStatus, item.Error)
+	}
+	if len(item.Windows) != 1 || item.Windows[0].ID != "xai-weekly-usage" || item.Windows[0].Used == nil || *item.Windows[0].Used != 0 || item.Windows[0].Limit == nil || *item.Windows[0].Limit != 100 {
+		t.Fatalf("paid account windows = %+v", item.Windows)
+	}
+	if item.Plan == nil || item.Plan.Name != "SuperGrok Plus" || item.Plan.Premium {
+		t.Fatalf("paid account plan = %+v", item.Plan)
 	}
 }
 
