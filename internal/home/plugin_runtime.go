@@ -171,16 +171,15 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	}
 	discoveryAuth, errResolve := r.pluginDiscoveryAuth(ctx, auth)
 	if errResolve != nil {
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 		log.Warnf("plugin model discovery auth %s is unavailable", auth.ID)
-		return true
+		// Resolution does not establish that a plugin handles this provider.
+		return false
 	}
 	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(discoveryAuth))
 	if !result.Handled {
 		return false
 	}
 	if !r.pluginDiscoveryStillCurrent(auth, discoveryAuth) {
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 		return true
 	}
 	if result.Err != nil {
@@ -211,9 +210,13 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 					updatedAuth.Attributes[key] = value
 				}
 			}
-			if updated, errUpdate := r.coreManager.Update(context.Background(), updatedAuth); errUpdate == nil && updated != nil {
-				activeAuth = updated.Clone()
+			updated, errUpdate := r.applyPluginDiscoveryAuthUpdate(ctx, updatedAuth, discoveryAuth)
+			if errUpdate != nil {
+				log.Warnf("plugin model discovery auth %s update was not accepted", auth.ID)
+				return true
 			}
+			activeAuth = updated
+			discoveryAuth = updated
 		}
 	}
 	if activeAuth == nil {
@@ -251,7 +254,9 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	models = applyExcludedModels(models, activeExcluded)
 	models = applyOAuthModelAlias(cfg, providerKey, activeAuthKind, models)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
-	r.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, forcePrefix), candidates)
+	r.publishPluginDiscoveryModels(auth, discoveryAuth, func() {
+		r.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, forcePrefix), candidates)
+	})
 	return true
 }
 
