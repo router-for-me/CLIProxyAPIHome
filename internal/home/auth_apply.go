@@ -173,7 +173,9 @@ func (r *Runtime) applyCoreAuthRemove(ctx context.Context, authID string) {
 	if errDel := r.coreManager.Delete(ctx, authID); errDel != nil {
 		log.Errorf("failed to delete auth %s: %v", authID, errDel)
 	}
+	r.pluginModelRegistryMu.Lock()
 	registry.GetGlobalRegistry().UnregisterClient(authID)
+	r.pluginModelRegistryMu.Unlock()
 
 	if provider != "" {
 		log.Infof("auth removed (auth=%s provider=%s label=%s)", authID, provider, label)

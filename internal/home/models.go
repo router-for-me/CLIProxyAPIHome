@@ -171,7 +171,9 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		return
 	}
 	if a.Disabled || a.Status == coreauth.StatusDisabled {
+		r.pluginModelRegistryMu.Lock()
 		registry.GetGlobalRegistry().UnregisterClient(a.ID)
+		r.pluginModelRegistryMu.Unlock()
 		return
 	}
 

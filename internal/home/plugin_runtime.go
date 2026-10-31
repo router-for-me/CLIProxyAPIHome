@@ -163,15 +163,24 @@ func (r *Runtime) pluginLoginPollAuths(resp pluginapi.AuthLoginPollResponse) ([]
 }
 
 func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *homeauth.Auth, provider, authKind string, excluded []string) bool {
-	if r == nil || r.pluginHost == nil || auth == nil {
+	if r == nil || r.pluginHost == nil || auth == nil || len(r.pluginHost.RegisteredPlugins()) == 0 {
 		return false
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(auth))
+	discoveryAuth, errResolve := r.pluginDiscoveryAuth(ctx, auth)
+	if errResolve != nil {
+		log.Warnf("plugin model discovery auth %s is unavailable", auth.ID)
+		// Resolution does not establish that a plugin handles this provider.
+		return false
+	}
+	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(discoveryAuth))
 	if !result.Handled {
 		return false
+	}
+	if !r.pluginDiscoveryStillCurrent(auth, discoveryAuth) {
+		return true
 	}
 	if result.Err != nil {
 		log.Warnf("plugin models for auth %s failed: %v", auth.ID, result.Err)
@@ -201,9 +210,13 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 					updatedAuth.Attributes[key] = value
 				}
 			}
-			if updated, errUpdate := r.coreManager.Update(context.Background(), updatedAuth); errUpdate == nil && updated != nil {
-				activeAuth = updated.Clone()
+			updated, errUpdate := r.applyPluginDiscoveryAuthUpdate(ctx, updatedAuth, discoveryAuth)
+			if errUpdate != nil {
+				log.Warnf("plugin model discovery auth %s update was not accepted", auth.ID)
+				return true
 			}
+			activeAuth = updated
+			discoveryAuth = updated
 		}
 	}
 	if activeAuth == nil {
@@ -241,7 +254,9 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	models = applyExcludedModels(models, activeExcluded)
 	models = applyOAuthModelAlias(cfg, providerKey, activeAuthKind, models)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
-	r.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, forcePrefix), candidates)
+	r.publishPluginDiscoveryModels(auth, discoveryAuth, func() {
+		r.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, forcePrefix), candidates)
+	})
 	return true
 }
 
