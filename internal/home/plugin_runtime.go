@@ -163,15 +163,25 @@ func (r *Runtime) pluginLoginPollAuths(resp pluginapi.AuthLoginPollResponse) ([]
 }
 
 func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *homeauth.Auth, provider, authKind string, excluded []string) bool {
-	if r == nil || r.pluginHost == nil || auth == nil {
+	if r == nil || r.pluginHost == nil || auth == nil || len(r.pluginHost.RegisteredPlugins()) == 0 {
 		return false
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(auth))
+	discoveryAuth, errResolve := r.pluginDiscoveryAuth(ctx, auth)
+	if errResolve != nil {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		log.Warnf("plugin model discovery auth %s is unavailable", auth.ID)
+		return true
+	}
+	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(discoveryAuth))
 	if !result.Handled {
 		return false
+	}
+	if !r.pluginDiscoveryStillCurrent(auth, discoveryAuth) {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		return true
 	}
 	if result.Err != nil {
 		log.Warnf("plugin models for auth %s failed: %v", auth.ID, result.Err)
