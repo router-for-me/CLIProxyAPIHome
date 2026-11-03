@@ -419,9 +419,9 @@ func billingCarveInputModalities(uncached, cacheRead int64, details billingToken
 	cachedText = clampBillingTokens(details.CachedText, cacheRead-imageCacheRead-audioCacheRead)
 
 	rawImageInput := details.ImageInput
-	if imageCacheRead > 0 && rawImageInput >= imageCacheRead {
-		rawImageInput -= imageCacheRead
-	} else if imageCacheRead == 0 && cacheRead > 0 && details.TextInput == 0 && rawImageInput > uncached && rawImageInput <= cacheRead-audioCacheRead-cachedText {
+	if imageCacheRead > 0 {
+		rawImageInput = max(rawImageInput-imageCacheRead, 0)
+	} else if cacheRead > 0 && details.TextInput == 0 && rawImageInput > uncached && rawImageInput <= cacheRead-audioCacheRead-cachedText {
 		// Upstreams such as OpenAI/DeepSeek Chat report total prompt image_tokens
 		// alongside cached_tokens without cached_image_tokens. When the cached
 		// prefix holds the image and exceeds uncached tokens, keep it in cache.
@@ -429,9 +429,9 @@ func billingCarveInputModalities(uncached, cacheRead int64, details billingToken
 		rawImageInput = 0
 	}
 	rawAudioInput := details.AudioInput
-	if audioCacheRead > 0 && rawAudioInput >= audioCacheRead {
-		rawAudioInput -= audioCacheRead
-	} else if audioCacheRead == 0 && cacheRead > 0 && details.TextInput == 0 && rawAudioInput > uncached && rawAudioInput <= cacheRead-imageCacheRead-cachedText {
+	if audioCacheRead > 0 {
+		rawAudioInput = max(rawAudioInput-audioCacheRead, 0)
+	} else if cacheRead > 0 && details.TextInput == 0 && rawAudioInput > uncached && rawAudioInput <= cacheRead-imageCacheRead-cachedText {
 		audioCacheRead = rawAudioInput
 		rawAudioInput = 0
 	}
