@@ -42,6 +42,9 @@ func TestDispatchRejectsUnpricedModelForUserKeyByDefault(t *testing.T) {
 	if _, _, errPriced := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "gpt-new"); errPriced != nil {
 		t.Fatalf("zero-priced dispatch error = %v, want allowed", errPriced)
 	}
+	if _, _, errPrefixed := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "aistudio/gpt-new"); errPrefixed != nil {
+		t.Fatalf("prefixed model dispatch error = %v, want allowed via bare model price", errPrefixed)
+	}
 
 	// Disabled rules do not count as configured.
 	if _, _, errDisabled := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "gpt-other"); errDisabled == nil {

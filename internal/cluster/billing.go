@@ -1501,16 +1501,49 @@ type billingPriceModelCandidate struct {
 	source string
 }
 
+// billingStripChannelPrefix returns the bare model name after a leading "prefix/"
+// segment when present, or empty when the model has no prefix.
+func billingStripChannelPrefix(model string) string {
+	model = strings.TrimSpace(model)
+	slash := strings.IndexByte(model, '/')
+	if slash <= 0 || slash >= len(model)-1 {
+		return ""
+	}
+	return strings.TrimSpace(model[slash+1:])
+}
+
 // billingPriceModelCandidates lists price lookup models: the executed model first,
-// then the upstream response_model, then the client-requested alias when they differ.
+// then the upstream response_model, then the client-requested alias when they differ,
+// followed by prefix-stripped bare model names as fallback candidates.
 func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidate {
 	model := strings.TrimSpace(usage.Model)
-	candidates := []billingPriceModelCandidate{{model: model, source: billingPriceModelSourceModel}}
-	if responseModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "response_model")); responseModel != "" && !strings.EqualFold(responseModel, model) {
-		candidates = append(candidates, billingPriceModelCandidate{model: responseModel, source: billingPriceModelSourceResponseModel})
+	seen := make(map[string]struct{}, 6)
+	var candidates []billingPriceModelCandidate
+	appendCandidate := func(name, source string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, billingPriceModelCandidate{model: name, source: source})
 	}
-	if alias := strings.TrimSpace(usage.Alias); alias != "" && !strings.EqualFold(alias, model) {
-		candidates = append(candidates, billingPriceModelCandidate{model: alias, source: billingPriceModelSourceAlias})
+	appendCandidate(model, billingPriceModelSourceModel)
+	if responseModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "response_model")); responseModel != "" {
+		appendCandidate(responseModel, billingPriceModelSourceResponseModel)
+	}
+	alias := strings.TrimSpace(usage.Alias)
+	if alias != "" {
+		appendCandidate(alias, billingPriceModelSourceAlias)
+	}
+	if bare := billingStripChannelPrefix(model); bare != "" {
+		appendCandidate(bare, billingPriceModelSourceModel)
+	}
+	if bareAlias := billingStripChannelPrefix(alias); bareAlias != "" {
+		appendCandidate(bareAlias, billingPriceModelSourceAlias)
 	}
 	return candidates
 }
@@ -1832,16 +1865,24 @@ func billingModelHasEnabledPrice(ctx context.Context, db *gorm.DB, model string)
 	if model == "" {
 		return false, nil
 	}
+	bareModel := billingStripChannelPrefix(model)
+	names := []string{strings.ToLower(model)}
+	if bareModel != "" {
+		names = append(names, strings.ToLower(bareModel))
+	}
 	var models []string
 	if errFind := db.WithContext(contextOrBackground(ctx)).
 		Model(&BillingModelPriceRecord{}).
-		Where("enabled = ? AND (LOWER(model) = ? OR model LIKE ?)", true, strings.ToLower(model), "%"+billingModelWildcard).
+		Where("enabled = ? AND (LOWER(model) IN ? OR model LIKE ?)", true, names, "%"+billingModelWildcard).
 		Distinct().
 		Pluck("model", &models).Error; errFind != nil {
 		return false, errFind
 	}
 	for _, ruleModel := range models {
 		if billingModelMatches(ruleModel, model, false) || billingModelMatches(ruleModel, model, true) {
+			return true, nil
+		}
+		if bareModel != "" && (billingModelMatches(ruleModel, bareModel, false) || billingModelMatches(ruleModel, bareModel, true)) {
 			return true, nil
 		}
 	}
