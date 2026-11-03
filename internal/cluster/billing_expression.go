@@ -66,21 +66,7 @@ func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
 	cacheWrite30m := clampBillingTokens(details.CacheWrite30m, cacheWrite)
 	cacheWrite1h := clampBillingTokens(details.CacheWrite1h, cacheWrite-cacheWrite30m)
 	cacheWrite12h := clampBillingTokens(details.CacheWrite12h, cacheWrite-cacheWrite30m-cacheWrite1h)
-	imageCacheRead := clampBillingTokens(details.ImageCacheRead, cacheRead)
-	audioCacheRead := clampBillingTokens(details.AudioCacheRead, cacheRead-imageCacheRead)
-	cachedText := clampBillingTokens(details.CachedText, cacheRead-imageCacheRead-audioCacheRead)
-	rawImageInput := details.ImageInput
-	if rawImageInput >= imageCacheRead && imageCacheRead > 0 {
-		rawImageInput -= imageCacheRead
-	}
-	rawAudioInput := details.AudioInput
-	if rawAudioInput >= audioCacheRead && audioCacheRead > 0 {
-		rawAudioInput -= audioCacheRead
-	}
-	imageInput := clampBillingTokens(rawImageInput, uncached)
-	audioInput := clampBillingTokens(rawAudioInput, uncached-imageInput)
-	videoInput := clampBillingTokens(details.VideoInput, uncached-imageInput-audioInput)
-	fileInput := clampBillingTokens(details.FileInput, uncached-imageInput-audioInput-videoInput)
+	imageInput, audioInput, videoInput, fileInput, imageCacheRead, audioCacheRead, cachedText := billingCarveInputModalities(uncached, cacheRead, details)
 	nonReasoning := breakdown.Output.NonReasoningTokens
 	imageOutput := clampBillingTokens(details.ImageOutput, nonReasoning)
 	audioOutput := clampBillingTokens(details.AudioOutput, nonReasoning-imageOutput)

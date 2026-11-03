@@ -130,6 +130,7 @@ type billingTokenDetails struct {
 	CacheWrite30m      int64 `json:"cache_write_30m_tokens,omitempty"`
 	CacheWrite1h       int64 `json:"cache_write_1h_tokens,omitempty"`
 	CacheWrite12h      int64 `json:"cache_write_12h_tokens,omitempty"`
+	TextInput          int64 `json:"text_input_tokens,omitempty"`
 	ImageInput         int64 `json:"image_input_tokens,omitempty"`
 	ImageOutput        int64 `json:"image_output_tokens,omitempty"`
 	AudioInput         int64 `json:"audio_input_tokens,omitempty"`
@@ -232,7 +233,7 @@ func billingTokenDetailsForUsage(usage *UsageRecord) billingTokenDetails {
 			totalWrite = usage.CacheCreationTokens
 		}
 		if totalWrite > 0 {
-			switch strings.ToLower(strings.TrimSpace(usagePayloadString(payload, "cache_details.ttl", "tokens.cache_creation.ttl", "cache_creation.ttl"))) {
+			switch strings.ToLower(strings.TrimSpace(usagePayloadString(payload, "cache_details.ttl", "cache_details.retention", "tokens.cache_creation.ttl", "cache_creation.ttl"))) {
 			case "30m":
 				cw30m = totalWrite
 			case "1h":
@@ -246,6 +247,7 @@ func billingTokenDetailsForUsage(usage *UsageRecord) billingTokenDetails {
 		CacheWrite30m:      cw30m,
 		CacheWrite1h:       cw1h,
 		CacheWrite12h:      cw12h,
+		TextInput:          first("text_input_tokens", "input_text_tokens", "input_tokens_details.text_tokens", "prompt_tokens_details.text_tokens"),
 		ImageInput:         first("image_input_tokens", "input_image_tokens", "input_tokens_details.image_tokens", "prompt_tokens_details.image_tokens"),
 		ImageOutput:        first("image_output_tokens", "output_image_tokens", "output_tokens_details.image_tokens", "completion_tokens_details.image_tokens"),
 		AudioInput:         first("audio_input_tokens", "input_audio_tokens", "input_tokens_details.audio_tokens", "prompt_tokens_details.audio_tokens"),
@@ -407,6 +409,43 @@ func billingApplyAdvisorIterationsTx(ctx context.Context, tx *gorm.DB, usage *Us
 		cost.Total = cost.BaseTotal
 	}
 	return nil
+}
+
+// billingCarveInputModalities splits uncached and cache-read input tokens into
+// disjoint modality buckets without double-counting cached media as uncached input.
+func billingCarveInputModalities(uncached, cacheRead int64, details billingTokenDetails) (imageInput, audioInput, videoInput, fileInput, imageCacheRead, audioCacheRead, cachedText int64) {
+	imageCacheRead = clampBillingTokens(details.ImageCacheRead, cacheRead)
+	audioCacheRead = clampBillingTokens(details.AudioCacheRead, cacheRead-imageCacheRead)
+	cachedText = clampBillingTokens(details.CachedText, cacheRead-imageCacheRead-audioCacheRead)
+
+	rawImageInput := details.ImageInput
+	if imageCacheRead > 0 && rawImageInput >= imageCacheRead {
+		rawImageInput -= imageCacheRead
+	} else if imageCacheRead == 0 && cacheRead > 0 && details.TextInput == 0 && rawImageInput > uncached && rawImageInput <= cacheRead-audioCacheRead-cachedText {
+		// Upstreams such as OpenAI/DeepSeek Chat report total prompt image_tokens
+		// alongside cached_tokens without cached_image_tokens. When the cached
+		// prefix holds the image and exceeds uncached tokens, keep it in cache.
+		imageCacheRead = rawImageInput
+		rawImageInput = 0
+	}
+	rawAudioInput := details.AudioInput
+	if audioCacheRead > 0 && rawAudioInput >= audioCacheRead {
+		rawAudioInput -= audioCacheRead
+	} else if audioCacheRead == 0 && cacheRead > 0 && details.TextInput == 0 && rawAudioInput > uncached && rawAudioInput <= cacheRead-imageCacheRead-cachedText {
+		audioCacheRead = rawAudioInput
+		rawAudioInput = 0
+	}
+
+	nonTextBudget := uncached
+	if details.TextInput > 0 && details.CachedText > 0 && details.TextInput >= details.CachedText {
+		uncachedText := clampBillingTokens(details.TextInput-details.CachedText, uncached)
+		nonTextBudget = uncached - uncachedText
+	}
+	imageInput = clampBillingTokens(rawImageInput, nonTextBudget)
+	audioInput = clampBillingTokens(rawAudioInput, nonTextBudget-imageInput)
+	videoInput = clampBillingTokens(details.VideoInput, nonTextBudget-imageInput-audioInput)
+	fileInput = clampBillingTokens(details.FileInput, nonTextBudget-imageInput-audioInput-videoInput)
+	return
 }
 
 func clampBillingTokens(value int64, limit int64) int64 {

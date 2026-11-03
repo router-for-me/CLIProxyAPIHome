@@ -24,6 +24,54 @@ func billingDimensionsTestUsage(tokensJSON string) *UsageRecord {
 	}
 }
 
+func TestBillingCachedMediaNotChargedAsUncachedInput(t *testing.T) {
+	t.Parallel()
+	imgPrice := 20.0
+	audioPrice := 30.0
+	snapshot := BillingPriceSnapshot{
+		InputPricePerMillion:     1,
+		OutputPricePerMillion:    10,
+		CacheReadPricePerMillion: 0.1,
+		BillingExtraPrices: BillingExtraPrices{
+			ImageInputPricePerMillion: &imgPrice,
+			AudioInputPricePerMillion: &audioPrice,
+		},
+	}
+	// 1. Explicit cached_image_tokens / cached_audio_tokens are subtracted from total prompt image/audio tokens.
+	explicitUsage := &UsageRecord{
+		Provider:                  "gemini",
+		TokenAccountingVersion:    UsageTokenAccountingSchemaVersion,
+		TokenAccountingQuality:    UsageTokenAccountingQualityComplete,
+		AccountingTotalTokens:     1000,
+		AccountingInputTokens:     1000,
+		UncachedInputTokens:       600,
+		AccountingCacheReadTokens: 400,
+		TokensJSON:                JSONB(`{"image_input_tokens":150,"cached_image_tokens":100,"audio_input_tokens":80,"cached_audio_tokens":80}`),
+	}
+	explicitCost := billingChargeCost(explicitUsage, snapshot)
+	if explicitCost.Items["image_input"].Tokens != 50 || explicitCost.Items["input"].Tokens != 550 {
+		t.Fatalf("explicit cached media items = %+v", explicitCost.Items)
+	}
+	// 2. Real chat.completion.chunk shape (77dcea63.log): prompt=196409, cached=196096 (uncached=313), total prompt image_tokens=5141.
+	chatCachedImage := &UsageRecord{
+		Provider:                  "openai",
+		TokenAccountingVersion:    UsageTokenAccountingSchemaVersion,
+		TokenAccountingQuality:    UsageTokenAccountingQualityComplete,
+		AccountingTotalTokens:     196752,
+		AccountingInputTokens:     196409,
+		UncachedInputTokens:       313,
+		AccountingCacheReadTokens: 196096,
+		AccountingOutputTokens:    343,
+		NonReasoningOutputTokens:  342,
+		AccountingReasoningTokens: 1,
+		TokensJSON:                JSONB(`{"input_tokens":196409,"cached_tokens":196096,"cache_read_tokens":196096,"cache_read_tokens_present":true,"image_input_tokens":5141,"output_tokens":343,"reasoning_tokens":1,"total_tokens":196752}`),
+	}
+	chatCost := billingChargeCost(chatCachedImage, snapshot)
+	if _, hasImg := chatCost.Items["image_input"]; hasImg || chatCost.Items["input"].Tokens != 313 {
+		t.Fatalf("cached prompt image leaked into uncached input: %+v", chatCost.Items)
+	}
+}
+
 func TestBillingAdvisorCacheTTLCharges(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

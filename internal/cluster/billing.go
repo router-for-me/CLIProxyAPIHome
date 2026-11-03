@@ -1767,8 +1767,7 @@ func billingCompleteChargeCost(cost *BillingCostBreakdown, breakdown UsageTokenB
 	cacheWrite1h := clampBillingTokens(details.CacheWrite1h, cacheWrite-cacheWrite30m)
 	cacheWrite12h := clampBillingTokens(details.CacheWrite12h, cacheWrite-cacheWrite30m-cacheWrite1h)
 	cacheWrite5m := cacheWrite - cacheWrite30m - cacheWrite1h - cacheWrite12h
-	imageInput := clampBillingTokens(details.ImageInput, uncached)
-	audioInput := clampBillingTokens(details.AudioInput, uncached-imageInput)
+	imageInput, audioInput, _, _, _, _, _ := billingCarveInputModalities(uncached, breakdown.Input.CacheReadTokens, details)
 	textInput := uncached - imageInput - audioInput
 
 	// A zero cache-write rate means the 5m write bucket keeps the ordinary input
