@@ -19,15 +19,18 @@ import (
 )
 
 const (
-	BillingModelPriceImportSourceModelsDev = "models.dev"
-	billingImportPreviewTTL                = 15 * time.Minute
-	billingImportPreviewRetention          = 24 * time.Hour
-	billingImportOperationRetention        = 30 * 24 * time.Hour
-	billingTierDiagnosticsWindow           = 30 * 24 * time.Hour
-	billingImportMaxTargets                = 10000
-	billingImportMaxPolicyEntries          = 10000
-	billingImportMaxSelectedKeys           = 10000
-	billingImportWriteBatchSize            = 50
+	BillingModelPriceImportSourceModelsDev  = "models.dev"
+	BillingModelPriceImportSourceOpenRouter = "openrouter"
+	BillingModelPriceImportSourceLiteLLM    = "litellm"
+	BillingModelPriceImportSourceAuto       = "auto"
+	billingImportPreviewTTL                 = 15 * time.Minute
+	billingImportPreviewRetention           = 24 * time.Hour
+	billingImportOperationRetention         = 30 * 24 * time.Hour
+	billingTierDiagnosticsWindow            = 30 * 24 * time.Hour
+	billingImportMaxTargets                 = 10000
+	billingImportMaxPolicyEntries           = 10000
+	billingImportMaxSelectedKeys            = 10000
+	billingImportWriteBatchSize             = 50
 )
 
 var (
@@ -120,17 +123,30 @@ type BillingModelPriceImportMatchOverride struct {
 
 type BillingModelPriceImportPreviewInput struct {
 	Source         string                                 `json:"source"`
+	AutoDiscover   bool                                   `json:"auto_discover,omitempty"`
+	CatalogJSON    json.RawMessage                        `json:"catalog_json,omitempty"`
 	Targets        []BillingModelPriceImportTarget        `json:"targets"`
 	Policy         BillingModelPriceImportPolicy          `json:"policy"`
 	MatchOverrides []BillingModelPriceImportMatchOverride `json:"match_overrides"`
 }
 
 type BillingModelPriceImportCost struct {
-	Input      float64 `json:"input"`
-	Output     float64 `json:"output"`
-	CacheRead  float64 `json:"cache_read"`
-	CacheWrite float64 `json:"cache_write"`
-	Request    float64 `json:"request"`
+	Input         float64  `json:"input"`
+	Output        float64  `json:"output"`
+	CacheRead     float64  `json:"cache_read"`
+	CacheWrite    float64  `json:"cache_write"`
+	Request       float64  `json:"request"`
+	CacheWrite30m *float64 `json:"cache_write_30m,omitempty"`
+	CacheWrite1h  *float64 `json:"cache_write_1h,omitempty"`
+	CacheWrite12h *float64 `json:"cache_write_12h,omitempty"`
+	Reasoning     *float64 `json:"reasoning,omitempty"`
+	ImageInput    *float64 `json:"image_input,omitempty"`
+	ImageOutput   *float64 `json:"image_output,omitempty"`
+	AudioInput    *float64 `json:"audio_input,omitempty"`
+	AudioOutput   *float64 `json:"audio_output,omitempty"`
+	WebSearch     *float64 `json:"web_search,omitempty"`
+	Image         *float64 `json:"image,omitempty"`
+	PricingExpr   string   `json:"pricing_expr,omitempty"`
 }
 
 type BillingModelPriceImportContextBand struct {
@@ -297,15 +313,23 @@ type BillingTierDiagnostics struct {
 }
 
 func (r *Repository) CreateBillingModelPriceImportPreview(ctx context.Context, input BillingModelPriceImportPreviewInput, catalog BillingModelPriceImportCatalog) (*BillingModelPriceImportPreview, error) {
-	input = normalizeBillingModelPriceImportPreviewInput(input)
-	if errValidate := validateBillingModelPriceImportPreviewInput(input, catalog); errValidate != nil {
-		return nil, errValidate
-	}
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
 	}
 	ctx = contextOrBackground(ctx)
+	input = normalizeBillingModelPriceImportPreviewInput(input)
+	if len(input.Targets) == 0 && input.AutoDiscover {
+		discovered, errDiscover := r.discoverBillingImportTargets(ctx, db)
+		if errDiscover != nil {
+			return nil, errDiscover
+		}
+		input.Targets = discovered
+		input = normalizeBillingModelPriceImportPreviewInput(input)
+	}
+	if errValidate := validateBillingModelPriceImportPreviewInput(input, catalog); errValidate != nil {
+		return nil, errValidate
+	}
 	now := time.Now().UTC()
 	if errCleanup := r.cleanupBillingModelPriceImports(ctx, db, now); errCleanup != nil {
 		return nil, errCleanup
@@ -560,7 +584,11 @@ func (r *Repository) GetBillingTierDiagnostics(ctx context.Context) (BillingTier
 }
 
 func buildBillingModelPriceImportPreview(input BillingModelPriceImportPreviewInput, catalog BillingModelPriceImportCatalog, existing []BillingModelPriceRecord, now time.Time) BillingModelPriceImportPreview {
-	preview := BillingModelPriceImportPreview{PreviewID: billingID("preview"), PreviewRevision: billingID("previewrev"), Source: BillingModelPriceImportSourceModelsDev, SourceURL: catalog.SourceURL, SourceVersion: catalog.Version, SourceFetchedAt: catalog.FetchedAt.UTC(), SourceModelCount: len(catalog.Models), GeneratedAt: now, ExpiresAt: now.Add(billingImportPreviewTTL), Atomic: true}
+	source := input.Source
+	if source == "" {
+		source = BillingModelPriceImportSourceModelsDev
+	}
+	preview := BillingModelPriceImportPreview{PreviewID: billingID("preview"), PreviewRevision: billingID("previewrev"), Source: source, SourceURL: catalog.SourceURL, SourceVersion: catalog.Version, SourceFetchedAt: catalog.FetchedAt.UTC(), SourceModelCount: len(catalog.Models), GeneratedAt: now, ExpiresAt: now.Add(billingImportPreviewTTL), Atomic: true}
 	compiledMultiplierRules := billingImportCompileMultiplierRules(input.Policy.MultiplierRules)
 	catalogIndex := newBillingImportCatalogIndex(catalog.Models)
 	policyIndex := newBillingImportMatchPolicyIndex(input.Policy.Aliases, input.MatchOverrides)
@@ -838,9 +866,14 @@ func (index billingImportMatchPolicyIndex) modelCandidates(model string) []strin
 	for _, position := range aliasPositions {
 		values = append(values, index.aliases[position].SourceModels...)
 	}
-	for _, suffix := range []string{"-thinking", "-preview", "-latest"} {
+	for _, suffix := range []string{"-thinking", "-preview", "-latest", ":free"} {
 		if strings.HasSuffix(strings.ToLower(bare), suffix) {
 			values = append(values, bare[:len(bare)-len(suffix)])
+		}
+	}
+	for _, candidate := range append([]string(nil), values...) {
+		for _, variant := range billingImportVersionDelimiterVariants(candidate) {
+			values = append(values, variant)
 		}
 	}
 	seen := make(map[string]struct{}, len(values))
@@ -994,7 +1027,26 @@ func applyBillingModelPriceImportRows(ctx context.Context, tx *gorm.DB, rows []B
 			return nil, ErrBillingImportInvalidSelection
 		}
 		if row.ExistingRule == nil {
-			record := BillingModelPriceRecord{ID: billingID("price"), Provider: strings.ToLower(strings.TrimSpace(row.Provider)), Model: strings.TrimSpace(row.Model), ServiceTier: row.ServiceTier, MinInputTokens: row.MinInputTokens, InputPricePerMillion: row.Final.Input, OutputPricePerMillion: row.Final.Output, CacheReadPricePerMillion: row.Final.CacheRead, CacheWritePricePerMillion: row.Final.CacheWrite, RequestPrice: row.Final.Request, Source: BillingPriceSourceSync, Enabled: row.WriteRule.Enabled, Note: row.WriteRule.Note, Revision: 1, CreatedAt: now, UpdatedAt: now}
+			record := BillingModelPriceRecord{
+				ID:                        billingID("price"),
+				Provider:                  strings.ToLower(strings.TrimSpace(row.Provider)),
+				Model:                     strings.TrimSpace(row.Model),
+				ServiceTier:               row.ServiceTier,
+				MinInputTokens:            row.MinInputTokens,
+				InputPricePerMillion:      row.Final.Input,
+				OutputPricePerMillion:     row.Final.Output,
+				CacheReadPricePerMillion:  row.Final.CacheRead,
+				CacheWritePricePerMillion: row.Final.CacheWrite,
+				RequestPrice:              row.Final.Request,
+				BillingExtraPrices:        row.Final.extraPrices(),
+				PricingExpr:               strings.TrimSpace(row.Final.PricingExpr),
+				Source:                    BillingPriceSourceSync,
+				Enabled:                   row.WriteRule.Enabled,
+				Note:                      row.WriteRule.Note,
+				Revision:                  1,
+				CreatedAt:                 now,
+				UpdatedAt:                 now,
+			}
 			creates = append(creates, record)
 			resourceIDs[row.RowKey] = record.ID
 			continue
@@ -1033,6 +1085,17 @@ func applyBillingModelPriceImportUpdateBatch(ctx context.Context, tx *gorm.DB, r
 		{name: "cache_read_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.CacheRead }},
 		{name: "cache_write_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.CacheWrite }},
 		{name: "request_price", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.Request }},
+		{name: "cache_write_30m_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.CacheWrite30m }},
+		{name: "cache_write_1h_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.CacheWrite1h }},
+		{name: "cache_write_12h_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.CacheWrite12h }},
+		{name: "reasoning_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.Reasoning }},
+		{name: "image_input_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.ImageInput }},
+		{name: "image_output_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.ImageOutput }},
+		{name: "audio_input_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.AudioInput }},
+		{name: "audio_output_price_per_million", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.AudioOutput }},
+		{name: "web_search_price_per_call", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.WebSearch }},
+		{name: "image_price_per_image", value: func(row BillingModelPriceImportPreviewRow) any { return row.Final.Image }},
+		{name: "pricing_expr", value: func(row BillingModelPriceImportPreviewRow) any { return strings.TrimSpace(row.Final.PricingExpr) }},
 		{name: "source", value: func(BillingModelPriceImportPreviewRow) any { return BillingPriceSourceSync }},
 		{name: "enabled", value: func(row BillingModelPriceImportPreviewRow) any { return row.WriteRule.Enabled }},
 		{name: "note", value: func(row BillingModelPriceImportPreviewRow) any { return row.WriteRule.Note }},
@@ -1088,11 +1151,20 @@ func validateBillingModelPriceImportPreviewInput(input BillingModelPriceImportPr
 	return nil
 }
 
+func IsSupportedBillingModelPriceImportSource(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "", BillingModelPriceImportSourceModelsDev, BillingModelPriceImportSourceOpenRouter, BillingModelPriceImportSourceLiteLLM, BillingModelPriceImportSourceAuto:
+		return true
+	default:
+		return false
+	}
+}
+
 func validateBillingModelPriceImportInput(input BillingModelPriceImportPreviewInput) error {
-	if strings.TrimSpace(input.Source) != "" && !strings.EqualFold(strings.TrimSpace(input.Source), BillingModelPriceImportSourceModelsDev) {
+	if !IsSupportedBillingModelPriceImportSource(input.Source) {
 		return fmt.Errorf("unsupported import source")
 	}
-	if len(input.Targets) == 0 || len(input.Targets) > billingImportMaxTargets {
+	if (!input.AutoDiscover && len(input.Targets) == 0) || len(input.Targets) > billingImportMaxTargets {
 		return fmt.Errorf("import targets are required and must not exceed %d", billingImportMaxTargets)
 	}
 	if len(input.Policy.MultiplierRules) > billingImportMaxPolicyEntries || len(input.Policy.Aliases) > billingImportMaxPolicyEntries || len(input.Policy.RowMultipliers) > billingImportMaxPolicyEntries || len(input.MatchOverrides) > billingImportMaxPolicyEntries {
@@ -1196,12 +1268,150 @@ func billingImportMultiplier(policy BillingModelPriceImportPolicy, compiledRules
 	return policy.DefaultMultiplier
 }
 
+func (c BillingModelPriceImportCost) extraPrices() BillingExtraPrices {
+	return BillingExtraPrices{
+		CacheWrite30mPricePerMillion: billingImportCloneFloatPtr(c.CacheWrite30m),
+		CacheWrite1hPricePerMillion:  billingImportCloneFloatPtr(c.CacheWrite1h),
+		CacheWrite12hPricePerMillion: billingImportCloneFloatPtr(c.CacheWrite12h),
+		ReasoningPricePerMillion:     billingImportCloneFloatPtr(c.Reasoning),
+		ImageInputPricePerMillion:    billingImportCloneFloatPtr(c.ImageInput),
+		ImageOutputPricePerMillion:   billingImportCloneFloatPtr(c.ImageOutput),
+		AudioInputPricePerMillion:    billingImportCloneFloatPtr(c.AudioInput),
+		AudioOutputPricePerMillion:   billingImportCloneFloatPtr(c.AudioOutput),
+		WebSearchPricePerCall:        billingImportCloneFloatPtr(c.WebSearch),
+		ImagePricePerImage:           billingImportCloneFloatPtr(c.Image),
+	}
+}
+
+func billingImportCloneFloatPtr(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	copied := *v
+	return &copied
+}
+
+func billingImportScaleFloatPtr(v *float64, multiplier float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	scaled := billingRoundAmount(*v * multiplier)
+	return &scaled
+}
+
 func billingImportMultiplyCost(cost BillingModelPriceImportCost, multiplier float64) BillingModelPriceImportCost {
-	return BillingModelPriceImportCost{Input: cost.Input * multiplier, Output: cost.Output * multiplier, CacheRead: cost.CacheRead * multiplier, CacheWrite: cost.CacheWrite * multiplier, Request: cost.Request * multiplier}
+	expr := strings.TrimSpace(cost.PricingExpr)
+	if expr != "" && multiplier != 1 {
+		body := strings.TrimSpace(strings.TrimPrefix(expr, "v1:"))
+		expr = fmt.Sprintf("(%s) * %g", body, multiplier)
+	}
+	return BillingModelPriceImportCost{
+		Input:         cost.Input * multiplier,
+		Output:        cost.Output * multiplier,
+		CacheRead:     cost.CacheRead * multiplier,
+		CacheWrite:    cost.CacheWrite * multiplier,
+		Request:       cost.Request * multiplier,
+		CacheWrite30m: billingImportScaleFloatPtr(cost.CacheWrite30m, multiplier),
+		CacheWrite1h:  billingImportScaleFloatPtr(cost.CacheWrite1h, multiplier),
+		CacheWrite12h: billingImportScaleFloatPtr(cost.CacheWrite12h, multiplier),
+		Reasoning:     billingImportScaleFloatPtr(cost.Reasoning, multiplier),
+		ImageInput:    billingImportScaleFloatPtr(cost.ImageInput, multiplier),
+		ImageOutput:   billingImportScaleFloatPtr(cost.ImageOutput, multiplier),
+		AudioInput:    billingImportScaleFloatPtr(cost.AudioInput, multiplier),
+		AudioOutput:   billingImportScaleFloatPtr(cost.AudioOutput, multiplier),
+		WebSearch:     billingImportScaleFloatPtr(cost.WebSearch, multiplier),
+		Image:         billingImportScaleFloatPtr(cost.Image, multiplier),
+		PricingExpr:   expr,
+	}
 }
 
 func billingImportZeroCost(cost BillingModelPriceImportCost) bool {
-	return cost.Input == 0 && cost.Output == 0 && cost.CacheRead == 0 && cost.CacheWrite == 0 && cost.Request == 0
+	if cost.Input != 0 || cost.Output != 0 || cost.CacheRead != 0 || cost.CacheWrite != 0 || cost.Request != 0 || strings.TrimSpace(cost.PricingExpr) != "" {
+		return false
+	}
+	for _, ptr := range []*float64{cost.CacheWrite30m, cost.CacheWrite1h, cost.CacheWrite12h, cost.Reasoning, cost.ImageInput, cost.ImageOutput, cost.AudioInput, cost.AudioOutput, cost.WebSearch, cost.Image} {
+		if ptr != nil && *ptr != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func billingImportVersionDelimiterVariants(model string) []string {
+	var out []string
+	runes := []rune(model)
+	// Convert digit.digit <-> digit-digit for version numbers like claude-opus-4.6 <-> claude-opus-4-6.
+	dotToDash := make([]rune, len(runes))
+	dashToDot := make([]rune, len(runes))
+	changedDot, changedDash := false, false
+	for i, r := range runes {
+		dotToDash[i] = r
+		dashToDot[i] = r
+		if i > 0 && i+1 < len(runes) && unicode.IsDigit(runes[i-1]) && unicode.IsDigit(runes[i+1]) {
+			if r == '.' {
+				dotToDash[i] = '-'
+				changedDot = true
+			} else if r == '-' && (i+2 == len(runes) || !unicode.IsDigit(runes[i+2])) {
+				dashToDot[i] = '.'
+				changedDash = true
+			}
+		}
+	}
+	if changedDot {
+		out = append(out, string(dotToDash))
+	}
+	if changedDash {
+		out = append(out, string(dashToDot))
+	}
+	return out
+}
+
+func (r *Repository) discoverBillingImportTargets(ctx context.Context, db *gorm.DB) ([]BillingModelPriceImportTarget, error) {
+	type pair struct {
+		Provider string
+		Model    string
+	}
+	var usagePairs []pair
+	if errUsage := db.WithContext(ctx).Model(&UsageRecord{}).
+		Select(" DISTINCT LOWER(TRIM(provider)) AS provider, TRIM(model) AS model").
+		Where("provider <> '' AND model <> ''").
+		Limit(billingImportMaxTargets).
+		Scan(&usagePairs).Error; errUsage != nil {
+		return nil, errUsage
+	}
+	var pricePairs []pair
+	if errPrices := db.WithContext(ctx).Model(&BillingModelPriceRecord{}).
+		Select("DISTINCT LOWER(TRIM(provider)) AS provider, TRIM(model) AS model").
+		Where("provider <> '' AND provider <> '*' AND model <> '' AND model NOT LIKE '%*'").
+		Limit(billingImportMaxTargets).
+		Scan(&pricePairs).Error; errPrices != nil {
+		return nil, errPrices
+	}
+	seen := make(map[string]struct{})
+	out := make([]BillingModelPriceImportTarget, 0, len(usagePairs)+len(pricePairs))
+	for _, item := range append(usagePairs, pricePairs...) {
+		p := strings.ToLower(strings.TrimSpace(item.Provider))
+		m := strings.TrimSpace(item.Model)
+		if p == "" || m == "" || strings.Contains(p, "*") || strings.Contains(m, "*") {
+			continue
+		}
+		key := billingImportTargetKey(p, m)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, BillingModelPriceImportTarget{
+			Provider:       p,
+			Model:          m,
+			ServiceTier:    BillingServiceTierWildcard,
+			MinInputTokens: 0,
+			Label:          m,
+		})
+		if len(out) >= billingImportMaxTargets {
+			break
+		}
+	}
+	return out, nil
 }
 func billingImportRuleIdentity(provider, model, tier string, min int64) string {
 	return strings.ToLower(strings.TrimSpace(provider)) + "\x00" + strings.TrimSpace(model) + "\x00" + normalizeBillingPriceServiceTier(tier) + "\x00" + fmt.Sprintf("%d", min)

@@ -21,9 +21,11 @@ import (
 
 const (
 	modelsDevCatalogURL                  = "https://models.dev/api.json"
+	openRouterCatalogURL                 = "https://openrouter.ai/api/v1/models"
+	liteLLMCatalogURL                    = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 	modelsDevDefaultCacheReadInputRatio  = 0.1
 	modelsDevDefaultCacheWriteInputRatio = 1.25
-	billingImportMaxRequestBodySize      = 4 << 20
+	billingImportMaxRequestBodySize      = 16 << 20
 )
 
 func (h *Handler) PreviewBillingModelPriceImport(c *gin.Context) {
@@ -39,7 +41,7 @@ func (h *Handler) PreviewBillingModelPriceImport(c *gin.Context) {
 	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
-	catalog, errCatalog := h.fetchBillingModelPriceImportCatalog(ctx)
+	catalog, errCatalog := h.resolveBillingModelPriceImportCatalog(ctx, body)
 	if errCatalog != nil {
 		respondError(c, http.StatusBadGateway, "models_dev_fetch_failed", errCatalog)
 		return
@@ -115,29 +117,107 @@ func (h *Handler) GetBillingTierDiagnostics(c *gin.Context) {
 	c.JSON(http.StatusOK, diagnostics)
 }
 
+func (h *Handler) resolveBillingModelPriceImportCatalog(ctx context.Context, body cluster.BillingModelPriceImportPreviewInput) (cluster.BillingModelPriceImportCatalog, error) {
+	source := strings.ToLower(strings.TrimSpace(body.Source))
+	if source == "" {
+		source = cluster.BillingModelPriceImportSourceModelsDev
+	}
+	now := time.Now().UTC()
+	if len(bytesTrimSpace(body.CatalogJSON)) > 0 {
+		return parseBillingModelPriceImportCatalogBySource(source, body.CatalogJSON, "inline://"+source, now)
+	}
+	switch source {
+	case cluster.BillingModelPriceImportSourceOpenRouter:
+		raw, errFetch := h.fetchCatalogBytes(ctx, openRouterCatalogURL)
+		if errFetch != nil {
+			return cluster.BillingModelPriceImportCatalog{}, errFetch
+		}
+		return parseOpenRouterBillingImportCatalog(raw, openRouterCatalogURL, now)
+	case cluster.BillingModelPriceImportSourceLiteLLM:
+		raw, errFetch := h.fetchCatalogBytes(ctx, liteLLMCatalogURL)
+		if errFetch != nil {
+			return cluster.BillingModelPriceImportCatalog{}, errFetch
+		}
+		return parseLiteLLMBillingImportCatalog(raw, liteLLMCatalogURL, now)
+	case cluster.BillingModelPriceImportSourceAuto:
+		return h.fetchAutoBillingModelPriceImportCatalog(ctx, now)
+	default:
+		return h.fetchBillingModelPriceImportCatalog(ctx)
+	}
+}
+
 func (h *Handler) fetchBillingModelPriceImportCatalog(ctx context.Context) (cluster.BillingModelPriceImportCatalog, error) {
+	raw, errFetch := h.fetchCatalogBytes(ctx, modelsDevCatalogURL)
+	if errFetch != nil {
+		return cluster.BillingModelPriceImportCatalog{}, errFetch
+	}
+	return parseBillingModelPriceImportCatalog(raw, modelsDevCatalogURL, time.Now().UTC())
+}
+
+func (h *Handler) fetchCatalogBytes(ctx context.Context, url string) ([]byte, error) {
 	client := h.modelsDevHTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 8 * time.Second}
+		client = &http.Client{Timeout: 12 * time.Second}
 	}
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, modelsDevCatalogURL, nil)
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if errRequest != nil {
-		return cluster.BillingModelPriceImportCatalog{}, errRequest
+		return nil, errRequest
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return cluster.BillingModelPriceImportCatalog{}, errDo
+		return nil, errDo
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("models.dev returned HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("%s returned HTTP %d", url, resp.StatusCode)
 	}
-	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if errRead != nil {
-		return cluster.BillingModelPriceImportCatalog{}, errRead
+	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+}
+
+func (h *Handler) fetchAutoBillingModelPriceImportCatalog(ctx context.Context, now time.Time) (cluster.BillingModelPriceImportCatalog, error) {
+	var catalogs []cluster.BillingModelPriceImportCatalog
+	for _, item := range []struct {
+		source string
+		url    string
+	}{
+		{source: cluster.BillingModelPriceImportSourceModelsDev, url: modelsDevCatalogURL},
+		{source: cluster.BillingModelPriceImportSourceOpenRouter, url: openRouterCatalogURL},
+		{source: cluster.BillingModelPriceImportSourceLiteLLM, url: liteLLMCatalogURL},
+	} {
+		raw, errFetch := h.fetchCatalogBytes(ctx, item.url)
+		if errFetch != nil {
+			continue
+		}
+		parsed, errParse := parseBillingModelPriceImportCatalogBySource(item.source, raw, item.url, now)
+		if errParse == nil && len(parsed.Models) > 0 {
+			catalogs = append(catalogs, parsed)
+		}
 	}
-	return parseBillingModelPriceImportCatalog(raw, modelsDevCatalogURL, time.Now().UTC())
+	if len(catalogs) == 0 {
+		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("failed to fetch any pricing catalog")
+	}
+	return mergeBillingImportCatalogs(catalogs, now), nil
+}
+
+func parseBillingModelPriceImportCatalogBySource(source string, raw []byte, sourceURL string, fetchedAt time.Time) (cluster.BillingModelPriceImportCatalog, error) {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case cluster.BillingModelPriceImportSourceOpenRouter:
+		return parseOpenRouterBillingImportCatalog(raw, sourceURL, fetchedAt)
+	case cluster.BillingModelPriceImportSourceLiteLLM:
+		return parseLiteLLMBillingImportCatalog(raw, sourceURL, fetchedAt)
+	case cluster.BillingModelPriceImportSourceAuto:
+		// Auto-detect JSON shape when inline catalog_json is used with source="auto".
+		if cat, errOR := parseOpenRouterBillingImportCatalog(raw, sourceURL, fetchedAt); errOR == nil && len(cat.Models) > 0 {
+			return cat, nil
+		}
+		if cat, errMD := parseBillingModelPriceImportCatalog(raw, sourceURL, fetchedAt); errMD == nil && len(cat.Models) > 0 {
+			return cat, nil
+		}
+		return parseLiteLLMBillingImportCatalog(raw, sourceURL, fetchedAt)
+	default:
+		return parseBillingModelPriceImportCatalog(raw, sourceURL, fetchedAt)
+	}
 }
 
 func parseBillingModelPriceImportCatalog(raw []byte, sourceURL string, fetchedAt time.Time) (cluster.BillingModelPriceImportCatalog, error) {
@@ -213,7 +293,18 @@ func parseBillingModelPriceImportCost(value any) (*cluster.BillingModelPriceImpo
 	cacheRead, hasCacheRead := billingImportNumberValue(record, "cache_read", "cacheRead", "cache_read_price")
 	cacheWrite, hasCacheWrite := billingImportNumberValue(record, "cache_write", "cacheWrite", "cache_write_price")
 	request, hasRequest := billingImportNumberValue(record, "request", "request_price", "requestPrice")
-	if !hasInput && !hasOutput && !hasCacheRead && !hasCacheWrite && !hasRequest {
+	cw30m := billingImportOptionalNumberPtr(record, "cache_write_30m", "cache_write_30m_price")
+	cw1h := billingImportOptionalNumberPtr(record, "cache_write_1h", "cache_write_1h_price", "input_cache_write_1h")
+	cw12h := billingImportOptionalNumberPtr(record, "cache_write_12h", "cache_write_12h_price")
+	reasoning := billingImportOptionalNumberPtr(record, "reasoning", "reasoning_price", "internal_reasoning")
+	imgIn := billingImportOptionalNumberPtr(record, "image_input", "input_image", "image_input_price")
+	imgOut := billingImportOptionalNumberPtr(record, "image_output", "output_image", "image_output_price")
+	audioIn := billingImportOptionalNumberPtr(record, "audio_input", "input_audio", "audio", "audio_input_price")
+	audioOut := billingImportOptionalNumberPtr(record, "audio_output", "output_audio", "audio_output_price")
+	webSearch := billingImportOptionalNumberPtr(record, "web_search", "web_search_price")
+	imagePrice := billingImportOptionalNumberPtr(record, "image", "image_price", "image_price_per_image")
+	hasExtra := cw30m != nil || cw1h != nil || cw12h != nil || reasoning != nil || imgIn != nil || imgOut != nil || audioIn != nil || audioOut != nil || webSearch != nil || imagePrice != nil
+	if !hasInput && !hasOutput && !hasCacheRead && !hasCacheWrite && !hasRequest && !hasExtra {
 		return nil, billingModelPriceImportCostPresence{}, false
 	}
 	if hasInput {
@@ -226,7 +317,23 @@ func parseBillingModelPriceImportCost(value any) (*cluster.BillingModelPriceImpo
 			hasCacheWrite = true
 		}
 	}
-	return &cluster.BillingModelPriceImportCost{Input: input, Output: output, CacheRead: cacheRead, CacheWrite: cacheWrite, Request: request}, billingModelPriceImportCostPresence{Input: hasInput, Output: hasOutput, CacheRead: hasCacheRead, CacheWrite: hasCacheWrite, Request: hasRequest}, true
+	return &cluster.BillingModelPriceImportCost{
+		Input:         input,
+		Output:        output,
+		CacheRead:     cacheRead,
+		CacheWrite:    cacheWrite,
+		Request:       request,
+		CacheWrite30m: cw30m,
+		CacheWrite1h:  cw1h,
+		CacheWrite12h: cw12h,
+		Reasoning:     reasoning,
+		ImageInput:    imgIn,
+		ImageOutput:   imgOut,
+		AudioInput:    audioIn,
+		AudioOutput:   audioOut,
+		WebSearch:     webSearch,
+		Image:         imagePrice,
+	}, billingModelPriceImportCostPresence{Input: hasInput, Output: hasOutput, CacheRead: hasCacheRead, CacheWrite: hasCacheWrite, Request: hasRequest}, true
 }
 
 func parseBillingModelPriceImportContextBands(value any, base billingModelPriceImportCostPresence) ([]cluster.BillingModelPriceImportContextBand, []string) {
@@ -367,7 +474,7 @@ func billingImportUnsupportedDimensions(value any) []string {
 		return nil
 	}
 	var unsupported []string
-	for _, field := range []string{"image", "input_image", "output_image", "audio", "input_audio", "output_audio", "video", "reasoning"} {
+	for _, field := range []string{"video"} {
 		raw, exists := record[field]
 		if !exists || raw == nil {
 			continue
@@ -378,6 +485,414 @@ func billingImportUnsupportedDimensions(value any) []string {
 		}
 	}
 	return unsupported
+}
+
+func billingImportOptionalNumberPtr(record map[string]any, keys ...string) *float64 {
+	value, ok := billingImportNumberValue(record, keys...)
+	if !ok || !isFiniteBillingImportNumber(value) || value < 0 {
+		return nil
+	}
+	rounded := math.Round(value*1e8) / 1e8
+	return &rounded
+}
+
+func billingImportPerTokenToPerMillionPtr(record map[string]any, keys ...string) *float64 {
+	value, ok := billingImportNumberValue(record, keys...)
+	if !ok || !isFiniteBillingImportNumber(value) || value < 0 {
+		return nil
+	}
+	scaled := math.Round(value*1e6*1e8) / 1e8
+	return &scaled
+}
+
+func parseOpenRouterBillingImportCatalog(raw []byte, sourceURL string, fetchedAt time.Time) (cluster.BillingModelPriceImportCatalog, error) {
+	var root struct {
+		Data []map[string]any `json:"data"`
+	}
+	if errDecode := json.Unmarshal(raw, &root); errDecode != nil {
+		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("decode openrouter catalog: %w", errDecode)
+	}
+	if len(root.Data) == 0 {
+		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("openrouter catalog has no models")
+	}
+	sum := sha256.Sum256(raw)
+	catalog := cluster.BillingModelPriceImportCatalog{SourceURL: sourceURL, Version: hex.EncodeToString(sum[:]), FetchedAt: fetchedAt}
+	for _, item := range root.Data {
+		id := billingImportStringValue(item, "id")
+		if id == "" || strings.HasSuffix(strings.ToLower(id), ":batch") {
+			continue
+		}
+		provider := "openrouter"
+		model := id
+		if parts := strings.SplitN(id, "/", 2); len(parts) == 2 {
+			provider = strings.ToLower(strings.TrimSpace(parts[0]))
+			model = strings.TrimSpace(parts[1])
+		}
+		pricing, ok := item["pricing"].(map[string]any)
+		if !ok {
+			continue
+		}
+		cost, bands, okCost := parseOpenRouterModelPricing(pricing)
+		if !okCost {
+			continue
+		}
+		name := billingImportStringValue(item, "name")
+		if name == "" {
+			name = id
+		}
+		catalog.Models = append(catalog.Models, cluster.BillingModelPriceImportCatalogModel{
+			Provider:     provider,
+			Model:        model,
+			Name:         name,
+			Cost:         cost,
+			ContextBands: bands,
+		})
+	}
+	if len(catalog.Models) == 0 {
+		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("openrouter catalog has no valid models")
+	}
+	return catalog, nil
+}
+
+func parseOpenRouterModelPricing(pricing map[string]any) (*cluster.BillingModelPriceImportCost, []cluster.BillingModelPriceImportContextBand, bool) {
+	promptPerM := billingImportPerTokenToPerMillionPtr(pricing, "prompt")
+	compPerM := billingImportPerTokenToPerMillionPtr(pricing, "completion")
+	if rawPrompt, ok := billingImportNumberValue(pricing, "prompt"); ok && rawPrompt < 0 {
+		return nil, nil, false
+	}
+	if promptPerM == nil && compPerM == nil {
+		return nil, nil, false
+	}
+	var input, output, cacheRead, cacheWrite, request float64
+	if promptPerM != nil {
+		input = *promptPerM
+	}
+	if compPerM != nil {
+		output = *compPerM
+	}
+	if cr := billingImportPerTokenToPerMillionPtr(pricing, "input_cache_read"); cr != nil {
+		cacheRead = *cr
+	} else if promptPerM != nil {
+		cacheRead = math.Round(input*modelsDevDefaultCacheReadInputRatio*1e8) / 1e8
+	}
+	if cw := billingImportPerTokenToPerMillionPtr(pricing, "input_cache_write"); cw != nil {
+		cacheWrite = *cw
+	} else if promptPerM != nil {
+		cacheWrite = math.Round(input*modelsDevDefaultCacheWriteInputRatio*1e8) / 1e8
+	}
+	if req := billingImportOptionalNumberPtr(pricing, "request"); req != nil {
+		request = *req
+	}
+	cost := &cluster.BillingModelPriceImportCost{
+		Input:        input,
+		Output:       output,
+		CacheRead:    cacheRead,
+		CacheWrite:   cacheWrite,
+		Request:      request,
+		CacheWrite1h: billingImportPerTokenToPerMillionPtr(pricing, "input_cache_write_1h"),
+		Reasoning:    billingImportPerTokenToPerMillionPtr(pricing, "internal_reasoning"),
+		ImageInput:   billingImportPerTokenToPerMillionPtr(pricing, "image"),
+		ImageOutput:  billingImportPerTokenToPerMillionPtr(pricing, "image_output"),
+		AudioInput:   billingImportPerTokenToPerMillionPtr(pricing, "audio"),
+		AudioOutput:  billingImportPerTokenToPerMillionPtr(pricing, "audio_output"),
+		WebSearch:    billingImportOptionalNumberPtr(pricing, "web_search"),
+	}
+	var bands []cluster.BillingModelPriceImportContextBand
+	if rawOverrides, ok := pricing["overrides"].([]any); ok && len(rawOverrides) > 0 {
+		if expr := buildOpenRouterTimeOverridesExpr(cost, rawOverrides); expr != "" {
+			cost.PricingExpr = expr
+		} else {
+			for _, rawOv := range rawOverrides {
+				ov, ok := rawOv.(map[string]any)
+				if !ok {
+					continue
+				}
+				minPrompt, hasMin := billingImportNumberValue(ov, "min_prompt_tokens")
+				if !hasMin || minPrompt <= 0 {
+					continue
+				}
+				ovCost, _, okOv := parseOpenRouterModelPricing(ov)
+				if !okOv || ovCost == nil {
+					continue
+				}
+				bands = append(bands, cluster.BillingModelPriceImportContextBand{
+					MinInputTokens: int64(minPrompt) + 1,
+					Cost:           *ovCost,
+				})
+			}
+		}
+	}
+	return cost, bands, true
+}
+
+func buildOpenRouterTimeOverridesExpr(base *cluster.BillingModelPriceImportCost, rawOverrides []any) string {
+	type branch struct {
+		cond string
+		expr string
+	}
+	var branches []branch
+	for _, rawOv := range rawOverrides {
+		ov, ok := rawOv.(map[string]any)
+		if !ok {
+			continue
+		}
+		_, hasStart := ov["utc_start"]
+		_, hasEnd := ov["utc_end"]
+		_, hasDays := ov["utc_days"]
+		if !hasStart && !hasEnd && !hasDays {
+			return ""
+		}
+		ovCost, _, okOv := parseOpenRouterModelPricing(ov)
+		if !okOv || ovCost == nil {
+			continue
+		}
+		cond := openRouterOverrideTimeCondition(ov)
+		if cond == "" {
+			continue
+		}
+		branches = append(branches, branch{cond: cond, expr: openRouterLinearTokenExpr(ovCost)})
+	}
+	if len(branches) == 0 {
+		return ""
+	}
+	result := fmt.Sprintf("tier('base', %s)", openRouterLinearTokenExpr(base))
+	for i := len(branches) - 1; i >= 0; i-- {
+		result = fmt.Sprintf("(%s ? tier('override_%d', %s) : %s)", branches[i].cond, i+1, branches[i].expr, result)
+	}
+	return result
+}
+
+func openRouterOverrideTimeCondition(ov map[string]any) string {
+	var parts []string
+	if rawDays, ok := ov["utc_days"].([]any); ok && len(rawDays) > 0 {
+		dayMap := map[string]int{
+			"sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3,
+			"thursday": 4, "friday": 5, "saturday": 6,
+		}
+		var nums []int
+		for _, d := range rawDays {
+			if s, ok := d.(string); ok {
+				if n, exists := dayMap[strings.ToLower(strings.TrimSpace(s))]; exists {
+					nums = append(nums, n)
+				}
+			}
+		}
+		if len(nums) == 5 && nums[0] == 1 && nums[4] == 5 {
+			parts = append(parts, "(weekday('UTC') >= 1 && weekday('UTC') <= 5)")
+		} else if len(nums) > 0 {
+			var dConds []string
+			for _, n := range nums {
+				dConds = append(dConds, fmt.Sprintf("weekday('UTC') == %d", n))
+			}
+			parts = append(parts, "("+strings.Join(dConds, " || ")+")")
+		}
+	}
+	start, hasStart := billingImportNumberValue(ov, "utc_start")
+	end, hasEnd := billingImportNumberValue(ov, "utc_end")
+	if hasStart && hasEnd {
+		sH := int(start) / 100
+		eH := int(end) / 100
+		if eH == 0 {
+			eH = 24
+		}
+		if sH < eH {
+			parts = append(parts, fmt.Sprintf("(hour('UTC') >= %d && hour('UTC') < %d)", sH, eH))
+		} else if sH > eH {
+			parts = append(parts, fmt.Sprintf("(hour('UTC') >= %d || hour('UTC') < %d)", sH, eH))
+		}
+	}
+	return strings.Join(parts, " && ")
+}
+
+func openRouterLinearTokenExpr(c *cluster.BillingModelPriceImportCost) string {
+	terms := []string{
+		fmt.Sprintf("p * %g", c.Input),
+		fmt.Sprintf("c * %g", c.Output),
+	}
+	if c.CacheRead > 0 {
+		terms = append(terms, fmt.Sprintf("cr * %g", c.CacheRead))
+	}
+	if c.CacheWrite > 0 {
+		terms = append(terms, fmt.Sprintf("cc * %g", c.CacheWrite))
+	}
+	if c.CacheWrite1h != nil && *c.CacheWrite1h > 0 {
+		terms = append(terms, fmt.Sprintf("cc1h * %g", *c.CacheWrite1h))
+	}
+	if c.Reasoning != nil && *c.Reasoning > 0 {
+		terms = append(terms, fmt.Sprintf("r * %g", *c.Reasoning))
+	}
+	return strings.Join(terms, " + ")
+}
+
+func parseLiteLLMBillingImportCatalog(raw []byte, sourceURL string, fetchedAt time.Time) (cluster.BillingModelPriceImportCatalog, error) {
+	var root map[string]any
+	if errDecode := json.Unmarshal(raw, &root); errDecode != nil {
+		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("decode litellm catalog: %w", errDecode)
+	}
+	sum := sha256.Sum256(raw)
+	catalog := cluster.BillingModelPriceImportCatalog{SourceURL: sourceURL, Version: hex.EncodeToString(sum[:]), FetchedAt: fetchedAt}
+	keys := make([]string, 0, len(root))
+	for k := range root {
+		if k == "sample_spec" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		rec, ok := root[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(billingImportStringValue(rec, "litellm_provider")))
+		model := strings.TrimSpace(key)
+		if parts := strings.SplitN(key, "/", 2); len(parts) == 2 {
+			if provider == "" {
+				provider = strings.ToLower(strings.TrimSpace(parts[0]))
+			}
+			model = strings.TrimSpace(parts[1])
+		}
+		if provider == "" {
+			provider = "openai"
+		}
+		inPtr := billingImportPerTokenToPerMillionPtr(rec, "input_cost_per_token")
+		outPtr := billingImportPerTokenToPerMillionPtr(rec, "output_cost_per_token")
+		imgPrice := billingImportOptionalNumberPtr(rec, "output_cost_per_image", "input_cost_per_image")
+		wsPrice := billingImportOptionalNumberPtr(rec, "search_context_cost_per_query")
+		if inPtr == nil && outPtr == nil && imgPrice == nil && wsPrice == nil {
+			continue
+		}
+		var input, output, cacheRead, cacheWrite float64
+		if inPtr != nil {
+			input = *inPtr
+		}
+		if outPtr != nil {
+			output = *outPtr
+		}
+		if cr := billingImportPerTokenToPerMillionPtr(rec, "cache_read_input_token_cost"); cr != nil {
+			cacheRead = *cr
+		} else if inPtr != nil {
+			cacheRead = math.Round(input*modelsDevDefaultCacheReadInputRatio*1e8) / 1e8
+		}
+		if cw := billingImportPerTokenToPerMillionPtr(rec, "cache_creation_input_token_cost"); cw != nil {
+			cacheWrite = *cw
+		} else if inPtr != nil {
+			cacheWrite = math.Round(input*modelsDevDefaultCacheWriteInputRatio*1e8) / 1e8
+		}
+		cost := &cluster.BillingModelPriceImportCost{
+			Input:         input,
+			Output:        output,
+			CacheRead:     cacheRead,
+			CacheWrite:    cacheWrite,
+			CacheWrite1h:  billingImportPerTokenToPerMillionPtr(rec, "cache_creation_input_token_cost_above_1hr"),
+			CacheWrite12h: billingImportPerTokenToPerMillionPtr(rec, "cache_creation_input_token_cost_above_12hr"),
+			Reasoning:     billingImportPerTokenToPerMillionPtr(rec, "output_cost_per_reasoning_token"),
+			ImageInput:    billingImportPerTokenToPerMillionPtr(rec, "input_cost_per_image_token"),
+			ImageOutput:   billingImportPerTokenToPerMillionPtr(rec, "output_cost_per_image_token"),
+			AudioInput:    billingImportPerTokenToPerMillionPtr(rec, "input_cost_per_audio_token"),
+			AudioOutput:   billingImportPerTokenToPerMillionPtr(rec, "output_cost_per_audio_token"),
+			WebSearch:     wsPrice,
+			Image:         imgPrice,
+		}
+		var bands []cluster.BillingModelPriceImportContextBand
+		for _, tierSpec := range []struct {
+			suffix string
+			minTok int64
+		}{
+			{suffix: "_above_128k_tokens", minTok: 128001},
+			{suffix: "_above_200k_tokens", minTok: 200001},
+		} {
+			tIn := billingImportPerTokenToPerMillionPtr(rec, "input_cost_per_token"+tierSpec.suffix)
+			tOut := billingImportPerTokenToPerMillionPtr(rec, "output_cost_per_token"+tierSpec.suffix)
+			if tIn == nil && tOut == nil {
+				continue
+			}
+			bandCost := *cost
+			if tIn != nil {
+				bandCost.Input = *tIn
+				bandCost.CacheRead = math.Round(*tIn*modelsDevDefaultCacheReadInputRatio*1e8) / 1e8
+				bandCost.CacheWrite = math.Round(*tIn*modelsDevDefaultCacheWriteInputRatio*1e8) / 1e8
+			}
+			if tOut != nil {
+				bandCost.Output = *tOut
+			}
+			if tCR := billingImportPerTokenToPerMillionPtr(rec, "cache_read_input_token_cost"+tierSpec.suffix); tCR != nil {
+				bandCost.CacheRead = *tCR
+			}
+			if tCW := billingImportPerTokenToPerMillionPtr(rec, "cache_creation_input_token_cost"+tierSpec.suffix); tCW != nil {
+				bandCost.CacheWrite = *tCW
+			}
+			bands = append(bands, cluster.BillingModelPriceImportContextBand{
+				MinInputTokens: tierSpec.minTok,
+				Cost:           bandCost,
+			})
+		}
+		catalog.Models = append(catalog.Models, cluster.BillingModelPriceImportCatalogModel{
+			Provider:     provider,
+			Model:        model,
+			Name:         key,
+			Cost:         cost,
+			ContextBands: bands,
+		})
+	}
+	if len(catalog.Models) == 0 {
+		return cluster.BillingModelPriceImportCatalog{}, fmt.Errorf("litellm catalog has no valid models")
+	}
+	return catalog, nil
+}
+
+func mergeBillingImportCatalogs(catalogs []cluster.BillingModelPriceImportCatalog, fetchedAt time.Time) cluster.BillingModelPriceImportCatalog {
+	out := cluster.BillingModelPriceImportCatalog{
+		SourceURL: catalogs[0].SourceURL,
+		Version:   catalogs[0].Version,
+		FetchedAt: fetchedAt,
+	}
+	indexByKey := make(map[string]int)
+	for _, cat := range catalogs {
+		for _, m := range cat.Models {
+			key := strings.ToLower(strings.TrimSpace(m.Provider)) + "::" + strings.ToLower(strings.TrimSpace(m.Model))
+			if idx, exists := indexByKey[key]; exists {
+				mergeBillingImportCatalogModel(&out.Models[idx], m)
+				continue
+			}
+			indexByKey[key] = len(out.Models)
+			out.Models = append(out.Models, m)
+		}
+	}
+	return out
+}
+
+func mergeBillingImportCatalogModel(dst *cluster.BillingModelPriceImportCatalogModel, src cluster.BillingModelPriceImportCatalogModel) {
+	if dst == nil || src.Cost == nil {
+		return
+	}
+	if dst.Cost == nil {
+		dst.Cost = src.Cost
+		dst.ContextBands = src.ContextBands
+		return
+	}
+	fillPtr := func(target **float64, candidate *float64) {
+		if *target == nil && candidate != nil {
+			v := *candidate
+			*target = &v
+		}
+	}
+	fillPtr(&dst.Cost.CacheWrite30m, src.Cost.CacheWrite30m)
+	fillPtr(&dst.Cost.CacheWrite1h, src.Cost.CacheWrite1h)
+	fillPtr(&dst.Cost.CacheWrite12h, src.Cost.CacheWrite12h)
+	fillPtr(&dst.Cost.Reasoning, src.Cost.Reasoning)
+	fillPtr(&dst.Cost.ImageInput, src.Cost.ImageInput)
+	fillPtr(&dst.Cost.ImageOutput, src.Cost.ImageOutput)
+	fillPtr(&dst.Cost.AudioInput, src.Cost.AudioInput)
+	fillPtr(&dst.Cost.AudioOutput, src.Cost.AudioOutput)
+	fillPtr(&dst.Cost.WebSearch, src.Cost.WebSearch)
+	fillPtr(&dst.Cost.Image, src.Cost.Image)
+	if dst.Cost.PricingExpr == "" && src.Cost.PricingExpr != "" {
+		dst.Cost.PricingExpr = src.Cost.PricingExpr
+	}
+	if len(dst.ContextBands) == 0 && len(src.ContextBands) > 0 {
+		dst.ContextBands = src.ContextBands
+	}
 }
 
 func billingImportRecordValue(record map[string]any, keys ...string) any {

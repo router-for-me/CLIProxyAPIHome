@@ -1832,7 +1832,7 @@ OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表�
 
 ### POST `/billing/model-prices/import/preview`
 
-创建服务端的不可变 `models.dev` 导入预览。服务端拉取并固定来源快照；客户端提供目标、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 自动从已有 usage 与价格规则发现模型）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
 
 当前 preview target 只描述通配符 base 规则（`service_tier: "*"`、`min_input_tokens: 0`）；其他 target scope 会被拒绝，不会被静默改写。已匹配行会包含官方价格、倍率后的最终价格、精确的 `write_rule`、带 `revision` 的完整可选 `existing_rule` 快照，以及机器可读的原因。models.dev 上下文分段会生成不同包含式下界的通配符行；`row_multipliers` 按返回的精确 row key 生效，包含 context-band 行。cache-read 和 cache-write 价格从固定的 catalog snapshot 导入。当 cost 对象包含 input 价格但省略 `cache_read` 或 `cache_write` 时，Home 分别按 `input * 0.1` 或 `input * 1.25` 派生缺失价格；显式值（包括零）保持不变。出现不支持的价格维度、格式错误或无效的价格/分段、重复分段，或 tier 缺少 base 已配置价格维度时，整个 target 都不可应用；服务端不会导入可能低估计费的子集。
 

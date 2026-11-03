@@ -946,3 +946,122 @@ func newBillingManagementTestHandler(t *testing.T) (*Handler, func()) {
 	}
 	return NewHandler(cluster.NewRepository(db), nil, "192.0.2.10", 0), closeRepo
 }
+
+func TestPreviewAndApplyBillingModelPriceImportOpenRouterAndLiteLLM(t *testing.T) {
+	t.Parallel()
+
+	handler, closeRepo := newBillingManagementTestHandler(t)
+	defer closeRepo()
+
+	// Seed usage for auto_discover test.
+	_, errUsage := handler.repo.AppendUsage(context.Background(), `{"timestamp":"2026-10-27T01:00:00Z","provider":"anthropic","model":"claude-opus-4-6","request_id":"seed-1","tokens":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`, "192.0.2.10")
+	if errUsage != nil {
+		t.Fatalf("AppendUsage() error = %v", errUsage)
+	}
+
+	// 1. OpenRouter catalog import with version delimiter matching (claude-opus-4.6 -> claude-opus-4-6),
+	// 1h cache write, web_search, and time-of-day overrides synthesized into pricing_expr.
+	openRouterJSON := `{
+  "data": [
+    {
+      "id": "anthropic/claude-opus-4.6",
+      "name": "Anthropic: Claude Opus 4.6",
+      "pricing": {
+        "prompt": "0.000005",
+        "completion": "0.000025",
+        "input_cache_read": "0.0000005",
+        "input_cache_write": "0.00000625",
+        "input_cache_write_1h": "0.00001",
+        "web_search": "0.01"
+      }
+    },
+    {
+      "id": "deepseek/deepseek-v4.1-flash",
+      "name": "DeepSeek V4.1 Flash",
+      "pricing": {
+        "prompt": "0.0000003",
+        "completion": "0.0000012",
+        "input_cache_read": "0.00000003",
+        "overrides": [
+          {
+            "utc_days": ["saturday", "sunday"],
+            "prompt": "0.00000015",
+            "completion": "0.0000006",
+            "input_cache_read": "0.000000015"
+          }
+        ]
+      }
+    }
+  ]
+}`
+	previewResp := httptest.NewRecorder()
+	previewCtx, _ := gin.CreateTestContext(previewResp)
+	previewBody := fmt.Sprintf(`{"source":"openrouter","catalog_json":%s,"targets":[{"provider":"anthropic","model":"claude-opus-4-6"},{"provider":"deepseek","model":"deepseek-v4.1-flash"}],"policy":{"overwrite_mode":"all","default_multiplier":1}}`, openRouterJSON)
+	previewCtx.Request = httptest.NewRequest(http.MethodPost, "/billing/model-prices/import/preview", strings.NewReader(previewBody))
+	previewCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.PreviewBillingModelPriceImport(previewCtx)
+	if previewResp.Code != http.StatusOK {
+		t.Fatalf("OpenRouter preview status = %d body=%s", previewResp.Code, previewResp.Body.String())
+	}
+	var preview cluster.BillingModelPriceImportPreview
+	if errDecode := json.Unmarshal(previewResp.Body.Bytes(), &preview); errDecode != nil {
+		t.Fatalf("decode OpenRouter preview: %v", errDecode)
+	}
+	if len(preview.Rows) != 2 || !preview.Rows[0].Applicable || !preview.Rows[1].Applicable {
+		t.Fatalf("OpenRouter preview rows = %#v", preview.Rows)
+	}
+	if preview.Rows[0].Final.CacheWrite1h == nil || *preview.Rows[0].Final.CacheWrite1h != 10 || preview.Rows[0].Final.WebSearch == nil || *preview.Rows[0].Final.WebSearch != 0.01 {
+		t.Fatalf("OpenRouter claude extra prices = %#v", preview.Rows[0].Final)
+	}
+	if !strings.Contains(preview.Rows[1].Final.PricingExpr, "weekday('UTC')") {
+		t.Fatalf("OpenRouter deepseek pricing_expr = %q, want weekday('UTC')", preview.Rows[1].Final.PricingExpr)
+	}
+
+	applyResp := httptest.NewRecorder()
+	applyCtx, _ := gin.CreateTestContext(applyResp)
+	applyBody := fmt.Sprintf(`{"preview_id":%q,"preview_revision":%q,"selected_keys":[%q,%q],"confirm_overwrite":true,"idempotency_key":"or-apply-1"}`, preview.PreviewID, preview.PreviewRevision, preview.Rows[0].RowKey, preview.Rows[1].RowKey)
+	applyCtx.Request = httptest.NewRequest(http.MethodPost, "/billing/model-prices/import/apply", strings.NewReader(applyBody))
+	applyCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.ApplyBillingModelPriceImport(applyCtx)
+	if applyResp.Code != http.StatusOK {
+		t.Fatalf("OpenRouter apply status = %d body=%s", applyResp.Code, applyResp.Body.String())
+	}
+	prices, errList := handler.repo.ListBillingModelPrices(context.Background(), cluster.BillingModelPriceQuery{Provider: "anthropic", Model: "claude-opus-4-6"})
+	if errList != nil || len(prices) != 1 || prices[0].CacheWrite1hPricePerMillion == nil || *prices[0].CacheWrite1hPricePerMillion != 10 || prices[0].WebSearchPricePerCall == nil || *prices[0].WebSearchPricePerCall != 0.01 {
+		t.Fatalf("persisted claude price = %#v err=%v", prices, errList)
+	}
+
+	// 2. LiteLLM catalog import with 1h/12h cache write, reasoning, image price, and >200k context band.
+	liteLLMJSON := `{
+  "sample_spec": {"input_cost_per_token": 0},
+  "openai/gpt-5.6-pro": {
+    "litellm_provider": "openai",
+    "input_cost_per_token": 0.0000025,
+    "output_cost_per_token": 0.00001,
+    "cache_read_input_token_cost": 0.00000025,
+    "cache_creation_input_token_cost": 0.000003125,
+    "cache_creation_input_token_cost_above_12hr": 0.000005,
+    "output_cost_per_reasoning_token": 0.000015,
+    "output_cost_per_image": 0.04,
+    "search_context_cost_per_query": 0.01,
+    "input_cost_per_token_above_200k_tokens": 0.000005,
+    "output_cost_per_token_above_200k_tokens": 0.00002
+  }
+}`
+	llResp := httptest.NewRecorder()
+	llCtx, _ := gin.CreateTestContext(llResp)
+	llBody := fmt.Sprintf(`{"source":"litellm","catalog_json":%s,"targets":[{"provider":"openai","model":"gpt-5.6-pro"}],"policy":{"overwrite_mode":"missing","default_multiplier":1}}`, liteLLMJSON)
+	llCtx.Request = httptest.NewRequest(http.MethodPost, "/billing/model-prices/import/preview", strings.NewReader(llBody))
+	llCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.PreviewBillingModelPriceImport(llCtx)
+	if llResp.Code != http.StatusOK {
+		t.Fatalf("LiteLLM preview status = %d body=%s", llResp.Code, llResp.Body.String())
+	}
+	var llPreview cluster.BillingModelPriceImportPreview
+	if errDecode := json.Unmarshal(llResp.Body.Bytes(), &llPreview); errDecode != nil {
+		t.Fatalf("decode LiteLLM preview: %v", errDecode)
+	}
+	if len(llPreview.Rows) != 2 || llPreview.Rows[0].Final.CacheWrite12h == nil || *llPreview.Rows[0].Final.CacheWrite12h != 5 || llPreview.Rows[0].Final.Reasoning == nil || *llPreview.Rows[0].Final.Reasoning != 15 || llPreview.Rows[0].Final.Image == nil || *llPreview.Rows[0].Final.Image != 0.04 || llPreview.Rows[1].MinInputTokens != 200001 {
+		t.Fatalf("LiteLLM preview rows = %#v", llPreview.Rows)
+	}
+}
