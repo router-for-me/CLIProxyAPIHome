@@ -445,6 +445,11 @@ func encodeRESPArray(args ...string) []byte {
 	return buf.Bytes()
 }
 
+const (
+	maxClusterRESPBulkLen = 16 << 20 // 16 MiB
+	maxClusterRESPLineLen = 64 << 10 // 64 KiB
+)
+
 // readRESPBulk reads a resp bulk.
 func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 	// Validate input data before converting it into runtime state.
@@ -454,7 +459,7 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 	}
 	switch prefix {
 	case '$':
-		line, errLine := reader.ReadString('\n')
+		line, errLine := readClusterRESPLine(reader)
 		if errLine != nil {
 			return nil, errLine
 		}
@@ -462,28 +467,67 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 		if errSize != nil {
 			return nil, errSize
 		}
+		if size < -1 {
+			return nil, fmt.Errorf("cluster resp: invalid bulk length")
+		}
 		if size < 0 {
 			return nil, fmt.Errorf("cluster resp: nil bulk response")
+		}
+		if size > maxClusterRESPBulkLen {
+			return nil, fmt.Errorf("cluster resp: bulk response is too large")
 		}
 		payload := make([]byte, size+2)
 		if _, errFull := io.ReadFull(reader, payload); errFull != nil {
 			return nil, errFull
 		}
+		if payload[size] != '\r' || payload[size+1] != '\n' {
+			return nil, fmt.Errorf("cluster resp: invalid bulk terminator")
+		}
 		return payload[:size], nil
 	case '+':
-		line, errLine := reader.ReadString('\n')
+		line, errLine := readClusterRESPLine(reader)
 		if errLine != nil {
 			return nil, errLine
 		}
-		return []byte(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")), nil
+		return []byte(line), nil
 	case '-':
-		line, errLine := reader.ReadString('\n')
+		line, errLine := readClusterRESPLine(reader)
 		if errLine != nil {
 			return nil, errLine
 		}
 		return nil, parseClusterRESPError(line)
 	default:
 		return nil, fmt.Errorf("cluster resp: unsupported response prefix %q", prefix)
+	}
+}
+
+func readClusterRESPLine(reader *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		fragment, errRead := reader.ReadSlice('\n')
+		if len(buf)+len(fragment) > maxClusterRESPLineLen+2 {
+			return "", fmt.Errorf("cluster resp: response line is too long")
+		}
+		if errRead == nil {
+			var line string
+			if len(buf) == 0 {
+				line = string(fragment)
+			} else {
+				buf = append(buf, fragment...)
+				line = string(buf)
+			}
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			if len(line) > maxClusterRESPLineLen {
+				return "", fmt.Errorf("cluster resp: response line is too long")
+			}
+			return line, nil
+		}
+		if errors.Is(errRead, bufio.ErrBufferFull) {
+			buf = append(buf, fragment...)
+			continue
+		}
+		return "", errRead
 	}
 }
 

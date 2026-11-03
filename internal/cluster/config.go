@@ -30,6 +30,8 @@ type PGSQLConfig struct {
 	Passowrd           string        `yaml:"passowrd"`
 	Database           string        `yaml:"database"`
 	SSLMode            string        `yaml:"sslmode"`
+	MaxOpenConns       int           `yaml:"max-open-conns"`
+	MaxIdleConns       *int          `yaml:"max-idle-conns"`
 	SlowQueryThreshold time.Duration `yaml:"slow-query-threshold"`
 }
 
@@ -227,6 +229,17 @@ func (c PGSQLConfig) Configured() bool {
 
 // Validate validates validate.
 func (c PGSQLConfig) Validate() error {
+	if c.MaxOpenConns < 0 {
+		return fmt.Errorf("pgsql.max-open-conns must not be negative")
+	}
+	if c.MaxIdleConns != nil {
+		if *c.MaxIdleConns < 0 {
+			return fmt.Errorf("pgsql.max-idle-conns must not be negative")
+		}
+		if c.MaxOpenConns > 0 && *c.MaxIdleConns > c.MaxOpenConns {
+			return fmt.Errorf("pgsql.max-idle-conns must not exceed pgsql.max-open-conns when the maximum is limited")
+		}
+	}
 	if strings.TrimSpace(c.PostgresURI) != "" {
 		if strings.TrimSpace(c.Host) != "" ||
 			c.Port != 0 ||

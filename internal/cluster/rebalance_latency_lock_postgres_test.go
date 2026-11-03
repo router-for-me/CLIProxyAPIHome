@@ -76,7 +76,7 @@ func TestPostgresLatencyReportDoesNotWaitForElectionGate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if errTransaction := f.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		_, now, errGate := lockRebalanceGate(tx)
+		_, now, errGate := lockMasterGate(tx)
 		if errGate != nil {
 			return errGate
 		}

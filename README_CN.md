@@ -80,6 +80,8 @@ Home 现在始终使用数据库驱动的运行时。没有 `cluster.yaml` 时�
 
 可以在所选的 `pgsql` 或 `sqlite` 后端下设置 `slow-query-threshold`，控制慢 SQL 日志阈值。该字段接受 `"500ms"`、`"1s"` 等 Go duration 字符串，默认为 `"200ms"`。
 
+PostgreSQL 连接池可在 `cluster.yaml` 中配置：`pgsql.max-open-conns` 默认为 `0`（不限总连接数），`pgsql.max-idle-conns` 默认为 `2`（受正数总连接上限约束）。显式设置 `max-idle-conns: 0` 表示不保留空闲连接；显式空闲上限不能超过正数总连接上限。这些限制按 Home 进程独立计算，修改后需重启。
+
 `config.yaml` 和 `auth-dir` 不再是运行时存储，只作为导入/导出的交换格式。迁移已有本地配置时，先运行：
 
 ```bash

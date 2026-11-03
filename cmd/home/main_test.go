@@ -165,6 +165,79 @@ func TestApplyConfigEventDoesNotSynchronizeRESPInFlightLimitsWhenRuntimeApplyFai
 	}
 }
 
+func TestRunLifecycleInitializationRequiresImportedConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		configured    bool
+		wantLifecycle int64
+	}{
+		{name: "empty startup"},
+		{name: "failed import", args: []string{"-import", "-config", "missing.yaml"}},
+		{name: "configured legacy startup", configured: true, wantLifecycle: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "home.db")
+			if test.configured {
+				db, errOpen := cluster.OpenSQLite(t.Context(), dbPath)
+				if errOpen != nil {
+					t.Fatal(errOpen)
+				}
+				sqlDB, errDB := db.DB()
+				if errDB != nil {
+					t.Fatal(errDB)
+				}
+				if errMigrate := cluster.AutoMigrate(db); errMigrate != nil {
+					t.Fatal(errMigrate)
+				}
+				// Stop at runtime config validation, after legacy lifecycle initialization.
+				if errUpsert := cluster.NewRepository(db).UpsertConfigValue(t.Context(), "port", "invalid-port"); errUpsert != nil {
+					t.Fatal(errUpsert)
+				}
+				if errClose := sqlDB.Close(); errClose != nil {
+					t.Fatal(errClose)
+				}
+			}
+
+			t.Chdir(dir)
+			oldArgs := os.Args
+			oldCommandLine := flag.CommandLine
+			os.Args = append([]string{"home", "-sqlite-path", dbPath}, test.args...)
+			flag.CommandLine = flag.NewFlagSet("home", flag.ContinueOnError)
+			t.Cleanup(func() {
+				os.Args = oldArgs
+				flag.CommandLine = oldCommandLine
+			})
+			if exitCode := run(); exitCode != 1 {
+				t.Fatalf("run() exit code = %d, want 1", exitCode)
+			}
+
+			db, errOpen := cluster.OpenSQLite(t.Context(), dbPath)
+			if errOpen != nil {
+				t.Fatal(errOpen)
+			}
+			sqlDB, errDB := db.DB()
+			if errDB != nil {
+				t.Fatal(errDB)
+			}
+			t.Cleanup(func() {
+				if errClose := sqlDB.Close(); errClose != nil {
+					t.Errorf("close database: %v", errClose)
+				}
+			})
+			var count int64
+			if errCount := db.Model(&cluster.LifecycleConfigRecord{}).Count(&count).Error; errCount != nil {
+				t.Fatal(errCount)
+			}
+			if count != test.wantLifecycle {
+				t.Fatalf("lifecycle rows = %d, want %d", count, test.wantLifecycle)
+			}
+		})
+	}
+}
+
 func TestRunExportUsesConfiguredHeartbeatTimeout(t *testing.T) {
 	const heartbeatTimeout = 30 * time.Second
 

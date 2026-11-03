@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -350,4 +351,123 @@ func TestServeMalformedTLSAndListenerClose(t *testing.T) {
 		t.Fatal(errServe)
 	}
 	assertClosed(t, idle)
+}
+
+func TestServeNotBlockedByIdleConnectionAndRecoversPanic(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("failed to listen: %v", errListen)
+	}
+	defer func() {
+		if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			t.Errorf("close listener: %v", errClose)
+		}
+	}()
+
+	var routed atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routed.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	httpLn := NewListener(listener.Addr(), 1024)
+	defer func() {
+		if errClose := httpLn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			t.Errorf("close http mux listener: %v", errClose)
+		}
+	}()
+
+	httpSrv := &http.Server{Handler: handler}
+	httpErrCh := make(chan error, 1)
+	go func() {
+		httpErrCh <- NormalizeServeError(httpSrv.Serve(httpLn))
+	}()
+	defer func() {
+		if errClose := httpSrv.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			t.Errorf("close http server: %v", errClose)
+		}
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NormalizeServeError(Serve(context.Background(), listener, httpLn, func(conn net.Conn) {
+			panic("simulated synchronous RESP callback panic")
+		}, nil, nil))
+	}()
+
+	// Open an idle TCP connection that never sends any bytes.
+	idleConn, errDialIdle := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	if errDialIdle != nil {
+		t.Fatalf("failed to dial idle connection: %v", errDialIdle)
+	}
+	defer func() {
+		if errClose := idleConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			t.Errorf("close idle connection: %v", errClose)
+		}
+	}()
+
+	// Trigger a RESP connection whose callback panics synchronously inside setupConn.
+	respConn, errDialRESP := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	if errDialRESP != nil {
+		t.Fatalf("failed to dial resp connection: %v", errDialRESP)
+	}
+	defer func() {
+		if errClose := respConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			t.Errorf("close resp connection: %v", errClose)
+		}
+	}()
+	if errDeadline := respConn.SetDeadline(time.Now().Add(2 * time.Second)); errDeadline != nil {
+		t.Fatalf("set resp connection deadline: %v", errDeadline)
+	}
+	if _, errWrite := respConn.Write([]byte("*1\r\n")); errWrite != nil {
+		t.Fatalf("write resp prefix: %v", errWrite)
+	}
+	var buf [1]byte
+	_, errRead := respConn.Read(buf[:])
+	if errRead == nil {
+		t.Fatal("expected panicking RESP connection to be closed by recovery")
+	}
+	if netErr, ok := errRead.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("expected panicking RESP connection to be closed immediately, got read timeout: %v", errRead)
+	}
+
+	// Send a real HTTP request and verify the accept loop is still alive.
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, errGet := client.Get("http://" + listener.Addr().String() + "/")
+	if errGet != nil {
+		t.Fatalf("HTTP request failed: %v", errGet)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Errorf("close response body: %v", errClose)
+		}
+	}()
+
+	if routed.Load() == 0 {
+		t.Fatal("expected HTTP request to be routed")
+	}
+
+	if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		t.Fatalf("close listener: %v", errClose)
+	}
+	select {
+	case errServe := <-errCh:
+		if errServe != nil {
+			t.Fatalf("Serve() returned error: %v", errServe)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Serve() to exit")
+	}
+
+	if errClose := httpLn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		t.Fatalf("close http mux listener: %v", errClose)
+	}
+	select {
+	case errHTTP := <-httpErrCh:
+		if errHTTP != nil {
+			t.Fatalf("httpSrv.Serve() returned error: %v", errHTTP)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for httpSrv.Serve() to exit")
+	}
 }

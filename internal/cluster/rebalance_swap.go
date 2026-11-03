@@ -55,6 +55,9 @@ func planLatencySwap(tx *gorm.DB, gate ClusterMasterGateRecord, now time.Time, h
 		a, b = selectLatencySwap(now, homes, members, clients, samples, retainedSignature)
 	}
 	if a.CertificateFingerprint == "" {
+		if errFirst == gorm.ErrRecordNotFound {
+			return nil
+		}
 		return tx.Where("id = ?", "active").Delete(&CPALatencyConfirmationRecord{}).Error
 	}
 	aHome := HomeIncarnationID{IP: a.HomeIP, Port: a.HomePort, StartedAt: a.HomeStartedAt}
@@ -91,6 +94,9 @@ func planLatencySwap(tx *gorm.DB, gate ClusterMasterGateRecord, now time.Time, h
 	}
 	if errCreate := tx.Create(&plans).Error; errCreate != nil {
 		return errCreate
+	}
+	if trace, ok := tx.Logger.(*gateTransactionTrace); ok {
+		trace.planCount += len(plans)
 	}
 	return tx.Delete(&confirmation).Error
 }

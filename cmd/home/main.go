@@ -235,10 +235,6 @@ func run() int {
 	repo := cluster.NewRepository(clusterDB)
 	clusterRepo = repo
 	nodeCfg := resolveDatabaseNodeConfig(clusterCfg, clusterExists)
-	if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
-		log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
-		return 1
-	}
 	if importState {
 		stats, errImport := cluster.ImportLocalState(runCtx, cluster.ImportOptions{
 			ConfigPath:           configPath,
@@ -261,6 +257,30 @@ func run() int {
 		)
 		return 0
 	}
+	snapshot, errSnapshot := repo.LoadConfigSnapshot(runCtx)
+	if errSnapshot != nil {
+		log.Errorf("failed to load database config snapshot: %v", errSnapshot)
+		return 1
+	}
+	if len(snapshot) == 0 {
+		// Successful imports can persist only lifecycle configuration or credentials.
+		var lifecycleCount int64
+		if errCountLifecycle := clusterDB.WithContext(runCtx).Model(&cluster.LifecycleConfigRecord{}).Where("id = ?", 1).Count(&lifecycleCount).Error; errCountLifecycle != nil {
+			log.Errorf("failed to check database lifecycle configuration: %v", errCountLifecycle)
+			return 1
+		}
+		if lifecycleCount == 0 {
+			var credentialCount int64
+			if errCountAuth := clusterDB.WithContext(runCtx).Model(&cluster.AuthRecord{}).Count(&credentialCount).Error; errCountAuth != nil {
+				log.Errorf("failed to check database credentials: %v", errCountAuth)
+				return 1
+			}
+			if credentialCount == 0 {
+				log.Errorf("database config is empty; run with -import first")
+				return 1
+			}
+		}
+	}
 	if exportState {
 		stats, errExport := cluster.ExportLocalState(runCtx, exportOptionsForDir(exportDir, repo, nodeCfg.HeartbeatTimeout))
 		if errExport != nil {
@@ -270,14 +290,8 @@ func run() int {
 		log.Infof("database export completed config_bytes=%d auth_files=%d", stats.ConfigBytes, stats.AuthFiles)
 		return 0
 	}
-
-	snapshot, errSnapshot := repo.LoadConfigSnapshot(runCtx)
-	if errSnapshot != nil {
-		log.Errorf("failed to load database config snapshot: %v", errSnapshot)
-		return 1
-	}
-	if len(snapshot) == 0 {
-		log.Errorf("database config is empty; run with -import first")
+	if _, errEnsureLifecycle := repo.EnsureLifecycleConfig(runCtx, nodeCfg.HeartbeatTimeout); errEnsureLifecycle != nil {
+		log.Errorf("failed to initialize lifecycle configuration: %v", errEnsureLifecycle)
 		return 1
 	}
 	lastSeenID, runtimeCfg, errRuntimeConfig := loadInitialRuntimeConfig(runCtx, repo)

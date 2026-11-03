@@ -80,6 +80,8 @@ Before using automatic CPA connection rebalancing, upgrade all Home nodes to a v
 
 Set `slow-query-threshold` under the selected `pgsql` or `sqlite` backend to control slow SQL logging. It accepts Go duration strings such as `"500ms"` or `"1s"` and defaults to `"200ms"`.
 
+PostgreSQL pool limits are configured in `cluster.yaml`: `pgsql.max-open-conns` defaults to `0` (unlimited), and `pgsql.max-idle-conns` defaults to `2` (capped by a positive total limit). Explicit `max-idle-conns: 0` disables idle connection retention; an explicit idle limit must not exceed a positive total limit. Limits apply per Home process and require a restart.
+
 `config.yaml` and `auth-dir` are no longer runtime storage. They are import/export exchange formats only. To migrate an existing local setup into the database, run:
 
 ```bash

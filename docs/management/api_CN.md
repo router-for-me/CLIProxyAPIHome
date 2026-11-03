@@ -2511,7 +2511,7 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
 | Form field or query | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | form `file` | file | 是 | Vertex service account JSON。 |
-| form/query `location` | string | 否 | Vertex location；默认 `us-central1`。 |
+| form/query `location` | string | 否 | Vertex location；默认 `global`。 |
 
 输出示例：
 
@@ -2521,7 +2521,7 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
   "auth-file": "11111111-2222-4333-8444-555555555555.json",
   "project_id": "project-id",
   "email": "service-account@example.iam.gserviceaccount.com",
-  "location": "us-central1"
+  "location": "global"
 }
 ```
 

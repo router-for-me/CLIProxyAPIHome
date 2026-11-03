@@ -50,9 +50,11 @@ func TestRebalanceLocksLifetimeBeforeElectionGateAndClock(t *testing.T) {
 			if !rebalanceTestCommand(t, f.handlers[1], f.lifetime(plan), args...) {
 				t.Fatal("command rejected")
 			}
-			want := []string{"cpa_node_membership", "home_process_incarnation", "gate insert", "cluster_master_gate", "database time"}
-			if action == "RESULT" {
-				want = append(want, "cpa_rebalance_clients")
+			want := []string{"cpa_node_membership", "home_process_incarnation", "cluster_rebalance_gate", "cluster_master_gate", "database time"}
+			if action == "CLAIM" {
+				want = append(want, "cluster_master_gate", "database time")
+			} else if action == "RESULT" {
+				want = append(want, "cpa_rebalance_clients", "database time")
 			} else if action == "LATENCY" {
 				want = []string{"cpa_node_membership", "home_process_incarnation", "cpa_rebalance_clients", "database time"}
 			}

@@ -123,7 +123,7 @@ func TestUsageTokenAccountingPendingQueriesUseLiteralVersion(t *testing.T) {
 func TestDatabaseSnapshotIndexOnlyVersionsRemainCompatible(t *testing.T) {
 	t.Parallel()
 
-	for _, version := range []int{6, 7, 8, 9, currentDatabaseVersion} {
+	for _, version := range []int{6, 7, 8, 9, 10, 11, 12, 13, currentDatabaseVersion} {
 		models, okModels := databaseSnapshotModels(version)
 		if !okModels || len(models) != len(homeDatabaseModels) {
 			t.Fatalf("snapshot version %d registry is incompatible", version)

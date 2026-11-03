@@ -333,8 +333,11 @@ func BenchmarkPlanLatencySwapUnderGate(b *testing.B) {
 						b.Error(errClose)
 					}
 				})
-				if errMigrate := db.AutoMigrate(&ClusterMasterGateRecord{}, &CPALatencyConfirmationRecord{}); errMigrate != nil {
+				if errMigrate := db.AutoMigrate(&ClusterMasterGateRecord{}, &ClusterRebalanceGateRecord{}, &CPALatencyConfirmationRecord{}); errMigrate != nil {
 					b.Fatal(errMigrate)
+				}
+				if errCreate := db.Create(&ClusterMasterGateRecord{ID: 1}).Error; errCreate != nil {
+					b.Fatal(errCreate)
 				}
 				if retained {
 					confirmation := CPALatencyConfirmationRecord{ID: "active", Signature: latencySwapSignature(f.members[0], f.members[1]), FirstSeenAt: f.now, UpdatedAt: f.now}

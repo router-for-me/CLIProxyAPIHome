@@ -82,9 +82,21 @@ func setupConn(ctx context.Context, conn net.Conn, httpListener *Listener, onRES
 	defer cancel()
 	stopClose := context.AfterFunc(setupCtx, func() { closeMuxConn(conn) })
 	handedOff := false
+	routedConn := conn
 	defer func() {
+		if recovered := recover(); recovered != nil {
+			var remoteAddr net.Addr
+			if conn != nil {
+				remoteAddr = conn.RemoteAddr()
+			}
+			log.Errorf("protocol mux: panic while routing connection from %v: %v", remoteAddr, recovered)
+			handedOff = false
+		}
 		stopClose()
 		if !handedOff {
+			if routedConn != nil && routedConn != conn {
+				closeMuxConn(routedConn)
+			}
 			closeMuxConn(conn)
 		}
 	}()
@@ -96,6 +108,7 @@ func setupConn(ctx context.Context, conn net.Conn, httpListener *Listener, onRES
 	if errClassify != nil || !stopClose() || setupCtx.Err() != nil {
 		return
 	}
+	routedConn = routed
 	// Setup deadlines must not leak into established HTTP/2 or RESP sessions.
 	if errDeadline := routed.SetDeadline(time.Time{}); errDeadline != nil {
 		return

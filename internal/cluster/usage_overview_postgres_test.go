@@ -68,7 +68,7 @@ func TestUsageObservabilityOverviewPostgres(t *testing.T) {
 			record.TokenAccountingQuality = UsageTokenAccountingQualityInconsistent
 		}
 		if i%13 == 0 {
-			record.APIKey, record.AuthType, record.Endpoint = "missing-key", "api_key", "/v1/chat/completions"
+			record.APIKey, record.AuthType, record.Endpoint, record.HomeIP = "missing-key", "api_key", "/v1/chat/completions", "192.0.2.2"
 		}
 		records = append(records, record)
 	}
@@ -90,25 +90,31 @@ func TestUsageObservabilityOverviewPostgres(t *testing.T) {
 	}
 
 	for _, filter := range []struct {
-		name, provider, model, credentialType string
+		name, provider, model, credentialType, homeIP, endpoint string
 	}{
 		{name: "all"},
 		{name: "provider", provider: "claude"},
 		{name: "model", model: "model-02"},
 		{name: "credential type", credentialType: "api_key"},
+		{name: "home", homeIP: "192.0.2.2"},
+		{name: "endpoint", endpoint: "chat/completions"},
+		{name: "combined", provider: "claude", credentialType: "api_key", homeIP: "192.0.2.2", endpoint: "chat/completions"},
 		{name: "empty", provider: "missing"},
 	} {
 		t.Run(filter.name, func(t *testing.T) {
 			query := UsageObservabilityOverviewQuery{From: &from, To: &to, Interval: "hour", Timezone: "Asia/Shanghai",
-				Provider: filter.provider, Model: filter.model, CredentialType: filter.credentialType}
+				Provider: filter.provider, Model: filter.model, CredentialType: filter.credentialType, HomeIP: filter.homeIP, Endpoint: filter.endpoint}
 			counter := &overviewQueryCounter{Interface: logger.Default.LogMode(logger.Silent)}
 			countedRepo := NewRepository(db.Session(&gorm.Session{Logger: counter}))
 			got, errOverview := countedRepo.UsageObservabilityOverview(ctx, query)
 			if errOverview != nil {
 				t.Fatal(errOverview)
 			}
-			if counter.count > 12 {
-				t.Fatalf("overview executed %d queries, want at most 12", counter.count)
+			if counter.count > 11 {
+				t.Fatalf("overview executed %d queries, want at most 11", counter.count)
+			}
+			if filter.name == "all" && counter.count != 11 {
+				t.Fatalf("nonempty overview executed %d queries, want 11", counter.count)
 			}
 			recordQuery := usageObservabilityOverviewRecordQuery(query)
 			wantTop, errTop := usageObservabilityTopSQL(db, recordQuery)

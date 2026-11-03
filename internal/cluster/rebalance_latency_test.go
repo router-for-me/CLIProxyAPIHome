@@ -21,10 +21,11 @@ func latencyTestState(t *testing.T, f *rebalanceFixture) (ClusterMasterGateRecor
 	if errFirst := f.repo.db.First(&gate, "id = ?", 1).Error; errFirst != nil {
 		t.Fatal(errFirst)
 	}
-	homes, errHomes := loadRebalanceHomes(f.repo.db, now, defaultHeartbeatTimeout)
+	snapshot, errHomes := loadRebalanceHomes(f.repo.db, now, defaultHeartbeatTimeout)
 	if errHomes != nil {
 		t.Fatal(errHomes)
 	}
+	homes := snapshot.homes
 	members, loads, errMembers := loadRebalanceMembers(f.repo.db, homes, now)
 	if errMembers != nil {
 		t.Fatal(errMembers)

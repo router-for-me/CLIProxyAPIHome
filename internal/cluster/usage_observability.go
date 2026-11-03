@@ -1973,15 +1973,24 @@ func usageObservabilityPreAggregatedSQLOrder(metric string, direction string) st
 	return metricColumn + " " + sortDirection + ", scoped.last_used_at DESC, scoped.aggregate_label ASC"
 }
 
-func usageObservabilityAggregateP95Query(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string) *gorm.DB {
+func usageObservabilityAggregateP95Query(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string, aggregateIDs ...string) *gorm.DB {
 	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
-	ranked := db.Table("(?) AS scoped_latency", base).
-		Select(`
+	scope := db.Table("(?) AS scoped_latency", base).
+		Where("scoped_latency.latency_ms >= ?", 0)
+	if len(aggregateIDs) > 0 {
+		scope = scope.Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
+	}
+	if usageObservabilityIsPostgres(db) {
+		// Match nearest-rank semantics without numbering every row in each partition.
+		return scope.Select("scoped_latency.aggregate_id AS aggregate_id, " +
+			usageObservabilityPostgresPercentile("scoped_latency.latency_ms", 95) + " AS p95_latency_ms").
+			Group("scoped_latency.aggregate_id")
+	}
+	ranked := scope.Select(`
 			scoped_latency.aggregate_id AS aggregate_id,
 			scoped_latency.latency_ms AS latency_ms,
 			COUNT(*) OVER (PARTITION BY scoped_latency.aggregate_id) AS latency_count,
-			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`).
-		Where("scoped_latency.latency_ms >= ?", 0)
+			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`)
 	return db.Table("(?) AS ranked_latency", ranked).
 		Select("ranked_latency.aggregate_id AS aggregate_id, MIN(ranked_latency.latency_ms) AS p95_latency_ms").
 		Where("ranked_latency.latency_rank * 100 >= ranked_latency.latency_count * 95").
@@ -1992,24 +2001,11 @@ func usageObservabilityAggregateP95Values(db *gorm.DB, query UsageObservabilityR
 	if len(aggregateIDs) == 0 {
 		return map[string]sql.NullFloat64{}, nil
 	}
-	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
-	ranked := db.Table("(?) AS scoped_latency", base).
-		Select(`
-			scoped_latency.aggregate_id AS aggregate_id,
-			scoped_latency.latency_ms AS latency_ms,
-			COUNT(*) OVER (PARTITION BY scoped_latency.aggregate_id) AS latency_count,
-			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`).
-		Where("scoped_latency.latency_ms >= ?", 0).
-		Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
-
 	var rows []struct {
 		AggregateID  string          `gorm:"column:aggregate_id"`
 		P95LatencyMS sql.NullFloat64 `gorm:"column:p95_latency_ms"`
 	}
-	if errScan := db.Table("(?) AS ranked_latency", ranked).
-		Select("ranked_latency.aggregate_id AS aggregate_id, MIN(ranked_latency.latency_ms) AS p95_latency_ms").
-		Where("ranked_latency.latency_rank * 100 >= ranked_latency.latency_count * 95").
-		Group("ranked_latency.aggregate_id").
+	if errScan := usageObservabilityAggregateP95Query(db, query, groupBy, aggregateIDs...).
 		Scan(&rows).Error; errScan != nil {
 		return nil, errScan
 	}
@@ -2092,7 +2088,30 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		%s AS metadata_auth_disabled,
 		%s AS metadata_auth_unavailable,
 		"usage"."provider" AS metadata_provider,
-		CASE WHEN "usage"."failed" THEN 'failed' ELSE 'success' END AS metadata_status,
+		CASE WHEN "usage"."failed" THEN 'failed' ELSE 'success' END AS metadata_status`,
+		idExpr,
+		labelExpr,
+		clientUserIDExpr,
+		usernameExpr,
+		clientAPIKeyIDExpr,
+		clientAPIKeyLabelExpr,
+		clientAPIKeyMaskedExpr,
+		credentialTypeExpr,
+		credentialIDExpr,
+		authIndexExpr,
+		credentialProviderExpr,
+		credentialLabelExpr,
+		authUUIDExpr,
+		authNextRetryAtExpr,
+		authStatusExpr,
+		authDisabledExpr,
+		authUnavailableExpr,
+	) + "," + usageObservabilityAggregateMetricsBaseSelect()
+}
+
+// Share row-level token normalization across ordinary and combined rankings.
+func usageObservabilityAggregateMetricsBaseSelect() string {
+	return fmt.Sprintf(`
 		"usage"."timestamp" AS timestamp,
 		"usage"."latency_ms" AS latency_ms,
 		"usage"."failed" AS failed,
@@ -2117,23 +2136,6 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		%s AS cache_rate_tokens,
 		%s AS cache_rate_total_tokens,
 		"billing_charge"."amount" AS amount`,
-		idExpr,
-		labelExpr,
-		clientUserIDExpr,
-		usernameExpr,
-		clientAPIKeyIDExpr,
-		clientAPIKeyLabelExpr,
-		clientAPIKeyMaskedExpr,
-		credentialTypeExpr,
-		credentialIDExpr,
-		authIndexExpr,
-		credentialProviderExpr,
-		credentialLabelExpr,
-		authUUIDExpr,
-		authNextRetryAtExpr,
-		authStatusExpr,
-		authDisabledExpr,
-		authUnavailableExpr,
 		usageObservabilitySQLDisplayTokens(`"usage"`, "input_tokens"),
 		usageObservabilitySQLDisplayTokens(`"usage"`, "output_tokens"),
 		usageObservabilitySQLCacheReadTokens(`"usage"`),
@@ -2234,7 +2236,7 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 	if includeP95 {
 		p95Select = "MAX(p95.p95_latency_ms) AS p95_latency_ms"
 	}
-	return fmt.Sprintf(`
+	return `
 		scoped.aggregate_id AS aggregate_id,
 		COALESCE(NULLIF(MAX(scoped.aggregate_label), ''), scoped.aggregate_id) AS aggregate_label,
 		MAX(scoped.metadata_user_id) AS metadata_user_id,
@@ -2253,7 +2255,12 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 		MAX(CASE WHEN scoped.metadata_auth_disabled THEN 1 ELSE 0 END) AS metadata_auth_disabled,
 		MAX(CASE WHEN scoped.metadata_auth_unavailable THEN 1 ELSE 0 END) AS metadata_auth_unavailable,
 		MAX(scoped.metadata_provider) AS metadata_provider,
-		MAX(scoped.metadata_status) AS metadata_status,
+		MAX(scoped.metadata_status) AS metadata_status,` + usageObservabilityAggregateMetricsSQLSelect(p95Select)
+}
+
+// Keep additive metrics and nullable latency/amount semantics identical for all rankings.
+func usageObservabilityAggregateMetricsSQLSelect(p95Select string) string {
+	return fmt.Sprintf(`
 		COUNT(*) AS request_count,
 		SUM(CASE WHEN scoped.failed THEN 0 ELSE 1 END) AS success_count,
 		SUM(CASE WHEN scoped.failed THEN 1 ELSE 0 END) AS failed_count,

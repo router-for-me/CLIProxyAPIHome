@@ -210,6 +210,21 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if isRequestScopedNotFoundResultError(result.Error) {
 		return transition
 	}
+	if isStreamTruncatedResultError(result.Error) {
+		// A truncated accepted stream already submitted its generation
+		// upstream; record the failure without cooling the credential/model.
+		state := ensureModelState(auth, resultModel)
+		state.Status = StatusError
+		state.UpdatedAt = now
+		if result.Error != nil {
+			state.LastError = cloneError(result.Error)
+			state.StatusMessage = result.Error.Message
+			auth.LastError = cloneError(result.Error)
+			auth.StatusMessage = result.Error.Message
+		}
+		auth.UpdatedAt = now
+		return transition
+	}
 	state := ensureModelState(auth, resultModel)
 	state.Unavailable = true
 	state.Status = StatusError
@@ -1003,6 +1018,16 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 
 // NewUsageResult creates a new usage result.
 func NewUsageResult(authIndex, provider, model string, statusCode int, body string) Result {
+	return newUsageResultWithCode(authIndex, provider, model, statusCode, body, "")
+}
+
+// NewUsageResultWithCode creates a usage result carrying a structured failure
+// classification (e.g. ErrorCodeStreamTruncated) reported by the downstream.
+func NewUsageResultWithCode(authIndex, provider, model string, statusCode int, body string, code string) Result {
+	return newUsageResultWithCode(authIndex, provider, model, statusCode, body, code)
+}
+
+func newUsageResultWithCode(authIndex, provider, model string, statusCode int, body string, code string) Result {
 	// Keep validation before state changes so failures leave existing data intact.
 	authIndex = strings.TrimSpace(authIndex)
 	provider = strings.TrimSpace(provider)
@@ -1035,10 +1060,17 @@ func NewUsageResult(authIndex, provider, model string, statusCode int, body stri
 		RetryAfter: retryAfter,
 		ResetAt:    resetAt,
 		Error: &Error{
+			Code:       strings.TrimSpace(code),
 			Message:    message,
 			HTTPStatus: statusCode,
 		},
 	}
+}
+
+// isStreamTruncatedResultError reports locally synthesized stream-truncation
+// failures that must not mark the credential/model unavailable.
+func isStreamTruncatedResultError(err *Error) bool {
+	return err != nil && err.Code == ErrorCodeStreamTruncated
 }
 
 func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {

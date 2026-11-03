@@ -14,9 +14,19 @@ func int64Ptr(value int64) *int64 {
 
 func TestBillingDisplayTokensDoNotChangeLedger(t *testing.T) {
 	t.Parallel()
+	t.Run("sqlite", func(t *testing.T) {
+		repo, closeRepo := newBillingTestRepository(t, t.Context())
+		t.Cleanup(closeRepo)
+		assertBillingDisplayTokensDoNotChangeLedger(t, repo)
+	})
+	t.Run("postgres", func(t *testing.T) {
+		assertBillingDisplayTokensDoNotChangeLedger(t, newPostgresQuiescenceRepository(t))
+	})
+}
+
+func assertBillingDisplayTokensDoNotChangeLedger(t *testing.T, repo *Repository) {
+	t.Helper()
 	ctx := context.Background()
-	repo, closeRepo := newBillingTestRepository(t, ctx)
-	defer closeRepo()
 	db, errDB := repo.database()
 	if errDB != nil {
 		t.Fatal(errDB)

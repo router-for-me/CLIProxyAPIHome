@@ -88,7 +88,7 @@ func TestPostgresLatencyCleanupDoesNotWaitForElectionGate(t *testing.T) {
 		t.Fatal(errCreate)
 	}
 	if errTransaction := f.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if _, _, errGate := lockRebalanceGate(tx); errGate != nil {
+		if _, _, errGate := lockMasterGate(tx); errGate != nil {
 			return errGate
 		}
 		for _, purge := range []func(context.Context, time.Time, int) (int64, error){f.repo.PurgeExpiredCPALatencySummaries, f.repo.PurgeExpiredCPALatencyConfirmations} {

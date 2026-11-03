@@ -26,11 +26,24 @@ func usageObservabilityOverviewGroupsPostgres(db *gorm.DB, query UsageObservabil
 		Models: []UsageObservabilityAggregateItem{}, Endpoints: []UsageObservabilityAggregateItem{}, Errors: []UsageObservabilityAggregateItem{},
 	}
 	efficiency := []UsageObservabilityAggregateItem{}
+	var clientRows []struct {
+		Kind int                            `gorm:"column:kind"`
+		Row  usageObservabilityAggregateRow `gorm:"embedded"`
+	}
+	if errScan := usageObservabilityOverviewClientGroupsPostgres(db, query).Scan(&clientRows).Error; errScan != nil {
+		return UsageObservabilityTopGroups{}, nil, errScan
+	}
+	for _, row := range clientRows {
+		if row.Kind == 0 {
+			top.Users = append(top.Users, usageObservabilityAggregateItemFromRow(&row.Row, "user"))
+		} else {
+			top.ClientKeys = append(top.ClientKeys, usageObservabilityAggregateItemFromRow(&row.Row, "client_key"))
+		}
+	}
 	for _, group := range []struct {
 		name  string
 		items *[]UsageObservabilityAggregateItem
 	}{
-		{"user", &top.Users}, {"client_key", &top.ClientKeys},
 		{"provider", &top.Providers}, {"endpoint", &top.Endpoints}, {"status_code", &top.Errors},
 	} {
 		metric := "request_count"
@@ -82,6 +95,52 @@ func usageObservabilityOverviewGroupsPostgres(db *gorm.DB, query UsageObservabil
 		}
 	}
 	return top, efficiency, nil
+}
+
+// usageObservabilityOverviewClientGroupsPostgres shares the detail scan between
+// both client rankings, retaining exact percentiles in the same aggregation pass.
+func usageObservabilityOverviewClientGroupsPostgres(db *gorm.DB, query UsageObservabilityRecordQuery) *gorm.DB {
+	_, keyLabel := usageObservabilityAggregateSQLIdentity("client_key")
+	base := usageObservabilityUsageBillingScope(db.Table("usage"), query).
+		Joins(`LEFT JOIN "api_key" ON "api_key"."api_key" = "usage"."api_key"`).
+		Select(fmt.Sprintf(`
+			COALESCE("billing_charge"."user_id", "api_key"."user_id") AS user_id,
+			COALESCE("billing_charge"."api_key_id", "api_key"."id") AS api_key_id,
+			%s AS client_key_label,
+			COALESCE("billing_charge"."api_key_label", CASE WHEN "api_key"."id" IS NULL THEN '' ELSE 'api-key-' || CAST("api_key"."id" AS TEXT) END) AS api_key_label,
+			"billing_charge"."api_key_masked" AS api_key_masked,
+			%s`, keyLabel, usageObservabilityAggregateMetricsBaseSelect()))
+	// GROUPING distinguishes a genuine unknown identity from the other subtotal.
+	// Keep numeric identities until after grouping and preserve billed ownership
+	// independently of the current API key's user or identity.
+	grouped := db.Table("(?) AS scoped", base).
+		Select(`
+			GROUPING(scoped.user_id) AS kind,
+			CASE WHEN GROUPING(scoped.user_id) = 0 THEN scoped.user_id ELSE scoped.api_key_id END AS numeric_id,
+			MAX(scoped.user_id) AS metadata_user_id,
+			MAX(scoped.api_key_id) AS metadata_api_key_id,
+			MAX(scoped.client_key_label) AS client_key_label,
+			MAX(scoped.api_key_label) AS metadata_api_key_label,
+			MAX(scoped.api_key_masked) AS metadata_api_key_masked,
+			` + usageObservabilityAggregateMetricsSQLSelect(usageObservabilityPostgresPercentile("scoped.latency_ms", 95)+" AS p95_latency_ms")).
+		Group("GROUPING SETS ((scoped.user_id), (scoped.api_key_id))")
+	// Usernames are needed only for grouped users, but must be resolved before
+	// Top N because the existing order uses the display label to break ties.
+	labeled := db.Table("(?) AS grouped", grouped).
+		Joins(`LEFT JOIN "user" ON grouped.kind = 0 AND "user"."id" = grouped.numeric_id`).
+		Select(`grouped.*,
+			COALESCE(CAST(grouped.numeric_id AS TEXT), 'unknown') AS aggregate_id,
+			CASE WHEN grouped.kind = 0
+				THEN COALESCE(NULLIF("user"."username", ''), COALESCE(CAST(grouped.numeric_id AS TEXT), 'unknown'))
+				ELSE grouped.client_key_label END AS aggregate_label,
+			CASE WHEN grouped.kind = 0 THEN "user"."username" ELSE '' END AS metadata_username`)
+	ranked := db.Table("(?) AS labeled", labeled).
+		Select(`labeled.*, ROW_NUMBER() OVER (
+			PARTITION BY kind ORDER BY request_count DESC, last_used_at DESC, aggregate_label ASC
+		) AS rank`)
+	return db.Table("(?) AS ranked", ranked).
+		Where("rank <= ?", 10).
+		Order("kind ASC, rank ASC")
 }
 
 func usageObservabilityOverviewGroupPostgres(db *gorm.DB, query UsageObservabilityRecordQuery, group string) *gorm.DB {

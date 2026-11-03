@@ -110,7 +110,7 @@ func TestPostgresRebalanceInstructionDoesNotWaitForElectionGate(t *testing.T) {
 
 	var payload []byte
 	errTransaction := f.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if _, _, errGate := lockRebalanceGate(tx); errGate != nil {
+		if _, _, errGate := lockMasterGate(tx); errGate != nil {
 			return errGate
 		}
 		// Poll through a separate connection while the election gate remains locked.
