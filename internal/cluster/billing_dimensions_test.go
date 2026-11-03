@@ -24,6 +24,34 @@ func billingDimensionsTestUsage(tokensJSON string) *UsageRecord {
 	}
 }
 
+func TestBillingAdvisorCacheTTLCharges(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	user := newBillingCaseUser(t, repo, "advisor-cache")
+	ttlPrice := 20.0
+	for _, rule := range []BillingModelPriceUpdate{
+		{Provider: "claude", Model: "parent", InputPricePerMillion: 1, Enabled: true},
+		{Provider: "claude", Model: "advisor", CacheWritePricePerMillion: 10, Extra: BillingExtraPrices{CacheWrite1hPricePerMillion: &ttlPrice}, Enabled: true},
+		{Provider: "claude", Model: "advisor-expr", PricingExpr: "cc * 10 + cc1h * 20", Enabled: true},
+	} {
+		if _, errCreate := repo.CreateBillingModelPrice(ctx, rule); errCreate != nil {
+			t.Fatal(errCreate)
+		}
+	}
+	for _, model := range []string{"advisor", "advisor-expr"} {
+		payload := `{"timestamp":"2026-10-27T01:00:00Z","provider":"claude","model":"parent","api_key":"advisor-cache","request_id":"` + model + `","tokens":{"input_tokens":1000,"total_tokens":1000},"iterations":[{"type":"advisor_message","model":"` + model + `","input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":1500,"cache_creation":{"ephemeral_5m_input_tokens":500,"ephemeral_1h_input_tokens":1000}}]}`
+		if _, errUsage := repo.AppendUsage(ctx, payload, "192.0.2.1"); errUsage != nil {
+			t.Fatal(errUsage)
+		}
+		charge, ok := billingCaseCharges(t, repo, user.ID)[model]
+		if !ok || charge.Amount != 0.026 || math.Abs(charge.BalanceBefore-charge.BalanceAfter-0.026) > 1e-10 {
+			t.Errorf("%s: found=%v amount=%v balance=%v -> %v, want delta 0.026; breakdown=%s", model, ok, charge.Amount, charge.BalanceBefore, charge.BalanceAfter, charge.CostBreakdown)
+		}
+	}
+}
+
 func TestBillingExtraDimensionsFallBackToParentPrices(t *testing.T) {
 	t.Parallel()
 

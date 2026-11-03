@@ -1745,7 +1745,7 @@ Query 参数：
 
 支持 `+ - * /`、比较运算、`&& || !` 以及 `cond ? a : b`。示例：`len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`；峰谷示例：`(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`。
 
-表达式未引用的 token 桶会在求值前并入父桶，保证不漏计：`cc12h` 并入 `cc1h`（或 `cc`），`cc1h` 并入 `cc`，`cc`、`cr`、`img`、`ai` 并入 `p`，`imgo`、`ao`、`r` 并入 `c`。如需某桶免费，需显式引用，例如 `cr * 0`。保存时会校验语法、变量与函数名、时区字面量，并用样例数据求值，结果必须为有限非负数，否则返回 `400 invalid_body`。扣费时若求值失败（如除零），Home 改用规则价格列计费并标记 `cost_diagnostic: pricing_expr_error`，错误写入 `cost_breakdown.expression_error`。成功的扣费会记录 `price_snapshot.pricing_expr`、`cost_breakdown.pricing_expr`、并桶后的 token 数（`expr:<name>` 项）以及结果（`expression` 项）。用户价格阶梯在使用表达式的档位上返回 `pricing_expr`。
+文本缓存 `ct` 从缓存读取桶拆出，并限制在扣除图片/音频缓存读取后的剩余 token 数内，避免重复计费。表达式未引用的 token 桶会在求值前并入父桶，保证不漏计：`ct` 并入 `cr`，`cc12h` 并入 `cc1h`（或 `cc`），`cc1h` 并入 `cc`，`cc`、`cr`、`img`、`ai` 并入 `p`，`imgo`、`ao`、`r` 并入 `c`。如需某桶免费，需显式引用，例如 `cr * 0`。保存时会校验语法、变量与函数名、时区字面量，并用样例数据求值，结果必须为有限非负数，否则返回 `400 invalid_body`。扣费时若求值失败（如除零），Home 改用规则价格列计费并标记 `cost_diagnostic: pricing_expr_error`，错误写入 `cost_breakdown.expression_error`。成功的扣费会记录 `price_snapshot.pricing_expr`、`cost_breakdown.pricing_expr`、并桶后的 token 数（`expr:<name>` 项）以及结果（`expression` 项）。用户价格阶梯在使用表达式的档位上返回 `pricing_expr`。
 
 ### POST `/billing/model-prices`
 
@@ -1831,6 +1831,8 @@ OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表�
 扣费 `price_snapshot` 审计数据包含 `requested_service_tier`、可选的 `response_service_tier`、`service_tier_source`、`effective_service_tier`、`response_tier_fallback`、`matched_service_tier`、`min_input_tokens`、`context_input_tokens` 和 `price_model_source`（`model` 或 `alias`，未命中规则时省略）。上下文分段使用 `context_input_tokens`，即包含 cache-read 和 cache-write 的完整提示上下文，因此缓存命中率高的 Anthropic usage 与等长未缓存请求会命中同一分段。在 OpenAI Responses 协议中，`input_tokens` 已包含 cache-read 和 cache-write token。Home 会先从普通 input 中扣除 cache-read token，再应用 cache-read 价格；当 `cache_write_price_per_million` 大于零时，也会先从普通 input 中扣除 cache-write token，再应用独立的 cache-write 价格；价格为零或未提供时，这些 cache-write token 仍按普通 input 计费。在 Anthropic Messages 协议中，`input_tokens`、`cache_read_input_tokens` 和 `cache_creation_input_tokens` 是相互独立的 bucket，因此 Home 会分别计费，不会从 input 中扣除任何 cache bucket。cache 字段兼容回填只更新 usage 计数；已有不可变 `billing_charge` 快照和余额不会自动重算，历史修正需要显式、可审计的余额调整。
 
 ### POST `/billing/model-prices/import/preview`
+
+OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考及缓存写入 TTL token 单价。可选 token 单价未设置时使用父桶单价，显式为零时保持免费；即使其他分支配置了同一细分维度，也不会漏计。
 
 创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 自动从已有 usage 与价格规则发现模型）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
 

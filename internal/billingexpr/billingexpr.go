@@ -277,6 +277,7 @@ func (p *Program) FoldTokens(numbers map[string]float64) {
 		move(VarCacheWrite1h, VarCacheWrite)
 	}
 	move(VarCacheWrite30m, VarCacheWrite)
+	move(VarCachedText, VarCacheRead)
 	move(VarImageCacheRead, VarCacheRead)
 	move(VarAudioCacheRead, VarCacheRead)
 	move(VarCacheWrite, VarInput)

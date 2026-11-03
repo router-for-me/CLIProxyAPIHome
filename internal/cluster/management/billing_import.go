@@ -712,21 +712,39 @@ func openRouterOverrideTimeCondition(ov map[string]any) string {
 }
 
 func openRouterLinearTokenExpr(c *cluster.BillingModelPriceImportCost) string {
-	terms := []string{
-		fmt.Sprintf("p * %g", c.Input),
-		fmt.Sprintf("c * %g", c.Output),
+	priceOr := func(price *float64, fallback float64) float64 {
+		if price != nil {
+			return *price
+		}
+		return fallback
 	}
-	if c.CacheRead > 0 {
-		terms = append(terms, fmt.Sprintf("cr * %g", c.CacheRead))
+	cacheWrite := c.CacheWrite
+	if cacheWrite <= 0 {
+		cacheWrite = c.Input
 	}
-	if c.CacheWrite > 0 {
-		terms = append(terms, fmt.Sprintf("cc * %g", c.CacheWrite))
-	}
-	if c.CacheWrite1h != nil && *c.CacheWrite1h > 0 {
-		terms = append(terms, fmt.Sprintf("cc1h * %g", *c.CacheWrite1h))
-	}
-	if c.Reasoning != nil && *c.Reasoning > 0 {
-		terms = append(terms, fmt.Sprintf("r * %g", *c.Reasoning))
+	cacheWrite30m := priceOr(c.CacheWrite30m, cacheWrite)
+	// Variable references are collected across all branches before folding.
+	// Emit every token dimension in each branch, including explicit zero prices
+	// and parent fallbacks, so a reference in another branch cannot drop tokens.
+	var terms []string
+	for _, bucket := range []struct {
+		name  string
+		price float64
+	}{
+		{"p", c.Input},
+		{"c", c.Output},
+		{"cr", c.CacheRead},
+		{"cc", cacheWrite},
+		{"cc30m", cacheWrite30m},
+		{"cc1h", priceOr(c.CacheWrite1h, cacheWrite)},
+		{"cc12h", priceOr(c.CacheWrite12h, priceOr(c.CacheWrite1h, cacheWrite30m))},
+		{"r", priceOr(c.Reasoning, c.Output)},
+		{"img", priceOr(c.ImageInput, c.Input)},
+		{"imgo", priceOr(c.ImageOutput, c.Output)},
+		{"ai", priceOr(c.AudioInput, c.Input)},
+		{"ao", priceOr(c.AudioOutput, c.Output)},
+	} {
+		terms = append(terms, fmt.Sprintf("%s * %g", bucket.name, bucket.price))
 	}
 	if c.Request > 0 {
 		terms = append(terms, fmt.Sprintf("req * usd(%g)", c.Request))

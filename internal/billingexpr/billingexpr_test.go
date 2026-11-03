@@ -55,14 +55,14 @@ func TestEvalTieredAndConditionalPricing(t *testing.T) {
 func TestFoldTokensNeverDropsUnreferencedBuckets(t *testing.T) {
 	t.Parallel()
 
-	numbers := map[string]float64{"p": 100, "c": 10, "r": 5, "cr": 50, "cc": 20, "cc1h": 7, "cc12h": 3, "img": 40, "imgo": 2, "ai": 1, "ao": 1}
+	numbers := map[string]float64{"p": 100, "c": 10, "r": 5, "cr": 50, "ct": 30, "cc": 20, "cc1h": 7, "cc12h": 3, "img": 40, "imgo": 2, "ai": 1, "ao": 1}
 	// Only p and c are priced, so every other bucket folds into them.
 	got := evalUSD(t, "p * 1 + c * 1", numbers, nil, time.Time{})
-	if want := (100.0 + 50 + 20 + 7 + 3 + 40 + 1 + 10 + 5 + 2 + 1) / 1e6; math.Abs(got-want) > 1e-15 {
+	if want := (100.0 + 50 + 30 + 20 + 7 + 3 + 40 + 1 + 10 + 5 + 2 + 1) / 1e6; math.Abs(got-want) > 1e-15 {
 		t.Fatalf("folded = %v, want %v", got, want)
 	}
 	// Referenced buckets keep their own coefficient; cc12h folds into cc1h when cc1h is priced.
-	numbers = map[string]float64{"p": 100, "cr": 50, "cc1h": 7, "cc12h": 3, "r": 5, "c": 10}
+	numbers = map[string]float64{"p": 100, "cr": 50, "ct": 30, "cc1h": 7, "cc12h": 3, "r": 5, "c": 10}
 	got = evalUSD(t, "p * 1 + cr * 0 + cc1h * 2 + c * 1 + r * 3", numbers, nil, time.Time{})
 	if want := (100.0 + 0 + 20 + 10 + 15) / 1e6; math.Abs(got-want) > 1e-15 {
 		t.Fatalf("partial fold = %v, want %v", got, want)

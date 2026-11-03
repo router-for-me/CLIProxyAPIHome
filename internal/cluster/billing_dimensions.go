@@ -381,6 +381,7 @@ func billingApplyAdvisorIterationsTx(ctx context.Context, tx *gorm.DB, usage *Us
 			AccountingOutputTokens:     outputTokens,
 			NonReasoningOutputTokens:   nonReasoning,
 			AccountingReasoningTokens:  reasoningTokens,
+			TokensJSON:                 JSONB(gjson.GetBytes(iterPayload, "tokens").Raw),
 			PayloadJSON:                JSONB(iterPayload),
 		}
 		_, iterSnapshot, errSnap := billingPriceSnapshotForUsage(ctx, tx, iterUsage)

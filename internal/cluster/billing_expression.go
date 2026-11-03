@@ -34,7 +34,6 @@ func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
 		billingexpr.VarImages:                 float64(unitDetails.Images),
 		billingexpr.VarAudioSeconds:           unitDetails.AudioSeconds,
 		billingexpr.VarUpstreamCost:           unitDetails.UpstreamCost,
-		billingexpr.VarCachedText:             float64(unitDetails.CachedText),
 		billingexpr.VarAcceptedPrediction:     float64(unitDetails.AcceptedPrediction),
 		billingexpr.VarRejectedPrediction:     float64(unitDetails.RejectedPrediction),
 	}
@@ -51,8 +50,10 @@ func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
 				inputTokens = 0
 			}
 		}
+		cachedText := clampBillingTokens(unitDetails.CachedText, cacheReadTokens)
+		numbers[billingexpr.VarCachedText] = float64(cachedText)
 		numbers[billingexpr.VarInput] = float64(inputTokens)
-		numbers[billingexpr.VarCacheRead] = float64(cacheReadTokens)
+		numbers[billingexpr.VarCacheRead] = float64(cacheReadTokens - cachedText)
 		numbers[billingexpr.VarCacheWrite] = float64(usage.CacheCreationTokens)
 		numbers[billingexpr.VarOutput] = float64(usage.OutputTokens)
 		numbers[billingexpr.VarTotalTokens] = float64(usage.TotalTokens)
@@ -67,6 +68,7 @@ func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
 	cacheWrite12h := clampBillingTokens(details.CacheWrite12h, cacheWrite-cacheWrite30m-cacheWrite1h)
 	imageCacheRead := clampBillingTokens(details.ImageCacheRead, cacheRead)
 	audioCacheRead := clampBillingTokens(details.AudioCacheRead, cacheRead-imageCacheRead)
+	cachedText := clampBillingTokens(details.CachedText, cacheRead-imageCacheRead-audioCacheRead)
 	rawImageInput := details.ImageInput
 	if rawImageInput >= imageCacheRead && imageCacheRead > 0 {
 		rawImageInput -= imageCacheRead
@@ -90,7 +92,8 @@ func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
 	numbers[billingexpr.VarFileInput] = float64(fileInput)
 	numbers[billingexpr.VarImageCacheRead] = float64(imageCacheRead)
 	numbers[billingexpr.VarAudioCacheRead] = float64(audioCacheRead)
-	numbers[billingexpr.VarCacheRead] = float64(cacheRead - imageCacheRead - audioCacheRead)
+	numbers[billingexpr.VarCachedText] = float64(cachedText)
+	numbers[billingexpr.VarCacheRead] = float64(cacheRead - imageCacheRead - audioCacheRead - cachedText)
 	numbers[billingexpr.VarCacheWrite] = float64(cacheWrite - cacheWrite30m - cacheWrite1h - cacheWrite12h)
 	numbers[billingexpr.VarCacheWrite30m] = float64(cacheWrite30m)
 	numbers[billingexpr.VarCacheWrite1h] = float64(cacheWrite1h)
@@ -178,7 +181,7 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 	for _, name := range []string{
 		billingexpr.VarInput, billingexpr.VarImageInput, billingexpr.VarAudioInput,
 		billingexpr.VarVideoInput, billingexpr.VarFileInput, billingexpr.VarImageCacheRead,
-		billingexpr.VarAudioCacheRead, billingexpr.VarCacheRead,
+		billingexpr.VarAudioCacheRead, billingexpr.VarCachedText, billingexpr.VarCacheRead,
 		billingexpr.VarCacheWrite, billingexpr.VarCacheWrite30m, billingexpr.VarCacheWrite1h,
 		billingexpr.VarCacheWrite12h, billingexpr.VarOutput, billingexpr.VarReasoning,
 		billingexpr.VarImageOutput, billingexpr.VarAudioOutput, billingexpr.VarVideoOutput,
