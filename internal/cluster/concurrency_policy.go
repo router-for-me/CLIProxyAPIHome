@@ -203,6 +203,9 @@ func (r *Repository) patchCredentialConcurrencyPolicyWithAuthScopeTx(ctx context
 	if errNormalize != nil {
 		return errNormalize
 	}
+	if errHook := recordConcurrencyContenderBackendPID(ctx, tx); errHook != nil {
+		return errHook
+	}
 	auth := AuthRecord{}
 	authQuery := tx.Clauses(clause.Locking{Strength: "UPDATE"})
 	if includeRetiredAuth {
@@ -219,9 +222,6 @@ func (r *Repository) patchCredentialConcurrencyPolicyWithAuthScopeTx(ctx context
 		return ErrConcurrencyCredentialNotFound
 	}
 	recordConcurrencyPolicyLock(ctx, "auth")
-	if errHook := recordConcurrencyContenderBackendPID(ctx, tx); errHook != nil {
-		return errHook
-	}
 	waitForConcurrencyPolicyPatchAuthLockAcquired(ctx)
 	if concurrencyPolicyPatchCanActivate(normalized) {
 		if errSafety := verifyConcurrencyPolicyActivation(ctx, tx, lifecycle.NodeHeartbeatTimeout); errSafety != nil {

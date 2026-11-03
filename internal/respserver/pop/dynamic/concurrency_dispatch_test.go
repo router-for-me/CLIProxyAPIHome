@@ -384,3 +384,39 @@ func TestConcurrencyRetryAfterMSUsesRuntimeConfigBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleAuthSkipsUnavailableCredential(t *testing.T) {
+	for _, session := range []string{"", "sticky"} {
+		t.Run(session, func(t *testing.T) {
+			runtime, admitter := newConcurrencyDispatchRuntime(t, []string{"cred-a", "cred-b"})
+			env := protocolOneDispatchEnv(runtime, "fp-a")
+			request := `{"type":"auth","model":"gpt","session_id":"` + session + `","concurrency_protocol":1,"headers":{"x-api-key":"dispatch-client-key"}}`
+			first := handleAuth(context.Background(), env, []string{"RPOP", "auth", request})
+			if gjson.GetBytes(first.BulkString, "auth.id").String() != "cred-a" {
+				t.Fatalf("initial reply = %s", first.BulkString)
+			}
+			admitter.SetResult("cred-a", concurrencyError("auth_unavailable"))
+			reply := handleAuth(context.Background(), env, []string{"RPOP", "auth", request})
+			if gjson.GetBytes(reply.BulkString, "auth.id").String() != "cred-b" {
+				t.Fatalf("reply = %s", reply.BulkString)
+			}
+			requests := admitter.Requests()
+			if len(requests) != 3 || requests[1].CredentialID != "cred-a" || requests[2].CredentialID != "cred-b" {
+				t.Fatalf("requests = %#v", requests)
+			}
+		})
+	}
+}
+
+func TestHandleAuthUnavailableCandidatesReturnMeaningfulError(t *testing.T) {
+	runtime, admitter := newConcurrencyDispatchRuntime(t, []string{"cred-a", "cred-b"})
+	admitter.SetResult("cred-a", concurrencyError("auth_unavailable"))
+	admitter.SetResult("cred-b", concurrencyError("auth_unavailable"))
+	reply := handleAuth(context.Background(), protocolOneDispatchEnv(runtime, "fp-a"), []string{"RPOP", "auth", `{"type":"auth","model":"gpt","concurrency_protocol":1,"headers":{"x-api-key":"dispatch-client-key"}}`})
+	if gjson.GetBytes(reply.BulkString, "error.type").String() != "auth_unavailable" || gjson.GetBytes(reply.BulkString, "error.message").String() != "credential is unavailable" || gjson.GetBytes(reply.BulkString, "error.retry_after_ms").Exists() {
+		t.Fatalf("reply = %s", reply.BulkString)
+	}
+	if admitter.Calls() != 2 {
+		t.Fatalf("calls = %d", admitter.Calls())
+	}
+}
