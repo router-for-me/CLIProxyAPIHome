@@ -254,11 +254,13 @@ func parseBillingModelPriceImportCatalog(raw []byte, sourceURL string, fetchedAt
 				continue
 			}
 			costRaw := billingImportRecordValue(modelRecord, "cost", "pricing")
-			cost, basePresence, configured := parseBillingModelPriceImportCost(costRaw)
-			entry := cluster.BillingModelPriceImportCatalogModel{Provider: provider, Model: billingImportStringValue(modelRecord, "id"), Name: billingImportStringValue(modelRecord, "name"), Cost: cost, InvalidPriceFields: billingImportInvalidPriceFields(costRaw), UnsupportedDimensions: billingImportUnsupportedDimensions(costRaw)}
-			if entry.Model == "" {
-				entry.Model = model
+			modelID := billingImportStringValue(modelRecord, "id")
+			if modelID == "" {
+				modelID = model
 			}
+			defaultCacheWrite := !strings.EqualFold(provider, "google") && !strings.HasPrefix(strings.ToLower(modelID), "gemini")
+			cost, basePresence, configured := parseBillingModelPriceImportCostWithOptions(costRaw, defaultCacheWrite)
+			entry := cluster.BillingModelPriceImportCatalogModel{Provider: provider, Model: modelID, Name: billingImportStringValue(modelRecord, "name"), Cost: cost, InvalidPriceFields: billingImportInvalidPriceFields(costRaw), UnsupportedDimensions: billingImportUnsupportedDimensions(costRaw)}
 			if entry.Name == "" {
 				entry.Name = entry.Model
 			}
@@ -284,6 +286,10 @@ type billingModelPriceImportCostPresence struct {
 }
 
 func parseBillingModelPriceImportCost(value any) (*cluster.BillingModelPriceImportCost, billingModelPriceImportCostPresence, bool) {
+	return parseBillingModelPriceImportCostWithOptions(value, true)
+}
+
+func parseBillingModelPriceImportCostWithOptions(value any, defaultCacheWrite bool) (*cluster.BillingModelPriceImportCost, billingModelPriceImportCostPresence, bool) {
 	record, ok := value.(map[string]any)
 	if !ok {
 		return nil, billingModelPriceImportCostPresence{}, false
@@ -312,7 +318,7 @@ func parseBillingModelPriceImportCost(value any) (*cluster.BillingModelPriceImpo
 			cacheRead = input * modelsDevDefaultCacheReadInputRatio
 			hasCacheRead = true
 		}
-		if !hasCacheWrite {
+		if !hasCacheWrite && defaultCacheWrite {
 			cacheWrite = input * modelsDevDefaultCacheWriteInputRatio
 			hasCacheWrite = true
 		}
@@ -532,7 +538,7 @@ func parseOpenRouterBillingImportCatalog(raw []byte, sourceURL string, fetchedAt
 		if !ok {
 			continue
 		}
-		cost, bands, okCost := parseOpenRouterModelPricing(pricing)
+		cost, bands, okCost := parseOpenRouterModelPricing(provider, model, pricing)
 		if !okCost {
 			continue
 		}
@@ -554,7 +560,7 @@ func parseOpenRouterBillingImportCatalog(raw []byte, sourceURL string, fetchedAt
 	return catalog, nil
 }
 
-func parseOpenRouterModelPricing(pricing map[string]any) (*cluster.BillingModelPriceImportCost, []cluster.BillingModelPriceImportContextBand, bool) {
+func parseOpenRouterModelPricing(provider, model string, pricing map[string]any) (*cluster.BillingModelPriceImportCost, []cluster.BillingModelPriceImportContextBand, bool) {
 	promptPerM := billingImportPerTokenToPerMillionPtr(pricing, "prompt")
 	compPerM := billingImportPerTokenToPerMillionPtr(pricing, "completion")
 	if rawPrompt, ok := billingImportNumberValue(pricing, "prompt"); ok && rawPrompt < 0 {
@@ -575,9 +581,10 @@ func parseOpenRouterModelPricing(pricing map[string]any) (*cluster.BillingModelP
 	} else if promptPerM != nil {
 		cacheRead = math.Round(input*modelsDevDefaultCacheReadInputRatio*1e8) / 1e8
 	}
-	if cw := billingImportPerTokenToPerMillionPtr(pricing, "input_cache_write"); cw != nil {
+	isAnthropic := strings.EqualFold(provider, "anthropic") || strings.HasPrefix(strings.ToLower(model), "claude")
+	if cw := billingImportPerTokenToPerMillionPtr(pricing, "input_cache_write"); cw != nil && isAnthropic {
 		cacheWrite = *cw
-	} else if promptPerM != nil {
+	} else if promptPerM != nil && isAnthropic {
 		cacheWrite = math.Round(input*modelsDevDefaultCacheWriteInputRatio*1e8) / 1e8
 	}
 	if req := billingImportOptionalNumberPtr(pricing, "request"); req != nil {
@@ -599,7 +606,7 @@ func parseOpenRouterModelPricing(pricing map[string]any) (*cluster.BillingModelP
 	}
 	var bands []cluster.BillingModelPriceImportContextBand
 	if rawOverrides, ok := pricing["overrides"].([]any); ok && len(rawOverrides) > 0 {
-		if expr := buildOpenRouterTimeOverridesExpr(cost, rawOverrides); expr != "" {
+		if expr := buildOpenRouterTimeOverridesExpr(provider, model, cost, rawOverrides); expr != "" {
 			cost.PricingExpr = expr
 		} else {
 			for _, rawOv := range rawOverrides {
@@ -611,7 +618,7 @@ func parseOpenRouterModelPricing(pricing map[string]any) (*cluster.BillingModelP
 				if !hasMin || minPrompt <= 0 {
 					continue
 				}
-				ovCost, _, okOv := parseOpenRouterModelPricing(ov)
+				ovCost, _, okOv := parseOpenRouterModelPricing(provider, model, ov)
 				if !okOv || ovCost == nil {
 					continue
 				}
@@ -625,7 +632,7 @@ func parseOpenRouterModelPricing(pricing map[string]any) (*cluster.BillingModelP
 	return cost, bands, true
 }
 
-func buildOpenRouterTimeOverridesExpr(base *cluster.BillingModelPriceImportCost, rawOverrides []any) string {
+func buildOpenRouterTimeOverridesExpr(provider, model string, base *cluster.BillingModelPriceImportCost, rawOverrides []any) string {
 	type branch struct {
 		cond string
 		expr string
@@ -642,7 +649,7 @@ func buildOpenRouterTimeOverridesExpr(base *cluster.BillingModelPriceImportCost,
 		if !hasStart && !hasEnd && !hasDays {
 			return ""
 		}
-		ovCost, _, okOv := parseOpenRouterModelPricing(ov)
+		ovCost, _, okOv := parseOpenRouterModelPricing(provider, model, ov)
 		if !okOv || ovCost == nil {
 			continue
 		}
@@ -774,9 +781,10 @@ func parseLiteLLMBillingImportCatalog(raw []byte, sourceURL string, fetchedAt ti
 		} else if inPtr != nil {
 			cacheRead = math.Round(input*modelsDevDefaultCacheReadInputRatio*1e8) / 1e8
 		}
-		if cw := billingImportPerTokenToPerMillionPtr(rec, "cache_creation_input_token_cost"); cw != nil {
+		isAnthropic := strings.Contains(strings.ToLower(provider), "anthropic") || strings.HasPrefix(strings.ToLower(model), "claude")
+		if cw := billingImportPerTokenToPerMillionPtr(rec, "cache_creation_input_token_cost"); cw != nil && isAnthropic {
 			cacheWrite = *cw
-		} else if inPtr != nil {
+		} else if inPtr != nil && isAnthropic {
 			cacheWrite = math.Round(input*modelsDevDefaultCacheWriteInputRatio*1e8) / 1e8
 		}
 		cost := &cluster.BillingModelPriceImportCost{

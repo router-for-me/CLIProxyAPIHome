@@ -756,10 +756,26 @@ func newBillingImportCatalogIndex(models []BillingModelPriceImportCatalogModel) 
 	return index
 }
 
+var defaultBillingImportAliases = []BillingModelPriceImportAlias{
+	{TargetModel: "gemini-3-flash", SourceModels: []string{"gemini-3-flash-preview", "gemini-3-flash"}},
+	{TargetModel: "gemini-3-flash-agent", SourceModels: []string{"gemini-3.5-flash", "gemini-3.5-flash-preview", "gemini-3-flash-preview"}},
+	{TargetModel: "gemini-pro-agent", SourceModels: []string{"gemini-3.1-pro-preview", "gemini-3.1-pro", "gemini-3-pro-preview"}},
+	{TargetModel: "gemini-3.5-flash-low", SourceModels: []string{"gemini-3.5-flash"}},
+	{TargetModel: "gemini-3.5-flash-extra-low", SourceModels: []string{"gemini-3.5-flash"}},
+	{TargetModel: "gemini-3.1-pro-low", SourceModels: []string{"gemini-3.1-pro-preview", "gemini-3.1-pro"}},
+	{TargetModel: "claude-opus-4-6-thinking", SourceModels: []string{"claude-opus-4-6", "claude-opus-4.6"}},
+	{TargetModel: "claude-sonnet-4-6-thinking", SourceModels: []string{"claude-sonnet-4-6", "claude-sonnet-4.6"}},
+	{TargetModel: "claude-opus-5-5-high", SourceModels: []string{"claude-opus-4-6", "claude-opus-4.6"}},
+	{TargetModel: "claude-sonnet-5-5-high", SourceModels: []string{"claude-sonnet-4-6", "claude-sonnet-4.6"}},
+}
+
 func newBillingImportMatchPolicyIndex(aliases []BillingModelPriceImportAlias, overrides []BillingModelPriceImportMatchOverride) billingImportMatchPolicyIndex {
+	combinedAliases := make([]BillingModelPriceImportAlias, 0, len(aliases)+len(defaultBillingImportAliases))
+	combinedAliases = append(combinedAliases, aliases...)
+	combinedAliases = append(combinedAliases, defaultBillingImportAliases...)
 	index := billingImportMatchPolicyIndex{
-		aliases:           aliases,
-		aliasesByTarget:   make(map[string][]int, len(aliases)),
+		aliases:           combinedAliases,
+		aliasesByTarget:   make(map[string][]int, len(combinedAliases)),
 		overrides:         overrides,
 		overridesByTarget: make(map[string][]int, len(overrides)),
 	}
@@ -866,14 +882,24 @@ func (index billingImportMatchPolicyIndex) modelCandidates(model string) []strin
 	for _, position := range aliasPositions {
 		values = append(values, index.aliases[position].SourceModels...)
 	}
-	for _, suffix := range []string{"-thinking", "-preview", "-latest", ":free"} {
+	for _, suffix := range []string{"-thinking", "-extra-low", "-high", "-medium", "-low", "-preview", "-latest", ":free"} {
 		if strings.HasSuffix(strings.ToLower(bare), suffix) {
-			values = append(values, bare[:len(bare)-len(suffix)])
+			stripped := bare[:len(bare)-len(suffix)]
+			values = append(values, stripped)
+			for _, aliasPos := range index.aliasPositionsForModel(stripped, stripped) {
+				values = append(values, index.aliases[aliasPos].SourceModels...)
+			}
 		}
 	}
 	for _, candidate := range append([]string(nil), values...) {
 		for _, variant := range billingImportVersionDelimiterVariants(candidate) {
 			values = append(values, variant)
+		}
+	}
+	for _, candidate := range append([]string(nil), values...) {
+		lower := strings.ToLower(candidate)
+		if !strings.HasSuffix(lower, "-preview") {
+			values = append(values, candidate+"-preview")
 		}
 	}
 	seen := make(map[string]struct{}, len(values))
