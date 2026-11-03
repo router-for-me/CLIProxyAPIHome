@@ -258,6 +258,7 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	if parentSessionID != "" && strings.TrimSpace(headers.Get("X-Parent-Session-ID")) == "" {
 		headers.Set("X-Parent-Session-ID", parentSessionID)
 	}
+	ctx = cluster.WithAPIKeyRequestCache(ctx)
 	authRes, authErr := env.Runtime.Authenticate(ctx, headers)
 	if authErr != nil {
 		reply := dispatch.BulkString([]byte(buildAuthErrorJSON(authErr)))

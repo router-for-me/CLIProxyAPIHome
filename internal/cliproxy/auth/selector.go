@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -399,12 +400,15 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 type SessionAffinitySelector struct {
 	fallback Selector
 	cache    *SessionCache
+	store    SessionAffinityStore
+	ttl      time.Duration
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
 	Fallback Selector
 	TTL      time.Duration
+	Store    SessionAffinityStore
 }
 
 // NewSessionAffinitySelectorWithConfig creates a selector with custom configuration.
@@ -415,10 +419,12 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
-	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+	selector := &SessionAffinitySelector{fallback: cfg.Fallback, store: cfg.Store, ttl: cfg.TTL}
+	if selector.store == nil {
+		selector.cache = NewSessionCache(cfg.TTL)
+		selector.store = selector.cache
 	}
+	return selector
 }
 
 // Pick selects an auth with session affinity when possible.
@@ -438,6 +444,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
@@ -455,45 +464,77 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
-
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
-			}
+	cacheKey := sessionBindingKey(provider, primaryID, model)
+	for {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
+		binding, errLoad := s.store.LoadSessionBinding(ctx, cacheKey)
+		if errLoad != nil {
+			return nil, fmt.Errorf("load session affinity binding: %w", errLoad)
 		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
-	}
-
-	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
+		var selected *Auth
+		active := time.Now().Before(binding.ExpiresAt)
+		if active {
 			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
+				if auth.ID == binding.AuthID {
+					selected = auth
+					break
 				}
 			}
 		}
+		if selected == nil && !active && fallbackID != "" && fallbackID != primaryID {
+			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
+			if errParent != nil {
+				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
+			}
+			if time.Now().Before(parent.ExpiresAt) {
+				for _, auth := range available {
+					if auth.ID == parent.AuthID {
+						selected = auth
+						break
+					}
+				}
+			}
+		}
+		if selected == nil {
+			var errPick error
+			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)
+			if errPick != nil {
+				return nil, errPick
+			}
+			if selected == nil {
+				return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
+			}
+		}
+		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
+		if !active && binding.Revision != "" {
+			commit.ExpiredAt = binding.ExpiresAt
+		}
+		if opts.SessionAffinity != nil {
+			opts.SessionAffinity.Store = s.store
+			opts.SessionAffinity.Commit = &commit
+			entry.Debugf("session-affinity: candidate selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), selected.ID, provider, model)
+			return selected, nil
+		}
+		swapped, errSwap := s.store.CompareAndSwapSessionBinding(ctx, commit)
+		if errSwap != nil {
+			return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
+		}
+		if swapped {
+			entry.Infof("session-affinity: binding selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), selected.ID, provider, model)
+			return selected, nil
+		}
+		// Another request won the binding. Re-read it instead of returning a
+		// credential selected from a stale snapshot.
 	}
+}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-	if err != nil {
-		return nil, err
-	}
-	s.cache.Set(cacheKey, auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-	return auth, nil
+// sessionBindingKey hashes a framed tuple to avoid delimiter collisions and
+// storing client-provided session identifiers in the database.
+func sessionBindingKey(provider, sessionID, model string) string {
+	encoded, _ := json.Marshal([3]string{provider, sessionID, model})
+	return fmt.Sprintf("%x", sha256.Sum256(encoded))
 }
 
 // selectorLogEntry handles a selector log entry.
@@ -522,8 +563,9 @@ func (s *SessionAffinitySelector) Stop() {
 	}
 }
 
-// InvalidateAuth removes all session bindings for a specific auth.
-// Called when an auth becomes rate-limited or unavailable.
+// InvalidateAuth removes local bindings when a credential is removed. Shared
+// bindings are revalidated against each request's candidates and replaced by CAS,
+// so a delayed node-local invalidation cannot delete a newer cluster binding.
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)

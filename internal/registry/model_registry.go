@@ -916,6 +916,13 @@ func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 	return result
 }
 
+// GetClientModelRoutes snapshots the registered provider and public model IDs together.
+func (r *ModelRegistry) GetClientModelRoutes(clientID string) (string, []string) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	return r.clientProviders[clientID], append([]string(nil), r.clientModels[clientID]...)
+}
+
 // GetModelInfoForClient returns one client-specific model definition.
 func (r *ModelRegistry) GetModelInfoForClient(clientID, modelID string) *ModelInfo {
 	clientID = strings.TrimSpace(clientID)

@@ -26,11 +26,20 @@ type Handler struct {
 	modelsDevHTTPClient   *http.Client
 	pluginStoreAuth       *pluginauth.Service
 	quotaRecollect        QuotaRecollectTrigger
+	heavyStatisticsSlots  chan struct{}
 }
 
 // NewHandler creates a new handler.
 func NewHandler(repo *cluster.Repository, runtime *home.Runtime, nodeIP string, nodePort int) *Handler {
-	return &Handler{repo: repo, runtime: runtime, nodeIP: strings.TrimSpace(nodeIP), nodePort: nodePort, heartbeatTimeout: cluster.DefaultHeartbeatTimeout(), pluginStoreAuth: pluginauth.NewService(repo)}
+	return &Handler{
+		repo:                 repo,
+		runtime:              runtime,
+		nodeIP:               strings.TrimSpace(nodeIP),
+		nodePort:             nodePort,
+		heartbeatTimeout:     cluster.DefaultHeartbeatTimeout(),
+		pluginStoreAuth:      pluginauth.NewService(repo),
+		heavyStatisticsSlots: make(chan struct{}, 2),
+	}
 }
 
 // SetForwardTLSConfig sets the TLS config used for cluster HTTP forwarding.
@@ -78,6 +87,25 @@ func (h *Handler) requestContext(c *gin.Context) (context.Context, context.Cance
 		ctx = c.Request.Context()
 	}
 	return context.WithTimeout(ctx, 10*time.Second)
+}
+
+// acquireHeavyStatisticsSlot shares the existing request budget between queueing and execution.
+// Only the three v8 statistics handlers call this gate; legacy routes keep their behavior.
+func (h *Handler) acquireHeavyStatisticsSlot(ctx context.Context, c *gin.Context) (func(), error) {
+	if !strings.HasPrefix(c.Request.URL.Path, "/v8/management/") {
+		return func() {}, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case h.heavyStatisticsSlots <- struct{}{}:
+		// Cancellation and a free slot can become ready together.
+		if errContext := ctx.Err(); errContext != nil {
+			<-h.heavyStatisticsSlots
+			return nil, errContext
+		}
+		return func() { <-h.heavyStatisticsSlots }, nil
+	}
 }
 
 // currentConfig handles a current config.

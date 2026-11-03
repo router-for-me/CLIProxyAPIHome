@@ -1,13 +1,17 @@
 package auth
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // sessionEntry stores auth binding with expiration.
 type sessionEntry struct {
 	authID    string
+	revision  string
 	expiresAt time.Time
 }
 
@@ -91,6 +95,17 @@ func (c *SessionCache) Set(sessionID, authID string) {
 		return
 	}
 	c.mu.Lock()
+	c.pruneLocked()
+	c.entries[sessionID] = sessionEntry{
+		authID:    authID,
+		revision:  uuid.NewString(),
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
+}
+
+// pruneLocked bounds the local cache. The caller must hold c.mu.
+func (c *SessionCache) pruneLocked() {
 	if len(c.entries) >= defaultMaxSessionCacheEntries {
 		now := time.Now()
 		pruned := 0
@@ -110,11 +125,44 @@ func (c *SessionCache) Set(sessionID, authID string) {
 			}
 		}
 	}
-	c.entries[sessionID] = sessionEntry{
-		authID:    authID,
-		expiresAt: time.Now().Add(c.ttl),
+}
+
+// LoadSessionBinding implements the atomic binding store for standalone selectors.
+func (c *SessionCache) LoadSessionBinding(ctx context.Context, key string) (SessionBinding, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return SessionBinding{}, ctx.Err()
 	}
-	c.mu.Unlock()
+	c.mu.RLock()
+	entry := c.entries[key]
+	c.mu.RUnlock()
+	return SessionBinding{AuthID: entry.authID, Revision: entry.revision, ExpiresAt: entry.expiresAt}, nil
+}
+
+// CompareAndSwapSessionBinding prevents concurrent first requests from returning
+// independently selected credentials, including after a binding has been evicted.
+func (c *SessionCache) CompareAndSwapSessionBinding(ctx context.Context, commit SessionAffinityCommit) (bool, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries[commit.Key].revision != commit.ExpectedRevision {
+		return false, nil
+	}
+	current := c.entries[commit.Key]
+	if !commit.ExpiredAt.IsZero() && !current.expiresAt.Equal(commit.ExpiredAt) {
+		return false, nil
+	}
+	revision := current.revision
+	now := time.Now()
+	if revision == "" || current.authID != commit.AuthID || !now.Before(current.expiresAt) {
+		revision = uuid.NewString()
+	}
+	c.pruneLocked()
+	c.entries[commit.Key] = sessionEntry{
+		authID: commit.AuthID, revision: revision, expiresAt: now.Add(commit.TTL),
+	}
+	return true, nil
 }
 
 // Invalidate removes a specific session binding.

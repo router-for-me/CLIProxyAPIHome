@@ -381,7 +381,8 @@ func (r *Repository) RefreshCPALiveness(ctx context.Context, lifetime Connection
 	}
 	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
 		membership := CPANodeMembershipRecord{}
-		errMember := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", fingerprint).First(&membership).Error
+		// Serialize liveness writers before evaluating the heartbeat timestamp, without blocking KEY SHARE readers.
+		errMember := tx.Clauses(clause.Locking{Strength: "NO KEY UPDATE"}).Where("certificate_fingerprint = ?", fingerprint).First(&membership).Error
 		if errors.Is(errMember, gorm.ErrRecordNotFound) {
 			return ErrMembershipNotActive
 		}
@@ -394,9 +395,15 @@ func (r *Repository) RefreshCPALiveness(ctx context.Context, lifetime Connection
 		if errHome := verifyActiveHomeIncarnation(tx, lifetime.Home); errHome != nil {
 			return errHome
 		}
-		now, errNow := DatabaseNow(ctx, tx)
-		if errNow != nil {
-			return errNow
+		// Persist the heartbeat before PONG without competing with lifecycle read locks.
+		var now any = gorm.Expr(strings.TrimPrefix(databaseNowQuery(tx), "SELECT "))
+		if tx.Dialector.Name() == "sqlite" {
+			// Match the bound UTC timestamps used by membership expiry predicates.
+			databaseTime, errNow := DatabaseNow(ctx, tx)
+			if errNow != nil {
+				return errNow
+			}
+			now = databaseTime
 		}
 		return tx.Model(&membership).Updates(map[string]any{"last_seen_at": now, "updated_at": now}).Error
 	})
@@ -492,8 +499,8 @@ func resolveQuiescenceHomeRowTx(ctx context.Context, tx *gorm.DB, row CPANodeQui
 
 	if home.State == HomeIncarnationActive {
 		cutoff := now.Add(-lifecycle.NodeHeartbeatTimeout)
-		if errExpire := tx.Model(&HomeProcessIncarnationRecord{}).
-			Where("home_ip = ? AND home_port = ? AND started_at = ? AND state = ? AND last_seen_at < ?", row.HomeIP, row.HomePort, row.HomeStartedAt, HomeIncarnationActive, cutoff).
+		if errExpire := homeIncarnationTransitionQuery(tx,
+			"home_ip = ? AND home_port = ? AND started_at = ? AND state = ? AND last_seen_at < ?", row.HomeIP, row.HomePort, row.HomeStartedAt, HomeIncarnationActive, cutoff).
 			Update("state", HomeIncarnationExpired).Error; errExpire != nil {
 			return errExpire
 		}
@@ -504,8 +511,8 @@ func resolveQuiescenceHomeRowTx(ctx context.Context, tx *gorm.DB, row CPANodeQui
 		return errConfig
 	}
 	graceCutoff := now.Add(-(lifecycle.NodeHeartbeatTimeout + cfg.ReclaimGrace))
-	if errFence := tx.Model(&HomeProcessIncarnationRecord{}).
-		Where("home_ip = ? AND home_port = ? AND started_at = ? AND state IN ? AND last_seen_at < ?", row.HomeIP, row.HomePort, row.HomeStartedAt, []string{HomeIncarnationExpired, HomeIncarnationRetired}, graceCutoff).
+	if errFence := homeIncarnationTransitionQuery(tx,
+		"home_ip = ? AND home_port = ? AND started_at = ? AND state IN ? AND last_seen_at < ?", row.HomeIP, row.HomePort, row.HomeStartedAt, []string{HomeIncarnationExpired, HomeIncarnationRetired}, graceCutoff).
 		Updates(map[string]any{"state": HomeIncarnationFenced, "fenced_at": now, "fence_reason": reason}).Error; errFence != nil {
 		return errFence
 	}
@@ -524,7 +531,7 @@ func lifecycleConfigForQuiescence(tx *gorm.DB) (LifecycleConfigRecord, error) {
 
 func verifyActiveHomeIncarnation(tx *gorm.DB, home HomeIncarnationID) error {
 	record := HomeProcessIncarnationRecord{}
-	errFirst := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(home.IP), home.Port, home.StartedAt).Error
+	errFirst := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).First(&record, "home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(home.IP), home.Port, home.StartedAt).Error
 	if errors.Is(errFirst, gorm.ErrRecordNotFound) {
 		return ErrHomeIncarnationNotFound
 	}

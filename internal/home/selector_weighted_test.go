@@ -13,7 +13,7 @@ import (
 func TestV8WeightedStrategyMatchesCPA(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Routing.Strategy = "weighted-round-robin"
-	selected := selectorFromConfig(cfg)
+	selected := selectorFromConfig(cfg, nil)
 	homeAuths := []*coreauth.Auth{{ID: "a-zero", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"weight": "0"}}, {ID: "b-positive", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"weight": "1"}}}
 	cpaAuths := []*cpaauth.Auth{{ID: "a-zero", Provider: "codex", Status: cpaauth.StatusActive, Attributes: map[string]string{"weight": "0"}}, {ID: "b-positive", Provider: "codex", Status: cpaauth.StatusActive, Attributes: map[string]string{"weight": "1"}}}
 	cpaSelector := &cpaauth.WeightedRoundRobinSelector{}

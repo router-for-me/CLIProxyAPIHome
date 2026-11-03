@@ -20,7 +20,7 @@ go build -o test-output ./cmd/home && rm test-output # Verify compile after Go c
 
 ## Config And Runtime
 - Default config file: `config.yaml` (template: `config.example.yaml`).
-- Home runtime state is database-backed. Without `cluster.yaml`, Home uses local SQLite (`home.db` by default, or `-sqlite-path`). With `cluster.yaml`, Home uses the configured cluster database; PostgreSQL is preferred for multi-node deployments.
+- Home runtime state is database-backed. Without `cluster.yaml`, Home uses local SQLite (`home.db` by default, or `-sqlite-path`). With `cluster.yaml`, Home uses the configured cluster database; SQLite supports only one active Home process per database. Deployments with multiple active Homes must use PostgreSQL.
 - `config.yaml` and `auth-dir` are import/export exchange formats only. Use `-import` to import local files into the database and `-export` to write database state back to files.
 - RESP password authentication has been removed. Home RESP access is mTLS-only; `allow-host` is only an IP allowlist.
 - The Management API is controlled by `remote-management.secret-key`; an empty key disables Management routes.

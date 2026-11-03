@@ -1,6 +1,7 @@
 package protocolmux
 
 import (
+	"context"
 	"net"
 	"sync"
 )
@@ -26,10 +27,16 @@ func NewListener(addr net.Addr, buffer int) *Listener {
 
 // Put handles put.
 func (l *Listener) Put(conn net.Conn) error {
+	return l.putContext(context.Background(), conn)
+}
+
+func (l *Listener) putContext(ctx context.Context, conn net.Conn) error {
 	if l == nil || conn == nil {
 		return nil
 	}
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-l.closeCh:
 		return net.ErrClosed
 	case l.connCh <- conn:

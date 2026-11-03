@@ -368,7 +368,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodDelete, "/auth-files", handler.DeleteAuthFile)
 	r.Set(http.MethodPatch, "/auth-files/status", handler.PatchAuthFileStatus)
 	r.Set(http.MethodPatch, "/auth-files/fields", handler.PatchAuthFileFields)
-	r.Set(http.MethodGet, "/models", handler.GetModels)
+	r.Set(http.MethodGet, "/models", handler.GetModelsV8)
 	r.Set(http.MethodGet, "/model-definitions/:channel", handler.GetStaticModelDefinitions)
 	r.Set(http.MethodGet, "/anthropic-auth-url", handler.RequestAnthropicToken)
 	r.Set(http.MethodGet, "/antigravity-auth-url", handler.RequestAntigravityToken)

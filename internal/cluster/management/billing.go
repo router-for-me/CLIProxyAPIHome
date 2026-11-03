@@ -147,7 +147,13 @@ func (h *Handler) GetBillingOverview(c *gin.Context) {
 	if !ok {
 		return
 	}
+	release, errAcquire := h.acquireHeavyStatisticsSlot(ctx, c)
+	if errAcquire != nil {
+		respondError(c, http.StatusInternalServerError, "billing_overview_load_failed", errAcquire)
+		return
+	}
 	overview, errOverview := h.repo.BillingOverview(ctx, query)
+	release()
 	if errOverview != nil {
 		respondError(c, http.StatusInternalServerError, "billing_overview_load_failed", errOverview)
 		return

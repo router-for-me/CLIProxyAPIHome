@@ -10,16 +10,13 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
 
 type runtimeKVTestAdapter struct {
 	enabled bool
 
-	mu           sync.Mutex
-	calls        []string
-	purgeCalled  chan struct{}
-	purgeSignals int
+	mu    sync.Mutex
+	calls []string
 }
 
 func (a *runtimeKVTestAdapter) Enabled() bool {
@@ -92,19 +89,6 @@ func (a *runtimeKVTestAdapter) KVMGet(ctx context.Context, keys []string) ([]KVG
 func (a *runtimeKVTestAdapter) KVMSet(ctx context.Context, pairs map[string][]byte) error {
 	a.record("KVMSet")
 	return nil
-}
-
-func (a *runtimeKVTestAdapter) KVPurgeExpired(ctx context.Context, now time.Time, limit int) (int64, error) {
-	a.record("KVPurgeExpired")
-	a.mu.Lock()
-	a.purgeSignals++
-	ch := a.purgeCalled
-	shouldSignal := a.purgeSignals == 1 && ch != nil
-	a.mu.Unlock()
-	if shouldSignal {
-		close(ch)
-	}
-	return 1, nil
 }
 
 func (a *runtimeKVTestAdapter) record(call string) {
@@ -192,30 +176,5 @@ func TestRuntimeKVDelegatesToAdapter(t *testing.T) {
 		if !adapter.hasCall(prefix) {
 			t.Fatalf("adapter call %q was not recorded", prefix)
 		}
-	}
-}
-
-func TestRuntimeKVStartPurgesExpiredRows(t *testing.T) {
-	adapter := &runtimeKVTestAdapter{
-		enabled:     true,
-		purgeCalled: make(chan struct{}),
-	}
-	runtime, errNewRuntime := NewRuntime(&config.Config{})
-	if errNewRuntime != nil {
-		t.Fatalf("NewRuntime() error = %v", errNewRuntime)
-	}
-	runtime.SetClusterAdapter(adapter)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if errStart := runtime.Start(ctx, ""); errStart != nil {
-		t.Fatalf("Start() error = %v", errStart)
-	}
-	defer runtime.Stop()
-
-	select {
-	case <-adapter.purgeCalled:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("KVPurgeExpired was not called")
 	}
 }

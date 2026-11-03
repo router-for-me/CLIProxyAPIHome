@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
@@ -59,6 +60,7 @@ func handleDefault(ctx context.Context, env dispatch.Env, args []string) dispatc
 
 // handleDefaultModels authenticates the downstream client and returns the models payload.
 func handleDefaultModels(ctx context.Context, env dispatch.Env, jsonArg string) dispatch.Reply {
+	ctx = cluster.WithAPIKeyRequestCache(ctx)
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/", nil)
 	if errReq != nil {
 		return dispatch.BulkString([]byte(buildErrorJSON(errReq.Error())))

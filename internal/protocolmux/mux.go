@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -22,16 +24,31 @@ func IsRESPPrefix(prefix byte) bool {
 	}
 }
 
-// Serve handles serve.
+const (
+	connectionSetupTimeout = 5 * time.Second
+	maxPendingSetups       = 128
+)
+
+// Serve classifies connections concurrently with a bounded setup budget.
+// Callbacks take ownership of their connections and must dispatch promptly.
 func Serve(ctx context.Context, listener net.Listener, httpListener *Listener, onRESPConn func(net.Conn), onHTTPConn func(net.Conn), tlsConfig *tls.Config) error {
-	// Decode the wire frame before dispatching command handling.
 	if listener == nil {
 		return net.ErrClosed
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
+	serveCtx, cancel := context.WithCancel(ctx)
+	stopListener := context.AfterFunc(serveCtx, func() {
+		closeMuxListener(listener)
+	})
+	var pending sync.WaitGroup
+	defer func() {
+		cancel()
+		stopListener()
+		pending.Wait()
+	}()
+	setups := make(chan struct{}, maxPendingSetups)
 	for {
 		conn, errAccept := listener.Accept()
 		if errAccept != nil {
@@ -40,91 +57,126 @@ func Serve(ctx context.Context, listener net.Listener, httpListener *Listener, o
 		if conn == nil {
 			continue
 		}
-
-		if routed := routeTLSConn(conn, httpListener, onHTTPConn); routed {
-			continue
+		if serveCtx.Err() != nil {
+			closeMuxConn(conn)
+			return net.ErrClosed
 		}
-
-		reader := bufio.NewReader(conn)
-		prefix, errPeek := reader.Peek(1)
-		if errPeek != nil {
-			if errClose := conn.Close(); errClose != nil {
-				log.Errorf("protocol mux: close conn after peek error: %v", errClose)
-			}
-			continue
-		}
-
-		if tlsConfig != nil && isTLSClientHello(prefix[0]) {
-			tlsConn := tls.Server(&BufferedConn{Conn: conn, reader: reader}, tlsConfig)
-			if errHandshake := tlsConn.Handshake(); errHandshake != nil {
-				if errClose := conn.Close(); errClose != nil {
-					log.Errorf("protocol mux: close conn after TLS handshake error: %v", errClose)
-				}
-				continue
-			}
-			if routed := routeTLSConn(tlsConn, httpListener, onHTTPConn); routed {
-				continue
-			}
-			reader = bufio.NewReader(tlsConn)
-			prefix, errPeek = reader.Peek(1)
-			if errPeek != nil {
-				if errClose := tlsConn.Close(); errClose != nil {
-					log.Errorf("protocol mux: close tls conn after peek error: %v", errClose)
-				}
-				continue
-			}
-			conn = tlsConn
-		}
-
-		wrapped := &BufferedConn{Conn: conn, reader: reader}
-		if IsRESPPrefix(prefix[0]) {
-			if onRESPConn != nil {
-				onRESPConn(wrapped)
-			} else {
-				_ = wrapped.Close()
-			}
-			continue
-		}
-
-		if onHTTPConn != nil {
-			onHTTPConn(wrapped)
-			continue
-		}
-		if httpListener == nil {
-			_ = wrapped.Close()
-			continue
-		}
-		if errPut := httpListener.Put(wrapped); errPut != nil {
-			if errClose := wrapped.Close(); errClose != nil {
-				log.Errorf("protocol mux: close conn after http route failure: %v", errClose)
-			}
+		select {
+		case setups <- struct{}{}:
+			pending.Add(1)
+			go func() {
+				defer pending.Done()
+				defer func() { <-setups }()
+				setupConn(serveCtx, conn, httpListener, onRESPConn, onHTTPConn, tlsConfig)
+			}()
+		default:
+			// Keep accepting when the setup budget is full, without accumulating
+			// unbounded sockets or goroutines behind slow clients.
+			closeMuxConn(conn)
 		}
 	}
 }
 
-func routeTLSConn(conn net.Conn, httpListener *Listener, onHTTPConn func(net.Conn)) bool {
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		return false
-	}
-	if errHandshake := tlsConn.Handshake(); errHandshake != nil {
-		if errClose := conn.Close(); errClose != nil {
-			log.Errorf("protocol mux: close conn after TLS handshake error: %v", errClose)
+func setupConn(ctx context.Context, conn net.Conn, httpListener *Listener, onRESPConn func(net.Conn), onHTTPConn func(net.Conn), tlsConfig *tls.Config) {
+	setupCtx, cancel := context.WithTimeout(ctx, connectionSetupTimeout)
+	defer cancel()
+	stopClose := context.AfterFunc(setupCtx, func() { closeMuxConn(conn) })
+	handedOff := false
+	routedConn := conn
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			var remoteAddr net.Addr
+			if conn != nil {
+				remoteAddr = conn.RemoteAddr()
+			}
+			log.Errorf("protocol mux: panic while routing connection from %v: %v", remoteAddr, recovered)
+			handedOff = false
 		}
-		return true
+		stopClose()
+		if !handedOff {
+			if routedConn != nil && routedConn != conn {
+				closeMuxConn(routedConn)
+			}
+			closeMuxConn(conn)
+		}
+	}()
+	deadline, _ := setupCtx.Deadline()
+	if errDeadline := conn.SetDeadline(deadline); errDeadline != nil {
+		return
 	}
-	proto := strings.TrimSpace(tlsConn.ConnectionState().NegotiatedProtocol)
-	if proto != "h2" && proto != "http/1.1" {
-		return false
+	routed, resp, errClassify := classifyConn(setupCtx, conn, tlsConfig)
+	if errClassify != nil || !stopClose() || setupCtx.Err() != nil {
+		return
+	}
+	routedConn = routed
+	// Setup deadlines must not leak into established HTTP/2 or RESP sessions.
+	if errDeadline := routed.SetDeadline(time.Time{}); errDeadline != nil {
+		return
+	}
+	if resp {
+		if onRESPConn != nil {
+			handedOff = true
+			onRESPConn(routed)
+		}
+		return
 	}
 	if onHTTPConn != nil {
-		onHTTPConn(tlsConn)
-	} else if httpListener != nil {
-		_ = httpListener.Put(tlsConn)
-	} else {
-		_ = conn.Close()
+		handedOff = true
+		onHTTPConn(routed)
+		return
 	}
-	return true
+	if httpListener != nil {
+		handedOff = httpListener.putContext(setupCtx, routed) == nil
+	}
+}
+
+func classifyConn(ctx context.Context, conn net.Conn, tlsConfig *tls.Config) (net.Conn, bool, error) {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+			return nil, false, errHandshake
+		}
+		if isHTTPProtocol(tlsConn) {
+			return tlsConn, false, nil
+		}
+	}
+	reader := bufio.NewReader(conn)
+	prefix, errPeek := reader.Peek(1)
+	if errPeek != nil {
+		return nil, false, errPeek
+	}
+	if tlsConfig != nil && isTLSClientHello(prefix[0]) {
+		tlsConn := tls.Server(&BufferedConn{Conn: conn, reader: reader}, tlsConfig)
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+			return nil, false, errHandshake
+		}
+		if isHTTPProtocol(tlsConn) {
+			return tlsConn, false, nil
+		}
+		reader = bufio.NewReader(tlsConn)
+		prefix, errPeek = reader.Peek(1)
+		if errPeek != nil {
+			return nil, false, errPeek
+		}
+		conn = tlsConn
+	}
+	return &BufferedConn{Conn: conn, reader: reader}, IsRESPPrefix(prefix[0]), nil
+}
+
+func isHTTPProtocol(conn *tls.Conn) bool {
+	proto := strings.TrimSpace(conn.ConnectionState().NegotiatedProtocol)
+	return proto == "h2" || proto == "http/1.1"
+}
+
+func closeMuxConn(conn net.Conn) {
+	if errClose := conn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		log.WithError(errClose).Debug("protocol mux: close connection")
+	}
+}
+
+func closeMuxListener(listener net.Listener) {
+	if errClose := listener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+		log.WithError(errClose).Debug("protocol mux: close listener")
+	}
 }
 
 func isTLSClientHello(prefix byte) bool {

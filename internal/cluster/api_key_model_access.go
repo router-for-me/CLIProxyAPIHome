@@ -19,8 +19,8 @@ func (r *Repository) ModelAccessForAPIKey(ctx context.Context, apiKey string) (*
 	if apiKey == "" {
 		return nil, fmt.Errorf("api key is required")
 	}
-	var record APIKeyRecord
-	if errFirst := db.WithContext(contextOrBackground(ctx)).Where("api_key = ?", apiKey).First(&record).Error; errFirst != nil {
+	record, errFirst := r.findAPIKeyForAccess(ctx, db, apiKey)
+	if errFirst != nil {
 		return nil, errFirst
 	}
 	baseChannelIDs, errBaseChannels := apiKeyChannelsFromJSON(record.Channels)

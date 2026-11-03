@@ -2,9 +2,11 @@ package management
 
 import (
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -87,6 +89,15 @@ func credentialModelEntries(models []*registry.ModelInfo) []gin.H {
 
 // GetModels returns static or currently available model definitions.
 func (h *Handler) GetModels(c *gin.Context) {
+	h.getModels(c, false)
+}
+
+// GetModelsV8 includes the execution identities used by billing for public aliases.
+func (h *Handler) GetModelsV8(c *gin.Context) {
+	h.getModels(c, true)
+}
+
+func (h *Handler) getModels(c *gin.Context, includeBillingModels bool) {
 	scope := strings.ToLower(strings.TrimSpace(firstNonEmptyQuery(c, "scope", "source", "mode", "type")))
 	if scope == "" {
 		scope = "available"
@@ -94,6 +105,10 @@ func (h *Handler) GetModels(c *gin.Context) {
 
 	switch scope {
 	case "available", "active", "current":
+		if includeBillingModels {
+			c.JSON(http.StatusOK, gin.H{"scope": "available", "models": h.availableBillingModelDefinitions()})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"scope":  "available",
 			"models": registry.GetGlobalRegistry().GetAvailableModelDefinitions(),
@@ -143,4 +158,62 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 		"channel": strings.ToLower(strings.TrimSpace(channel)),
 		"models":  models,
 	})
+}
+
+// Billing identities are resolved per credential, because one public alias may
+// refer to different upstream models even within the same provider.
+type billingModelTarget struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+type billingModelDefinition struct {
+	*registry.ModelInfo
+	BillingModels []billingModelTarget `json:"billing_models"`
+}
+
+func (h *Handler) availableBillingModelDefinitions() []billingModelDefinition {
+	modelRegistry := registry.GetGlobalRegistry()
+	models := modelRegistry.GetAvailableModelDefinitions()
+	targets := make(map[string]map[billingModelTarget]struct{}, len(models))
+	for _, model := range models {
+		targets[model.ID] = make(map[billingModelTarget]struct{})
+	}
+	if h != nil && h.runtime != nil && h.runtime.CoreManager() != nil {
+		manager := h.runtime.CoreManager()
+		for _, auth := range manager.List() {
+			if auth == nil || auth.Disabled {
+				continue
+			}
+			provider, routes := modelRegistry.GetClientModelRoutes(auth.ID)
+			if provider == "" {
+				continue
+			}
+			for _, route := range routes {
+				set, exists := targets[route]
+				if !exists {
+					continue
+				}
+				model := coreauth.CanonicalModelID(manager.ResolveExecutionModel(auth, route))
+				if model != "" {
+					set[billingModelTarget{Provider: provider, Model: model}] = struct{}{}
+				}
+			}
+		}
+	}
+	out := make([]billingModelDefinition, 0, len(models))
+	for _, model := range models {
+		items := make([]billingModelTarget, 0, len(targets[model.ID]))
+		for target := range targets[model.ID] {
+			items = append(items, target)
+		}
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].Provider != items[j].Provider {
+				return items[i].Provider < items[j].Provider
+			}
+			return items[i].Model < items[j].Model
+		})
+		out = append(out, billingModelDefinition{ModelInfo: model, BillingModels: items})
+	}
+	return out
 }

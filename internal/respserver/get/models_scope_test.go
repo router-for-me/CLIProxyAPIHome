@@ -179,6 +179,13 @@ func TestHandleDefaultModelsScopes(t *testing.T) {
 			if errRemove := db.Callback().Query().Remove(callback); errRemove != nil {
 				t.Fatal(errRemove)
 			}
+			wantKeyQueries := 1
+			if test.source == "fallback-header" {
+				wantKeyQueries++
+			}
+			if count := queries[(cluster.APIKeyRecord{}).TableName()]; count != wantKeyQueries {
+				t.Errorf("API key queried %d times, want %d", count, wantKeyQueries)
+			}
 			for _, table := range []string{"model_group_detail", "channel_group_detail"} {
 				if queries[table] > 1 {
 					t.Errorf("%s queried %d times, want at most one batch", table, queries[table])

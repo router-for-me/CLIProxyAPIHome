@@ -529,6 +529,8 @@ type usageObservabilityOverviewBounds struct {
 }
 
 type usageObservabilityTotalsRow struct {
+	P50LatencyMS               sql.NullFloat64 `gorm:"column:p50_latency_ms"`
+	P95LatencyMS               sql.NullFloat64 `gorm:"column:p95_latency_ms"`
 	RequestCount               int64           `gorm:"column:request_count"`
 	SuccessCount               sql.NullInt64   `gorm:"column:success_count"`
 	FailedCount                sql.NullInt64   `gorm:"column:failed_count"`
@@ -566,6 +568,7 @@ type usageObservabilityLatencyPercentileRow struct {
 }
 
 type usageObservabilityTrendBucketRow struct {
+	P95LatencyMS               sql.NullFloat64 `gorm:"column:p95_latency_ms"`
 	BucketUnix                 int64           `gorm:"column:bucket_unix"`
 	RequestCount               int64           `gorm:"column:request_count"`
 	SuccessCount               sql.NullInt64   `gorm:"column:success_count"`
@@ -839,6 +842,14 @@ func (r *Repository) UsageObservabilityOverview(ctx context.Context, query Usage
 		return UsageObservabilityOverview{}, errTrend
 	}
 	overview.Activity = usageObservabilityActivity(overview.Trend)
+	if usageObservabilityIsPostgres(db) {
+		var errGroups error
+		overview.Top, overview.ModelEfficiency, errGroups = usageObservabilityOverviewGroupsPostgres(db, recordQuery)
+		if errGroups != nil {
+			return UsageObservabilityOverview{}, errGroups
+		}
+		return overview, nil
+	}
 	modelEfficiency, errModelEfficiency := usageObservabilityAggregateItemsSQL(db, recordQuery, "model", "total_tokens", "desc", 10)
 	if errModelEfficiency != nil {
 		return UsageObservabilityOverview{}, errModelEfficiency
@@ -930,7 +941,11 @@ func usageObservabilityTotalsSQL(db *gorm.DB, query UsageObservabilityRecordQuer
 	scope := usageObservabilityNarrowUsageScope(db.Table("usage").
 		Joins(`LEFT JOIN "billing_charge" ON "billing_charge"."usage_id" = "usage"."id"`).
 		Joins(`LEFT JOIN "api_key" ON "api_key"."api_key" = "usage"."api_key"`), query)
-	if errScan := scope.Select(usageObservabilityTotalsSQLSelect()).Scan(&row).Error; errScan != nil {
+	selectSQL := usageObservabilityTotalsSQLSelect()
+	if usageObservabilityIsPostgres(db) {
+		selectSQL += ", " + usageObservabilityPostgresPercentile(`"usage"."latency_ms"`, 50) + " AS p50_latency_ms, " + usageObservabilityPostgresPercentile(`"usage"."latency_ms"`, 95) + " AS p95_latency_ms"
+	}
+	if errScan := scope.Select(selectSQL).Scan(&row).Error; errScan != nil {
 		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errScan
 	}
 	if row.RequestCount > 0 {
@@ -946,9 +961,13 @@ func usageObservabilityTotalsSQL(db *gorm.DB, query UsageObservabilityRecordQuer
 		}
 	}
 	totals := usageObservabilityTotalsFromRow(&row)
-	percentiles, errPercentiles := usageObservabilityLatencyPercentilesSQL(db, query)
-	if errPercentiles != nil {
-		return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errPercentiles
+	percentiles := usageObservabilityLatencyPercentileRow{P50LatencyMS: row.P50LatencyMS, P95LatencyMS: row.P95LatencyMS}
+	if !usageObservabilityIsPostgres(db) {
+		var errPercentiles error
+		percentiles, errPercentiles = usageObservabilityLatencyPercentilesSQL(db, query)
+		if errPercentiles != nil {
+			return UsageObservabilityTotals{}, usageObservabilityOverviewBounds{}, errPercentiles
+		}
 	}
 	if percentiles.P50LatencyMS.Valid {
 		p50 := percentiles.P50LatencyMS.Float64
@@ -1097,22 +1116,37 @@ func usageObservabilityLiveSQL(db *gorm.DB, query UsageObservabilityRecordQuery,
 	if liveQuery.From == nil || liveQuery.From.Before(cutoff) {
 		liveQuery.From = &cutoff
 	}
-	totals, _, errTotals := usageObservabilityTotalsSQL(db, liveQuery)
-	if errTotals != nil {
-		return UsageObservabilityLiveSummary{}, errTotals
+	// Live metrics need neither billing joins nor distinct user/credential counts.
+	var row usageObservabilityTotalsRow
+	selectSQL := `COUNT(*) AS request_count, SUM(CASE WHEN "usage"."failed" THEN 1 ELSE 0 END) AS failed_count, SUM(` + usageObservabilitySQLAccountingTotalTokens(`"usage"`) + `) AS accounting_total_tokens`
+	if usageObservabilityIsPostgres(db) {
+		selectSQL += ", " + usageObservabilityPostgresPercentile(`"usage"."latency_ms"`, 50) + " AS p50_latency_ms, " + usageObservabilityPostgresPercentile(`"usage"."latency_ms"`, 95) + " AS p95_latency_ms"
 	}
-	live := UsageObservabilityLiveSummary{
-		WindowSeconds: windowSeconds,
-		ErrorRate:     totals.ErrorRate,
-		SuccessRate:   totals.SuccessRate,
-		P50LatencyMS:  totals.P50LatencyMS,
-		P95LatencyMS:  totals.P95LatencyMS,
+	if errScan := usageObservabilityNarrowUsageScope(db.Table("usage"), liveQuery).Select(selectSQL).Scan(&row).Error; errScan != nil {
+		return UsageObservabilityLiveSummary{}, errScan
+	}
+	percentiles := usageObservabilityLatencyPercentileRow{P50LatencyMS: row.P50LatencyMS, P95LatencyMS: row.P95LatencyMS}
+	if !usageObservabilityIsPostgres(db) {
+		var errPercentiles error
+		percentiles, errPercentiles = usageObservabilityLatencyPercentilesSQL(db, liveQuery)
+		if errPercentiles != nil {
+			return UsageObservabilityLiveSummary{}, errPercentiles
+		}
+	}
+	live := UsageObservabilityLiveSummary{WindowSeconds: windowSeconds}
+	if row.RequestCount > 0 {
+		live.ErrorRate = float64(optionalSQLInt64Value(row.FailedCount)) / float64(row.RequestCount)
+		live.SuccessRate = float64(row.RequestCount-optionalSQLInt64Value(row.FailedCount)) / float64(row.RequestCount)
+	}
+	if percentiles.P50LatencyMS.Valid {
+		live.P50LatencyMS = &percentiles.P50LatencyMS.Float64
+	}
+	if percentiles.P95LatencyMS.Valid {
+		live.P95LatencyMS = &percentiles.P95LatencyMS.Float64
 	}
 	minutes := float64(windowSeconds) / 60
-	if minutes > 0 {
-		live.RPM = float64(totals.RequestCount) / minutes
-		live.TPM = float64(totals.TokenBreakdown.TotalTokens) / minutes
-	}
+	live.RPM = float64(row.RequestCount) / minutes
+	live.TPM = float64(optionalSQLInt64Value(row.AccountingTotalTokens)) / minutes
 	return live, nil
 }
 
@@ -1150,9 +1184,7 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 		accountingTotalTokensExpr,
 	)
 	base := usageObservabilityUsageBillingScope(db.Table("usage"), query).Select(baseSelect, bucketArgs...)
-	var rows []usageObservabilityTrendBucketRow
-	if errFind := db.Table("(?) AS trend_source", base).
-		Select(`
+	selectSQL := `
 			trend_source.bucket_unix AS bucket_unix,
 			COUNT(*) AS request_count,
 			SUM(CASE WHEN trend_source.failed THEN 0 ELSE 1 END) AS success_count,
@@ -1179,16 +1211,30 @@ func usageObservabilityTrendSQL(db *gorm.DB, query UsageObservabilityRecordQuery
 			SUM(trend_source.accounting_reasoning_tokens) AS accounting_reasoning_tokens,
 			SUM(trend_source.unclassified_tokens) AS unclassified_tokens,
 			SUM(trend_source.amount) AS total_amount,
-			AVG(CASE WHEN trend_source.latency_ms >= 0 THEN trend_source.latency_ms END) AS avg_latency_ms`).
+			AVG(CASE WHEN trend_source.latency_ms >= 0 THEN trend_source.latency_ms END) AS avg_latency_ms`
+	if usageObservabilityIsPostgres(db) {
+		selectSQL += ", " + usageObservabilityPostgresPercentile("trend_source.latency_ms", 95) + " AS p95_latency_ms"
+	}
+	var rows []usageObservabilityTrendBucketRow
+	if errFind := db.Table("(?) AS trend_source", base).
+		Select(selectSQL).
 		Group("trend_source.bucket_unix").
 		Order("trend_source.bucket_unix ASC").
 		Scan(&rows).Error; errFind != nil {
 		return nil, errFind
 	}
 
-	percentiles, errPercentiles := usageObservabilityTrendP95SQL(db, query, bucketExpr, bucketArgs)
-	if errPercentiles != nil {
-		return nil, errPercentiles
+	percentiles := make(map[int64]sql.NullFloat64, len(rows))
+	if usageObservabilityIsPostgres(db) {
+		for _, row := range rows {
+			percentiles[row.BucketUnix] = row.P95LatencyMS
+		}
+	} else {
+		var errPercentiles error
+		percentiles, errPercentiles = usageObservabilityTrendP95SQL(db, query, bucketExpr, bucketArgs)
+		if errPercentiles != nil {
+			return nil, errPercentiles
+		}
 	}
 	return usageObservabilityTrendFromBucketRows(rows, percentiles, interval, location), nil
 }
@@ -1927,15 +1973,24 @@ func usageObservabilityPreAggregatedSQLOrder(metric string, direction string) st
 	return metricColumn + " " + sortDirection + ", scoped.last_used_at DESC, scoped.aggregate_label ASC"
 }
 
-func usageObservabilityAggregateP95Query(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string) *gorm.DB {
+func usageObservabilityAggregateP95Query(db *gorm.DB, query UsageObservabilityRecordQuery, groupBy string, aggregateIDs ...string) *gorm.DB {
 	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
-	ranked := db.Table("(?) AS scoped_latency", base).
-		Select(`
+	scope := db.Table("(?) AS scoped_latency", base).
+		Where("scoped_latency.latency_ms >= ?", 0)
+	if len(aggregateIDs) > 0 {
+		scope = scope.Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
+	}
+	if usageObservabilityIsPostgres(db) {
+		// Match nearest-rank semantics without numbering every row in each partition.
+		return scope.Select("scoped_latency.aggregate_id AS aggregate_id, " +
+			usageObservabilityPostgresPercentile("scoped_latency.latency_ms", 95) + " AS p95_latency_ms").
+			Group("scoped_latency.aggregate_id")
+	}
+	ranked := scope.Select(`
 			scoped_latency.aggregate_id AS aggregate_id,
 			scoped_latency.latency_ms AS latency_ms,
 			COUNT(*) OVER (PARTITION BY scoped_latency.aggregate_id) AS latency_count,
-			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`).
-		Where("scoped_latency.latency_ms >= ?", 0)
+			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`)
 	return db.Table("(?) AS ranked_latency", ranked).
 		Select("ranked_latency.aggregate_id AS aggregate_id, MIN(ranked_latency.latency_ms) AS p95_latency_ms").
 		Where("ranked_latency.latency_rank * 100 >= ranked_latency.latency_count * 95").
@@ -1946,24 +2001,11 @@ func usageObservabilityAggregateP95Values(db *gorm.DB, query UsageObservabilityR
 	if len(aggregateIDs) == 0 {
 		return map[string]sql.NullFloat64{}, nil
 	}
-	base := usageObservabilityAggregateBaseQuery(db, query, groupBy)
-	ranked := db.Table("(?) AS scoped_latency", base).
-		Select(`
-			scoped_latency.aggregate_id AS aggregate_id,
-			scoped_latency.latency_ms AS latency_ms,
-			COUNT(*) OVER (PARTITION BY scoped_latency.aggregate_id) AS latency_count,
-			ROW_NUMBER() OVER (PARTITION BY scoped_latency.aggregate_id ORDER BY scoped_latency.latency_ms ASC) AS latency_rank`).
-		Where("scoped_latency.latency_ms >= ?", 0).
-		Where("scoped_latency.aggregate_id IN ?", aggregateIDs)
-
 	var rows []struct {
 		AggregateID  string          `gorm:"column:aggregate_id"`
 		P95LatencyMS sql.NullFloat64 `gorm:"column:p95_latency_ms"`
 	}
-	if errScan := db.Table("(?) AS ranked_latency", ranked).
-		Select("ranked_latency.aggregate_id AS aggregate_id, MIN(ranked_latency.latency_ms) AS p95_latency_ms").
-		Where("ranked_latency.latency_rank * 100 >= ranked_latency.latency_count * 95").
-		Group("ranked_latency.aggregate_id").
+	if errScan := usageObservabilityAggregateP95Query(db, query, groupBy, aggregateIDs...).
 		Scan(&rows).Error; errScan != nil {
 		return nil, errScan
 	}
@@ -2046,7 +2088,30 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		%s AS metadata_auth_disabled,
 		%s AS metadata_auth_unavailable,
 		"usage"."provider" AS metadata_provider,
-		CASE WHEN "usage"."failed" THEN 'failed' ELSE 'success' END AS metadata_status,
+		CASE WHEN "usage"."failed" THEN 'failed' ELSE 'success' END AS metadata_status`,
+		idExpr,
+		labelExpr,
+		clientUserIDExpr,
+		usernameExpr,
+		clientAPIKeyIDExpr,
+		clientAPIKeyLabelExpr,
+		clientAPIKeyMaskedExpr,
+		credentialTypeExpr,
+		credentialIDExpr,
+		authIndexExpr,
+		credentialProviderExpr,
+		credentialLabelExpr,
+		authUUIDExpr,
+		authNextRetryAtExpr,
+		authStatusExpr,
+		authDisabledExpr,
+		authUnavailableExpr,
+	) + "," + usageObservabilityAggregateMetricsBaseSelect()
+}
+
+// Share row-level token normalization across ordinary and combined rankings.
+func usageObservabilityAggregateMetricsBaseSelect() string {
+	return fmt.Sprintf(`
 		"usage"."timestamp" AS timestamp,
 		"usage"."latency_ms" AS latency_ms,
 		"usage"."failed" AS failed,
@@ -2071,23 +2136,6 @@ func usageObservabilityAggregateBaseSelect(groupBy string) string {
 		%s AS cache_rate_tokens,
 		%s AS cache_rate_total_tokens,
 		"billing_charge"."amount" AS amount`,
-		idExpr,
-		labelExpr,
-		clientUserIDExpr,
-		usernameExpr,
-		clientAPIKeyIDExpr,
-		clientAPIKeyLabelExpr,
-		clientAPIKeyMaskedExpr,
-		credentialTypeExpr,
-		credentialIDExpr,
-		authIndexExpr,
-		credentialProviderExpr,
-		credentialLabelExpr,
-		authUUIDExpr,
-		authNextRetryAtExpr,
-		authStatusExpr,
-		authDisabledExpr,
-		authUnavailableExpr,
 		usageObservabilitySQLDisplayTokens(`"usage"`, "input_tokens"),
 		usageObservabilitySQLDisplayTokens(`"usage"`, "output_tokens"),
 		usageObservabilitySQLCacheReadTokens(`"usage"`),
@@ -2188,7 +2236,7 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 	if includeP95 {
 		p95Select = "MAX(p95.p95_latency_ms) AS p95_latency_ms"
 	}
-	return fmt.Sprintf(`
+	return `
 		scoped.aggregate_id AS aggregate_id,
 		COALESCE(NULLIF(MAX(scoped.aggregate_label), ''), scoped.aggregate_id) AS aggregate_label,
 		MAX(scoped.metadata_user_id) AS metadata_user_id,
@@ -2207,7 +2255,12 @@ func usageObservabilityAggregateSQLSelect(includeP95 bool) string {
 		MAX(CASE WHEN scoped.metadata_auth_disabled THEN 1 ELSE 0 END) AS metadata_auth_disabled,
 		MAX(CASE WHEN scoped.metadata_auth_unavailable THEN 1 ELSE 0 END) AS metadata_auth_unavailable,
 		MAX(scoped.metadata_provider) AS metadata_provider,
-		MAX(scoped.metadata_status) AS metadata_status,
+		MAX(scoped.metadata_status) AS metadata_status,` + usageObservabilityAggregateMetricsSQLSelect(p95Select)
+}
+
+// Keep additive metrics and nullable latency/amount semantics identical for all rankings.
+func usageObservabilityAggregateMetricsSQLSelect(p95Select string) string {
+	return fmt.Sprintf(`
 		COUNT(*) AS request_count,
 		SUM(CASE WHEN scoped.failed THEN 0 ELSE 1 END) AS success_count,
 		SUM(CASE WHEN scoped.failed THEN 1 ELSE 0 END) AS failed_count,

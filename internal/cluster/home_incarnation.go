@@ -119,17 +119,44 @@ func (r *Repository) RegisterHomeIncarnation(ctx context.Context, ip string, por
 
 // HeartbeatHomeIncarnation refreshes an active incarnation with database time.
 func (r *Repository) HeartbeatHomeIncarnation(ctx context.Context, id HomeIncarnationID) error {
-	return r.updateHomeIncarnation(ctx, id, func(tx *gorm.DB, record *HomeProcessIncarnationRecord, now time.Time) error {
+	db, errDB := r.database()
+	if errDB != nil {
+		return errDB
+	}
+	errHeartbeat := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+		// Acquire the liveness writer lock before evaluating database time. It remains compatible
+		// with lifecycle KEY SHARE readers, but serializes heartbeats and state transitions.
+		var record HomeProcessIncarnationRecord
+		errFind := tx.Clauses(clause.Locking{Strength: "NO KEY UPDATE"}).
+			First(&record, "home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(id.IP), id.Port, id.StartedAt).Error
+		if errors.Is(errFind, gorm.ErrRecordNotFound) {
+			return ErrHomeIncarnationNotFound
+		}
+		if errFind != nil {
+			return errFind
+		}
 		if record.State == HomeIncarnationFenced {
 			return ErrHomeIncarnationFenced
 		}
 		if record.State != HomeIncarnationActive {
 			return ErrHomeIncarnationInactive
 		}
-		return tx.Model(&HomeProcessIncarnationRecord{}).
-			Where("home_ip = ? AND home_port = ? AND started_at = ? AND state = ?", id.IP, id.Port, id.StartedAt, HomeIncarnationActive).
-			Update("last_seen_at", now).Error
+		var lastSeenAt any = gorm.Expr(strings.TrimPrefix(databaseNowQuery(tx), "SELECT "))
+		if tx.Dialector.Name() == "sqlite" {
+			// Bind UTC time.Time like lifecycle cutoffs; bare CURRENT_TIMESTAMP has a different text representation.
+			now, errNow := DatabaseNow(ctx, tx)
+			if errNow != nil {
+				return errNow
+			}
+			lastSeenAt = now
+		}
+		return tx.Model(&record).Update("last_seen_at", lastSeenAt).Error
 	})
+	if errHeartbeat != nil {
+		// GORM may combine cancellation and rollback errors without preserving the cancellation cause.
+		return errors.Join(errHeartbeat, contextOrBackground(ctx).Err())
+	}
+	return nil
 }
 
 // RetireHomeIncarnation permanently retires an active incarnation.
@@ -175,9 +202,19 @@ func expireStaleHomeIncarnations(ctx context.Context, tx *gorm.DB, nodeHeartbeat
 		return errNow
 	}
 	cutoff := now.Add(-nodeHeartbeatTimeout)
-	return tx.Model(&HomeProcessIncarnationRecord{}).
-		Where("state = ? AND last_seen_at < ?", HomeIncarnationActive, cutoff).
+	return homeIncarnationTransitionQuery(tx, "state = ? AND last_seen_at < ?", HomeIncarnationActive, cutoff).
 		Update("state", HomeIncarnationExpired).Error
+}
+
+// homeIncarnationTransitionQuery locks eligible incarnations exclusively before changing non-key state.
+// A plain UPDATE only takes NO KEY UPDATE, which would not conflict with lifecycle KEY SHARE readers.
+// Keep the eligibility predicate inside the locking subquery so fresh heartbeats are rechecked after waiting.
+func homeIncarnationTransitionQuery(tx *gorm.DB, predicate string, args ...any) *gorm.DB {
+	candidates := tx.Model(&HomeProcessIncarnationRecord{}).
+		Select("home_ip, home_port, started_at").Where(predicate, args...).
+		Order("home_ip, home_port, started_at").Clauses(clause.Locking{Strength: "UPDATE"})
+	return tx.Model(&HomeProcessIncarnationRecord{}).
+		Where("(home_ip, home_port, started_at) IN (?)", candidates)
 }
 
 func homeIncarnationLifecycleConfig(tx *gorm.DB) (LifecycleConfigRecord, error) {

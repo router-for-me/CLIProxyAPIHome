@@ -182,6 +182,9 @@ func writeRequestLogFile(filename string, content string) error {
 		return fmt.Errorf("empty filename")
 	}
 
+	logFilesMu.RLock()
+	defer logFilesMu.RUnlock()
+
 	logDir := "logs"
 	if errMk := os.MkdirAll(logDir, 0o755); errMk != nil {
 		return fmt.Errorf("ensure logs dir: %w", errMk)

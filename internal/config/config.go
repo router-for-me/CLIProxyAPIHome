@@ -82,8 +82,8 @@ type Config struct {
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
 
-	// LogsMaxTotalSizeMB limits the total size (in MB) of log files under the logs directory.
-	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
+	// LogsMaxTotalSizeMB limits local log files independently on each Home and downstream CPA node.
+	// When exceeded, the oldest log files are deleted until within the limit (in MB). Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
 
 	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.

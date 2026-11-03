@@ -383,3 +383,70 @@ func TestRecordUsagePayloadIgnoresAliasWithoutModel(t *testing.T) {
 		t.Fatalf("alias-only result changed auth: %#v", got)
 	}
 }
+
+func TestRecordUsagePayloadStreamTruncatedDoesNotCooldown(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-truncated-auth",
+		Index:    "usage-truncated-index",
+		Provider: "gemini",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	rt.RecordUsagePayload(context.Background(), `{
+		"auth_index": "usage-truncated-index",
+		"provider": "gemini",
+		"model": "gemini-3.1-pro-preview",
+		"failed": true,
+		"fail": {
+			"status_code": 502,
+			"body": "upstream stream closed before finishReason",
+			"code": "stream_truncated"
+		}
+	}`)
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gemini-3.1-pro-preview"]
+	if state == nil {
+		t.Fatalf("ModelStates missing after truncated usage payload: %#v", got.ModelStates)
+	}
+	if state.Unavailable || !state.NextRetryAfter.IsZero() {
+		t.Fatalf("truncated stream cooled the model: unavailable=%t next_retry_after=%v", state.Unavailable, state.NextRetryAfter)
+	}
+	if got.Unavailable {
+		t.Fatal("truncated stream marked auth unavailable")
+	}
+}
+
+func TestRecordUsagePayloadPlain502StillCooldowns(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "usage-plain-502-auth",
+		Index:    "usage-plain-502-index",
+		Provider: "gemini",
+		Status:   coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+
+	rt.RecordUsagePayload(context.Background(), `{
+		"auth_index": "usage-plain-502-index",
+		"provider": "gemini",
+		"model": "gemini-3.1-pro-preview",
+		"failed": true,
+		"fail": {
+			"status_code": 502,
+			"body": "upstream stream closed before finishReason"
+		}
+	}`)
+
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got == nil {
+		t.Fatalf("GetByID(%s) missing auth after usage payload", auth.ID)
+	}
+	state := got.ModelStates["gemini-3.1-pro-preview"]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("plain 502 must keep cooldown, state=%#v", state)
+	}
+}

@@ -1,13 +1,13 @@
-# CLIProxyAPIHome SQLite cluster mode configuration.
-# Copy this file to cluster.yaml to enable cluster behavior.
+# CLIProxyAPIHome SQLite single-Home configuration.
+# Copy this file to cluster.yaml to configure the database and node settings.
 
 # Database configuration: SQLite
 #
 # Configure exactly one database backend; do not add a pgsql section.
 # Without cluster.yaml, Home already uses ./home.db. Use this file when SQLite
-# needs an explicit cluster configuration or a custom database path.
-# SQLite is best suited to a single Home process. PostgreSQL is recommended
-# when multiple Home processes need to share runtime state.
+# needs explicit node settings or a custom database path.
+# SQLite supports only one active Home process per database. Multiple CPA nodes
+# may connect to that Home. Multiple active Homes must use PostgreSQL.
 #
 # Active example: relative database path.
 # Home creates the database file when it does not exist. Its parent directory
@@ -29,9 +29,9 @@ sqlite:
   slow-query-threshold: "200ms"
 
 node:
-  # Public address advertised to other Home nodes and CPA clients. Required for multi-node SQLite deployments.
+  # Public address advertised to CPA clients. Configure it so clients can reach this Home.
   # external-ip: "203.0.113.10"
-  # Optional public port advertised to other Home nodes and CPA clients when a reverse proxy changes the reachable port.
+  # Optional public port advertised to CPA clients when a reverse proxy changes the reachable port.
   # external-port: 443
   port: 8327
   heartbeat-interval: "5s"

@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/stdlib"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -38,14 +42,39 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 		return nil, errDSN
 	}
 
-	db, errOpen := gorm.Open(postgres.Open(dsn), databaseGORMConfig(cfg.SlowQueryThreshold))
-	if errOpen != nil {
-		return nil, errOpen
+	pgConfig, errParseConfig := pgx.ParseConfig(dsn)
+	if errParseConfig != nil {
+		return nil, errParseConfig
 	}
-
-	sqlDB, errDB := db.DB()
-	if errDB != nil {
-		return nil, errDB
+	pgConfig.Tracer = postgresTransactionTracer{}
+	// Preserve gorm.io/driver/postgres's timezone and timestamp scan settings
+	// when supplying a pgx pool with a tracer instead of its default pool.
+	var options []stdlib.OptionOpenDB
+	if timezone := regexp.MustCompile(`(time_zone|TimeZone|timezone)=(.*?)($|&| )`).FindStringSubmatch(dsn); len(timezone) > 2 {
+		pgConfig.RuntimeParams["timezone"] = timezone[2]
+		options = append(options, stdlib.OptionAfterConnect(func(_ context.Context, conn *pgx.Conn) error {
+			location, errLoadLocation := time.LoadLocation(timezone[2])
+			if errLoadLocation != nil {
+				return errLoadLocation
+			}
+			conn.TypeMap().RegisterType(&pgtype.Type{
+				Name: "timestamp", OID: pgtype.TimestampOID,
+				Codec: &pgtype.TimestampCodec{ScanLocation: location},
+			})
+			return nil
+		}))
+	}
+	sqlDB := stdlib.OpenDB(*pgConfig, options...)
+	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	if cfg.MaxIdleConns != nil {
+		sqlDB.SetMaxIdleConns(*cfg.MaxIdleConns)
+	}
+	db, errOpen := gorm.Open(postgres.New(postgres.Config{DSN: dsn, Conn: sqlDB}), databaseGORMConfig(cfg.SlowQueryThreshold))
+	if errOpen != nil {
+		if errClose := sqlDB.Close(); errClose != nil {
+			return nil, fmt.Errorf("open postgres: %w; close sql db: %v", errOpen, errClose)
+		}
+		return nil, errOpen
 	}
 	if errPing := sqlDB.PingContext(ctx); errPing != nil {
 		if errClose := sqlDB.Close(); errClose != nil {
@@ -239,6 +268,8 @@ func runCustomMigrations(db *gorm.DB) error {
 	}{
 		{name: "migrate_cpa_node_primary_key", run: migrateCPANodePrimaryKey},
 		{name: "migrate_billing_indexes", run: migrateBillingIndexes},
+		{name: "migrate_billing_usage_cover_index", run: migrateBillingUsageCoverIndex},
+		{name: "migrate_billing_overview_indexes", run: migrateBillingOverviewIndexes},
 		{name: "migrate_billing_import_indexes", run: migrateBillingImportIndexes},
 		{name: "migrate_certificate_fingerprints", run: migrateCertificateFingerprints},
 		{name: "migrate_api_key_channels", run: migrateAPIKeyChannels},

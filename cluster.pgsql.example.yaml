@@ -26,6 +26,14 @@ pgsql:
   # database: "cliproxy_home"
   # sslmode: "disable"
 
+  # Per-Home database connection pool limits; changes require a Home restart.
+  # Maximum total connections: 0 means unlimited (default).
+  max-open-conns: 0
+  # Maximum retained idle connections: 0 disables idle connection reuse.
+  # Defaults to 2, capped by max-open-conns when that limit is positive.
+  # Explicit values must not exceed a positive max-open-conns.
+  # max-idle-conns: 2
+
   # Queries taking longer than this threshold are logged as slow SQL.
   # Optional; defaults to "200ms". Uses Go duration syntax such as "1s".
   slow-query-threshold: "200ms"

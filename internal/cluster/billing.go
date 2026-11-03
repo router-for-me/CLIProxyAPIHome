@@ -521,7 +521,6 @@ func (r *Repository) BillingOverview(ctx context.Context, query BillingOverviewQ
 	ctx = contextOrBackground(ctx)
 
 	chargeQuery := billingChargeQueryFromOverview(query)
-	chargeScope := billingChargeQueryScope(db.WithContext(ctx).Model(&BillingChargeRecord{}), chargeQuery)
 	var chargeTotals struct {
 		TotalChargeAmount float64
 		RequestCount      int64
@@ -532,18 +531,7 @@ func (r *Repository) BillingOverview(ctx context.Context, query BillingOverviewQ
 		MinCreatedAt      sql.NullString `gorm:"column:min_created_at"`
 		MaxCreatedAt      sql.NullString `gorm:"column:max_created_at"`
 	}
-	if errScan := chargeScope.
-		Joins(`LEFT JOIN "usage" AS "billing_usage" ON "billing_usage"."id" = "billing_charge"."usage_id"`).
-		Select(`
-		COALESCE(SUM("billing_charge"."amount"), 0) AS total_charge_amount,
-		COUNT(*) AS request_count,
-		COALESCE(SUM(` + billingDisplayTokenSQL("input_tokens") + `), 0) AS input_tokens,
-		COALESCE(SUM(` + billingDisplayTokenSQL("output_tokens") + `), 0) AS output_tokens,
-		COALESCE(SUM("billing_charge"."cache_tokens"), 0) AS cache_tokens,
-		COUNT(DISTINCT "billing_charge"."user_id") AS active_user_count,
-		MIN("billing_charge"."created_at") AS min_created_at,
-		MAX("billing_charge"."created_at") AS max_created_at`,
-		).Scan(&chargeTotals).Error; errScan != nil {
+	if errScan := billingOverviewTotalsQuery(db.WithContext(ctx), chargeQuery).Scan(&chargeTotals).Error; errScan != nil {
 		return BillingOverview{}, errScan
 	}
 
@@ -564,13 +552,9 @@ func (r *Repository) BillingOverview(ctx context.Context, query BillingOverviewQ
 	if errTopUsers != nil {
 		return BillingOverview{}, errTopUsers
 	}
-	topModels, errTopModels := billingTopModels(ctx, db, chargeQuery)
-	if errTopModels != nil {
-		return BillingOverview{}, errTopModels
-	}
-	topProviders, errTopProviders := billingTopProviders(ctx, db, chargeQuery)
-	if errTopProviders != nil {
-		return BillingOverview{}, errTopProviders
+	topModels, topProviders, errRankings := billingTopModelsAndProviders(ctx, db, chargeQuery)
+	if errRankings != nil {
+		return BillingOverview{}, errRankings
 	}
 	ledgerTotals, errLedger := billingLedgerTotals(ctx, db, query)
 	if errLedger != nil {

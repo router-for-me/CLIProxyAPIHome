@@ -6,6 +6,11 @@ type UpstreamResponse struct {
 	Body   []byte `json:"body"`
 }
 
+// ErrorCodeStreamTruncated marks locally synthesized failures for accepted
+// upstream streams that ended without a terminal frame. The public status
+// stays 502, but the credential must not cool because of it.
+const ErrorCodeStreamTruncated = "stream_truncated"
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

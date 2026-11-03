@@ -27,7 +27,7 @@ func (r *Repository) RequireActiveCPAMembership(ctx context.Context, tx *gorm.DB
 		return CPANodeMembershipRecord{}, fmt.Errorf("database transaction is nil")
 	}
 	var member CPANodeMembershipRecord
-	errMember := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
+	errMember := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "KEY SHARE"}).
 		Where("certificate_fingerprint = ? AND connected_at = ? AND state = ?", identity.CertificateFingerprint, identity.MembershipConnectedAt, MembershipStateActive).
 		First(&member).Error
 	if errMember != nil || member.NodeID != identity.NodeID {
@@ -51,18 +51,16 @@ func (r *Repository) IngestInFlightFrame(ctx context.Context, identity InFlightI
 		return InFlightIngestResult{}, errEnvelope
 	}
 
+	// Decode untrusted JSON before acquiring any database locks. Rejections still commit revision state below.
+	frame, errFrame := decodeInFlightFrameStrict(raw, limits)
 	result := InFlightIngestResult{Revision: envelope.Revision}
 	var protocolErr error
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if _, errMembership := r.RequireActiveCPAMembership(ctx, tx, identity); errMembership != nil {
 			return errors.Join(ErrInFlightLifetimeMismatch, errMembership)
 		}
-		now, errNow := DatabaseNow(ctx, tx)
-		if errNow != nil {
-			return errNow
-		}
 		if errEnvelope != nil {
-			errReject := r.markInFlightRejected(ctx, tx, identity, envelope.Revision, now, &result)
+			errReject := r.markInFlightRejected(ctx, tx, identity, envelope.Revision, &result)
 			if errReject != nil {
 				if isInFlightProtocolError(errReject) {
 					protocolErr = errReject
@@ -74,9 +72,8 @@ func (r *Repository) IngestInFlightFrame(ctx context.Context, identity InFlightI
 			return nil
 		}
 
-		frame, errFrame := decodeInFlightFrameStrict(raw, limits)
 		if errFrame != nil {
-			errReject := r.markInFlightRejected(ctx, tx, identity, envelope.Revision, now, &result)
+			errReject := r.markInFlightRejected(ctx, tx, identity, envelope.Revision, &result)
 			if errReject != nil {
 				if isInFlightProtocolError(errReject) {
 					protocolErr = errReject
@@ -87,7 +84,7 @@ func (r *Repository) IngestInFlightFrame(ctx context.Context, identity InFlightI
 			protocolErr = errFrame
 			return nil
 		}
-		if errStage := r.stageInFlightFrame(ctx, tx, identity, frame, raw, now, limits, &result); errStage != nil {
+		if errStage := r.stageInFlightFrame(ctx, tx, identity, frame, raw, limits, &result); errStage != nil {
 			if isInFlightProtocolError(errStage) {
 				protocolErr = errStage
 				return nil
@@ -408,26 +405,30 @@ func validInFlightString(value string, limits InFlightLimits) bool {
 	return strings.TrimSpace(value) != "" && (limits.MaxStringBytes <= 0 || len(value) <= limits.MaxStringBytes)
 }
 
-func (r *Repository) stageInFlightFrame(ctx context.Context, tx *gorm.DB, identity InFlightIngestIdentity, frame InFlightSnapshotFrame, raw []byte, now time.Time, limits InFlightLimits, result *InFlightIngestResult) error {
-	attempt, found, errAttempt := r.lockInFlightAttempt(ctx, tx, identity)
+func (r *Repository) stageInFlightFrame(ctx context.Context, tx *gorm.DB, identity InFlightIngestIdentity, frame InFlightSnapshotFrame, raw []byte, limits InFlightLimits, result *InFlightIngestResult) error {
+	initial := newInFlightAttempt(identity, frame, time.Time{})
+	if frame.Kind == InFlightFrameOverflow {
+		initial.State = "overflow"
+		initial.AggregateGroupCount = frame.AggregateGroupCount
+	}
+	attempt, found, errAttempt := r.lockInFlightAttempt(ctx, tx, identity, initial)
 	if errAttempt != nil {
 		return errAttempt
 	}
+	// The attempt lookup, conflicting insert, and winner lookup may all wait. Timestamp only after they finish.
+	now, errNow := DatabaseNow(ctx, tx)
+	if errNow != nil {
+		return errNow
+	}
 	if !found {
 		if frame.Kind == InFlightFrameOverflow {
-			attempt = newInFlightAttempt(identity, frame, now)
-			attempt.State = "overflow"
-			attempt.AggregateGroupCount = frame.AggregateGroupCount
-			if errCreate := tx.Create(&attempt).Error; errCreate != nil {
-				return errCreate
+			attempt.UpdatedAt = now
+			if errSave := tx.Save(&attempt).Error; errSave != nil {
+				return errSave
 			}
 			result.Accepted = true
 			result.State = "overflow"
 			return nil
-		}
-		attempt = newInFlightAttempt(identity, frame, now)
-		if errCreate := tx.Create(&attempt).Error; errCreate != nil {
-			return errCreate
 		}
 		return r.stageInFlightPart(ctx, tx, identity, &attempt, frame, raw, now, limits, result)
 	}
@@ -445,10 +446,10 @@ func (r *Repository) stageInFlightFrame(ctx context.Context, tx *gorm.DB, identi
 			attempt.State = "overflow"
 			attempt.AggregateGroupCount = frame.AggregateGroupCount
 		}
-		if errSave := tx.Save(&attempt).Error; errSave != nil {
-			return errSave
-		}
 		if frame.Kind == InFlightFrameOverflow {
+			if errSave := tx.Save(&attempt).Error; errSave != nil {
+				return errSave
+			}
 			result.Accepted = true
 			result.State = "overflow"
 			return nil
@@ -522,15 +523,13 @@ func (r *Repository) stageInFlightPart(ctx context.Context, tx *gorm.DB, identit
 		return errCreate
 	}
 
-	var parts []CPAInFlightSnapshotPartRecord
-	if errFind := tx.WithContext(contextOrBackground(ctx)).Where("certificate_fingerprint = ? AND membership_connected_at = ? AND revision = ?", identity.CertificateFingerprint, identity.MembershipConnectedAt, frame.Revision).Order("part_index ASC").Find(&parts).Error; errFind != nil {
-		return errFind
-	}
-	encodedBytes, errEncodedBytes := inFlightPartsEncodedBytes(parts)
+	// The attempt lock serializes distinct parts; duplicate parts returned before this point.
+	// Maintain progress incrementally instead of rereading every staged payload on every part.
+	encodedBytes, errEncodedBytes := checkedInFlightAdd(attempt.EncodedBytes, int64(part.EncodedBytes))
 	if errEncodedBytes != nil {
 		return errEncodedBytes
 	}
-	attempt.ReceivedPartCount = len(parts)
+	attempt.ReceivedPartCount++
 	attempt.EncodedBytes = encodedBytes
 	attempt.UpdatedAt = now
 	if limits.MaxRevisionBytes > 0 && encodedBytes > int64(limits.MaxRevisionBytes) {
@@ -540,14 +539,21 @@ func (r *Repository) stageInFlightPart(ctx context.Context, tx *gorm.DB, identit
 		result.State = "rejected"
 		return ErrInFlightRevisionOverflow
 	}
-	if errSave := tx.Save(attempt).Error; errSave != nil {
-		return errSave
-	}
-
-	if len(parts) != attempt.PartCount {
+	if attempt.ReceivedPartCount != attempt.PartCount {
+		if errSave := tx.Save(attempt).Error; errSave != nil {
+			return errSave
+		}
 		result.Accepted = true
 		result.State = "staging"
 		return nil
+	}
+
+	// A single-part revision is already in memory. Read multipart payloads only once, at completion.
+	parts := []CPAInFlightSnapshotPartRecord{part}
+	if attempt.PartCount > 1 {
+		if errFind := tx.WithContext(contextOrBackground(ctx)).Where("certificate_fingerprint = ? AND membership_connected_at = ? AND revision = ?", identity.CertificateFingerprint, identity.MembershipConnectedAt, frame.Revision).Order("part_index ASC").Find(&parts).Error; errFind != nil {
+			return errFind
+		}
 	}
 	payload, errPayload := completeInFlightPayload(parts, frame, limits)
 	if errPayload != nil {
@@ -610,15 +616,19 @@ func (r *Repository) verifyPublishedInFlightReplay(ctx context.Context, tx *gorm
 	return nil
 }
 
-func (r *Repository) markInFlightRejected(ctx context.Context, tx *gorm.DB, identity InFlightIngestIdentity, revision int64, now time.Time, result *InFlightIngestResult) error {
-	attempt, found, errAttempt := r.lockInFlightAttempt(ctx, tx, identity)
+func (r *Repository) markInFlightRejected(ctx context.Context, tx *gorm.DB, identity InFlightIngestIdentity, revision int64, result *InFlightIngestResult) error {
+	attempt, found, errAttempt := r.lockInFlightAttempt(ctx, tx, identity, newRejectedInFlightAttempt(identity, revision, time.Time{}))
 	if errAttempt != nil {
 		return errAttempt
 	}
+	now, errNow := DatabaseNow(ctx, tx)
+	if errNow != nil {
+		return errNow
+	}
 	if !found {
 		attempt = newRejectedInFlightAttempt(identity, revision, now)
-		if errCreate := tx.Create(&attempt).Error; errCreate != nil {
-			return errCreate
+		if errSave := tx.Save(&attempt).Error; errSave != nil {
+			return errSave
 		}
 		result.State = "rejected"
 		return nil
@@ -656,13 +666,25 @@ func (r *Repository) markInFlightRejected(ctx context.Context, tx *gorm.DB, iden
 	return nil
 }
 
-func (r *Repository) lockInFlightAttempt(ctx context.Context, tx *gorm.DB, identity InFlightIngestIdentity) (CPAInFlightSnapshotAttemptRecord, bool, error) {
+func (r *Repository) lockInFlightAttempt(ctx context.Context, tx *gorm.DB, identity InFlightIngestIdentity, initial CPAInFlightSnapshotAttemptRecord) (CPAInFlightSnapshotAttemptRecord, bool, error) {
 	attempt := CPAInFlightSnapshotAttemptRecord{}
-	errAttempt := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("certificate_fingerprint = ? AND membership_connected_at = ?", identity.CertificateFingerprint, identity.MembershipConnectedAt).
-		First(&attempt).Error
+	query := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("certificate_fingerprint = ? AND membership_connected_at = ?", identity.CertificateFingerprint, identity.MembershipConnectedAt)
+	errAttempt := query.First(&attempt).Error
 	if errors.Is(errAttempt, gorm.ErrRecordNotFound) {
-		return CPAInFlightSnapshotAttemptRecord{}, false, nil
+		// Lifecycle readers can now run concurrently, including the first frame of a lifetime.
+		// A conflicting insert must wait and then lock the winner's row, not abort the transaction.
+		// The initial row is an uncommitted seed; callers apply database timestamps after acquiring this lock.
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&initial)
+		if created.Error != nil {
+			return CPAInFlightSnapshotAttemptRecord{}, false, created.Error
+		}
+		if created.RowsAffected == 1 {
+			return initial, false, nil
+		}
+		errAttempt = tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("certificate_fingerprint = ? AND membership_connected_at = ?", identity.CertificateFingerprint, identity.MembershipConnectedAt).
+			First(&attempt).Error
 	}
 	if errAttempt != nil {
 		return CPAInFlightSnapshotAttemptRecord{}, false, errAttempt

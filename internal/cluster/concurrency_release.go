@@ -57,7 +57,7 @@ func applyConcurrencyReleaseTx(ctx context.Context, repo *Repository, tx *gorm.D
 	if errLifetime := repo.LockActiveConcurrencyLifetimeTx(ctx, tx, req.Lifetime); errLifetime != nil {
 		return ErrConcurrencyNodeUnavailable
 	}
-	if _, _, errPolicy := lockConcurrencyPolicyTx(ctx, tx, credentialID); errPolicy != nil {
+	if _, errPolicy := lockConcurrencyPolicyTx(ctx, tx, credentialID); errPolicy != nil {
 		return errPolicy
 	}
 	counter, errCounter := lockConcurrencyCounterTx(ctx, tx, credentialID, model, strings.TrimSpace(req.Lifetime.Fingerprint))
@@ -75,14 +75,11 @@ func applyConcurrencyReleaseTx(ctx context.Context, repo *Repository, tx *gorm.D
 	if delta > counter.ActiveCount {
 		return ErrConcurrencyReleaseExceedsActive
 	}
-	now, errNow := DatabaseNow(ctx, tx)
-	if errNow != nil {
-		return errNow
-	}
-	counter.ActiveCount -= delta
-	counter.LastReleaseSeq = req.ReleaseSeq
-	counter.UpdatedAt = now
-	return tx.WithContext(contextOrBackground(ctx)).Save(&counter).Error
+	return tx.WithContext(contextOrBackground(ctx)).Model(&counter).Updates(map[string]any{
+		"active_count":     counter.ActiveCount - delta,
+		"last_release_seq": req.ReleaseSeq,
+		"updated_at":       gorm.Expr(strings.TrimPrefix(databaseNowQuery(tx), "SELECT ")),
+	}).Error
 }
 
 func lockConcurrencyCounterTx(ctx context.Context, tx *gorm.DB, credentialID string, model string, fingerprint string) (CredentialConcurrencyCounterRecord, error) {

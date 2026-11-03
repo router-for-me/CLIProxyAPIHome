@@ -12,6 +12,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,8 @@ type Server struct {
 	inFlightStore           dispatch.InFlightSnapshotStore
 	concurrencyReleaseStore dispatch.ConcurrencyReleaseStore
 	inFlightLimits          atomic.Pointer[cluster.InFlightLimits]
+	clusterBroadcastMu      sync.Mutex
+	clusterBroadcast        *clusterSubscriptionBroadcast
 }
 
 const (
@@ -56,7 +59,37 @@ const (
 const (
 	respAuthSourceNone = "none"
 	respAuthSourceMTLS = "mtls"
+
+	maxRESPArrayLen                  = 1024
+	maxUnauthenticatedRESPArrayLen   = 16
+	maxRESPBulkLen                   = 64 << 20 // 64 MiB
+	maxUnauthenticatedRESPBulkLen    = 64 << 10 // 64 KiB
+	maxRESPFrameBytes                = 64 << 20 // 64 MiB
+	maxUnauthenticatedRESPFrameBytes = 64 << 10 // 64 KiB
+	maxRESPLineLen                   = 64 << 10 // 64 KiB
 )
+
+type respReadLimits struct {
+	maxArrayLen   int
+	maxBulkLen    int
+	maxFrameBytes int
+}
+
+func defaultRESPReadLimits() respReadLimits {
+	return respReadLimits{
+		maxArrayLen:   maxRESPArrayLen,
+		maxBulkLen:    maxRESPBulkLen,
+		maxFrameBytes: maxRESPFrameBytes,
+	}
+}
+
+func unauthenticatedRESPReadLimits() respReadLimits {
+	return respReadLimits{
+		maxArrayLen:   maxUnauthenticatedRESPArrayLen,
+		maxBulkLen:    maxUnauthenticatedRESPBulkLen,
+		maxFrameBytes: maxUnauthenticatedRESPFrameBytes,
+	}
+}
 
 // New creates a new.
 func New(addr string, runtime *home.Runtime) *Server {
@@ -182,19 +215,26 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedC
 	}()
 
 	if s.cluster != nil {
+		updates, unsubscribe := s.subscribeClusterUpdates()
+		context.AfterFunc(runCtx, unsubscribe)
 		go func() {
-			ticker := time.NewTicker(clusterSubscriptionUpdateInterval)
-			defer ticker.Stop()
-
 			for {
 				select {
 				case <-runCtx.Done():
 					return
-				case <-ticker.C:
-					if errSend := s.writeClusterSubscriptionUpdate(runCtx, writer); errSend != nil {
-						log.Warnf("failed to publish cluster update to subscriber: %v", errSend)
-						cancel()
+				case payload := <-updates:
+					if runCtx.Err() != nil {
 						return
+					}
+					if len(payload) > 0 {
+						if errSend := writer.WriteDispatchReply(subscriptionMessage(clusterSubscriptionChannel, payload)); errSend != nil {
+							log.Warnf("failed to publish cluster update to subscriber: %v", errSend)
+							cancel()
+							return
+						}
+					}
+					if errSend := s.writeRebalanceInstruction(runCtx, tracked.Lifetime(), writer); errSend != nil {
+						log.Debugf("failed to publish rebalance instruction: %v", errSend)
 					}
 				}
 			}
@@ -209,25 +249,6 @@ func (s *Server) refreshSubscriptionLiveness(ctx context.Context, lifetime clust
 		return fmt.Errorf("cluster lifecycle unavailable")
 	}
 	return s.cluster.RefreshCPALiveness(ctx, lifetime)
-}
-
-func (s *Server) writeClusterSubscriptionUpdate(ctx context.Context, writer *safeWriter) error {
-	if s == nil || s.cluster == nil || writer == nil {
-		return nil
-	}
-	s.syncClusterClientCount(ctx)
-	payload, errPayload := s.cluster.Handle(ctx, []string{clusterCommand, "NODES"}, "")
-	if errPayload != nil {
-		if ctx != nil && ctx.Err() != nil {
-			return ctx.Err()
-		}
-		log.Warnf("failed to build cluster update for subscriber: %v", errPayload)
-		return nil
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	return writer.WriteDispatchReply(subscriptionMessage(clusterSubscriptionChannel, payload))
 }
 
 func buildOrWriteDispatchReply(writer *safeWriter, reply dispatch.Reply) error {
@@ -334,6 +355,14 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 	if s == nil || conn == nil {
 		return
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Errorf("panic while handling resp connection from %v: %v", conn.RemoteAddr(), recovered)
+			if errClose := conn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+				log.Errorf("resp connection close error after panic: %v", errClose)
+			}
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -388,7 +417,17 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 	addedNode := false
 	var unsubscribeConfig func()
 	var cancelSubscriptionUpdates context.CancelFunc
+	var pendingConfigSubscriptionReady chan struct{}
+	var pendingConfigSubscriptionAborted chan struct{}
 	defer func() {
+		if pendingConfigSubscriptionAborted != nil {
+			close(pendingConfigSubscriptionAborted)
+			pendingConfigSubscriptionAborted = nil
+		}
+		if pendingConfigSubscriptionReady != nil {
+			close(pendingConfigSubscriptionReady)
+			pendingConfigSubscriptionReady = nil
+		}
 		if cancelSubscriptionUpdates != nil {
 			cancelSubscriptionUpdates()
 			cancelSubscriptionUpdates = nil
@@ -414,8 +453,6 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 		}
 	}()
 
-	var pendingConfigSubscriptionReady chan struct{}
-	var pendingConfigSubscriptionAborted chan struct{}
 	connEnv := &dispatch.ConnEnv{
 		AttachSubscriptionLifetimeFunc: tracked.AttachSubscriptionLifetime,
 		FenceFingerprint: func(fenceCtx context.Context, _ string) error {
@@ -489,10 +526,15 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 		}
 	}
 
+	readLimits := unauthenticatedRESPReadLimits()
+	if isRESPAuthenticated(authSource) {
+		readLimits = defaultRESPReadLimits()
+	}
+
 	for {
 		pendingConfigSubscriptionReady = nil
 		pendingConfigSubscriptionAborted = nil
-		args, errRead := readRESPArray(reader)
+		args, errRead := readRESPArrayWithLimits(reader, readLimits)
 		if errRead != nil {
 			if !errors.Is(errRead, io.EOF) {
 				_ = writer.WriteRedisError("ERR " + errRead.Error())
@@ -514,6 +556,12 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 		closeConnection := false
 		var livenessFailure *cluster.ConnectionLifetime
 		func() {
+			defer func() {
+				finishHandler()
+				if clientCertificateFingerprint != "" {
+					node.GlobalRegistry().UpdateFingerprintState(clientCertificateFingerprint, clientNodeID, clientIP, 0, -1, s.fingerprints.LatestFenceRevision(tracked.Lifetime()))
+				}
+			}()
 			if len(args) == 0 {
 				_ = writer.WriteRedisError("ERR empty command")
 				return
@@ -549,6 +597,20 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 					_ = writer.WriteRedisError("ERR cluster disabled")
 					return
 				}
+				if len(args) >= 2 && strings.EqualFold(args[1], "BALANCE") {
+					handler, supported := s.cluster.(clusterRebalanceHandler)
+					if !supported {
+						_ = writer.WriteRedisError("ERR cluster rebalance unsupported")
+						return
+					}
+					payload, errRebalance := handler.HandleRebalance(connectionCtx, tracked.Lifetime(), args)
+					if errRebalance != nil {
+						_ = writer.WriteRedisError(cluster.FormatRESPError(errRebalance))
+						return
+					}
+					_ = writer.WriteRedisBulkString(payload)
+					return
+				}
 				payload, errCluster := s.cluster.Handle(connectionCtx, args, clientIP)
 				if errCluster != nil {
 					_ = writer.WriteRedisError(cluster.FormatRESPError(errCluster))
@@ -562,7 +624,10 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 				return
 			}
 			if cmd == "PING" {
-				if unsubscribeConfig != nil {
+				// Telemetry echoes do not refresh liveness or put database work into measured RTT.
+				// Periodic heartbeats and ordinary PINGs retain their existing lifetime checks.
+				latencyPing := len(args) == 2 && strings.HasPrefix(args[1], "home-rtt/")
+				if unsubscribeConfig != nil && !latencyPing {
 					lifetime := tracked.Lifetime()
 					if errLiveness := s.refreshSubscriptionLiveness(connectionCtx, lifetime); errLiveness != nil {
 						log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
@@ -609,10 +674,6 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			}
 			hasReply = true
 		}()
-		finishHandler()
-		if clientCertificateFingerprint != "" {
-			node.GlobalRegistry().UpdateFingerprintState(clientCertificateFingerprint, clientNodeID, clientIP, 0, -1, s.fingerprints.LatestFenceRevision(tracked.Lifetime()))
-		}
 		if livenessFailure != nil {
 			if errFence := s.fingerprints.Fence(context.WithoutCancel(connectionCtx), *livenessFailure, s.fingerprints.LatestFenceRevision(*livenessFailure)); errFence != nil {
 				log.Warnf("failed to fence subscription after client PING liveness failure: %v", errFence)
@@ -628,7 +689,9 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			if errAttach := connEnv.AttachSubscriptionLifetime(*reply.SubscriptionLifetime); errAttach != nil {
 				if pendingConfigSubscriptionReady != nil {
 					close(pendingConfigSubscriptionAborted)
+					pendingConfigSubscriptionAborted = nil
 					close(pendingConfigSubscriptionReady)
+					pendingConfigSubscriptionReady = nil
 				}
 				log.Warnf("failed to attach RESP subscription lifetime: %v", errAttach)
 				return
@@ -637,7 +700,9 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 		if errWrite := writeDispatchReplyWithFence(ctx, writer, reply, connEnv); errWrite != nil {
 			if pendingConfigSubscriptionReady != nil {
 				close(pendingConfigSubscriptionAborted)
+				pendingConfigSubscriptionAborted = nil
 				close(pendingConfigSubscriptionReady)
+				pendingConfigSubscriptionReady = nil
 			}
 			log.Errorf("resp write reply error: %v", errWrite)
 			return
@@ -646,17 +711,23 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			payload, errConfig := s.runtime.ReadConfigYAMLContext(connectionCtx)
 			if errConfig != nil {
 				close(pendingConfigSubscriptionAborted)
+				pendingConfigSubscriptionAborted = nil
 				close(pendingConfigSubscriptionReady)
+				pendingConfigSubscriptionReady = nil
 				log.Warnf("failed to publish initial config snapshot: %v", errConfig)
 				return
 			}
 			if errInitial := writer.WriteDispatchReply(subscriptionMessage(configSubscriptionChannel, payload)); errInitial != nil {
 				close(pendingConfigSubscriptionAborted)
+				pendingConfigSubscriptionAborted = nil
 				close(pendingConfigSubscriptionReady)
+				pendingConfigSubscriptionReady = nil
 				log.Warnf("failed to publish initial config snapshot: %v", errInitial)
 				return
 			}
 			close(pendingConfigSubscriptionReady)
+			pendingConfigSubscriptionReady = nil
+			pendingConfigSubscriptionAborted = nil
 			cancelSubscriptionUpdates = s.startSubscriptionUpdates(connectionCtx, tracked, writer)
 		}
 	}
@@ -664,6 +735,29 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 
 // readRESPArray reads a resp array.
 func readRESPArray(reader *bufio.Reader) ([]string, error) {
+	return readRESPArrayWithLimits(reader, defaultRESPReadLimits())
+}
+
+func readRESPArrayWithLimit(reader *bufio.Reader, maxBulkLen int) ([]string, error) {
+	limits := defaultRESPReadLimits()
+	if maxBulkLen > 0 && maxBulkLen < limits.maxBulkLen {
+		limits.maxBulkLen = maxBulkLen
+		limits.maxFrameBytes = maxBulkLen
+	}
+	return readRESPArrayWithLimits(reader, limits)
+}
+
+func readRESPArrayWithLimits(reader *bufio.Reader, limits respReadLimits) ([]string, error) {
+	if limits.maxArrayLen <= 0 || limits.maxArrayLen > maxRESPArrayLen {
+		limits.maxArrayLen = maxRESPArrayLen
+	}
+	if limits.maxBulkLen <= 0 || limits.maxBulkLen > maxRESPBulkLen {
+		limits.maxBulkLen = maxRESPBulkLen
+	}
+	if limits.maxFrameBytes <= 0 || limits.maxFrameBytes > maxRESPFrameBytes {
+		limits.maxFrameBytes = maxRESPFrameBytes
+	}
+
 	// Decode the wire frame before dispatching command handling.
 	prefix, errRead := reader.ReadByte()
 	if errRead != nil {
@@ -677,12 +771,13 @@ func readRESPArray(reader *bufio.Reader) ([]string, error) {
 		return nil, errLine
 	}
 	count, errAtoi := strconv.Atoi(line)
-	if errAtoi != nil || count < 0 {
+	if errAtoi != nil || count < 0 || count > limits.maxArrayLen {
 		return nil, fmt.Errorf("protocol error")
 	}
 	args := make([]string, 0, count)
+	remainingBytes := limits.maxFrameBytes
 	for i := 0; i < count; i++ {
-		value, errValue := readRESPString(reader)
+		value, errValue := readRESPStringWithBudget(reader, limits.maxBulkLen, &remainingBytes)
 		if errValue != nil {
 			return nil, errValue
 		}
@@ -693,15 +788,33 @@ func readRESPArray(reader *bufio.Reader) ([]string, error) {
 
 // readRESPString reads a resp string.
 func readRESPString(reader *bufio.Reader) (string, error) {
+	return readRESPStringWithBudget(reader, maxRESPBulkLen, nil)
+}
+
+func readRESPStringWithLimit(reader *bufio.Reader, maxBulkLen int) (string, error) {
+	return readRESPStringWithBudget(reader, maxBulkLen, nil)
+}
+
+func readRESPStringWithBudget(reader *bufio.Reader, maxBulkLen int, remainingBytes *int) (string, error) {
 	prefix, errRead := reader.ReadByte()
 	if errRead != nil {
 		return "", errRead
 	}
 	switch prefix {
 	case '$':
-		return readRESPBulkString(reader)
+		return readRESPBulkStringWithBudget(reader, maxBulkLen, remainingBytes)
 	case '+', ':':
-		return readRESPLine(reader)
+		line, errLine := readRESPLine(reader)
+		if errLine != nil {
+			return "", errLine
+		}
+		if remainingBytes != nil {
+			if len(line) > *remainingBytes {
+				return "", fmt.Errorf("protocol error")
+			}
+			*remainingBytes -= len(line)
+		}
+		return line, nil
 	default:
 		return "", fmt.Errorf("protocol error")
 	}
@@ -709,6 +822,17 @@ func readRESPString(reader *bufio.Reader) (string, error) {
 
 // readRESPBulkString reads a resp bulk string.
 func readRESPBulkString(reader *bufio.Reader) (string, error) {
+	return readRESPBulkStringWithBudget(reader, maxRESPBulkLen, nil)
+}
+
+func readRESPBulkStringWithLimit(reader *bufio.Reader, maxBulkLen int) (string, error) {
+	return readRESPBulkStringWithBudget(reader, maxBulkLen, nil)
+}
+
+func readRESPBulkStringWithBudget(reader *bufio.Reader, maxBulkLen int, remainingBytes *int) (string, error) {
+	if maxBulkLen <= 0 || maxBulkLen > maxRESPBulkLen {
+		maxBulkLen = maxRESPBulkLen
+	}
 	line, errLine := readRESPLine(reader)
 	if errLine != nil {
 		return "", errLine
@@ -717,28 +841,57 @@ func readRESPBulkString(reader *bufio.Reader) (string, error) {
 	if errAtoi != nil {
 		return "", fmt.Errorf("protocol error")
 	}
+	if length < -1 {
+		return "", fmt.Errorf("protocol error")
+	}
 	if length < 0 {
 		return "", nil
+	}
+	if length > maxBulkLen || (remainingBytes != nil && length > *remainingBytes) {
+		return "", fmt.Errorf("bulk string too large")
 	}
 	buf := make([]byte, length+2)
 	if _, errRead := io.ReadFull(reader, buf); errRead != nil {
 		return "", errRead
 	}
-	if length+2 < 2 || buf[length] != '\r' || buf[length+1] != '\n' {
+	if buf[length] != '\r' || buf[length+1] != '\n' {
 		return "", fmt.Errorf("protocol error")
+	}
+	if remainingBytes != nil {
+		*remainingBytes -= length
 	}
 	return string(buf[:length]), nil
 }
 
 // readRESPLine reads a resp line.
 func readRESPLine(reader *bufio.Reader) (string, error) {
-	line, errRead := reader.ReadString('\n')
-	if errRead != nil {
+	var buf []byte
+	for {
+		fragment, errRead := reader.ReadSlice('\n')
+		if len(buf)+len(fragment) > maxRESPLineLen+2 {
+			return "", fmt.Errorf("protocol error")
+		}
+		if errRead == nil {
+			var line string
+			if len(buf) == 0 {
+				line = string(fragment)
+			} else {
+				buf = append(buf, fragment...)
+				line = string(buf)
+			}
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			if len(line) > maxRESPLineLen {
+				return "", fmt.Errorf("protocol error")
+			}
+			return line, nil
+		}
+		if errors.Is(errRead, bufio.ErrBufferFull) {
+			buf = append(buf, fragment...)
+			continue
+		}
 		return "", errRead
 	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line, nil
 }
 
 // writeRedisSimpleString writes a redis simple string.

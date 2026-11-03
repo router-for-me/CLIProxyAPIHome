@@ -161,6 +161,8 @@ routing:
   # Non-positive weights exclude the credential while this strategy is active.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
   # Enable universal session-sticky routing for all clients.
+  # Home nodes using the same database share bindings across reloads and restarts.
+  # Upgrade every Home node before relying on cluster-wide session affinity.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
   # execution or derived session identity, and the existing first-message hash fallback.
@@ -1118,8 +1120,10 @@ observability:
     # CPA node file logging. Home itself writes its application log to stdout.
     logging-to-file: false
 
-    # Maximum total size (MB) of log files under the logs directory. When exceeded, the oldest log
-    # files are deleted until within the limit. Set to 0 to disable.
+    # Per-node maximum total size (MB) of local log files on every Home and CPA node.
+    # Each Home cleans its logs/ directory at startup and every minute, using the latest config.
+    # Oldest .log/.log.gz files are deleted first. Set to 0 to disable cleanup.
+    # Does not limit database records or container stdout logs.
     logs-max-total-size-mb: 0
 
     # Maximum number of error log files retained when request logging is disabled.

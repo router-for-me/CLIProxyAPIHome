@@ -2511,7 +2511,7 @@ Input:
 | Form field or query | Type | Required | Description |
 | --- | --- | --- | --- |
 | form `file` | file | yes | Vertex service account JSON. |
-| form/query `location` | string | no | Vertex location. Default: `us-central1`. |
+| form/query `location` | string | no | Vertex location. Default: `global`. |
 
 Example response:
 
@@ -2521,7 +2521,7 @@ Example response:
   "auth-file": "11111111-2222-4333-8444-555555555555.json",
   "project_id": "project-id",
   "email": "service-account@example.iam.gserviceaccount.com",
-  "location": "us-central1"
+  "location": "global"
 }
 ```
 
@@ -2762,7 +2762,12 @@ When an observation is joined to a policy in `/credentials/in-flight`, `/credent
 
 ### Credential concurrency policy and limiter routes
 
-Before activating a policy, follow the [strict credential concurrency limits deployment runbook](../README.md). It defines the required topology, capability checks, certificate identities, and fail-closed mixed-version rollout.
+Before activating a policy:
+
+- Use only one active Home per SQLite database; multiple active Homes require PostgreSQL, even when all limits are disabled.
+- Give each Home and CPA node its own mTLS certificate and private key. Do not share identities between nodes or reuse an identity for a replacement node.
+- Keep all limits disabled while upgrading every Home and CPA. Confirm old processes are stopped, every active CPA membership uses protocol version `1`, and authenticated `GET /capabilities` on each live Home returns `capabilities.credential_concurrency_limits_v2: true`.
+- Active policies are unsupported with legacy CPAs or old/capability-missing Homes. Remove those nodes from service and remove or fence their memberships/incarnations before enabling or continuing policies; never bypass these checks through direct database writes.
 
 The policy route groups are `GET /credentials/concurrency-policies`, `GET /credentials/:credential_id/concurrency-policy` plus `PATCH /credentials/:credential_id/concurrency-policy`, and `GET /credentials/concurrency`. The first two read stored policy; the patch replaces only supplied fields; the final route reads policy plus the authoritative admitted-counter state. `PATCH /credentials/fields` is the auth-files compatibility form of the same policy patch.
 
@@ -3496,10 +3501,17 @@ Response: file attachment.
 Returns model definitions from either the current runtime registry or the static model catalog.
 
 Each model includes `providers`, the authoritative provider identifiers used by `usage.provider`
-and Billing model-price rules. Clients must create one candidate per `(provider, model)` pair and
-must not derive Billing providers from `type`, `owned_by`, or a static catalog group name.
-Clients must omit model records whose `providers` field is absent or empty because they do not have
-a safe Billing identity.
+and Billing model-price rules. Available v8 models additionally include `billing_models`, an array
+of `{"provider": "z-ai", "model": "glm-5.3-flash"}` execution identities resolved per credential.
+A public `id` such as `team/MY-MODEL` can map to multiple upstream models, including multiple models
+under the same provider. Billing editors must use these pairs instead of the public `id` or the
+merged display `name`. Targets are unique and sorted by provider/model; an empty array means no
+billing identity could be resolved and must not be replaced with an alias-based guess.
+
+Static models and older responses omit `billing_models`; clients can retain their existing
+`(providers[], id)` candidates for those responses. Clients must not derive Billing providers from
+`type`, `owned_by`, or a static catalog group name, and must omit records without a safe Billing
+identity. This metadata does not rewrite existing price rules or historical charges.
 
 Provider implementations must register every executor identifier that can appear in
 `usage.provider` under the same normalized runtime registry provider key. Adding or renaming an
@@ -4083,7 +4095,7 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `observability.pprof.addr` | string | pprof listen address. |
 | `server.commercial-mode` | boolean | Reduces high-overhead middleware behavior under high concurrency. |
 | `observability.logs.logging-to-file` | boolean | Writes app logs to files instead of stdout. |
-| `observability.logs.logs-max-total-size-mb` | integer | Total log file size limit in MB; `0` disables cleanup. |
+| `observability.logs.logs-max-total-size-mb` | integer | Per-node local log file size limit in MB for every Home and CPA node; `0` disables cleanup. Each Home checks its `logs/` directory at startup and every minute using the latest cluster-synchronized config, deleting the oldest `.log`/`.log.gz` files first. Does not limit database records or container stdout logs. |
 | `observability.logs.error-logs-max-files` | integer | Retained request error log file count. |
 | `plugins.enabled` | boolean | Enables trusted in-process plugins on Home and downstream CPA nodes. |
 | `plugins.dir` | string | Local plugin artifact directory used by each node. |
@@ -4100,8 +4112,8 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `quota-exceeded.switch-preview-model` | boolean | Switches to preview model on quota errors. |
 | `oauth.providers.antigravity.antigravity-credits` | boolean | Uses Antigravity credits as last-resort Claude fallback. |
 | `routing.strategy` | string | `round-robin`, `weighted-round-robin`, or `fill-first`. |
-| `routing.session-affinity` | boolean | Universal session-sticky credential routing. |
-| `routing.session-affinity-ttl` | string | Session-to-auth binding duration. |
+| `routing.session-affinity` | boolean | Database-backed session-sticky credential routing, shared across Home nodes using the same database. Bindings survive config reloads and restarts; unavailable credentials may be reselected. Upgrade all Home nodes to enable cluster-wide consistency. |
+| `routing.session-affinity-ttl` | string | Session-to-auth idle timeout, renewed by successful dispatches. Default: `1h`. |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
 | `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate with zero-width characters in system instructions. |

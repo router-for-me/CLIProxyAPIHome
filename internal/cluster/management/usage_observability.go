@@ -91,7 +91,13 @@ func (h *Handler) GetUsageOverview(c *gin.Context) {
 	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
+	release, errAcquire := h.acquireHeavyStatisticsSlot(ctx, c)
+	if errAcquire != nil {
+		respondError(c, http.StatusInternalServerError, "usage_overview_load_failed", errAcquire)
+		return
+	}
 	overview, errOverview := h.repo.UsageObservabilityOverview(ctx, usageObservabilityOverviewQueryFromHTTP(query))
+	release()
 	if errOverview != nil {
 		if errors.Is(errOverview, cluster.ErrUsageObservabilityTooManyTrendBuckets) {
 			respondUsageHTTPError(c, newUsageHTTPError("invalid_interval_range", "%v", errOverview))
@@ -188,7 +194,13 @@ func (h *Handler) ListUsageAggregates(c *gin.Context) {
 	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
+	release, errAcquire := h.acquireHeavyStatisticsSlot(ctx, c)
+	if errAcquire != nil {
+		respondError(c, http.StatusInternalServerError, "usage_aggregates_load_failed", errAcquire)
+		return
+	}
 	result, errAggregates := h.repo.ListUsageObservabilityAggregates(ctx, usageObservabilityAggregateQueryFromHTTP(query))
+	release()
 	if errAggregates != nil {
 		respondError(c, http.StatusInternalServerError, "usage_aggregates_load_failed", errAggregates)
 		return

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
@@ -161,6 +162,79 @@ func TestApplyConfigEventDoesNotSynchronizeRESPInFlightLimitsWhenRuntimeApplyFai
 	}
 	if published {
 		t.Fatal("config event was published after runtime apply failure")
+	}
+}
+
+func TestRunLifecycleInitializationRequiresImportedConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		configured    bool
+		wantLifecycle int64
+	}{
+		{name: "empty startup"},
+		{name: "failed import", args: []string{"-import", "-config", "missing.yaml"}},
+		{name: "configured legacy startup", configured: true, wantLifecycle: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "home.db")
+			if test.configured {
+				db, errOpen := cluster.OpenSQLite(t.Context(), dbPath)
+				if errOpen != nil {
+					t.Fatal(errOpen)
+				}
+				sqlDB, errDB := db.DB()
+				if errDB != nil {
+					t.Fatal(errDB)
+				}
+				if errMigrate := cluster.AutoMigrate(db); errMigrate != nil {
+					t.Fatal(errMigrate)
+				}
+				// Stop at runtime config validation, after legacy lifecycle initialization.
+				if errUpsert := cluster.NewRepository(db).UpsertConfigValue(t.Context(), "port", "invalid-port"); errUpsert != nil {
+					t.Fatal(errUpsert)
+				}
+				if errClose := sqlDB.Close(); errClose != nil {
+					t.Fatal(errClose)
+				}
+			}
+
+			t.Chdir(dir)
+			oldArgs := os.Args
+			oldCommandLine := flag.CommandLine
+			os.Args = append([]string{"home", "-sqlite-path", dbPath}, test.args...)
+			flag.CommandLine = flag.NewFlagSet("home", flag.ContinueOnError)
+			t.Cleanup(func() {
+				os.Args = oldArgs
+				flag.CommandLine = oldCommandLine
+			})
+			if exitCode := run(); exitCode != 1 {
+				t.Fatalf("run() exit code = %d, want 1", exitCode)
+			}
+
+			db, errOpen := cluster.OpenSQLite(t.Context(), dbPath)
+			if errOpen != nil {
+				t.Fatal(errOpen)
+			}
+			sqlDB, errDB := db.DB()
+			if errDB != nil {
+				t.Fatal(errDB)
+			}
+			t.Cleanup(func() {
+				if errClose := sqlDB.Close(); errClose != nil {
+					t.Errorf("close database: %v", errClose)
+				}
+			})
+			var count int64
+			if errCount := db.Model(&cluster.LifecycleConfigRecord{}).Count(&count).Error; errCount != nil {
+				t.Fatal(errCount)
+			}
+			if count != test.wantLifecycle {
+				t.Fatalf("lifecycle rows = %d, want %d", count, test.wantLifecycle)
+			}
+		})
 	}
 }
 
@@ -389,10 +463,11 @@ func TestRuntimeConcurrencyAdmitterUsesCurrentHomeIdentity(t *testing.T) {
 	spy := &concurrencyAdmitterSpy{}
 	homeID := cluster.HomeIncarnationID{IP: "127.0.0.1", Port: 8317, StartedAt: time.Now().UTC()}
 	admitter := newRuntimeConcurrencyAdmitter(spy, func() (cluster.HomeIncarnationID, bool) { return homeID, true })
-	if _, errAdmit := admitter.AdmitCredentialConcurrency(context.Background(), home.ConcurrencyAdmissionRequest{CredentialID: "cred", Model: "gpt", Fingerprint: "fp", ConnectedAt: time.Now().UTC(), Controlled: true, ProtocolVersion: 1}); errAdmit != nil {
+	binding := &coreauth.SessionAffinityCommit{Key: strings.Repeat("a", 64), AuthID: "cred", TTL: time.Hour}
+	if _, errAdmit := admitter.AdmitCredentialConcurrency(context.Background(), home.ConcurrencyAdmissionRequest{CredentialID: "cred", Model: "gpt", Fingerprint: "fp", ConnectedAt: time.Now().UTC(), Controlled: true, ProtocolVersion: 1, SessionAffinity: binding}); errAdmit != nil {
 		t.Fatal(errAdmit)
 	}
-	if spy.calls != 1 || spy.request.Lifetime.Home != homeID {
+	if spy.calls != 1 || spy.request.Lifetime.Home != homeID || spy.request.SessionAffinity != binding {
 		t.Fatalf("request = %#v", spy.request)
 	}
 }

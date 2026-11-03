@@ -553,7 +553,7 @@ func TestQuiescenceEligibilityDoesNotLockRecentHomeAndFencesPostGrace(t *testing
 
 	var homeLockQueries atomic.Int64
 	if errCallback := repo.db.Callback().Query().After("gorm:query").Register("quiescence:record-home-eligibility-lock", func(tx *gorm.DB) {
-		if tx.Statement.Table != (HomeProcessIncarnationRecord{}).TableName() || !statementContainsString(tx.Statement.Vars, participant.IP) {
+		if tx.DryRun || tx.Statement.Table != (HomeProcessIncarnationRecord{}).TableName() || !statementContainsString(tx.Statement.Vars, participant.IP) {
 			return
 		}
 		if _, locked := tx.Statement.Clauses["FOR"]; locked {

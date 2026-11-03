@@ -87,6 +87,9 @@ func usagePayloadWithCPAIdentity(payload string, env dispatch.Env) (string, erro
 
 // SanitizeUsageLog removes provider API key secrets from the fallback usage log.
 func SanitizeUsageLog() error {
+	logFilesMu.RLock()
+	defer logFilesMu.RUnlock()
+
 	usageLogMu.Lock()
 	defer usageLogMu.Unlock()
 	return sanitizeUsageLogPathLocked(filepath.Join("logs", "usage.log"))
@@ -98,6 +101,9 @@ func appendUsageLog(payload string) error {
 	if strings.TrimSpace(payload) == "" {
 		return fmt.Errorf("empty payload")
 	}
+
+	logFilesMu.RLock()
+	defer logFilesMu.RUnlock()
 
 	usageLogMu.Lock()
 	defer usageLogMu.Unlock()

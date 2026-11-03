@@ -44,6 +44,7 @@ type Options struct {
 	Query           url.Values
 	OriginalRequest []byte
 	Metadata        map[string]any
+	SessionAffinity *SessionAffinitySelection
 }
 
 func requestRetryRoundFromOptions(opts Options) int {

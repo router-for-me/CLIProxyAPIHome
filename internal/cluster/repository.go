@@ -592,6 +592,8 @@ func (r *Repository) replaceCPANodeSnapshot(ctx context.Context, home HomeIncarn
 	if errDB != nil {
 		return errDB
 	}
+	// Heartbeats and RESP count updates share this Repository. Serialize the complete replacement
+	// independently of the shared Home lifecycle lock, including its DELETE and CREATE statements.
 	r.cpaSnapshotMu.Lock()
 	defer r.cpaSnapshotMu.Unlock()
 	home.IP = strings.TrimSpace(home.IP)

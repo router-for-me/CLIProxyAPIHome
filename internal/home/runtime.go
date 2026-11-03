@@ -55,6 +55,7 @@ type Runtime struct {
 	pluginSyncNodeActive    func(context.Context, string, string) (bool, error)
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
 	clusterAdapter          ClusterAdapter
+	sessionAffinityStore    coreauth.SessionAffinityStore
 	concurrencyAdmitter     ConcurrencyAdmitter
 	clusterRefresh          func(context.Context, string, string) ([]byte, error)
 	originalStore           coreauth.Store
@@ -120,6 +121,9 @@ type ConcurrencyAdmissionRequest struct {
 	ConnectedAt     time.Time
 	Controlled      bool
 	ProtocolVersion int
+	// SessionAffinity must be committed atomically with admission. On conflict,
+	// return coreauth.ErrSessionAffinityConflict without consuming a slot.
+	SessionAffinity *coreauth.SessionAffinityCommit
 }
 
 // ConcurrencyAdmissionResult describes the credential and model admitted by the limiter.
@@ -193,7 +197,6 @@ type kvStore interface {
 	KVIncrBy(ctx context.Context, key string, delta int64) (int64, error)
 	KVMGet(ctx context.Context, keys []string) ([]KVGetResult, error)
 	KVMSet(ctx context.Context, pairs map[string][]byte) error
-	KVPurgeExpired(ctx context.Context, now time.Time, limit int) (int64, error)
 }
 
 type pluginStatusStore interface {
@@ -241,7 +244,7 @@ func NewRuntime(cfg *config.Config) (*Runtime, error) {
 		dirSetter.SetBaseDir(cfg.AuthDir)
 	}
 
-	selector := selectorFromConfig(cfg)
+	selector := selectorFromConfig(cfg, nil)
 	coreManager := coreauth.NewManager(store, selector, nil)
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 	coreManager.SetConfig(cfg)
@@ -279,6 +282,14 @@ func (r *Runtime) SetClusterAdapter(adapter ClusterAdapter) {
 		return
 	}
 	r.clusterAdapter = adapter
+	r.sessionAffinityStore = nil
+	if adapter != nil && adapter.Enabled() {
+		if provider, ok := adapter.(interface {
+			SessionAffinityStore() coreauth.SessionAffinityStore
+		}); ok {
+			r.sessionAffinityStore = provider.SessionAffinityStore()
+		}
+	}
 	if admitter, ok := adapter.(ConcurrencyAdmitter); ok {
 		r.concurrencyAdmitter = admitter
 	} else {
@@ -295,6 +306,7 @@ func (r *Runtime) SetClusterAdapter(adapter ClusterAdapter) {
 			r.coreManager.SetFullAuthResolver(nil)
 			r.coreManager.SetStore(r.originalStore)
 		}
+		r.coreManager.SetSelector(selectorFromConfig(r.Config(), r.sessionAffinityStore))
 	}
 }
 
@@ -333,7 +345,6 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 	r.startClusterUsageWriter(runCtx)
-	r.startKVCleanupLoop(runCtx)
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -671,39 +682,6 @@ func (r *Runtime) ListPendingPluginTasks(ctx context.Context, nodeType string, n
 	return store.ListPendingPluginTasks(ctx, nodeType, nodeID)
 }
 
-func (r *Runtime) startKVCleanupLoop(ctx context.Context) {
-	store, errStore := r.kvStore()
-	if errStore != nil {
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	go r.runKVCleanupLoop(ctx, store)
-}
-
-func (r *Runtime) runKVCleanupLoop(ctx context.Context, store kvStore) {
-	if store == nil {
-		return
-	}
-	purge := func() {
-		if _, errPurge := store.KVPurgeExpired(ctx, time.Now().UTC(), 1000); errPurge != nil {
-			log.Errorf("kv store purge error: %v", errPurge)
-		}
-	}
-	purge()
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			purge()
-		}
-	}
-}
-
 // BuildRefreshPayload builds a build refresh payload.
 func BuildRefreshPayload(updated *coreauth.Auth) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
@@ -964,8 +942,20 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
+	// Database-backed admissions commit the binding and the concurrency counter
+	// in one transaction. Standalone dispatch without a limiter can CAS directly.
+	// Legacy custom admitters without a shared store retain selector-side commits.
+	if r.concurrencyAdmitter == nil || r.sessionAffinityStore != nil {
+		opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
+	}
 	var lastCandidateError error
 	for {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
+		}
+		if opts.SessionAffinity != nil {
+			*opts.SessionAffinity = coreauth.SessionAffinitySelection{}
+		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
 			if lastCandidateError != nil {
@@ -1009,12 +999,32 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			result.UnaccountedReply = unaccounted
 			result.AccountedReply = accounted
 		}
+		var binding *coreauth.SessionAffinityCommit
+		if opts.SessionAffinity != nil {
+			binding = opts.SessionAffinity.Commit
+		}
+		// Explicitly installed local/custom selectors cannot participate in the
+		// database admission transaction. Keep their selector-side CAS behavior.
+		if binding != nil && r.concurrencyAdmitter != nil && opts.SessionAffinity.Store != r.sessionAffinityStore {
+			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
+			if errSwap != nil {
+				return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
+			}
+			if !swapped {
+				continue
+			}
+			binding = nil
+		}
 		if r.concurrencyAdmitter != nil {
 			admission, errAdmit := r.concurrencyAdmitter.AdmitCredentialConcurrency(ctx, ConcurrencyAdmissionRequest{
 				CredentialID: auth.ID, Model: concurrencyModel, Fingerprint: concurrencyCtx.Fingerprint,
 				ConnectedAt: concurrencyCtx.ConnectedAt, Controlled: concurrencyCtx.Controlled, ProtocolVersion: concurrencyCtx.ProtocolVersion,
+				SessionAffinity: binding,
 			})
 			if errAdmit != nil {
+				if errors.Is(errAdmit, coreauth.ErrSessionAffinityConflict) {
+					continue
+				}
 				admissionType := concurrencyAdmissionErrorType(errAdmit)
 				if !concurrencyCandidateIneligible(admissionType) {
 					return nil, errAdmit
@@ -1040,6 +1050,14 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				return result, nil
 			}
 			result.Concurrency = admission
+		} else if binding != nil {
+			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
+			if errSwap != nil {
+				return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
+			}
+			if !swapped {
+				continue
+			}
 		}
 		return result, nil
 	}

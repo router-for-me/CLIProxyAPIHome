@@ -2509,7 +2509,7 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
 | Form field or query | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | form `file` | file | 是 | Vertex service account JSON。 |
-| form/query `location` | string | 否 | Vertex location；默认 `us-central1`。 |
+| form/query `location` | string | 否 | Vertex location；默认 `global`。 |
 
 输出示例：
 
@@ -2519,7 +2519,7 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
   "auth-file": "11111111-2222-4333-8444-555555555555.json",
   "project_id": "project-id",
   "email": "service-account@example.iam.gserviceaccount.com",
-  "location": "us-central1"
+  "location": "global"
 }
 ```
 
@@ -2760,7 +2760,12 @@ DELETE /credentials/credential-db-id/cooldown?model=gpt-5
 
 ### Credential concurrency policy 和 limiter 路由
 
-启用 policy 前，必须遵循[严格凭证并发限制部署运行手册](../CN.md)。手册规定所需拓扑、capability 检查、certificate identity 和 fail-closed mixed-version 发布方式。
+启用 policy 前：
+
+- 每个 SQLite 数据库只能有一个 active Home；多个 active Home 必须使用 PostgreSQL，即使所有 limit 均已关闭。
+- 每个 Home 和 CPA 节点必须使用独立的 mTLS certificate 和 private key；不得在节点间共享身份，也不得为替换节点复用身份。
+- 升级全部 Home 和 CPA 期间保持所有 limit 关闭。确认旧进程已停止、所有 active CPA membership 使用 protocol version `1`，且每个 live Home 经认证的 `GET /capabilities` 均返回 `capabilities.credential_concurrency_limits_v2: true`。
+- 存在 legacy CPA、旧 Home 或缺少 capability 的 Home 时，不支持 active policy。启用或继续使用 policy 前，必须将这些节点移出服务，并移除或 fence 对应的 membership/incarnation；不得通过直接修改数据库绕过检查。
 
 policy 路由组为 `GET /credentials/concurrency-policies`、`GET /credentials/:credential_id/concurrency-policy` 加 `PATCH /credentials/:credential_id/concurrency-policy`，以及 `GET /credentials/concurrency`。前两组读取已存储的 policy；PATCH 只替换明确提供的字段；最后一个路由读取 policy 和权威 admitted-counter state。`PATCH /credentials/fields` 是同一 policy patch 的 auth-files compatibility 形式。
 
@@ -3490,6 +3495,8 @@ Query 参数：
 
 ### GET `/models?scope=available|static`
 
+可用模型在 v8 响应中额外包含 `billing_models`，元素为 `{"provider": "z-ai", "model": "glm-5.3-flash"}`。这些计价身份按凭证使用实际调度解析器生成，去重后按供应商和模型排序。公开 `id`（例如 `team/MY-MODEL`）可能对应多个上游模型，同一供应商下也可能存在多个映射。模型价格编辑器应使用这些组合，不能把公开别名或合并后的 `name` 当作计价模型。空数组表示未解析到可靠身份，不应回退猜测。静态模型和旧版响应不含该字段，可继续使用原有 `(providers[], id)` 候选。此元数据不会修改已有价格规则或历史账单。
+
 从当前 runtime registry 或静态模型目录返回模型定义。
 
 每个模型都包含 `providers`，其值是 `usage.provider` 和 Billing 模型价格规则使用的权威
@@ -4080,7 +4087,7 @@ Query 参数：
 | `observability.pprof.addr` | string | pprof listen address。 |
 | `server.commercial-mode` | boolean | 高并发下减少高开销 middleware 行为。 |
 | `observability.logs.logging-to-file` | boolean | 将 app logs 写入文件而非 stdout。 |
-| `observability.logs.logs-max-total-size-mb` | integer | 日志文件总大小上限；`0` 禁用清理。 |
+| `observability.logs.logs-max-total-size-mb` | integer | 每台 Home 和 CPA 节点各自的本地日志文件总大小上限（MB）；`0` 禁用清理。每台 Home 启动时及之后每分钟读取集群同步后的最新配置，检查自己的 `logs/` 目录，优先删除最旧的 `.log`/`.log.gz` 文件。不限制数据库记录或容器 stdout 日志。 |
 | `observability.logs.error-logs-max-files` | integer | request error log 文件保留数量。 |
 | `plugins.enabled` | boolean | 在 Home 和下游 CPA 节点启用受信任的进程内插件。 |
 | `plugins.dir` | string | 每个节点本地插件产物目录。 |
@@ -4097,8 +4104,8 @@ Query 参数：
 | `quota-exceeded.switch-preview-model` | boolean | Quota error 时切换到 preview model。 |
 | `oauth.providers.antigravity.antigravity-credits` | boolean | Claude 最后兜底使用 Antigravity credits。 |
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
-| `routing.session-affinity` | boolean | 通用 session-sticky credential routing。 |
-| `routing.session-affinity-ttl` | string | Session-to-auth binding 持续时间。 |
+| `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
+| `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
 | `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |

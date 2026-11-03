@@ -9,7 +9,7 @@ import (
 )
 
 // selectorFromConfig derives selector from config.
-func selectorFromConfig(cfg *config.Config) coreauth.Selector {
+func selectorFromConfig(cfg *config.Config, store coreauth.SessionAffinityStore) coreauth.Selector {
 	// Build the candidate view before applying availability rules.
 	if cfg == nil {
 		return &coreauth.RoundRobinSelector{}
@@ -40,5 +40,6 @@ func selectorFromConfig(cfg *config.Config) coreauth.Selector {
 	return coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 		Fallback: selector,
 		TTL:      ttl,
+		Store:    store,
 	})
 }

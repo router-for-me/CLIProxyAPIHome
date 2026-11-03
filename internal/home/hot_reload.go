@@ -103,7 +103,7 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 	if r.coreManager != nil {
 		r.coreManager.SetConfig(cfg)
 		r.coreManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
-		r.coreManager.SetSelector(selectorFromConfig(cfg))
+		r.coreManager.SetSelector(selectorFromConfig(cfg, r.sessionAffinityStore))
 	}
 	r.applyPluginConfig(ctx, cfg)
 
@@ -120,7 +120,7 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 			} else {
 				r.coreManager.SetOAuthModelAlias(oldCfg.OAuthModelAlias)
 			}
-			r.coreManager.SetSelector(selectorFromConfig(oldCfg))
+			r.coreManager.SetSelector(selectorFromConfig(oldCfg, r.sessionAffinityStore))
 		}
 		r.applyPluginConfig(ctx, oldCfg)
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {

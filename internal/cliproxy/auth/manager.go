@@ -1474,6 +1474,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
 		}
 
+		if opts.SessionAffinity != nil {
+			*opts.SessionAffinity = SessionAffinitySelection{}
+		}
 		var auth *Auth
 		if pluginScheduler != nil {
 			pluginAuth, handled, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths)

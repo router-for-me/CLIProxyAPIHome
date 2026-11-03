@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/concurrency"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -56,6 +57,8 @@ type ConcurrencyAdmissionRequest struct {
 	Model           string
 	Lifetime        ConnectionLifetime
 	ProtocolVersion int
+	// SessionAffinity must commit atomically with admission when present.
+	SessionAffinity *coreauth.SessionAffinityCommit
 }
 
 // ConcurrencyAdmissionResult describes the canonical credential and model admitted by the limiter.
@@ -129,7 +132,8 @@ func withConcurrencyTransaction(ctx context.Context, db *gorm.DB, fn func(*gorm.
 	return db.WithContext(contextOrBackground(ctx)).Transaction(fn)
 }
 
-// LockActiveConcurrencyLifetimeTx locks and verifies the active membership and Home that accepted a command.
+// LockActiveConcurrencyLifetimeTx pins the active membership and Home until the command commits.
+// State transitions must take FOR UPDATE; KEY SHARE lets independent commands and heartbeats proceed.
 func (r *Repository) LockActiveConcurrencyLifetimeTx(ctx context.Context, tx *gorm.DB, lifetime ConnectionLifetime) error {
 	if tx == nil || !lifetime.Controlled || strings.TrimSpace(lifetime.Fingerprint) == "" || lifetime.ConnectedAt.IsZero() {
 		return ErrConcurrencyNodeUnavailable
@@ -139,7 +143,7 @@ func (r *Repository) LockActiveConcurrencyLifetimeTx(ctx context.Context, tx *go
 	}
 
 	var membership CPANodeMembershipRecord
-	errMembership := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
+	errMembership := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "KEY SHARE"}).
 		Where("certificate_fingerprint = ? AND connected_at = ? AND state = ? AND home_ip = ? AND home_port = ? AND home_started_at = ?", strings.TrimSpace(lifetime.Fingerprint), lifetime.ConnectedAt, MembershipStateActive, strings.TrimSpace(lifetime.Home.IP), lifetime.Home.Port, lifetime.Home.StartedAt).
 		First(&membership).Error
 	if errMembership != nil {
@@ -147,7 +151,7 @@ func (r *Repository) LockActiveConcurrencyLifetimeTx(ctx context.Context, tx *go
 	}
 
 	var home HomeProcessIncarnationRecord
-	errHome := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
+	errHome := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "KEY SHARE"}).
 		Where("home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(lifetime.Home.IP), lifetime.Home.Port, lifetime.Home.StartedAt).
 		First(&home).Error
 	if errHome != nil || home.State != HomeIncarnationActive {
@@ -189,11 +193,32 @@ func (r *Repository) AdmitCredentialConcurrency(ctx context.Context, req Concurr
 		if errLifetime := r.LockActiveConcurrencyLifetimeTx(ctx, tx, req.Lifetime); errLifetime != nil {
 			return newAdmissionError("concurrency_node_unavailable", errLifetime)
 		}
-		policy, models, errPolicy := lockConcurrencyPolicyTx(ctx, tx, credentialID)
+		policy, errPolicy := lockConcurrencyPolicyTx(ctx, tx, credentialID)
 		if errPolicy != nil {
 			return newAdmissionError("concurrency_tracker_unavailable", errPolicy)
 		}
+		var models map[string]int64
+		if policy.CredentialID != "" {
+			var errModels error
+			models, errModels = loadCredentialConcurrencyModels(tx.WithContext(contextOrBackground(ctx)), credentialID, true)
+			if errModels != nil {
+				return newAdmissionError("concurrency_tracker_unavailable", errModels)
+			}
+		}
 		waitForConcurrencyAdmissionPolicyLock(ctx)
+
+		if req.SessionAffinity != nil {
+			if req.SessionAffinity.AuthID != credentialID {
+				return fmt.Errorf("session affinity credential does not match admission")
+			}
+			swapped, errSwap := compareAndSwapSessionBindingTx(tx, *req.SessionAffinity)
+			if errSwap != nil {
+				return errSwap
+			}
+			if !swapped {
+				return coreauth.ErrSessionAffinityConflict
+			}
+		}
 
 		credentialLimit := positiveLimit(policy.MaxInFlight)
 		modelLimit := positiveLimitValue(models[model])
@@ -220,32 +245,30 @@ func (r *Repository) AdmitCredentialConcurrency(ctx context.Context, req Concurr
 		result.Accounted = true
 		return nil
 	})
+	if errTransaction != nil {
+		result.Accounted = false
+	}
 	return result, errTransaction
 }
 
-func lockConcurrencyPolicyTx(ctx context.Context, tx *gorm.DB, credentialID string) (CredentialConcurrencyPolicyRecord, map[string]int64, error) {
+// lockConcurrencyPolicyTx serializes admissions, releases, and model policy changes.
+// Policy writers must hold this parent row lock before changing model policies.
+func lockConcurrencyPolicyTx(ctx context.Context, tx *gorm.DB, credentialID string) (CredentialConcurrencyPolicyRecord, error) {
 	if tx == nil {
-		return CredentialConcurrencyPolicyRecord{}, nil, fmt.Errorf("database transaction is nil")
+		return CredentialConcurrencyPolicyRecord{}, fmt.Errorf("database transaction is nil")
 	}
 	credentialID = strings.TrimSpace(credentialID)
 	if credentialID == "" {
-		return CredentialConcurrencyPolicyRecord{}, nil, ErrConcurrencyCredentialNotFound
+		return CredentialConcurrencyPolicyRecord{}, ErrConcurrencyCredentialNotFound
 	}
 
 	policy := CredentialConcurrencyPolicyRecord{}
 	errPolicy := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&policy, "credential_id = ?", credentialID).Error
 	if errors.Is(errPolicy, gorm.ErrRecordNotFound) {
-		return CredentialConcurrencyPolicyRecord{}, map[string]int64{}, nil
+		return CredentialConcurrencyPolicyRecord{}, nil
 	}
-	if errPolicy != nil {
-		return CredentialConcurrencyPolicyRecord{}, nil, errPolicy
-	}
-	models, errModels := loadCredentialConcurrencyModels(tx.WithContext(contextOrBackground(ctx)), credentialID, true)
-	if errModels != nil {
-		return CredentialConcurrencyPolicyRecord{}, nil, errModels
-	}
-	return policy, models, nil
+	return policy, errPolicy
 }
 
 func positiveLimit(value *int64) int64 {
@@ -266,27 +289,25 @@ func sumConcurrencyCountsTx(ctx context.Context, tx *gorm.DB, credentialID strin
 	if tx == nil {
 		return 0, 0, fmt.Errorf("database transaction is nil")
 	}
-	query := tx.WithContext(contextOrBackground(ctx)).Model(&CredentialConcurrencyCounterRecord{}).Where("credential_id = ?", credentialID)
-	var minimum int64
-	if errMinimum := query.Select("COALESCE(MIN(active_count), 0)").Scan(&minimum).Error; errMinimum != nil {
-		return 0, 0, errMinimum
+	var counts struct {
+		Minimum          int64
+		CredentialActive int64
+		ModelActive      int64
 	}
-	if minimum < 0 {
+	// Keep MIN independent of the sums so positive rows cannot hide invalid counters.
+	errCounts := tx.WithContext(contextOrBackground(ctx)).Model(&CredentialConcurrencyCounterRecord{}).
+		Where("credential_id = ?", credentialID).
+		Select(`COALESCE(MIN(active_count), 0) AS minimum,
+			COALESCE(SUM(active_count), 0) AS credential_active,
+			COALESCE(SUM(CASE WHEN model = ? THEN active_count ELSE 0 END), 0) AS model_active`, model).
+		Scan(&counts).Error
+	if errCounts != nil {
+		return 0, 0, errCounts
+	}
+	if counts.Minimum < 0 || counts.CredentialActive < 0 || counts.ModelActive < 0 {
 		return 0, 0, ErrConcurrencyCounterInvalid
 	}
-
-	var credentialActive int64
-	if errCredential := query.Select("COALESCE(SUM(active_count), 0)").Scan(&credentialActive).Error; errCredential != nil {
-		return 0, 0, errCredential
-	}
-	var modelActive int64
-	if errModel := query.Where("model = ?", model).Select("COALESCE(SUM(active_count), 0)").Scan(&modelActive).Error; errModel != nil {
-		return 0, 0, errModel
-	}
-	if credentialActive < 0 || modelActive < 0 {
-		return 0, 0, ErrConcurrencyCounterInvalid
-	}
-	return credentialActive, modelActive, nil
+	return counts.CredentialActive, counts.ModelActive, nil
 }
 
 func incrementConcurrencyCounterTx(ctx context.Context, tx *gorm.DB, credentialID string, model string, fingerprint string) error {
@@ -297,28 +318,32 @@ func incrementConcurrencyCounterTx(ctx context.Context, tx *gorm.DB, credentialI
 		return ErrConcurrencyCounterInvalid
 	}
 
-	counter := CredentialConcurrencyCounterRecord{}
-	errCounter := tx.WithContext(contextOrBackground(ctx)).Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("credential_id = ? AND model = ? AND certificate_fingerprint = ?", credentialID, model, fingerprint).
-		First(&counter).Error
-	now, errNow := DatabaseNow(contextOrBackground(ctx), tx)
-	if errNow != nil {
-		return errNow
+	activeCount := clause.Column{Table: (CredentialConcurrencyCounterRecord{}).TableName(), Name: "active_count"}
+	now := gorm.Expr(strings.TrimPrefix(databaseNowQuery(tx), "SELECT "))
+	// The policy lock protects the preceding limit check. The conflict update
+	// preserves the cumulative release baseline and rejects invalid increments.
+	result := tx.WithContext(contextOrBackground(ctx)).Model(&CredentialConcurrencyCounterRecord{}).
+		Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "credential_id"}, {Name: "model"}, {Name: "certificate_fingerprint"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"active_count": gorm.Expr("? + 1", activeCount),
+				"updated_at":   now,
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Gte{Column: activeCount, Value: int64(0)},
+				clause.Lt{Column: activeCount, Value: int64(math.MaxInt64)},
+			}},
+		}).Create(map[string]any{
+		"credential_id": credentialID, "model": model, "certificate_fingerprint": fingerprint,
+		"active_count": int64(1), "last_release_seq": int64(0), "updated_at": now,
+	})
+	if result.Error != nil {
+		return result.Error
 	}
-	if errors.Is(errCounter, gorm.ErrRecordNotFound) {
-		return tx.WithContext(contextOrBackground(ctx)).Create(&CredentialConcurrencyCounterRecord{
-			CredentialID: credentialID, Model: model, CertificateFingerprint: fingerprint, ActiveCount: 1, UpdatedAt: now,
-		}).Error
-	}
-	if errCounter != nil {
-		return errCounter
-	}
-	if counter.ActiveCount < 0 || counter.ActiveCount == math.MaxInt64 {
+	if result.RowsAffected != 1 {
 		return ErrConcurrencyCounterInvalid
 	}
-	counter.ActiveCount++
-	counter.UpdatedAt = now
-	return tx.WithContext(contextOrBackground(ctx)).Save(&counter).Error
+	return nil
 }
 
 // CredentialConcurrencyState is the authoritative policy and admitted-count state for one credential.
@@ -355,32 +380,62 @@ func (r *Repository) ReadConcurrencyState(ctx context.Context) ([]CredentialConc
 		if errPolicies := tx.WithContext(contextOrBackground(ctx)).Order("credential_id ASC").Find(&policies).Error; errPolicies != nil {
 			return errPolicies
 		}
+		if len(policies) == 0 {
+			return nil
+		}
+
+		var modelPolicies []CredentialConcurrencyModelPolicyRecord
+		if errModels := tx.Find(&modelPolicies).Error; errModels != nil {
+			return errModels
+		}
+		modelsByCredential := make(map[string][]CredentialConcurrencyModelPolicyRecord, len(policies))
+		for _, modelPolicy := range modelPolicies {
+			modelsByCredential[modelPolicy.CredentialID] = append(modelsByCredential[modelPolicy.CredentialID], modelPolicy)
+		}
+
+		var counts []struct {
+			CredentialID string
+			Model        string
+			Minimum      int64
+			ActiveCount  int64
+		}
+		// Exclude counters without a policy before aggregating, including invalid orphan counters.
+		errCounts := tx.Model(&CredentialConcurrencyCounterRecord{}).
+			Where("credential_id IN (?)", tx.Model(&CredentialConcurrencyPolicyRecord{}).Select("credential_id")).
+			Select("credential_id, model, MIN(active_count) AS minimum, SUM(active_count) AS active_count").
+			Group("credential_id, model").Scan(&counts).Error
+		if errCounts != nil {
+			return errCounts
+		}
+		totals := make(map[string]int64, len(policies))
+		countsByModel := make(map[string]map[string]int64, len(policies))
+		for _, count := range counts {
+			// MIN detects negatives hidden by a positive sum; check cross-model overflow in Go.
+			if count.Minimum < 0 || count.ActiveCount < 0 || totals[count.CredentialID] > math.MaxInt64-count.ActiveCount {
+				return ErrConcurrencyCounterInvalid
+			}
+			totals[count.CredentialID] += count.ActiveCount
+			if countsByModel[count.CredentialID] == nil {
+				countsByModel[count.CredentialID] = make(map[string]int64)
+			}
+			countsByModel[count.CredentialID][count.Model] = count.ActiveCount
+		}
+
+		states = make([]CredentialConcurrencyState, 0, len(policies))
 		for _, policy := range policies {
-			models, errModels := loadCredentialConcurrencyModels(tx.WithContext(contextOrBackground(ctx)), policy.CredentialID, false)
-			if errModels != nil {
-				return errModels
-			}
-			credentialActive, _, errCounts := sumConcurrencyCountsTx(ctx, tx, policy.CredentialID, "")
-			if errCounts != nil {
-				return errCounts
-			}
+			models := modelsByCredential[policy.CredentialID]
 			state := CredentialConcurrencyState{
-				CredentialID: policy.CredentialID, MaxInFlight: cloneInt64(policy.MaxInFlight), AdmittedInFlight: credentialActive,
+				CredentialID: policy.CredentialID, MaxInFlight: cloneInt64(policy.MaxInFlight), AdmittedInFlight: totals[policy.CredentialID],
 				PolicyVersion: policy.Version, EffectiveAt: policy.EffectiveAt, ObservationBarrier: policy.ObservationBarrierRevision,
 				Models: make([]CredentialConcurrencyModelState, 0, len(models)),
 			}
-			modelKeys := make([]string, 0, len(models))
-			for model := range models {
-				modelKeys = append(modelKeys, model)
+			for _, modelPolicy := range models {
+				state.Models = append(state.Models, CredentialConcurrencyModelState{
+					Model: modelPolicy.Model, MaxInFlight: modelPolicy.MaxInFlight,
+					AdmittedInFlight: countsByModel[policy.CredentialID][modelPolicy.Model],
+				})
 			}
-			sort.Strings(modelKeys)
-			for _, model := range modelKeys {
-				_, modelActive, errModelCounts := sumConcurrencyCountsTx(ctx, tx, policy.CredentialID, model)
-				if errModelCounts != nil {
-					return errModelCounts
-				}
-				state.Models = append(state.Models, CredentialConcurrencyModelState{Model: model, MaxInFlight: models[model], AdmittedInFlight: modelActive})
-			}
+			sort.Slice(state.Models, func(i, j int) bool { return state.Models[i].Model < state.Models[j].Model })
 			states = append(states, state)
 		}
 		return nil

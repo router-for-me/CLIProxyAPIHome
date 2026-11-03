@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -252,6 +253,57 @@ func TestReadConcurrencyStateReturnsAuthoritativeCounters(t *testing.T) {
 	}
 	if len(states[0].Models) != 1 || states[0].Models[0].Model != "gpt" || states[0].Models[0].AdmittedInFlight != 2 || states[0].Models[0].MaxInFlight != 2 {
 		t.Fatalf("models = %#v", states[0].Models)
+	}
+}
+
+func TestReadConcurrencyStatePreservesPoliciesWithoutCounters(t *testing.T) {
+	for _, backend := range []struct {
+		name string
+		open func(*testing.T) *Repository
+	}{
+		{"sqlite", newCredentialFoundationTestRepository},
+		{"postgres", newPostgresQuiescenceRepository},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			repo := backend.open(t)
+			policies := []CredentialConcurrencyPolicyRecord{
+				{CredentialID: "model-only", Version: 3, EffectiveAt: databaseTestTime, ObservationBarrierRevision: 7},
+				{CredentialID: "disabled", Version: 2, EffectiveAt: databaseTestTime, ObservationBarrierRevision: 5},
+			}
+			if errCreate := repo.db.Create(&policies).Error; errCreate != nil {
+				t.Fatal(errCreate)
+			}
+			models := []CredentialConcurrencyModelPolicyRecord{
+				{CredentialID: "model-only", Model: "zeta", MaxInFlight: 4},
+				{CredentialID: "model-only", Model: "alpha", MaxInFlight: 2},
+			}
+			if errCreate := repo.db.Create(&models).Error; errCreate != nil {
+				t.Fatal(errCreate)
+			}
+			// Orphan counters must not affect states or fail aggregation, even if their sum overflows.
+			seedReleaseCounter(t, repo, "orphan", "gpt", "fp-a", math.MaxInt64, 0)
+			seedReleaseCounter(t, repo, "orphan", "gpt", "fp-b", 1, 0)
+			seedReleaseCounter(t, repo, "orphan", "claude", "fp-a", -1, 0)
+			want := []CredentialConcurrencyState{
+				{CredentialID: "disabled", PolicyVersion: 2, EffectiveAt: databaseTestTime, ObservationBarrier: 5, Models: []CredentialConcurrencyModelState{}},
+				{CredentialID: "model-only", PolicyVersion: 3, EffectiveAt: databaseTestTime, ObservationBarrier: 7, Models: []CredentialConcurrencyModelState{
+					{Model: "alpha", MaxInFlight: 2},
+					{Model: "zeta", MaxInFlight: 4},
+				}},
+			}
+			states, errRead := repo.ReadConcurrencyState(t.Context())
+			if errRead != nil || len(states) != len(want) {
+				t.Fatalf("states=(%#v,%v), want %#v", states, errRead, want)
+			}
+			for index, state := range states {
+				expected := want[index]
+				if state.CredentialID != expected.CredentialID || state.MaxInFlight != nil || state.AdmittedInFlight != 0 ||
+					state.PolicyVersion != expected.PolicyVersion || !state.EffectiveAt.Equal(expected.EffectiveAt) ||
+					state.ObservationBarrier != expected.ObservationBarrier || state.Models == nil || !slices.Equal(state.Models, expected.Models) {
+					t.Fatalf("state=%#v, want %#v", state, expected)
+				}
+			}
+		})
 	}
 }
 

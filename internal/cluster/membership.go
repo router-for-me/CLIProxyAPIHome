@@ -205,7 +205,7 @@ func (r *Repository) RecordParticipation(ctx context.Context, lifetime Connectio
 	}
 	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
 		member := CPANodeMembershipRecord{}
-		errMember := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		errMember := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).
 			Where("certificate_fingerprint = ?", fingerprint).
 			First(&member).Error
 		if errors.Is(errMember, gorm.ErrRecordNotFound) {
@@ -219,7 +219,7 @@ func (r *Repository) RecordParticipation(ctx context.Context, lifetime Connectio
 		}
 
 		home := HomeProcessIncarnationRecord{}
-		errHome := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		errHome := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).
 			First(&home, "home_ip = ? AND home_port = ? AND started_at = ?", strings.TrimSpace(lifetime.Home.IP), lifetime.Home.Port, lifetime.Home.StartedAt).Error
 		if errors.Is(errHome, gorm.ErrRecordNotFound) {
 			return ErrHomeIncarnationNotFound

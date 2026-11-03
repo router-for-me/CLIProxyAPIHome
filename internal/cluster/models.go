@@ -158,7 +158,11 @@ func (ConcurrencyActivationGateRecord) TableName() string {
 
 // ClusterMasterGateRecord serializes the single persisted Home master selection.
 type ClusterMasterGateRecord struct {
-	ID int `gorm:"column:id;primaryKey"`
+	ID            int       `gorm:"column:id;primaryKey"`
+	Term          int64     `gorm:"column:term;not null;default:0"`
+	MasterKey     string    `gorm:"column:master_key;not null;default:''"`
+	LeaseUntil    time.Time `gorm:"column:lease_until"`
+	LastBalanceAt time.Time `gorm:"column:last_balance_at"`
 }
 
 func (ClusterMasterGateRecord) TableName() string {
