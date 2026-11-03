@@ -152,6 +152,7 @@ func TestBillingSettingsGetAndPatch(t *testing.T) {
 	getCtx.Request = httptest.NewRequest(http.MethodGet, "/billing/settings", nil)
 	handler.GetBillingSettings(getCtx)
 	if getResp.Code != http.StatusOK ||
+		!bytes.Contains(getResp.Body.Bytes(), []byte(`"model_source":"request"`)) ||
 		!bytes.Contains(getResp.Body.Bytes(), []byte(`"service_tier_source":"request"`)) ||
 		!bytes.Contains(getResp.Body.Bytes(), []byte(`"report_timezone":"UTC"`)) {
 		t.Fatalf("GET status/body = %d %s", getResp.Code, getResp.Body.String())
@@ -159,10 +160,11 @@ func TestBillingSettingsGetAndPatch(t *testing.T) {
 
 	patchResp := httptest.NewRecorder()
 	patchCtx, _ := gin.CreateTestContext(patchResp)
-	patchCtx.Request = httptest.NewRequest(http.MethodPatch, "/billing/settings", bytes.NewBufferString(`{"service_tier_source":"response","report_timezone":"Asia/Shanghai"}`))
+	patchCtx.Request = httptest.NewRequest(http.MethodPatch, "/billing/settings", bytes.NewBufferString(`{"model_source":"response","service_tier_source":"response","report_timezone":"Asia/Shanghai"}`))
 	patchCtx.Request.Header.Set("Content-Type", "application/json")
 	handler.UpdateBillingSettings(patchCtx)
 	if patchResp.Code != http.StatusOK ||
+		!bytes.Contains(patchResp.Body.Bytes(), []byte(`"model_source":"response"`)) ||
 		!bytes.Contains(patchResp.Body.Bytes(), []byte(`"service_tier_source":"response"`)) ||
 		!bytes.Contains(patchResp.Body.Bytes(), []byte(`"report_timezone":"Asia/Shanghai"`)) {
 		t.Fatalf("PATCH status/body = %d %s", patchResp.Code, patchResp.Body.String())

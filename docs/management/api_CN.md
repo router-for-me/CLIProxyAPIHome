@@ -1810,12 +1810,12 @@ Query 参数：
 
 ### GET `/billing/settings`
 
-返回 DB-backed 计费策略。`service_tier_source` 默认为 `request`，允许值为 `request` 或 `response`。`report_timezone` 必须是受支持的 IANA 时区，默认值为 `UTC`；当 Management Billing 请求未提供 `timezone` 覆盖时，它作为报表默认日历时区。修改该设置只影响后续报表的边界和分组，不会重新计算历史 charge、重写价格快照或改变余额。无论哪种 tier-source 模式，`auto`、`default` 和 `standard` 都按本地 Standard 价格 tier 匹配。
+返回 DB-backed 计费策略。`model_source` 默认为 `request`，允许值为 `request` 或 `response`（`request` 优先按请求侧模型 ID 匹配价格，未命中时回退到 `response_model`；`response` 优先按上游 `response_model` 匹配价格，未命中时回退到请求侧模型）。`service_tier_source` 默认为 `request`，允许值为 `request` 或 `response`。`report_timezone` 必须是受支持的 IANA 时区，默认值为 `UTC`；当 Management Billing 请求未提供 `timezone` 覆盖时，它作为报表默认日历时区。修改该设置只影响后续报表的边界和分组，不会重新计算历史 charge、重写价格快照或改变余额。无论哪种 tier-source 模式，`auto`、`default` 和 `standard` 都按本地 Standard 价格 tier 匹配。
 
 `allow_unpriced_models` 默认为 `false`。为 `false` 时，用户所属 API key 请求的模型如果在任何 provider 下都没有启用的价格规则，dispatch 会返回 `model_not_found`（`model <id> has no configured price`）。价格全为 0 的规则也算已配置，因此显式免费的模型仍可调用。不属于用户的 API key 不受此限制。设为 `true` 后允许调用未配价模型，其扣费按 $0 记录并标记 `cost_diagnostic: unpriced_model`。管理员扣费响应还包含扣费时固化的字段：`billed_cache_read_tokens`、`billed_cache_write_tokens`、`billed_reasoning_tokens`（v2 完整核算下实际计价的 token 桶，旧版核算为 `null`），以及 `cost_breakdown`（`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`）。扣费金额、余额增减和余额在入库前统一量化到 8 位小数，因此 `cost_breakdown.total` 与 `amount` 一致。管理员扣费响应还包含 `base_amount`（规则倍率后、用户 `billing_multiplier` 前的标价金额）、`billing_multiplier` 和 `auth_index`（服务凭证）。`amount = round(base_amount * billing_multiplier, 8)`。按 `auth_index` 汇总 `base_amount` 可衡量每个凭证的产出价值，不受客户折扣影响；`amount` 为实际收入。`cost_breakdown` 同样记录 `base_total`、`billing_multiplier` 和实际生效的 `reasoning_effort_multiplier`。默认 `request` 来源优先使用 CPA 上报的 `effective_service_tier`（CPA 配置覆盖后实际发往上游的 tier），缺失时才回退到客户端的 `service_tier`，因此被 CPA 升级为 `priority` 的请求按 priority 计费，被降级的请求按较低 tier 计费；快照记录为 `outbound_service_tier`。失败请求仅在上游报告了已消耗 token 时计费（如 prompt 已处理后客户端取消的 `499` 流），此类扣费不含 `request_price` 与按次附加费，并在 `price_snapshot` 中记录 `failed_request: true` 与 `fail_status_code`；无 token 的失败请求不计费。`/images/generations` 或 `/images/edits` 请求在 CPA 未上报 `image_count` 时至少按 1 张图片收取 `image_price_per_image`。管理员扣费响应中的 `cost_diagnostic` 为空表示正常，`unpriced_model` 表示未命中任何价格规则，`zero_price` 表示命中规则但金额为 $0；同一值也写入 `price_snapshot.cost_diagnostic`。
 
 ```json
-{ "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
+{ "model_source": "request", "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
 ```
 
 ### PATCH `/billing/settings`
@@ -1823,7 +1823,7 @@ Query 参数：
 局部更新计费设置。所有字段均为可选。在 `response` 模式下，如果 response tier 缺失，会回退到 request tier，并在扣费价格快照中记录该回退。非法 tier-source 值或不支持的时区名称返回 `400 invalid_body`。
 
 ```json
-{ "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
+{ "model_source": "request", "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
 ```
 
 OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表示，不能作为字面量直接发给 Codex backend。参见 [OpenAI 定价页](https://developers.openai.com/api/docs/pricing) 和 [Responses Create 参考](https://developers.openai.com/api/reference/resources/responses/methods/create)。Home 保存请求 `service_tier` 和可选上游 `response_service_tier`，方便后续切换计费来源而无需重新灌入 usage。默认 `request` 来源按 `service_tier`（客户端请求 tier）计费。在 `response` 模式下优先使用 `response_service_tier`，上游未返回时回退请求 tier。`auto`、`default` 和 `standard` 都映射到本地 Standard 规则；使用 `flex` 或 `priority` 时请配置相应规则。

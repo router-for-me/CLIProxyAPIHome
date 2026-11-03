@@ -420,11 +420,46 @@ func TestBillingSettingsDefaultToRequest(t *testing.T) {
 	if errSettings != nil {
 		t.Fatalf("GetBillingSettings() error = %v", errSettings)
 	}
+	if settings.ModelSource != BillingModelSourceRequest {
+		t.Fatalf("model source = %q, want request", settings.ModelSource)
+	}
 	if settings.ServiceTierSource != BillingServiceTierSourceRequest {
 		t.Fatalf("service tier source = %q, want request", settings.ServiceTierSource)
 	}
 	if settings.ReportTimezone != BillingReportTimezoneUTC {
 		t.Fatalf("report timezone = %q, want UTC", settings.ReportTimezone)
+	}
+
+	// Verify model_source="request" (default) vs model_source="response".
+	if _, errCreate := repo.CreateBillingModelPrice(ctx, BillingModelPriceUpdate{Provider: "antigravity", Model: "gemini-4-argon-high", InputPricePerMillion: 5, Enabled: true}); errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	if _, errCreate := repo.CreateBillingModelPrice(ctx, BillingModelPriceUpdate{Provider: "antigravity", Model: "gemini-4-argon", InputPricePerMillion: 2, Enabled: true}); errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	db, _ := repo.database()
+	usage := &UsageRecord{
+		Provider:    "antigravity",
+		Model:       "gemini-4-argon-high",
+		InputTokens: 100,
+		PayloadJSON: JSONB(`{"model":"gemini-4-argon-high","response_model":"gemini-4-argon"}`),
+	}
+	_, reqSnap, errReq := billingPriceSnapshotForUsage(ctx, db, usage)
+	if errReq != nil {
+		t.Fatal(errReq)
+	}
+	if reqSnap.Model != "gemini-4-argon-high" || reqSnap.InputPricePerMillion != 5 || reqSnap.ModelSource != BillingModelSourceRequest || reqSnap.PriceModelSource != billingPriceModelSourceModel {
+		t.Fatalf("request mode snapshot = %+v, want gemini-4-argon-high @ 5", reqSnap)
+	}
+	if _, errPatch := repo.UpdateBillingSettings(ctx, BillingSettingsPatch{ModelSource: stringPtr(BillingModelSourceResponse)}); errPatch != nil {
+		t.Fatal(errPatch)
+	}
+	_, respSnap, errResp := billingPriceSnapshotForUsage(ctx, db, usage)
+	if errResp != nil {
+		t.Fatal(errResp)
+	}
+	if respSnap.Model != "gemini-4-argon" || respSnap.InputPricePerMillion != 2 || respSnap.ModelSource != BillingModelSourceResponse || respSnap.PriceModelSource != billingPriceModelSourceResponseModel {
+		t.Fatalf("response mode snapshot = %+v, want gemini-4-argon @ 2", respSnap)
 	}
 }
 

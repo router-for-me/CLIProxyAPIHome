@@ -1819,12 +1819,12 @@ Response:
 
 ### GET `/billing/settings`
 
-Returns the DB-backed billing policy. `service_tier_source` is `request` by default and may be `request` or `response`. `report_timezone` is a supported IANA timezone and defaults to `UTC`; it is the default calendar timezone for Management Billing reports when a request does not provide a `timezone` override. Changing it affects future report boundaries and grouping only. It does not reprice historical charges, rewrite price snapshots, or change balances. In either tier-source mode, `auto`, `default`, and `standard` match the local Standard price tier.
+Returns the DB-backed billing policy. `model_source` is `request` by default and may be `request` or `response` (`request` matches the requested/routed model first and falls back to `response_model`; `response` matches `response_model` first and falls back to the request model). `service_tier_source` is `request` by default and may be `request` or `response`. `report_timezone` is a supported IANA timezone and defaults to `UTC`; it is the default calendar timezone for Management Billing reports when a request does not provide a `timezone` override. Changing it affects future report boundaries and grouping only. It does not reprice historical charges, rewrite price snapshots, or change balances. In either tier-source mode, `auto`, `default`, and `standard` match the local Standard price tier.
 
 `allow_unpriced_models` defaults to `false`. While false, dispatch for a user-owned API key fails with `model_not_found` (`model <id> has no configured price`) when no enabled price rule names the requested model for any provider. A rule whose prices are all zero counts as configured, so explicitly free models remain callable. API keys that are not owned by a user are not gated. Set it to `true` to allow unpriced models; their charges are recorded at $0 with `cost_diagnostic: unpriced_model`.
 
 ```json
-{ "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
+{ "model_source": "request", "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
 ```
 
 ### PATCH `/billing/settings`
@@ -1832,7 +1832,7 @@ Returns the DB-backed billing policy. `service_tier_source` is `request` by defa
 Partially updates billing settings. All fields are optional. In `response` mode, a missing response tier falls back to the request tier and records that fallback in the charge price snapshot. Invalid tier-source values or unsupported timezone names return `400 invalid_body`.
 
 ```json
-{ "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
+{ "model_source": "request", "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
 ```
 
 OpenAI defines an omitted `service_tier` as `auto`; `auto` is represented internally by Home and is not a literal Codex backend request value. See the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) and [Responses Create reference](https://developers.openai.com/api/reference/resources/responses/methods/create). Home stores the request `service_tier` and optional upstream `response_service_tier` so later billing policy can switch sources without re-ingesting usage. The default `request` source bills from the outbound tier CPA reports as `effective_service_tier` (the tier in the final upstream request after CPA config overrides) and falls back to `service_tier` (client-requested tier) when the payload omits it, so a request CPA upgraded to `priority` bills as priority and one CPA downgraded bills at the lower tier. Snapshots record it as `outbound_service_tier`. In `response` mode, Home uses `response_service_tier` when present and falls back to the request tier when the upstream omits it. `auto`, `default`, and `standard` map to the local Standard price tier; configure `flex` or `priority` rules when those tiers are used.

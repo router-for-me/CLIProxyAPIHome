@@ -31,6 +31,8 @@ const (
 	BillingServiceTierWildcard       = "*"
 	BillingServiceTierSourceRequest  = "request"
 	BillingServiceTierSourceResponse = "response"
+	BillingModelSourceRequest        = "request"
+	BillingModelSourceResponse       = "response"
 	BillingReportTimezoneUTC         = "UTC"
 	billingSettingsKVKey             = "billing.settings"
 
@@ -290,6 +292,7 @@ type BillingPriceSnapshot struct {
 	MatchedServiceTier         string             `json:"matched_service_tier"`
 	MinInputTokens             int64              `json:"min_input_tokens"`
 	ContextInputTokens         int64              `json:"context_input_tokens"`
+	ModelSource                string             `json:"model_source,omitempty"`
 	PriceModelSource           string             `json:"price_model_source,omitempty"`
 	PriceMatch                 string             `json:"price_match,omitempty"`
 	RequestedServiceTier       string             `json:"requested_service_tier"`
@@ -305,6 +308,7 @@ type BillingPriceSnapshot struct {
 }
 
 type BillingSettings struct {
+	ModelSource       string `json:"model_source"`
 	ServiceTierSource string `json:"service_tier_source"`
 	ReportTimezone    string `json:"report_timezone"`
 	// AllowUnpricedModels lets user-owned API keys call models without any enabled
@@ -314,6 +318,7 @@ type BillingSettings struct {
 }
 
 type BillingSettingsPatch struct {
+	ModelSource         *string
 	ServiceTierSource   *string
 	ReportTimezone      *string
 	AllowUnpricedModels *bool
@@ -331,6 +336,13 @@ func (r *Repository) UpdateBillingSettings(ctx context.Context, patch BillingSet
 	settings, errSettings := r.GetBillingSettings(ctx)
 	if errSettings != nil {
 		return BillingSettings{}, errSettings
+	}
+	if patch.ModelSource != nil {
+		modelSource, errModelSource := normalizeBillingModelSource(*patch.ModelSource)
+		if errModelSource != nil {
+			return BillingSettings{}, errModelSource
+		}
+		settings.ModelSource = modelSource
 	}
 	if patch.ServiceTierSource != nil {
 		source, errSource := normalizeBillingServiceTierSource(*patch.ServiceTierSource)
@@ -1454,15 +1466,23 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		}
 	}
 	contextInputTokens := billingContextInputTokens(usage)
-	price, priceModelSource, priceMatch, errFind := billingFindPrice(ctx, tx, provider, billingPriceModelCandidates(usage), effectiveTier, contextInputTokens)
+	primaryCandidates, fallbackCandidates := billingPriceModelCandidateGroups(usage, settings.ModelSource)
+	price, priceModelSource, priceMatch, errFind := billingFindPrice(ctx, tx, provider, primaryCandidates, effectiveTier, contextInputTokens)
 	if errFind != nil {
 		return nil, BillingPriceSnapshot{}, errFind
+	}
+	if price == nil && len(fallbackCandidates) > 0 {
+		price, priceModelSource, priceMatch, errFind = billingFindPrice(ctx, tx, provider, fallbackCandidates, effectiveTier, contextInputTokens)
+		if errFind != nil {
+			return nil, BillingPriceSnapshot{}, errFind
+		}
 	}
 	if price == nil {
 		return nil, BillingPriceSnapshot{
 			Provider:             provider,
 			Model:                model,
 			ContextInputTokens:   contextInputTokens,
+			ModelSource:          settings.ModelSource,
 			RequestedServiceTier: requestedTier,
 			ResponseServiceTier:  responseTierRaw,
 			ServiceTierSource:    settings.ServiceTierSource,
@@ -1485,6 +1505,7 @@ func billingPriceSnapshotForUsage(ctx context.Context, tx *gorm.DB, usage *Usage
 		MatchedServiceTier:         price.ServiceTier,
 		MinInputTokens:             price.MinInputTokens,
 		ContextInputTokens:         contextInputTokens,
+		ModelSource:                settings.ModelSource,
 		PriceModelSource:           priceModelSource,
 		PriceMatch:                 priceMatch,
 		RequestedServiceTier:       requestedTier,
@@ -1512,40 +1533,61 @@ func billingStripChannelPrefix(model string) string {
 	return strings.TrimSpace(model[slash+1:])
 }
 
-// billingPriceModelCandidates lists price lookup models: the executed model first,
-// then the upstream response_model, then the client-requested alias when they differ,
-// followed by prefix-stripped bare model names as fallback candidates.
-func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidate {
+// billingPriceModelCandidateGroups splits price lookup candidates into primary and
+// fallback groups according to modelSource ("request" by default, or "response").
+func billingPriceModelCandidateGroups(usage *UsageRecord, modelSource string) ([]billingPriceModelCandidate, []billingPriceModelCandidate) {
 	model := strings.TrimSpace(usage.Model)
-	seen := make(map[string]struct{}, 6)
-	var candidates []billingPriceModelCandidate
-	appendCandidate := func(name, source string) {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return
-		}
-		key := strings.ToLower(name)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		candidates = append(candidates, billingPriceModelCandidate{model: name, source: source})
-	}
-	appendCandidate(model, billingPriceModelSourceModel)
-	if responseModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "response_model")); responseModel != "" {
-		appendCandidate(responseModel, billingPriceModelSourceResponseModel)
-	}
 	alias := strings.TrimSpace(usage.Alias)
-	if alias != "" {
-		appendCandidate(alias, billingPriceModelSourceAlias)
+	requestedModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "requested_model"))
+	responseModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "response_model"))
+
+	buildGroup := func(seen map[string]struct{}, items ...billingPriceModelCandidate) []billingPriceModelCandidate {
+		var out []billingPriceModelCandidate
+		for _, item := range items {
+			name := strings.TrimSpace(item.model)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, billingPriceModelCandidate{model: name, source: item.source})
+		}
+		return out
 	}
-	if bare := billingStripChannelPrefix(model); bare != "" {
-		appendCandidate(bare, billingPriceModelSourceModel)
+
+	reqItems := []billingPriceModelCandidate{
+		{model: model, source: billingPriceModelSourceModel},
+		{model: alias, source: billingPriceModelSourceAlias},
+		{model: requestedModel, source: billingPriceModelSourceAlias},
+		{model: billingStripChannelPrefix(model), source: billingPriceModelSourceModel},
+		{model: billingStripChannelPrefix(alias), source: billingPriceModelSourceAlias},
+		{model: billingStripChannelPrefix(requestedModel), source: billingPriceModelSourceAlias},
 	}
-	if bareAlias := billingStripChannelPrefix(alias); bareAlias != "" {
-		appendCandidate(bareAlias, billingPriceModelSourceAlias)
+	respItems := []billingPriceModelCandidate{
+		{model: responseModel, source: billingPriceModelSourceResponseModel},
+		{model: billingStripChannelPrefix(responseModel), source: billingPriceModelSourceResponseModel},
 	}
-	return candidates
+
+	seen := make(map[string]struct{}, 8)
+	if strings.EqualFold(strings.TrimSpace(modelSource), BillingModelSourceResponse) {
+		primary := buildGroup(seen, respItems...)
+		fallback := buildGroup(seen, reqItems...)
+		if len(primary) == 0 {
+			return fallback, nil
+		}
+		return primary, fallback
+	}
+	primary := buildGroup(seen, reqItems...)
+	fallback := buildGroup(seen, respItems...)
+	return primary, fallback
+}
+
+func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidate {
+	primary, fallback := billingPriceModelCandidateGroups(usage, BillingModelSourceRequest)
+	return append(primary, fallback...)
 }
 
 // billingContextInputTokens returns the full prompt context used for context-band
@@ -1926,6 +1968,7 @@ func billingMatchedPriceRule(record *BillingModelPriceRecord) string {
 
 func billingSettingsFromDB(ctx context.Context, db *gorm.DB) (BillingSettings, error) {
 	defaults := BillingSettings{
+		ModelSource:       BillingModelSourceRequest,
 		ServiceTierSource: BillingServiceTierSourceRequest,
 		ReportTimezone:    BillingReportTimezoneUTC,
 	}
@@ -1944,6 +1987,12 @@ func billingSettingsFromDB(ctx context.Context, db *gorm.DB) (BillingSettings, e
 	if errUnmarshal := json.Unmarshal(record.Value, &settings); errUnmarshal != nil {
 		return defaults, nil
 	}
+	modelSource, errModelSource := normalizeBillingModelSource(settings.ModelSource)
+	if errModelSource != nil {
+		settings.ModelSource = BillingModelSourceRequest
+	} else {
+		settings.ModelSource = modelSource
+	}
 	source, errSource := normalizeBillingServiceTierSource(settings.ServiceTierSource)
 	if errSource != nil {
 		settings.ServiceTierSource = BillingServiceTierSourceRequest
@@ -1957,6 +2006,17 @@ func billingSettingsFromDB(ctx context.Context, db *gorm.DB) (BillingSettings, e
 		settings.ReportTimezone = timezone
 	}
 	return settings, nil
+}
+
+func normalizeBillingModelSource(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", BillingModelSourceRequest:
+		return BillingModelSourceRequest, nil
+	case BillingModelSourceResponse:
+		return BillingModelSourceResponse, nil
+	default:
+		return "", fmt.Errorf("model_source must be request or response")
+	}
 }
 
 func normalizeBillingServiceTierSource(value string) (string, error) {

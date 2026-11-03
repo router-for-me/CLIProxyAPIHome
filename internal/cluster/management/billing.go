@@ -41,6 +41,7 @@ type billingModelPriceRequest struct {
 }
 
 type billingSettingsRequest struct {
+	ModelSource         *string `json:"model_source"`
 	ServiceTierSource   *string `json:"service_tier_source"`
 	ReportTimezone      *string `json:"report_timezone"`
 	AllowUnpricedModels *bool   `json:"allow_unpriced_models"`
@@ -278,12 +279,13 @@ func (h *Handler) UpdateBillingSettings(c *gin.Context) {
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	settings, errSettings := h.repo.UpdateBillingSettings(ctx, cluster.BillingSettingsPatch{
+		ModelSource:         body.ModelSource,
 		ServiceTierSource:   body.ServiceTierSource,
 		ReportTimezone:      body.ReportTimezone,
 		AllowUnpricedModels: body.AllowUnpricedModels,
 	})
 	if errSettings != nil {
-		if strings.Contains(errSettings.Error(), "service_tier_source") || strings.Contains(errSettings.Error(), "report_timezone") {
+		if strings.Contains(errSettings.Error(), "model_source") || strings.Contains(errSettings.Error(), "service_tier_source") || strings.Contains(errSettings.Error(), "report_timezone") {
 			respondError(c, http.StatusBadRequest, "invalid_body", errSettings)
 			return
 		}
