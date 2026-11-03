@@ -23,6 +23,7 @@ type billingModelPriceRequest struct {
 	CacheReadPricePerMillion   *float64            `json:"cache_read_price_per_million"`
 	CacheWritePricePerMillion  *float64            `json:"cache_write_price_per_million"`
 	RequestPrice               *float64            `json:"request_price"`
+	CacheWrite30mPrice         optionalJSONFloat   `json:"cache_write_30m_price_per_million"`
 	CacheWrite1hPrice          optionalJSONFloat   `json:"cache_write_1h_price_per_million"`
 	CacheWrite12hPrice         optionalJSONFloat   `json:"cache_write_12h_price_per_million"`
 	ReasoningPrice             optionalJSONFloat   `json:"reasoning_price_per_million"`
@@ -465,6 +466,7 @@ func billingModelPricePatchFromRequest(c *gin.Context, body billingModelPriceReq
 func billingExtraPricesFromRequest(body billingModelPriceRequest) map[string]*float64 {
 	out := make(map[string]*float64)
 	for name, field := range map[string]optionalJSONFloat{
+		cluster.BillingPriceCacheWrite30m: body.CacheWrite30mPrice,
 		cluster.BillingPriceCacheWrite1h:  body.CacheWrite1hPrice,
 		cluster.BillingPriceCacheWrite12h: body.CacheWrite12hPrice,
 		cluster.BillingPriceReasoning:     body.ReasoningPrice,
@@ -524,6 +526,7 @@ func billingModelPriceResponse(record *cluster.BillingModelPriceRecord) gin.H {
 		"cache_read_price_per_million":      record.CacheReadPricePerMillion,
 		"cache_write_price_per_million":     record.CacheWritePricePerMillion,
 		"request_price":                     record.RequestPrice,
+		"cache_write_30m_price_per_million": record.CacheWrite30mPricePerMillion,
 		"cache_write_1h_price_per_million":  record.CacheWrite1hPricePerMillion,
 		"cache_write_12h_price_per_million": record.CacheWrite12hPricePerMillion,
 		"reasoning_price_per_million":       record.ReasoningPricePerMillion,

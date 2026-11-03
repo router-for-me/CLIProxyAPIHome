@@ -16,6 +16,7 @@ import (
 // newly reported bucket is never billed below the ordinary rate; an explicit 0
 // bills the bucket as free.
 const (
+	BillingPriceCacheWrite30m = "cache_write_30m_price_per_million"
 	BillingPriceCacheWrite1h  = "cache_write_1h_price_per_million"
 	BillingPriceCacheWrite12h = "cache_write_12h_price_per_million"
 	BillingPriceReasoning     = "reasoning_price_per_million"
@@ -30,6 +31,7 @@ const (
 
 // BillingExtraPrices holds optional per-dimension prices in USD per million tokens.
 type BillingExtraPrices struct {
+	CacheWrite30mPricePerMillion *float64 `gorm:"column:cache_write_30m_price_per_million" json:"cache_write_30m_price_per_million"`
 	CacheWrite1hPricePerMillion  *float64 `gorm:"column:cache_write_1h_price_per_million" json:"cache_write_1h_price_per_million"`
 	CacheWrite12hPricePerMillion *float64 `gorm:"column:cache_write_12h_price_per_million" json:"cache_write_12h_price_per_million"`
 	ReasoningPricePerMillion     *float64 `gorm:"column:reasoning_price_per_million" json:"reasoning_price_per_million"`
@@ -44,6 +46,7 @@ type BillingExtraPrices struct {
 // BillingExtraPriceNames returns the optional price field names in stable order.
 func BillingExtraPriceNames() []string {
 	return []string{
+		BillingPriceCacheWrite30m,
 		BillingPriceCacheWrite1h,
 		BillingPriceCacheWrite12h,
 		BillingPriceReasoning,
@@ -58,6 +61,7 @@ func BillingExtraPriceNames() []string {
 
 func (p *BillingExtraPrices) fieldPointers() map[string]**float64 {
 	return map[string]**float64{
+		BillingPriceCacheWrite30m: &p.CacheWrite30mPricePerMillion,
 		BillingPriceCacheWrite1h:  &p.CacheWrite1hPricePerMillion,
 		BillingPriceCacheWrite12h: &p.CacheWrite12hPricePerMillion,
 		BillingPriceReasoning:     &p.ReasoningPricePerMillion,
@@ -120,17 +124,50 @@ func billingPriceOr(value *float64, fallback float64) float64 {
 }
 
 // billingTokenDetails are optional sub-buckets reported inside the usage tokens
-// object. Each is a subset of a canonical v2 bucket and is clamped to it.
+// object or structured top-level usage fields. Each token bucket is a subset of
+// a canonical v2 bucket and is clamped to it.
 type billingTokenDetails struct {
-	CacheWrite1h  int64
-	CacheWrite12h int64
-	ImageInput    int64
-	ImageOutput   int64
-	AudioInput    int64
-	AudioOutput   int64
+	CacheWrite30m      int64 `json:"cache_write_30m_tokens,omitempty"`
+	CacheWrite1h       int64 `json:"cache_write_1h_tokens,omitempty"`
+	CacheWrite12h      int64 `json:"cache_write_12h_tokens,omitempty"`
+	ImageInput         int64 `json:"image_input_tokens,omitempty"`
+	ImageOutput        int64 `json:"image_output_tokens,omitempty"`
+	AudioInput         int64 `json:"audio_input_tokens,omitempty"`
+	AudioOutput        int64 `json:"audio_output_tokens,omitempty"`
+	VideoInput         int64 `json:"video_input_tokens,omitempty"`
+	VideoOutput        int64 `json:"video_output_tokens,omitempty"`
+	FileInput          int64 `json:"file_input_tokens,omitempty"`
+	ImageCacheRead     int64 `json:"image_cache_read_tokens,omitempty"`
+	AudioCacheRead     int64 `json:"audio_cache_read_tokens,omitempty"`
+	CachedText         int64 `json:"cached_text_tokens,omitempty"`
+	AcceptedPrediction int64 `json:"accepted_prediction_tokens,omitempty"`
+	RejectedPrediction int64 `json:"rejected_prediction_tokens,omitempty"`
 	// Per-unit counters reported in the tokens object or at the payload top level.
-	WebSearchCalls int64
-	Images         int64
+	WebSearchCalls         int64   `json:"web_search_requests,omitempty"`
+	WebSearchQueries       int64   `json:"web_search_queries,omitempty"`
+	WebFetchCalls          int64   `json:"web_fetch_calls,omitempty"`
+	XSearchCalls           int64   `json:"x_search_calls,omitempty"`
+	CodeExecutionCalls     int64   `json:"code_execution_calls,omitempty"`
+	FileSearchCalls        int64   `json:"file_search_calls,omitempty"`
+	DocumentSearchCalls    int64   `json:"document_search_calls,omitempty"`
+	MCPCalls               int64   `json:"mcp_calls,omitempty"`
+	GoogleMapsChunks       int64   `json:"google_maps_chunks,omitempty"`
+	NumSourcesUsed         int64   `json:"num_sources_used,omitempty"`
+	NumServerSideToolsUsed int64   `json:"num_server_side_tools_used,omitempty"`
+	PromptMedia            int64   `json:"prompt_media,omitempty"`
+	CompletionMedia        int64   `json:"completion_media,omitempty"`
+	PromptAudio            int64   `json:"prompt_audio,omitempty"`
+	Images                 int64   `json:"image_count,omitempty"`
+	AudioSeconds           float64 `json:"audio_seconds,omitempty"`
+	UpstreamCost           float64 `json:"upstream_cost,omitempty"`
+}
+
+func (d billingTokenDetails) hasUnitActivity() bool {
+	return d.WebSearchCalls > 0 || d.WebSearchQueries > 0 || d.WebFetchCalls > 0 ||
+		d.XSearchCalls > 0 || d.CodeExecutionCalls > 0 || d.FileSearchCalls > 0 ||
+		d.DocumentSearchCalls > 0 || d.MCPCalls > 0 || d.GoogleMapsChunks > 0 || d.NumSourcesUsed > 0 ||
+		d.NumServerSideToolsUsed > 0 || d.PromptMedia > 0 || d.CompletionMedia > 0 ||
+		d.PromptAudio > 0 || d.Images > 0 || d.AudioSeconds > 0 || d.UpstreamCost > 0
 }
 
 func billingTokenDetailsForUsage(usage *UsageRecord) billingTokenDetails {
@@ -141,39 +178,234 @@ func billingTokenDetailsForUsage(usage *UsageRecord) billingTokenDetails {
 	payload := string(usage.PayloadJSON)
 	first := func(paths ...string) int64 {
 		for _, path := range paths {
-			if value := gjson.Get(raw, path); raw != "" && value.Exists() {
+			if value := gjson.Get(raw, path); raw != "" && value.Exists() && value.Int() > 0 {
+				return value.Int()
+			}
+			if value := gjson.Get(payload, path); payload != "" && value.Exists() && value.Int() > 0 {
 				return value.Int()
 			}
 		}
 		return 0
 	}
-	units := func(path string) int64 {
-		if value := first(path); value > 0 {
-			return value
-		}
-		if payload == "" {
-			return 0
-		}
-		if value := gjson.Get(payload, path).Int(); value > 0 {
-			return value
+	firstFloat := func(paths ...string) float64 {
+		for _, path := range paths {
+			if value := gjson.Get(raw, path); raw != "" && value.Exists() && value.Float() > 0 {
+				return value.Float()
+			}
+			if value := gjson.Get(payload, path); payload != "" && value.Exists() && value.Float() > 0 {
+				return value.Float()
+			}
 		}
 		return 0
 	}
-	images := units("image_count")
-	// An images endpoint returns at least one image even when CPA omits the count.
-	if images == 0 && billingImagesEndpoint(usage.Endpoint) {
-		images = 1
+	cw5m := first(
+		"cache_creation_5m_tokens",
+		"cache_write_5m_tokens",
+		"cache_details.ephemeral_5m_input_tokens",
+		"cache_details.by_ttl.5m",
+		"cache_creation.ephemeral_5m_input_tokens",
+	)
+	cw30m := first(
+		"cache_creation_30m_tokens",
+		"cache_write_30m_tokens",
+		"cache_details.ephemeral_30m_input_tokens",
+		"cache_details.by_ttl.30m",
+		"cache_creation.ephemeral_30m_input_tokens",
+	)
+	cw1h := first(
+		"cache_creation_1h_tokens",
+		"cache_write_1h_tokens",
+		"cache_details.ephemeral_1h_input_tokens",
+		"cache_details.by_ttl.1h",
+		"cache_creation.ephemeral_1h_input_tokens",
+	)
+	cw12h := first(
+		"cache_creation_12h_tokens",
+		"cache_write_12h_tokens",
+		"cache_details.ephemeral_12h_input_tokens",
+		"cache_details.by_ttl.12h",
+		"cache_creation.ephemeral_12h_input_tokens",
+	)
+	if cw5m == 0 && cw30m == 0 && cw1h == 0 && cw12h == 0 && payload != "" {
+		totalWrite := usage.AccountingCacheWriteTokens
+		if totalWrite <= 0 {
+			totalWrite = usage.CacheCreationTokens
+		}
+		if totalWrite > 0 {
+			switch strings.ToLower(strings.TrimSpace(usagePayloadString(payload, "cache_details.ttl", "tokens.cache_creation.ttl", "cache_creation.ttl"))) {
+			case "30m":
+				cw30m = totalWrite
+			case "1h":
+				cw1h = totalWrite
+			case "12h":
+				cw12h = totalWrite
+			}
+		}
 	}
-	return billingTokenDetails{
-		WebSearchCalls: units("web_search_requests"),
-		Images:         images,
-		CacheWrite1h:   first("cache_creation_1h_tokens", "cache_write_1h_tokens"),
-		CacheWrite12h:  first("cache_creation_12h_tokens", "cache_write_12h_tokens"),
-		ImageInput:     first("image_input_tokens"),
-		ImageOutput:    first("image_output_tokens"),
-		AudioInput:     first("audio_input_tokens"),
-		AudioOutput:    first("audio_output_tokens"),
+	details := billingTokenDetails{
+		CacheWrite30m:      cw30m,
+		CacheWrite1h:       cw1h,
+		CacheWrite12h:      cw12h,
+		ImageInput:         first("image_input_tokens", "input_image_tokens", "input_tokens_details.image_tokens", "prompt_tokens_details.image_tokens"),
+		ImageOutput:        first("image_output_tokens", "output_image_tokens", "output_tokens_details.image_tokens", "completion_tokens_details.image_tokens"),
+		AudioInput:         first("audio_input_tokens", "input_audio_tokens", "input_tokens_details.audio_tokens", "prompt_tokens_details.audio_tokens"),
+		AudioOutput:        first("audio_output_tokens", "output_audio_tokens", "output_tokens_details.audio_tokens", "completion_tokens_details.audio_tokens"),
+		VideoInput:         first("video_input_tokens", "input_video_tokens", "input_tokens_details.video_tokens", "prompt_tokens_details.video_tokens"),
+		VideoOutput:        first("video_output_tokens", "output_video_tokens", "output_tokens_details.video_tokens", "completion_tokens_details.video_tokens"),
+		FileInput:          first("file_input_tokens", "input_file_tokens", "input_tokens_details.file_tokens", "prompt_tokens_details.file_tokens"),
+		ImageCacheRead:     first("cached_image_tokens", "image_cache_read_tokens", "input_tokens_details.cached_tokens_details.image_tokens", "prompt_tokens_details.cached_tokens_details.image_tokens"),
+		AudioCacheRead:     first("cached_audio_tokens", "audio_cache_read_tokens", "input_tokens_details.cached_tokens_details.audio_tokens", "prompt_tokens_details.cached_tokens_details.audio_tokens"),
+		CachedText:         first("cached_text_tokens", "input_tokens_details.cached_tokens_details.text_tokens", "prompt_tokens_details.cached_tokens_details.text_tokens"),
+		AcceptedPrediction: first("accepted_prediction_tokens", "output_tokens_details.accepted_prediction_tokens", "completion_tokens_details.accepted_prediction_tokens"),
+		RejectedPrediction: first("rejected_prediction_tokens", "output_tokens_details.rejected_prediction_tokens", "completion_tokens_details.rejected_prediction_tokens"),
+		UpstreamCost:       firstFloat("cost_details.cost", "cost_details.upstream_inference_cost", "cost"),
 	}
+	if details.UpstreamCost == 0 {
+		if ticks := first("cost_details.cost_in_usd_ticks", "cost_in_usd_ticks"); ticks > 0 {
+			details.UpstreamCost = float64(ticks) / 1e10
+		} else {
+			promptCost := firstFloat("cost_details.upstream_inference_prompt_cost")
+			compCost := firstFloat("cost_details.upstream_inference_completions_cost")
+			details.UpstreamCost = promptCost + compCost
+		}
+	}
+	if usage.Failed {
+		return details
+	}
+	details.WebSearchCalls = first(
+		"web_search_requests",
+		"tool_usage_details.web_search_calls",
+		"server_tool_use.web_search_requests",
+	)
+	details.WebSearchQueries = first("tool_usage_details.web_search_queries")
+	details.WebFetchCalls = first("tool_usage_details.web_fetch_calls", "server_tool_use.web_fetch_requests")
+	details.XSearchCalls = first("tool_usage_details.x_search_calls")
+	details.CodeExecutionCalls = first("tool_usage_details.code_execution_calls", "server_tool_use.code_execution_requests")
+	details.FileSearchCalls = first("tool_usage_details.file_search_calls", "server_tool_use.file_search_requests")
+	details.DocumentSearchCalls = first("tool_usage_details.document_search_calls")
+	details.MCPCalls = first("tool_usage_details.mcp_calls", "server_tool_use.mcp_requests")
+	details.GoogleMapsChunks = first("tool_usage_details.extra.google_maps_chunks", "google_maps_chunks")
+	details.NumSourcesUsed = first("tool_usage_details.num_sources_used", "num_sources_used")
+	details.NumServerSideToolsUsed = first("tool_usage_details.num_server_side_tools_used", "num_server_side_tools_used")
+	details.PromptMedia = first("media_counts.prompt_media")
+	details.CompletionMedia = first("media_counts.completion_media")
+	details.PromptAudio = first("media_counts.prompt_audio")
+	details.Images = first(
+		"image_count",
+		"images",
+		"tool_usage_details.image_generation_calls",
+	)
+	details.AudioSeconds = firstFloat("media_counts.audio_seconds", "audio_seconds")
+	// An images endpoint returns at least one image even when no count is known.
+	if details.Images == 0 && billingImagesEndpoint(usage.Endpoint) {
+		details.Images = 1
+	}
+	return details
+}
+
+// billingApplyAdvisorIterationsTx prices advisor_message entries in usage.iterations[]
+// against their own model price rule and adds them to the parent charge breakdown.
+// Standard "message" and "compaction" iterations are already summed in top-level usage.
+func billingApplyAdvisorIterationsTx(ctx context.Context, tx *gorm.DB, usage *UsageRecord, cost *BillingCostBreakdown) error {
+	if tx == nil || usage == nil || cost == nil {
+		return nil
+	}
+	payload := strings.TrimSpace(string(usage.PayloadJSON))
+	if payload == "" {
+		return nil
+	}
+	iterations := gjson.Get(payload, "iterations")
+	if !iterations.IsArray() {
+		return nil
+	}
+	for _, item := range iterations.Array() {
+		iterType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		if iterType != "advisor_message" {
+			continue
+		}
+		iterModel := strings.TrimSpace(item.Get("model").String())
+		if iterModel == "" {
+			iterModel = usage.Model
+		}
+		inputTokens := item.Get("input_tokens").Int()
+		outputTokens := item.Get("output_tokens").Int()
+		reasoningTokens := item.Get("reasoning_tokens").Int()
+		if reasoningTokens == 0 {
+			reasoningTokens = item.Get("thinking_tokens").Int()
+		}
+		cacheRead := item.Get("cache_read_input_tokens").Int()
+		cacheWrite := item.Get("cache_creation_input_tokens").Int()
+		cw5m := item.Get("cache_creation_5m_tokens").Int()
+		if cw5m == 0 {
+			cw5m = item.Get("cache_creation.ephemeral_5m_input_tokens").Int()
+		}
+		cw1h := item.Get("cache_creation_1h_tokens").Int()
+		if cw1h == 0 {
+			cw1h = item.Get("cache_creation.ephemeral_1h_input_tokens").Int()
+		}
+		nonReasoning := outputTokens
+		if reasoningTokens > 0 && reasoningTokens <= outputTokens {
+			nonReasoning = outputTokens - reasoningTokens
+		}
+		totalTokens := inputTokens + outputTokens + cacheRead + cacheWrite
+		if totalTokens <= 0 {
+			continue
+		}
+		iterPayload, _ := json.Marshal(map[string]any{
+			"tokens": map[string]any{
+				"cache_creation_5m_tokens": cw5m,
+				"cache_creation_1h_tokens": cw1h,
+			},
+		})
+		iterUsage := &UsageRecord{
+			Timestamp:                  usage.Timestamp,
+			Provider:                   usage.Provider,
+			ExecutorType:               usage.ExecutorType,
+			Model:                      iterModel,
+			ServiceTier:                usage.ServiceTier,
+			ResponseServiceTier:        usage.ResponseServiceTier,
+			InputTokens:                inputTokens,
+			OutputTokens:               outputTokens,
+			ReasoningTokens:            reasoningTokens,
+			CacheReadTokens:            cacheRead,
+			CacheReadTokensPresent:     true,
+			CacheCreationTokens:        cacheWrite,
+			TotalTokens:                totalTokens,
+			TokenAccountingVersion:     UsageTokenAccountingSchemaVersion,
+			TokenAccountingQuality:     UsageTokenAccountingQualityComplete,
+			AccountingTotalTokens:      totalTokens,
+			AccountingInputTokens:      inputTokens + cacheRead + cacheWrite,
+			UncachedInputTokens:        inputTokens,
+			AccountingCacheReadTokens:  cacheRead,
+			AccountingCacheWriteTokens: cacheWrite,
+			AccountingOutputTokens:     outputTokens,
+			NonReasoningOutputTokens:   nonReasoning,
+			AccountingReasoningTokens:  reasoningTokens,
+			PayloadJSON:                JSONB(iterPayload),
+		}
+		_, iterSnapshot, errSnap := billingPriceSnapshotForUsage(ctx, tx, iterUsage)
+		if errSnap != nil {
+			return errSnap
+		}
+		iterSnapshot.RequestPrice = 0
+		iterCost := billingChargeCost(iterUsage, iterSnapshot)
+		if iterCost.BaseTotal <= 0 {
+			continue
+		}
+		if cost.Items == nil {
+			cost.Items = make(map[string]BillingCostItem)
+		}
+		key := "iteration:" + iterModel
+		prev := cost.Items[key]
+		cost.Items[key] = BillingCostItem{
+			Tokens: prev.Tokens + totalTokens,
+			Cost:   billingRoundAmount(prev.Cost + iterCost.BaseTotal),
+		}
+		cost.Surcharges = billingRoundAmount(cost.Surcharges + iterCost.BaseTotal)
+		cost.BaseTotal = billingRoundAmount(cost.BaseTotal + iterCost.BaseTotal)
+		cost.Total = cost.BaseTotal
+	}
+	return nil
 }
 
 func clampBillingTokens(value int64, limit int64) int64 {

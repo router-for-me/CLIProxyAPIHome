@@ -37,8 +37,9 @@ const (
 	billingIDRandomBytes    = 12
 	billingOverviewTopLimit = 10
 
-	billingPriceModelSourceModel = "model"
-	billingPriceModelSourceAlias = "alias"
+	billingPriceModelSourceModel         = "model"
+	billingPriceModelSourceResponseModel = "response_model"
+	billingPriceModelSourceAlias         = "alias"
 
 	// BillingCostDiagnosticUnpricedModel marks a charge whose usage matched no enabled price rule.
 	BillingCostDiagnosticUnpricedModel = "unpriced_model"
@@ -766,6 +767,9 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		snapshot = billingFailedUsageSnapshot(usage, snapshot)
 	}
 	cost := billingChargeCost(usage, snapshot)
+	if errIter := billingApplyAdvisorIterationsTx(ctx, tx, usage, &cost); errIter != nil {
+		return errIter
+	}
 	if !billingUsageHasBillableActivity(usage, cost.Total) {
 		return nil
 	}
@@ -804,7 +808,7 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		Provider:               strings.ToLower(strings.TrimSpace(usage.Provider)),
 		Model:                  strings.TrimSpace(usage.Model),
 		OriginalModel:          firstNonEmptyBillingString(usage.Alias, usage.Model),
-		ActualModel:            strings.TrimSpace(usage.Model),
+		ActualModel:            firstNonEmptyBillingString(usagePayloadString(payload, "response_model"), usage.Model),
 		RequestID:              strings.TrimSpace(usage.RequestID),
 		Endpoint:               strings.TrimSpace(usage.Endpoint),
 		InputTokens:            usage.InputTokens,
@@ -1498,11 +1502,14 @@ type billingPriceModelCandidate struct {
 }
 
 // billingPriceModelCandidates lists price lookup models: the executed model first,
-// then the client-requested alias when it differs.
+// then the upstream response_model, then the client-requested alias when they differ.
 func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidate {
 	model := strings.TrimSpace(usage.Model)
 	candidates := []billingPriceModelCandidate{{model: model, source: billingPriceModelSourceModel}}
-	if alias := strings.TrimSpace(usage.Alias); alias != "" && alias != model {
+	if responseModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "response_model")); responseModel != "" && !strings.EqualFold(responseModel, model) {
+		candidates = append(candidates, billingPriceModelCandidate{model: responseModel, source: billingPriceModelSourceResponseModel})
+	}
+	if alias := strings.TrimSpace(usage.Alias); alias != "" && !strings.EqualFold(alias, model) {
 		candidates = append(candidates, billingPriceModelCandidate{model: alias, source: billingPriceModelSourceAlias})
 	}
 	return candidates
@@ -1555,6 +1562,8 @@ type BillingCostBreakdown struct {
 	ReasoningEffortMultiplier float64 `json:"reasoning_effort_multiplier,omitempty"`
 	// PricingExpr is set when the amount came from the rule's pricing expression.
 	PricingExpr string `json:"pricing_expr,omitempty"`
+	// MatchedTier records the tier name selected by tier(name, expr) in pricing_expr.
+	MatchedTier string `json:"matched_tier,omitempty"`
 	// ExpressionError records a runtime expression failure that fell back to columns.
 	ExpressionError string `json:"expression_error,omitempty"`
 	// Surcharges are per-unit fees (web search calls, images); like the request
@@ -1661,9 +1670,10 @@ func billingChargeCost(usage *UsageRecord, snapshot BillingPriceSnapshot) Billin
 func billingCompleteChargeCost(cost *BillingCostBreakdown, breakdown UsageTokenBreakdown, details billingTokenDetails, snapshot BillingPriceSnapshot) {
 	uncached := breakdown.Input.UncachedTokens
 	cacheWrite := breakdown.Input.CacheWriteTokens
-	cacheWrite1h := clampBillingTokens(details.CacheWrite1h, cacheWrite)
-	cacheWrite12h := clampBillingTokens(details.CacheWrite12h, cacheWrite-cacheWrite1h)
-	cacheWrite5m := cacheWrite - cacheWrite1h - cacheWrite12h
+	cacheWrite30m := clampBillingTokens(details.CacheWrite30m, cacheWrite)
+	cacheWrite1h := clampBillingTokens(details.CacheWrite1h, cacheWrite-cacheWrite30m)
+	cacheWrite12h := clampBillingTokens(details.CacheWrite12h, cacheWrite-cacheWrite30m-cacheWrite1h)
+	cacheWrite5m := cacheWrite - cacheWrite30m - cacheWrite1h - cacheWrite12h
 	imageInput := clampBillingTokens(details.ImageInput, uncached)
 	audioInput := clampBillingTokens(details.AudioInput, uncached-imageInput)
 	textInput := uncached - imageInput - audioInput
@@ -1676,8 +1686,9 @@ func billingCompleteChargeCost(cost *BillingCostBreakdown, breakdown UsageTokenB
 		cacheWrite5m = 0
 		cacheWritePrice = snapshot.InputPricePerMillion
 	}
+	cacheWrite30mPrice := billingPriceOr(snapshot.CacheWrite30mPricePerMillion, cacheWritePrice)
 	cacheWrite1hPrice := billingPriceOr(snapshot.CacheWrite1hPricePerMillion, cacheWritePrice)
-	cacheWrite12hPrice := billingPriceOr(snapshot.CacheWrite12hPricePerMillion, cacheWrite1hPrice)
+	cacheWrite12hPrice := billingPriceOr(snapshot.CacheWrite12hPricePerMillion, billingPriceOr(snapshot.CacheWrite1hPricePerMillion, cacheWrite30mPrice))
 
 	reasoning := breakdown.Output.ReasoningTokens
 	nonReasoning := breakdown.Output.NonReasoningTokens
@@ -1694,6 +1705,7 @@ func billingCompleteChargeCost(cost *BillingCostBreakdown, breakdown UsageTokenB
 	cost.add("audio_input", audioInput, billingPriceOr(snapshot.AudioInputPricePerMillion, snapshot.InputPricePerMillion))
 	cost.add("cache_read", breakdown.Input.CacheReadTokens, snapshot.CacheReadPricePerMillion)
 	cost.add("cache_write", cacheWrite5m, snapshot.CacheWritePricePerMillion)
+	cost.add("cache_write_30m", cacheWrite30m, cacheWrite30mPrice)
 	cost.add("cache_write_1h", cacheWrite1h, cacheWrite1hPrice)
 	cost.add("cache_write_12h", cacheWrite12h, cacheWrite12hPrice)
 	cost.add("output", textOutput, snapshot.OutputPricePerMillion)
@@ -1758,14 +1770,18 @@ func billingUsageHasBillableActivity(usage *UsageRecord, amount float64) bool {
 	if usage == nil {
 		return false
 	}
-	return amount != 0 ||
+	if amount != 0 ||
 		usage.AccountingTotalTokens > 0 ||
 		usage.TotalTokens > 0 ||
 		usage.InputTokens > 0 ||
 		usage.OutputTokens > 0 ||
 		usage.CacheReadTokens > 0 ||
 		usage.CacheCreationTokens > 0 ||
-		usage.CachedTokens > 0
+		usage.CachedTokens > 0 {
+		return true
+	}
+	details := billingTokenDetailsForUsage(usage)
+	return details.hasUnitActivity()
 }
 
 func billingCacheTokens(usage *UsageRecord) int64 {

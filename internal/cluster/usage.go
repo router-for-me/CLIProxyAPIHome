@@ -216,7 +216,7 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 		Alias:                      strings.TrimSpace(gjson.Get(payload, "alias").String()),
 		Effort:                     strings.TrimSpace(gjson.Get(payload, "reasoning_effort").String()),
 		ServiceTier:                usageServiceTierFromPayload(payload),
-		ResponseServiceTier:        strings.TrimSpace(gjson.Get(payload, "response_service_tier").String()),
+		ResponseServiceTier:        usagePayloadString(payload, "response_service_tier", "upstream_service_tier"),
 		Endpoint:                   strings.TrimSpace(gjson.Get(payload, "endpoint").String()),
 		AuthType:                   strings.TrimSpace(gjson.Get(payload, "auth_type").String()),
 		APIKey:                     strings.TrimSpace(gjson.Get(payload, "api_key").String()),

@@ -22,39 +22,101 @@ const (
 
 // Token variables, in tokens. Their coefficients are USD per million tokens.
 const (
-	VarInput          = "p"     // uncached text input
-	VarOutput         = "c"     // non-reasoning text output
-	VarReasoning      = "r"     // reasoning output
-	VarCacheRead      = "cr"    // cache reads
-	VarCacheWrite     = "cc"    // 5-minute cache writes
-	VarCacheWrite1h   = "cc1h"  // 1-hour cache writes
-	VarCacheWrite12h  = "cc12h" // 12-hour cache writes
-	VarImageInput     = "img"   // image input
-	VarImageOutput    = "imgo"  // image output
-	VarAudioInput     = "ai"    // audio input
-	VarAudioOutput    = "ao"    // audio output
-	VarContextLength  = "len"   // full prompt context, for conditions only
-	VarRequest        = "req"   // always 1; "req * usd(0.01)" bills per request
-	VarWebSearchCalls = "ws"    // web search calls; bill with "ws * usd(0.01)"
-	VarImages         = "imgn"  // generated images; bill with "imgn * usd(0.04)"
-	VarTier           = "tier"
-	VarEffort         = "effort"
-	VarModel          = "model"
-	VarProvider       = "provider"
-	VarEndpoint       = "endpoint"
-	tokensPerMillion  = 1000000.0
-	defaultSampleSize = 1000
+	VarInput                  = "p"           // uncached text input
+	VarOutput                 = "c"           // non-reasoning text output
+	VarReasoning              = "r"           // reasoning output
+	VarCacheRead              = "cr"          // cache reads
+	VarCacheWrite             = "cc"          // 5-minute cache writes
+	VarCacheWrite30m          = "cc30m"       // 30-minute cache writes
+	VarCacheWrite1h           = "cc1h"        // 1-hour cache writes
+	VarCacheWrite12h          = "cc12h"       // 12-hour cache writes
+	VarImageInput             = "img"         // image input
+	VarImageOutput            = "imgo"        // image output
+	VarAudioInput             = "ai"          // audio input
+	VarAudioOutput            = "ao"          // audio output
+	VarVideoInput             = "vi"          // video input
+	VarVideoOutput            = "vo"          // video output
+	VarFileInput              = "fi"          // file/document input
+	VarImageCacheRead         = "img_cr"      // cached image input tokens
+	VarAudioCacheRead         = "acr"         // cached audio input tokens
+	VarCachedText             = "ct"          // cached text input tokens
+	VarAcceptedPrediction     = "apred"       // accepted prediction tokens
+	VarRejectedPrediction     = "rpred"       // rejected prediction tokens
+	VarTotalTokens            = "total"       // total input + output tokens
+	VarContextLength          = "len"         // full prompt context, for conditions only
+	VarRequest                = "req"         // 1 on success, 0 on failure; "req * usd(0.01)" bills per request
+	VarWebSearchCalls         = "ws"          // web search calls; bill with "ws * usd(0.01)"
+	VarWebSearchQueries       = "wsq"         // web search queries
+	VarWebFetchCalls          = "wf"          // web fetch calls
+	VarXSearchCalls           = "xs"          // X search calls
+	VarCodeExecutionCalls     = "ce"          // code execution / interpreter calls
+	VarFileSearchCalls        = "fs"          // file / collections search calls
+	VarDocumentSearchCalls    = "ds"          // document / attachment search calls
+	VarMCPCalls               = "mcp"         // remote MCP tool calls
+	VarGoogleMapsChunks       = "maps"        // Gemini Google Maps grounding chunks
+	VarNumSourcesUsed         = "src"         // sources used (e.g. xAI Live Search)
+	VarNumServerSideToolsUsed = "st"          // total server-side tool invocations
+	VarPromptMedia            = "pmedia"      // prompt media count
+	VarCompletionMedia        = "cmedia"      // completion media count
+	VarPromptAudio            = "paudio"      // prompt audio count
+	VarImages                 = "imgn"        // generated images; bill with "imgn * usd(0.04)"
+	VarImageCountAlias        = "image_count" // new-api alias for imgn
+	VarImageOutputAlias       = "img_o"       // new-api alias for imgo
+	VarAudioSeconds           = "asec"        // audio/video duration in seconds; bill with "asec * usd(0.001)"
+	VarUpstreamCost           = "upcost"      // upstream reported cost in USD; bill with "usd(upcost)"
+	VarTier                   = "tier"
+	VarUpstreamTier           = "upstream_tier"
+	VarSpeed                  = "speed"
+	VarGeo                    = "geo"
+	VarCacheTTL               = "cache_ttl"
+	VarImageSize              = "img_size"
+	VarImageResolution        = "img_res"
+	VarImageQuality           = "img_quality"
+	VarImageAspectRatio       = "img_ratio"
+	VarImageTier              = "img_tier"
+	VarBYOK                   = "byok"
+	VarResponseModel          = "response_model"
+	VarEffort                 = "effort"
+	VarModel                  = "model"
+	VarProvider               = "provider"
+	VarEndpoint               = "endpoint"
+	tokensPerMillion          = 1000000.0
+	defaultSampleSize         = 1000
 )
+
+// varAliases maps compatibility aliases (such as new-api names) to canonical variable names.
+var varAliases = map[string]string{
+	VarImageCountAlias:  VarImages,
+	VarImageOutputAlias: VarImageOutput,
+	"ai_cr":             VarAudioCacheRead,
+	"ci":                VarCodeExecutionCalls,
+}
+
+func canonicalVarName(name string) string {
+	if canonical, ok := varAliases[name]; ok {
+		return canonical
+	}
+	return name
+}
 
 var numberVars = map[string]struct{}{
 	VarInput: {}, VarOutput: {}, VarReasoning: {}, VarCacheRead: {}, VarCacheWrite: {},
-	VarCacheWrite1h: {}, VarCacheWrite12h: {}, VarImageInput: {}, VarImageOutput: {},
-	VarAudioInput: {}, VarAudioOutput: {}, VarContextLength: {}, VarRequest: {},
-	VarWebSearchCalls: {}, VarImages: {},
+	VarCacheWrite30m: {}, VarCacheWrite1h: {}, VarCacheWrite12h: {}, VarImageInput: {}, VarImageOutput: {},
+	VarAudioInput: {}, VarAudioOutput: {}, VarVideoInput: {}, VarVideoOutput: {}, VarFileInput: {},
+	VarImageCacheRead: {}, VarAudioCacheRead: {}, VarCachedText: {},
+	VarAcceptedPrediction: {}, VarRejectedPrediction: {}, VarTotalTokens: {},
+	VarContextLength: {}, VarRequest: {}, VarWebSearchCalls: {}, VarWebSearchQueries: {},
+	VarWebFetchCalls: {}, VarXSearchCalls: {}, VarCodeExecutionCalls: {}, VarFileSearchCalls: {},
+	VarDocumentSearchCalls: {}, VarMCPCalls: {}, VarGoogleMapsChunks: {},
+	VarNumSourcesUsed: {}, VarNumServerSideToolsUsed: {},
+	VarPromptMedia: {}, VarCompletionMedia: {}, VarPromptAudio: {},
+	VarImages: {}, VarAudioSeconds: {}, VarUpstreamCost: {},
 }
 
 var stringVars = map[string]struct{}{
-	VarTier: {}, VarEffort: {}, VarModel: {}, VarProvider: {}, VarEndpoint: {},
+	VarTier: {}, VarUpstreamTier: {}, VarSpeed: {}, VarGeo: {}, VarCacheTTL: {},
+	VarImageSize: {}, VarImageResolution: {}, VarImageQuality: {}, VarImageAspectRatio: {}, VarImageTier: {},
+	VarBYOK: {}, VarResponseModel: {}, VarEffort: {}, VarModel: {}, VarProvider: {}, VarEndpoint: {},
 }
 
 type function struct {
@@ -66,17 +128,32 @@ var functions = map[string]function{
 	"hour":     {minArgs: 0, maxArgs: 1},
 	"minute":   {minArgs: 0, maxArgs: 1},
 	"weekday":  {minArgs: 0, maxArgs: 1},
+	"month":    {minArgs: 0, maxArgs: 1},
+	"day":      {minArgs: 0, maxArgs: 1},
 	"min":      {minArgs: 1, maxArgs: 16},
 	"max":      {minArgs: 1, maxArgs: 16},
+	"abs":      {minArgs: 1, maxArgs: 1},
+	"ceil":     {minArgs: 1, maxArgs: 1},
+	"floor":    {minArgs: 1, maxArgs: 1},
+	"round":    {minArgs: 1, maxArgs: 1},
 	"usd":      {minArgs: 1, maxArgs: 1},
+	"fixed":    {minArgs: 1, maxArgs: 1},
+	"tier":     {minArgs: 2, maxArgs: 2},
 	"contains": {minArgs: 2, maxArgs: 2},
+	"has":      {minArgs: 2, maxArgs: 2},
+	"u":        {minArgs: 1, maxArgs: 1},
+	"s":        {minArgs: 1, maxArgs: 1},
+	"param":    {minArgs: 1, maxArgs: 1},
 }
 
-// Env supplies variable values and the evaluation clock.
+// Env supplies variable values, dynamic lookup hooks, and the evaluation clock.
 type Env struct {
-	Numbers map[string]float64
-	Strings map[string]string
-	Now     time.Time
+	Numbers      map[string]float64
+	Strings      map[string]string
+	LookupNumber func(path string) float64
+	LookupString func(path string) string
+	Now          time.Time
+	MatchedTier  string
 }
 
 // Program is a compiled expression.
@@ -100,13 +177,14 @@ func Compile(source string) (*Program, error) {
 	if cached, ok := programCache.Load(source); ok {
 		return cached.(*Program), nil
 	}
-	if source == "" {
+	body := strings.TrimSpace(strings.TrimPrefix(source, "v1:"))
+	if body == "" {
 		return nil, fmt.Errorf("expression is empty")
 	}
 	if len(source) > maxSourceLength {
 		return nil, fmt.Errorf("expression exceeds %d characters", maxSourceLength)
 	}
-	tokens, errLex := lex(source)
+	tokens, errLex := lex(body)
 	if errLex != nil {
 		return nil, errLex
 	}
@@ -134,9 +212,15 @@ func Validate(source string) error {
 	for name := range numberVars {
 		sample.Numbers[name] = defaultSampleSize
 	}
-	sample.Numbers[VarRequest] = 1
-	sample.Numbers[VarWebSearchCalls] = 1
-	sample.Numbers[VarImages] = 1
+	for _, unitVar := range []string{
+		VarRequest, VarWebSearchCalls, VarWebSearchQueries, VarWebFetchCalls,
+		VarXSearchCalls, VarCodeExecutionCalls, VarFileSearchCalls, VarDocumentSearchCalls,
+		VarMCPCalls, VarGoogleMapsChunks, VarNumSourcesUsed, VarNumServerSideToolsUsed,
+		VarPromptMedia, VarCompletionMedia, VarPromptAudio,
+		VarImages, VarAudioSeconds, VarUpstreamCost,
+	} {
+		sample.Numbers[unitVar] = 1
+	}
 	for name := range stringVars {
 		sample.Strings[name] = ""
 	}
@@ -146,21 +230,28 @@ func Validate(source string) error {
 
 // EvalUSD evaluates the expression and converts the result to USD.
 func (p *Program) EvalUSD(env Env) (float64, error) {
+	amount, _, errEval := p.EvalUSDWithTrace(env)
+	return amount, errEval
+}
+
+// EvalUSDWithTrace evaluates the expression and returns the USD amount and any
+// tier name recorded by tier(name, expr).
+func (p *Program) EvalUSDWithTrace(env Env) (float64, string, error) {
 	value, errEval := p.root.eval(&env)
 	if errEval != nil {
-		return 0, errEval
+		return 0, "", errEval
 	}
 	number, ok := value.(float64)
 	if !ok {
-		return 0, fmt.Errorf("expression must evaluate to a number, got %s", typeName(value))
+		return 0, "", fmt.Errorf("expression must evaluate to a number, got %s", typeName(value))
 	}
 	if math.IsNaN(number) || math.IsInf(number, 0) {
-		return 0, fmt.Errorf("expression result is not finite")
+		return 0, "", fmt.Errorf("expression result is not finite")
 	}
 	if number < 0 {
-		return 0, fmt.Errorf("expression result must be non-negative")
+		return 0, "", fmt.Errorf("expression result must be non-negative")
 	}
-	return number / tokensPerMillion, nil
+	return number / tokensPerMillion, env.MatchedTier, nil
 }
 
 // FoldTokens moves token buckets the program does not reference into their parent
@@ -175,16 +266,28 @@ func (p *Program) FoldTokens(numbers map[string]float64) {
 	}
 	if p.Uses(VarCacheWrite1h) {
 		move(VarCacheWrite12h, VarCacheWrite1h)
+	} else if p.Uses(VarCacheWrite30m) {
+		move(VarCacheWrite12h, VarCacheWrite30m)
 	} else {
 		move(VarCacheWrite12h, VarCacheWrite)
 	}
-	move(VarCacheWrite1h, VarCacheWrite)
+	if p.Uses(VarCacheWrite30m) {
+		move(VarCacheWrite1h, VarCacheWrite30m)
+	} else {
+		move(VarCacheWrite1h, VarCacheWrite)
+	}
+	move(VarCacheWrite30m, VarCacheWrite)
+	move(VarImageCacheRead, VarCacheRead)
+	move(VarAudioCacheRead, VarCacheRead)
 	move(VarCacheWrite, VarInput)
 	move(VarCacheRead, VarInput)
 	move(VarImageInput, VarInput)
 	move(VarAudioInput, VarInput)
+	move(VarVideoInput, VarInput)
+	move(VarFileInput, VarInput)
 	move(VarImageOutput, VarOutput)
 	move(VarAudioOutput, VarOutput)
+	move(VarVideoOutput, VarOutput)
 	move(VarReasoning, VarOutput)
 }
 
@@ -391,13 +494,14 @@ func (p *parser) parsePrimary() (node, error) {
 		if p.acceptOperator("(") {
 			return p.parseCall(current)
 		}
-		if _, ok := numberVars[current.text]; ok {
-			p.uses[current.text] = true
-			return &variableNode{name: current.text, number: true}, nil
+		canonical := canonicalVarName(current.text)
+		if _, ok := numberVars[canonical]; ok {
+			p.uses[canonical] = true
+			return &variableNode{name: canonical, number: true}, nil
 		}
-		if _, ok := stringVars[current.text]; ok {
-			p.uses[current.text] = true
-			return &variableNode{name: current.text}, nil
+		if _, ok := stringVars[canonical]; ok {
+			p.uses[canonical] = true
+			return &variableNode{name: canonical}, nil
 		}
 		return nil, fmt.Errorf("unknown variable %q at position %d", current.text, current.pos)
 	case tokenOperator:
@@ -442,7 +546,7 @@ func (p *parser) parseCall(name token) (node, error) {
 		return nil, fmt.Errorf("%s() takes %d to %d arguments, got %d", name.text, spec.minArgs, spec.maxArgs, len(args))
 	}
 	switch name.text {
-	case "hour", "minute", "weekday":
+	case "hour", "minute", "weekday", "month", "day":
 		if len(args) == 1 {
 			literal, isLiteral := args[0].(*literalNode)
 			if !isLiteral {
@@ -609,7 +713,7 @@ func (n *callNode) eval(env *Env) (any, error) {
 		values[index] = value
 	}
 	switch n.name {
-	case "hour", "minute", "weekday":
+	case "hour", "minute", "weekday", "month", "day":
 		now := env.Now
 		if now.IsZero() {
 			now = time.Now()
@@ -628,6 +732,10 @@ func (n *callNode) eval(env *Env) (any, error) {
 			return float64(local.Hour()), nil
 		case "minute":
 			return float64(local.Minute()), nil
+		case "month":
+			return float64(local.Month()), nil
+		case "day":
+			return float64(local.Day()), nil
 		default:
 			return float64(local.Weekday()), nil
 		}
@@ -643,19 +751,75 @@ func (n *callNode) eval(env *Env) (any, error) {
 			}
 		}
 		return result, nil
+	case "abs", "ceil", "floor", "round":
+		number, ok := values[0].(float64)
+		if !ok {
+			return nil, fmt.Errorf("%s() requires a number, got %s", n.name, typeName(values[0]))
+		}
+		switch n.name {
+		case "abs":
+			return math.Abs(number), nil
+		case "ceil":
+			return math.Ceil(number), nil
+		case "floor":
+			return math.Floor(number), nil
+		default:
+			return math.Round(number), nil
+		}
 	case "usd":
 		number, ok := values[0].(float64)
 		if !ok {
 			return nil, fmt.Errorf("usd() requires a number, got %s", typeName(values[0]))
 		}
 		return number * tokensPerMillion, nil
-	case "contains":
+	case "fixed":
+		number, ok := values[0].(float64)
+		if !ok {
+			return nil, fmt.Errorf("fixed() requires a number, got %s", typeName(values[0]))
+		}
+		reqFactor := 1.0
+		if env.Numbers != nil {
+			if req, exists := env.Numbers[VarRequest]; exists {
+				reqFactor = req
+			}
+		}
+		return number * reqFactor * tokensPerMillion, nil
+	case "tier":
+		name, okName := values[0].(string)
+		if !okName {
+			return nil, fmt.Errorf("tier() first argument must be a string, got %s", typeName(values[0]))
+		}
+		number, okNum := values[1].(float64)
+		if !okNum {
+			return nil, fmt.Errorf("tier() second argument must be a number, got %s", typeName(values[1]))
+		}
+		env.MatchedTier = name
+		return number, nil
+	case "contains", "has":
 		haystack, okHaystack := values[0].(string)
 		needle, okNeedle := values[1].(string)
 		if !okHaystack || !okNeedle {
-			return nil, fmt.Errorf("contains() requires strings")
+			return nil, fmt.Errorf("%s() requires strings", n.name)
 		}
 		return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle)), nil
+	case "u":
+		path, ok := values[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("u() requires a string path, got %s", typeName(values[0]))
+		}
+		if env.LookupNumber != nil {
+			return env.LookupNumber(path), nil
+		}
+		return 0.0, nil
+	case "s", "param":
+		path, ok := values[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("%s() requires a string path, got %s", n.name, typeName(values[0]))
+		}
+		if env.LookupString != nil {
+			return env.LookupString(path), nil
+		}
+		return "", nil
 	}
 	return nil, fmt.Errorf("unknown function %q", n.name)
 }

@@ -1698,7 +1698,8 @@ Query 参数：
 | `cache_read_price_per_million` | number | Cache-read token 价格。 |
 | `cache_write_price_per_million` | number | Cache-write token 价格。 |
 | `request_price` | number | 每请求价格。 |
-| `cache_write_1h_price_per_million` | number 或 null | 1 小时缓存写入单价；`null` 回退到 cache-write 单价（其为 0 时回退到 input 单价）。 |
+| `cache_write_30m_price_per_million` | number 或 null | 30 分钟缓存写入单价；`null` 回退到 cache-write 单价（其为 0 时回退到 input 单价）。 |
+| `cache_write_1h_price_per_million` | number 或 null | 1 小时缓存写入单价；`null` 回退到 30 分钟缓存写入单价。 |
 | `cache_write_12h_price_per_million` | number 或 null | 12 小时缓存写入单价；`null` 回退到 1 小时缓存写入单价。 |
 | `reasoning_price_per_million` | number 或 null | 思考输出 token 单价；`null` 按 output 单价计费。 |
 | `image_input_price_per_million` | number 或 null | 图片输入 token 单价；`null` 回退到 input 单价。 |
@@ -1715,9 +1716,9 @@ Query 参数：
 | `updated_at` | string | 最近更新时间。 |
 | `revision` | integer | 用于导入并发冲突检测的单调递增规则版本。 |
 
-可选维度单价作用于从 v2 规范桶中拆出的子桶，因此总 token 数不变：`cache_write_1h`/`cache_write_12h` 来自 cache-write 桶，`image_input`/`audio_input` 来自未缓存输入，`reasoning` 来自输出，`image_output`/`audio_output` 来自非思考输出。Home 从 usage 的 `tokens` 对象读取可选计数 `cache_creation_1h_tokens`（别名 `cache_write_1h_tokens`）、`cache_creation_12h_tokens`（别名 `cache_write_12h_tokens`）、`image_input_tokens`、`image_output_tokens`、`audio_input_tokens`、`audio_output_tokens`，并将每项截断到其父桶。CPA 未上报某计数时该子桶为空，按父桶单价计费。显式 `0` 表示该子桶免费；`null` 不会导致少收。
+可选维度单价作用于从 v2 规范桶中拆出的子桶，因此总 token 数不变：`cache_write_30m`/`cache_write_1h`/`cache_write_12h` 来自 cache-write 桶，`image_input`/`audio_input` 来自未缓存输入，`reasoning` 来自输出，`image_output`/`audio_output` 来自非思考输出。Home 从 usage 的 `tokens` 对象或顶层结构化字段读取可选计数 `cache_creation_30m_tokens`（别名 `cache_write_30m_tokens` 或 `cache_details.ephemeral_30m_input_tokens`）、`cache_creation_1h_tokens`（别名 `cache_write_1h_tokens` 或 `cache_details.ephemeral_1h_input_tokens`）、`cache_creation_12h_tokens`（别名 `cache_write_12h_tokens` 或 `cache_details.ephemeral_12h_input_tokens`）、`image_input_tokens`、`image_output_tokens`、`audio_input_tokens`、`audio_output_tokens`，并将每项截断到其父桶；当未显式上报分档计数且 `cache_details.ttl` 为 `30m`、`1h` 或 `12h` 时，缓存写入会归入对应 TTL 档位。CPA 未上报某计数时该子桶为空，按父桶单价计费。显式 `0` 表示该子桶免费；`null` 不会导致少收。
 
-按次附加费使用 `web_search_requests` 与 `image_count` 计数，读取自 usage 的 `tokens` 对象或 payload 顶层，在 `cost_breakdown` 中以 `count * 单价` 记为 `web_search_calls`、`images` 项，与 `request_price` 一样直接累加，不乘 `reasoning_effort_multipliers`。未配置单价时不收费。CPA 当前尚未上报这些计数，在其上报前这些子项为空。
+按次附加费使用 `web_search_requests`（回退 `tool_usage_details.web_search_calls`）与 `image_count`（回退 `tool_usage_details.image_generation_calls`）计数，读取自 usage 的 `tokens` 对象或 payload 顶层，在 `cost_breakdown` 中以 `count * 单价` 记为 `web_search_calls`、`images` 项，与 `request_price` 一样直接累加，不乘 `reasoning_effort_multipliers`。未配置单价时不收费。
 
 #### 价格表达式
 
@@ -1731,14 +1732,16 @@ Query 参数：
 | `c` | 非思考文本输出 token。 |
 | `r` | 思考输出 token。 |
 | `cr` | 缓存读取 token。 |
-| `cc`、`cc1h`、`cc12h` | 5 分钟、1 小时、12 小时缓存写入 token。 |
-| `img`、`imgo`、`ai`、`ao` | 图片输入、图片输出、音频输入、音频输出 token。 |
-| `len` | 完整提示上下文（未缓存 + 缓存读 + 缓存写），用于条件判断。 |
-| `req` | 恒为 `1`。 |
-| `ws`、`imgn` | 联网搜索次数、生成图片张数。表达式未引用时，仍按规则的按次单价收费。 |
-| `tier`、`effort`、`model`、`provider`、`endpoint` | 生效 service tier、reasoning effort、实际模型、provider、endpoint 字符串；字符串 `==`/`!=` 不区分大小写。 |
-| `hour(tz)`、`minute(tz)`、`weekday(tz)` | usage 时间在 IANA 时区字面量下的值（默认 `UTC`）；`weekday` 中周日为 `0`。 |
-| `min(...)`、`max(...)`、`usd(x)`、`contains(s, sub)` | 辅助函数。 |
+| `cc`、`cc30m`、`cc1h`、`cc12h` | 5 分钟、30 分钟、1 小时、12 小时缓存写入 token。 |
+| `img`、`imgo`（`img_o`）、`ai`、`ao`、`vi`、`vo`、`fi` | 图片输入、图片输出、音频输入、音频输出、视频输入、视频输出、文件/文档输入 token。 |
+| `img_cr`、`acr`（`ai_cr`）、`ct`、`apred`、`rpred` | 图片缓存读取、音频缓存读取、文本缓存读取、采纳预测、拒绝预测 token。 |
+| `len`、`total` | 完整提示上下文（未缓存 + 缓存读 + 缓存写）及总 token（输入 + 输出），用于条件判断。 |
+| `req` | 成功请求为 `1`，失败请求为 `0`。 |
+| `ws`、`wsq`、`wf`、`xs`、`ce`（`ci`）、`fs`、`ds`、`mcp`、`maps`、`src`、`st` | `tool_usage_details` 服务端工具计数：联网搜索调用/查询、网页抓取、X 搜索、代码执行、文件/集合搜索、文档搜索、MCP 调用、Google Maps 接地块数、引用源数、服务端工具总调用数。表达式未引用 `ws` 时，仍按规则 `web_search_price_per_call` 收费。 |
+| `imgn`（`image_count`）、`pmedia`、`cmedia`、`paudio`、`asec`、`upcost` | 生成图片张数、提示/输出媒体数、提示音频数（`media_counts`）、音视频秒数（`media_counts.audio_seconds`）、上游上报美元成本（`cost_details`）。表达式未引用 `imgn`/`image_count` 时，仍按规则 `image_price_per_image` 收费。 |
+| `tier`、`upstream_tier`、`speed`、`geo`、`cache_ttl`、`img_size`、`img_res`、`img_quality`、`img_ratio`、`img_tier`、`byok`、`response_model`、`effort`、`model`、`provider`、`endpoint` | 生效 service tier、上游返回 service tier、推理速度、推理地域、缓存 TTL/retention、图片尺寸/分辨率/质量/宽高比/归一化尺寸档位（`1k`/`2k`/`4k`）、BYOK 标记、上游实际响应模型、reasoning effort、实际模型、provider、endpoint 字符串；字符串 `==`/`!=` 不区分大小写。 |
+| `hour(tz)`、`minute(tz)`、`weekday(tz)`、`month(tz)`、`day(tz)` | usage 时间在 IANA 时区字面量下的值（默认 `UTC`）；`weekday` 中周日为 `0`。 |
+| `tier(name, expr)`、`fixed(x)`、`usd(x)`、`u(path)`、`s(path)`（`param(path)`）、`min(...)`、`max(...)`、`abs(x)`、`ceil(x)`、`floor(x)`、`round(x)`、`contains(s, sub)`（`has(s, sub)`） | 辅助函数。`tier(name, expr)` 会在 `cost_breakdown` 中记录 `matched_tier`；`fixed(x)` 按 `req * usd(x)` 计费；`u(path)` 与 `s(path)` 动态读取 usage JSON 数值与字符串字段；兼容可选 `v1:` 前缀。 |
 
 支持 `+ - * /`、比较运算、`&& || !` 以及 `cond ? a : b`。示例：`len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`；峰谷示例：`(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`。
 
@@ -1761,6 +1764,7 @@ Query 参数：
 | `cache_read_price_per_million` | number | 否 | 非负 cache-read token 价格。 |
 | `cache_write_price_per_million` | number | 否 | 非负 cache-write token 价格。 |
 | `request_price` | number | 否 | 非负每请求价格。 |
+| `cache_write_30m_price_per_million` | number 或 null | 否 | 可选非负 30 分钟缓存写入单价；`PATCH` 时 `null` 表示清除。 |
 | `cache_write_1h_price_per_million` | number 或 null | 否 | 可选非负 1 小时缓存写入单价；`PATCH` 时 `null` 表示清除。 |
 | `cache_write_12h_price_per_million` | number 或 null | 否 | 可选非负 12 小时缓存写入单价；`PATCH` 时 `null` 表示清除。 |
 | `reasoning_price_per_million` | number 或 null | 否 | 可选非负思考输出单价；`PATCH` 时 `null` 表示清除。 |

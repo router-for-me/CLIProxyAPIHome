@@ -1707,7 +1707,8 @@ Model price fields:
 | `cache_read_price_per_million` | number | Cache-read token price. |
 | `cache_write_price_per_million` | number | Cache-write token price. |
 | `request_price` | number | Per-request price. |
-| `cache_write_1h_price_per_million` | number or null | Price for 1-hour cache writes; `null` falls back to the cache-write price (or input price when that is zero). |
+| `cache_write_30m_price_per_million` | number or null | Price for 30-minute cache writes; `null` falls back to the cache-write price (or input price when that is zero). |
+| `cache_write_1h_price_per_million` | number or null | Price for 1-hour cache writes; `null` falls back to the 30-minute cache-write price. |
 | `cache_write_12h_price_per_million` | number or null | Price for 12-hour cache writes; `null` falls back to the 1-hour cache-write price. |
 | `reasoning_price_per_million` | number or null | Price for reasoning output tokens; `null` bills them at the output price. |
 | `image_input_price_per_million` | number or null | Price for image input tokens; `null` falls back to the input price. |
@@ -1724,9 +1725,9 @@ Model price fields:
 | `updated_at` | string | Last update time. |
 | `revision` | integer | Monotonic rule revision used by import conflict detection. |
 
-Optional dimension prices apply to sub-buckets carved out of the canonical v2 buckets, so totals never change: `cache_write_1h`/`cache_write_12h` come from the cache-write bucket, `image_input`/`audio_input` from uncached input, `reasoning` from output, and `image_output`/`audio_output` from non-reasoning output. Home reads the optional counters `cache_creation_1h_tokens` (alias `cache_write_1h_tokens`), `cache_creation_12h_tokens` (alias `cache_write_12h_tokens`), `image_input_tokens`, `image_output_tokens`, `audio_input_tokens`, and `audio_output_tokens` from the usage `tokens` object and clamps each to its parent bucket. When CPA does not report a counter, its bucket is empty and the parent price applies. An explicit `0` bills the bucket as free; `null` never undercharges.
+Optional dimension prices apply to sub-buckets carved out of the canonical v2 buckets, so totals never change: `cache_write_30m`/`cache_write_1h`/`cache_write_12h` come from the cache-write bucket, `image_input`/`audio_input` from uncached input, `reasoning` from output, and `image_output`/`audio_output` from non-reasoning output. Home reads the optional counters `cache_creation_30m_tokens` (alias `cache_write_30m_tokens` or `cache_details.ephemeral_30m_input_tokens`), `cache_creation_1h_tokens` (alias `cache_write_1h_tokens` or `cache_details.ephemeral_1h_input_tokens`), `cache_creation_12h_tokens` (alias `cache_write_12h_tokens` or `cache_details.ephemeral_12h_input_tokens`), `image_input_tokens`, `image_output_tokens`, `audio_input_tokens`, and `audio_output_tokens` from the usage `tokens` object or structured payload fields and clamps each to its parent bucket. When no TTL sub-bucket is set and `cache_details.ttl` names `30m`, `1h`, or `12h`, the cache-write bucket is assigned to that TTL. When CPA does not report a counter, its bucket is empty and the parent price applies. An explicit `0` bills the bucket as free; `null` never undercharges.
 
-Per-unit surcharges use the counters `web_search_requests` and `image_count`, read from the usage `tokens` object or the payload top level. They are billed as `count * unit_price` items (`web_search_calls`, `images`) in `cost_breakdown`, added like `request_price`, and not scaled by `reasoning_effort_multipliers`. With no unit price configured they bill nothing. CPA does not report these counters yet, so they stay empty until it does.
+Per-unit surcharges use the counters `web_search_requests` (fallback `tool_usage_details.web_search_calls`) and `image_count` (fallback `tool_usage_details.image_generation_calls`), read from the usage `tokens` object or the payload top level. They are billed as `count * unit_price` items (`web_search_calls`, `images`) in `cost_breakdown`, added like `request_price`, and not scaled by `reasoning_effort_multipliers`. With no unit price configured they bill nothing.
 
 #### Pricing expressions
 
@@ -1740,14 +1741,16 @@ The expression evaluates to USD per million tokens: each token variable is multi
 | `c` | Non-reasoning text output tokens. |
 | `r` | Reasoning output tokens. |
 | `cr` | Cache-read tokens. |
-| `cc`, `cc1h`, `cc12h` | 5-minute, 1-hour, and 12-hour cache-write tokens. |
-| `img`, `imgo`, `ai`, `ao` | Image input, image output, audio input, and audio output tokens. |
-| `len` | Full prompt context (`uncached + cache read + cache write`), for conditions. |
-| `req` | Always `1`. |
-| `ws`, `imgn` | Web search calls and generated images. When the expression does not reference one, the rule's per-unit price still applies to it. |
-| `tier`, `effort`, `model`, `provider`, `endpoint` | Effective service tier, reasoning effort, executed model, provider, and endpoint strings. String `==` and `!=` are case-insensitive. |
-| `hour(tz)`, `minute(tz)`, `weekday(tz)` | Usage time in an IANA timezone literal (default `UTC`); `weekday` is `0` for Sunday. |
-| `min(...)`, `max(...)`, `usd(x)`, `contains(s, sub)` | Helpers. |
+| `cc`, `cc30m`, `cc1h`, `cc12h` | 5-minute, 30-minute, 1-hour, and 12-hour cache-write tokens. |
+| `img`, `imgo` (`img_o`), `ai`, `ao`, `vi`, `vo`, `fi` | Image input, image output, audio input, audio output, video input, video output, and file/document input tokens. |
+| `img_cr`, `acr` (`ai_cr`), `ct`, `apred`, `rpred` | Image cache-read, audio cache-read, cached text, accepted prediction, and rejected prediction tokens. |
+| `len`, `total` | Full prompt context (`uncached + cache read + cache write`) and total (`input + output`) tokens, for conditions. |
+| `req` | `1` on succeeded requests, `0` on failed requests. |
+| `ws`, `wsq`, `wf`, `xs`, `ce` (`ci`), `fs`, `ds`, `mcp`, `maps`, `src`, `st` | Server-side tool counters from `tool_usage_details`: web search calls/queries, web fetch, X search, code execution, file/collections search, document search, MCP calls, Google Maps grounding chunks, sources used, and total server-side tools used. When the expression does not reference `ws`, the rule's `web_search_price_per_call` still applies. |
+| `imgn` (`image_count`), `pmedia`, `cmedia`, `paudio`, `asec`, `upcost` | Generated images, prompt/completion media counts, prompt audio count (`media_counts`), audio/video seconds (`media_counts.audio_seconds`), and upstream USD cost (`cost_details`). When the expression does not reference `imgn`/`image_count`, the rule's `image_price_per_image` still applies. |
+| `tier`, `upstream_tier`, `speed`, `geo`, `cache_ttl`, `img_size`, `img_res`, `img_quality`, `img_ratio`, `img_tier`, `byok`, `response_model`, `effort`, `model`, `provider`, `endpoint` | Effective service tier, upstream service tier, inference speed, inference geography, cache TTL/retention, image size/resolution/quality/aspect ratio/normalized size tier (`1k`/`2k`/`4k`), BYOK flag, upstream response model, reasoning effort, executed model, provider, and endpoint strings. String `==` and `!=` are case-insensitive. |
+| `hour(tz)`, `minute(tz)`, `weekday(tz)`, `month(tz)`, `day(tz)` | Usage time in an IANA timezone literal (default `UTC`); `weekday` is `0` for Sunday. |
+| `tier(name, expr)`, `fixed(x)`, `usd(x)`, `u(path)`, `s(path)` (`param(path)`), `min(...)`, `max(...)`, `abs(x)`, `ceil(x)`, `floor(x)`, `round(x)`, `contains(s, sub)` (`has(s, sub)`) | Helpers. `tier(name, expr)` records `matched_tier` in `cost_breakdown`; `fixed(x)` bills `req * usd(x)`; `u(path)` and `s(path)` read numeric/string fields from the usage payload. Optional `v1:` prefix is accepted. |
 
 Operators are `+ - * /`, comparisons, `&& || !`, and `cond ? a : b`. Example: `len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`. Peak pricing example: `(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`.
 
@@ -1770,6 +1773,7 @@ Request body fields:
 | `cache_read_price_per_million` | number | no | Non-negative cache-read token price. |
 | `cache_write_price_per_million` | number | no | Non-negative cache-write token price. |
 | `request_price` | number | no | Non-negative per-request price. |
+| `cache_write_30m_price_per_million` | number or null | no | Optional non-negative 30-minute cache-write price. On `PATCH`, `null` clears it. |
 | `cache_write_1h_price_per_million` | number or null | no | Optional non-negative 1-hour cache-write price. On `PATCH`, `null` clears it. |
 | `cache_write_12h_price_per_million` | number or null | no | Optional non-negative 12-hour cache-write price. On `PATCH`, `null` clears it. |
 | `reasoning_price_per_million` | number or null | no | Optional non-negative reasoning-output price. On `PATCH`, `null` clears it. |
