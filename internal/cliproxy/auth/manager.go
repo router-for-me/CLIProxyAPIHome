@@ -952,8 +952,8 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 		return nil, false
 	}
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	a := m.auths[id]
-	m.mu.RUnlock()
 	if a == nil {
 		return nil, false
 	}
@@ -970,8 +970,8 @@ func (m *Manager) GetByIndex(index string) (*Auth, bool) {
 		return nil, false
 	}
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	a := m.indexAuth[index]
-	m.mu.RUnlock()
 	if a == nil {
 		return nil, false
 	}
