@@ -116,7 +116,7 @@ type BillingChargeRecord struct {
 	// BaseAmount is the list value before the user billing multiplier; summing it
 	// by AuthIndex values credential output independently of customer discounts.
 	BaseAmount        float64 `gorm:"column:base_amount;not null;default:0"`
-	BillingMultiplier float64 `gorm:"column:billing_multiplier;not null;default:1"`
+	BillingMultiplier float64 `gorm:"column:billing_multiplier;not null"`
 	AuthIndex         string  `gorm:"column:auth_index;not null;default:'';index"`
 	BalanceBefore     float64 `gorm:"column:balance_before;not null;default:0"`
 	BalanceAfter      float64 `gorm:"column:balance_after;not null;default:0"`
@@ -1599,7 +1599,7 @@ func (b *BillingCostBreakdown) addSurcharges(details billingTokenDetails, snapsh
 
 func (b *BillingCostBreakdown) finish(requestPrice float64) {
 	tokenCost := b.Total
-	if b.ReasoningEffortMultiplier > 0 {
+	if b.ReasoningEffort != "" {
 		tokenCost *= b.ReasoningEffortMultiplier
 	}
 	b.Request = requestPrice

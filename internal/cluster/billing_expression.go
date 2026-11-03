@@ -18,6 +18,11 @@ func billingExpressionTokens(usage *UsageRecord) map[string]float64 {
 		billingexpr.VarWebSearchCalls: float64(unitDetails.WebSearchCalls),
 		billingexpr.VarImages:         float64(unitDetails.Images),
 	}
+	if usage.Failed {
+		numbers[billingexpr.VarRequest] = 0
+		numbers[billingexpr.VarWebSearchCalls] = 0
+		numbers[billingexpr.VarImages] = 0
+	}
 	breakdown := usageTokenBreakdownForRecord(usage)
 	if breakdown.Quality != UsageTokenAccountingQualityComplete {
 		inputTokens := usage.InputTokens
