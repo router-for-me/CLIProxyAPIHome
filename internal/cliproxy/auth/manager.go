@@ -576,11 +576,14 @@ func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth,
 		if stateVersion <= 0 {
 			return false, nil
 		}
+		// Auth may still be shared with GetByID; publish version changes under
+		// the same mutex that protects readers of the manager's auth snapshots.
+		m.mu.Lock()
 		auth.StateVersion = stateVersion
 		if !synchronizeCurrent {
+			m.mu.Unlock()
 			return true, nil
 		}
-		m.mu.Lock()
 		if current := m.auths[auth.ID]; current != nil {
 			if current == auth || current.StateVersion == previousVersion {
 				current.StateVersion = stateVersion
