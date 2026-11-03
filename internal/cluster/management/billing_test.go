@@ -993,12 +993,29 @@ func TestPreviewAndApplyBillingModelPriceImportOpenRouterAndLiteLLM(t *testing.T
           }
         ]
       }
+    },
+    {
+      "id": "openai/gpt-time-req",
+      "name": "GPT Time Request Fee",
+      "pricing": {
+        "prompt": "0.000001",
+        "completion": "0.000002",
+        "request": "0.01",
+        "overrides": [
+          {
+            "utc_days": ["sunday"],
+            "prompt": "0.0000005",
+            "completion": "0.000001",
+            "request": "0.01"
+          }
+        ]
+      }
     }
   ]
 }`
 	previewResp := httptest.NewRecorder()
 	previewCtx, _ := gin.CreateTestContext(previewResp)
-	previewBody := fmt.Sprintf(`{"source":"openrouter","catalog_json":%s,"targets":[{"provider":"anthropic","model":"claude-opus-4-6"},{"provider":"deepseek","model":"deepseek-v4.1-flash"}],"policy":{"overwrite_mode":"all","default_multiplier":1}}`, openRouterJSON)
+	previewBody := fmt.Sprintf(`{"source":"openrouter","catalog_json":%s,"targets":[{"provider":"anthropic","model":"claude-opus-4-6"},{"provider":"deepseek","model":"deepseek-v4.1-flash"},{"provider":"openai","model":"gpt-time-req"}],"policy":{"overwrite_mode":"all","default_multiplier":1}}`, openRouterJSON)
 	previewCtx.Request = httptest.NewRequest(http.MethodPost, "/billing/model-prices/import/preview", strings.NewReader(previewBody))
 	previewCtx.Request.Header.Set("Content-Type", "application/json")
 	handler.PreviewBillingModelPriceImport(previewCtx)
@@ -1009,7 +1026,7 @@ func TestPreviewAndApplyBillingModelPriceImportOpenRouterAndLiteLLM(t *testing.T
 	if errDecode := json.Unmarshal(previewResp.Body.Bytes(), &preview); errDecode != nil {
 		t.Fatalf("decode OpenRouter preview: %v", errDecode)
 	}
-	if len(preview.Rows) != 2 || !preview.Rows[0].Applicable || !preview.Rows[1].Applicable {
+	if len(preview.Rows) != 3 || !preview.Rows[0].Applicable || !preview.Rows[1].Applicable || !preview.Rows[2].Applicable {
 		t.Fatalf("OpenRouter preview rows = %#v", preview.Rows)
 	}
 	if preview.Rows[0].Final.CacheWrite1h == nil || *preview.Rows[0].Final.CacheWrite1h != 10 || preview.Rows[0].Final.WebSearch == nil || *preview.Rows[0].Final.WebSearch != 0.01 {
@@ -1018,10 +1035,13 @@ func TestPreviewAndApplyBillingModelPriceImportOpenRouterAndLiteLLM(t *testing.T
 	if !strings.Contains(preview.Rows[1].Final.PricingExpr, "weekday('UTC')") {
 		t.Fatalf("OpenRouter deepseek pricing_expr = %q, want weekday('UTC')", preview.Rows[1].Final.PricingExpr)
 	}
+	if !strings.Contains(preview.Rows[2].Final.PricingExpr, "req * usd(0.01)") {
+		t.Fatalf("OpenRouter gpt-time-req pricing_expr = %q, want req * usd(0.01)", preview.Rows[2].Final.PricingExpr)
+	}
 
 	applyResp := httptest.NewRecorder()
 	applyCtx, _ := gin.CreateTestContext(applyResp)
-	applyBody := fmt.Sprintf(`{"preview_id":%q,"preview_revision":%q,"selected_keys":[%q,%q],"confirm_overwrite":true,"idempotency_key":"or-apply-1"}`, preview.PreviewID, preview.PreviewRevision, preview.Rows[0].RowKey, preview.Rows[1].RowKey)
+	applyBody := fmt.Sprintf(`{"preview_id":%q,"preview_revision":%q,"selected_keys":[%q,%q,%q],"confirm_overwrite":true,"idempotency_key":"or-apply-1"}`, preview.PreviewID, preview.PreviewRevision, preview.Rows[0].RowKey, preview.Rows[1].RowKey, preview.Rows[2].RowKey)
 	applyCtx.Request = httptest.NewRequest(http.MethodPost, "/billing/model-prices/import/apply", strings.NewReader(applyBody))
 	applyCtx.Request.Header.Set("Content-Type", "application/json")
 	handler.ApplyBillingModelPriceImport(applyCtx)
@@ -1031,6 +1051,14 @@ func TestPreviewAndApplyBillingModelPriceImportOpenRouterAndLiteLLM(t *testing.T
 	prices, errList := handler.repo.ListBillingModelPrices(context.Background(), cluster.BillingModelPriceQuery{Provider: "anthropic", Model: "claude-opus-4-6"})
 	if errList != nil || len(prices) != 1 || prices[0].CacheWrite1hPricePerMillion == nil || *prices[0].CacheWrite1hPricePerMillion != 10 || prices[0].WebSearchPricePerCall == nil || *prices[0].WebSearchPricePerCall != 0.01 {
 		t.Fatalf("persisted claude price = %#v err=%v", prices, errList)
+	}
+	// Verify charging 100 input tokens on a Tuesday (base branch) preserves the $0.01 request fee ($0.0001 + $0.01 = $0.0101).
+	if _, errUsageReq := handler.repo.AppendUsage(context.Background(), `{"timestamp":"2026-06-09T12:00:00Z","provider":"openai","model":"gpt-time-req","api_key":"client-key-import","request_id":"req-or-time","tokens":{"input_tokens":100,"total_tokens":100}}`, "192.0.2.15"); errUsageReq != nil {
+		t.Fatalf("AppendUsage(gpt-time-req) error = %v", errUsageReq)
+	}
+	chargesReq, errChargesReq := handler.repo.ListBillingCharges(context.Background(), cluster.BillingChargeQuery{Model: "gpt-time-req", Limit: 10})
+	if errChargesReq != nil || len(chargesReq.Records) == 0 || chargesReq.Records[0].Amount != 0.0101 {
+		t.Fatalf("gpt-time-req charges = %+v err=%v, want 0.0101", chargesReq.Records, errChargesReq)
 	}
 
 	// 2. LiteLLM catalog import with 1h/12h cache write, reasoning, image price, and >200k context band.

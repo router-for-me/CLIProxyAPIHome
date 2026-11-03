@@ -47,8 +47,18 @@ func validateBillingPricePattern(provider string, model string) error {
 	return nil
 }
 
-// billingModelMatches compares a rule model with a usage model case-insensitively.
+// BillingModelMatches compares a rule model with a usage model case-insensitively.
 // Pattern mode only accepts rules ending in "*" and matches by prefix.
+func BillingModelMatches(ruleModel string, model string, pattern bool) bool {
+	return billingModelMatches(ruleModel, model, pattern)
+}
+
+// BillingStripChannelPrefix returns the bare model name after a leading "prefix/"
+// segment when present, or empty when the model has no prefix.
+func BillingStripChannelPrefix(model string) string {
+	return billingStripChannelPrefix(model)
+}
+
 func billingModelMatches(ruleModel string, model string, pattern bool) bool {
 	ruleModel = strings.ToLower(strings.TrimSpace(ruleModel))
 	model = strings.ToLower(strings.TrimSpace(model))

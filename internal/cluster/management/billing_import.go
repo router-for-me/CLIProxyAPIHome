@@ -728,6 +728,9 @@ func openRouterLinearTokenExpr(c *cluster.BillingModelPriceImportCost) string {
 	if c.Reasoning != nil && *c.Reasoning > 0 {
 		terms = append(terms, fmt.Sprintf("r * %g", *c.Reasoning))
 	}
+	if c.Request > 0 {
+		terms = append(terms, fmt.Sprintf("req * usd(%g)", c.Request))
+	}
 	return strings.Join(terms, " + ")
 }
 

@@ -723,33 +723,51 @@ func (r *Repository) ListEnabledBillingModelPricesForModels(ctx context.Context,
 		return nil, errDB
 	}
 
-	wanted := make([]string, 0, len(modelIDs))
-	seen := make(map[string]struct{}, len(modelIDs))
-	for _, modelID := range modelIDs {
-		trimmed := strings.TrimSpace(modelID)
+	wanted := make([]string, 0, len(modelIDs)*2)
+	seen := make(map[string]struct{}, len(modelIDs)*2)
+	addWanted := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
 		if trimmed == "" {
-			continue
+			return
 		}
-		if _, ok := seen[trimmed]; ok {
-			continue
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			return
 		}
-		seen[trimmed] = struct{}{}
+		seen[key] = struct{}{}
 		wanted = append(wanted, trimmed)
+	}
+	for _, modelID := range modelIDs {
+		addWanted(modelID)
+		addWanted(billingStripChannelPrefix(modelID))
 	}
 	if len(wanted) == 0 {
 		return []BillingModelPriceRecord{}, nil
 	}
 
+	lowerWanted := make([]string, 0, len(wanted))
+	for _, modelID := range wanted {
+		lowerWanted = append(lowerWanted, strings.ToLower(modelID))
+	}
 	var records []BillingModelPriceRecord
 	if errFind := db.WithContext(contextOrBackground(ctx)).
 		Model(&BillingModelPriceRecord{}).
 		Where("enabled = ?", true).
-		Where("model IN ?", wanted).
+		Where("LOWER(model) IN ? OR model LIKE ?", lowerWanted, "%"+billingModelWildcard).
 		Order("provider ASC, model ASC, service_tier ASC, min_input_tokens ASC, id ASC").
 		Find(&records).Error; errFind != nil {
 		return nil, errFind
 	}
-	return records, nil
+	filtered := make([]BillingModelPriceRecord, 0, len(records))
+	for _, record := range records {
+		for _, modelID := range wanted {
+			if billingModelMatches(record.Model, modelID, false) || billingModelMatches(record.Model, modelID, true) {
+				filtered = append(filtered, record)
+				break
+			}
+		}
+	}
+	return filtered, nil
 }
 
 func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm.DB, usage *UsageRecord, payload string) error {
@@ -839,7 +857,7 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 		PriceSnapshot:          priceSnapshot,
 		CreatedAt:              usage.Timestamp.UTC(),
 	}
-	insert := tx.WithContext(ctx).Clauses(clause.OnConflict{
+	insert := tx.WithContext(ctx).Select("*").Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "payload_hash"}},
 		DoNothing: true,
 	}).Create(charge)
@@ -2142,6 +2160,11 @@ func migrateBillingIndexes(db *gorm.DB) error {
 	}
 	if errDefaults := db.Model(&BillingModelPriceRecord{}).Where("revision IS NULL OR revision < ?", 1).Update("revision", 1).Error; errDefaults != nil {
 		return errDefaults
+	}
+	if errBaseAmount := db.Model(&BillingChargeRecord{}).
+		Where("base_amount = ? AND amount <> ? AND billing_multiplier = ?", 0, 0, 1).
+		Update("base_amount", gorm.Expr("amount")).Error; errBaseAmount != nil {
+		return errBaseAmount
 	}
 	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_model_price_active_unique ON billing_model_price (provider, model, service_tier, min_input_tokens) WHERE deleted_at IS NULL AND enabled = TRUE`).Error
 }

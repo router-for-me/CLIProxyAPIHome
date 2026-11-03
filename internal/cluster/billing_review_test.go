@@ -2,8 +2,10 @@ package cluster
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBillingReviewZeroMultipliers(t *testing.T) {
@@ -181,5 +183,99 @@ func TestBillingCPAStructuredUsageDetails(t *testing.T) {
 	chargeGeminiImg := billingCaseCharges(t, repo, user.ID)["gemini-img-4k"]
 	if chargeGeminiImg.Amount != 0.535 || !strings.Contains(string(chargeGeminiImg.CostBreakdown), `"matched_tier":"4k"`) {
 		t.Fatalf("gemini-img-4k amount = %v breakdown = %s, want 0.535 / matched_tier=4k", chargeGeminiImg.Amount, string(chargeGeminiImg.CostBreakdown))
+	}
+}
+
+func TestBillingV14UpgradeAndPopulatedChargeMigration(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	// 1. Verify schema migration coordinator upgrades v14 -> v15 (currentDatabaseVersion) and retains v14 snapshot models.
+	if currentDatabaseVersion < 15 {
+		t.Fatalf("currentDatabaseVersion = %d, want >= 15", currentDatabaseVersion)
+	}
+	if _, ok := databaseSnapshotModels(14); !ok {
+		t.Fatal("v14 snapshot models must remain supported")
+	}
+	store := newFakeSchemaMigrationStore(schemaMigrationState{Version: 14, Initialized: true})
+	migResult, errCoord := coordinateSchemaMigration(ctx, currentDatabaseVersion, time.Millisecond, time.Second, false, store.operations())
+	if errCoord != nil {
+		t.Fatalf("coordinateSchemaMigration(v14->v%d) error = %v", currentDatabaseVersion, errCoord)
+	}
+	if !migResult.MigrationExecutor || !migResult.MigrationCommitted || migResult.CurrentState.Version != currentDatabaseVersion {
+		t.Fatalf("v14 upgrade result = %+v, want executed and committed to %d", migResult, currentDatabaseVersion)
+	}
+
+	// 2. Verify populated pre-v15 billing_charge table migrates safely on SQLite and preserves 1 for historical charges + 0 for new zero-multiplier charges.
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatal(errDB)
+	}
+	username := "pop-migrate@example.com"
+	credits := 50.0
+	user, errUser := repo.CreateUser(ctx, UserUpdate{Username: &username, Credits: &credits})
+	if errUser != nil {
+		t.Fatal(errUser)
+	}
+	keyVal := "pop-migrate-key"
+	if _, errKey := repo.CreateAPIKeyForUser(ctx, user.ID, APIKeyUserUpdate{APIKey: &keyVal}); errKey != nil {
+		t.Fatal(errKey)
+	}
+	if _, errPrice := repo.CreateBillingModelPrice(ctx, BillingModelPriceUpdate{
+		Provider:             "openai",
+		Model:                "gpt-pop",
+		InputPricePerMillion: 10,
+		Enabled:              true,
+	}); errPrice != nil {
+		t.Fatal(errPrice)
+	}
+	if _, errU1 := repo.AppendUsage(ctx, `{"timestamp":"2026-10-27T02:00:00Z","provider":"openai","model":"gpt-pop","api_key":"pop-migrate-key","request_id":"hist-1","tokens":{"input_tokens":100000,"total_tokens":100000}}`, "192.0.2.1"); errU1 != nil {
+		t.Fatal(errU1)
+	}
+	if errReset := db.Model(&BillingChargeRecord{}).Where("request_id = ?", "hist-1").Updates(map[string]any{"base_amount": 0}).Error; errReset != nil {
+		t.Fatal(errReset)
+	}
+	for _, col := range []string{"billing_multiplier", "base_amount", "auth_index", "cost_diagnostic", "cost_breakdown"} {
+		if errDrop := db.Migrator().DropColumn(&BillingChargeRecord{}, col); errDrop != nil {
+			t.Fatalf("DropColumn(billing_charge.%s) error = %v", col, errDrop)
+		}
+	}
+	if errDrop := db.Migrator().DropColumn(&BillingModelPriceRecord{}, "pricing_expr"); errDrop != nil {
+		t.Fatalf("DropColumn(billing_model_price.pricing_expr) error = %v", errDrop)
+	}
+	if errDrop := db.Migrator().DropColumn(&UserRecord{}, "billing_multiplier"); errDrop != nil {
+		t.Fatalf("DropColumn(user.billing_multiplier) error = %v", errDrop)
+	}
+	if errMigrate := AutoMigrateContext(ctx, db); errMigrate != nil {
+		t.Fatalf("AutoMigrateContext on populated pre-v15 tables error = %v", errMigrate)
+	}
+	histCharge := billingCaseCharges(t, repo, user.ID)["hist-1"]
+	if histCharge.BillingMultiplier != 1 || histCharge.BaseAmount != 1 || histCharge.Amount != 1 {
+		t.Fatalf("historical charge after upgrade = %+v, want multiplier=1 base=1 amount=1", histCharge)
+	}
+
+	// 3. Verify exporting/importing a v14 snapshot (with frozen legacy user, billing_model_price, and billing_charge shapes) succeeds on v15.
+	snapshotPath := filepath.Join(t.TempDir(), "legacy-v14.snapshot.zip")
+	if _, errExport := exportDatabaseSnapshotVersion(ctx, db, snapshotPath, 14); errExport != nil {
+		t.Fatalf("exportDatabaseSnapshotVersion(v14) error = %v", errExport)
+	}
+	snapshot, errOpenSnap := OpenDatabaseSnapshot(ctx, snapshotPath)
+	if errOpenSnap != nil {
+		t.Fatalf("OpenDatabaseSnapshot(v14) error = %v", errOpenSnap)
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	targetDB := openDatabaseSnapshotSQLiteRawTestDB(t, filepath.Join(t.TempDir(), "target-v15.db"))
+	if _, errImport := ImportDatabaseSnapshot(ctx, targetDB, snapshot, nil); errImport != nil {
+		t.Fatalf("ImportDatabaseSnapshot(v14 -> v15) error = %v", errImport)
+	}
+	var importedCharge BillingChargeRecord
+	if errFirst := targetDB.First(&importedCharge, "request_id = ?", "hist-1").Error; errFirst != nil {
+		t.Fatalf("load imported v14 charge: %v", errFirst)
+	}
+	if importedCharge.BillingMultiplier != 1 || importedCharge.BaseAmount != 1 || importedCharge.Amount != 1 {
+		t.Fatalf("imported v14 charge = %+v, want multiplier=1 base_amount=1 amount=1", importedCharge)
 	}
 }
