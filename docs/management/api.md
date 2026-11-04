@@ -1982,6 +1982,8 @@ Upstream provider keys are configured through the v8 config tree. They are disti
 
 All paths support `GET`, `PUT`, `PATCH`, and `DELETE`. `GET` returns a raw group array. `PUT` and `PATCH` replace the entire array for that family; neither appends nor patches one key by index. `DELETE` removes that family and clears its provider-key records. Send `[]` to replace it with an empty list. Removing one key requires writing the remaining complete family list with retained `id` values. These writes return `{"status":"ok","config-version":8}`.
 
+JSON reads add a read-only `auth_index` to every key, equal to the key's credential `id`; a keyless `openai-compatibility` group carries it on the group. It is the selector `/requests/api-call` accepts as `auth_index`, matching CPA's v8 config reads. `GET /config.yaml` omits it, and writes drop `auth_index` and `auth-index` from groups and keys, so a read can be sent back unchanged.
+
 ### Native Provider Groups
 
 Example `PUT /config/api-keys/codex` body:

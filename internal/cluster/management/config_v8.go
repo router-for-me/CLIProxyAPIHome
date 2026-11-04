@@ -48,6 +48,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 					deleteConfigV8Path(server, []string{"credential"})
 				}
 			}
+			injectConfigV8APIKeyAuthIndexes(root)
 		}
 		value := configV8Node(root, parts)
 		if value == nil {
@@ -85,6 +86,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			return
 		}
 		update = input.Content[0]
+		stripConfigV8AuthIndexes(parts, update)
 		if len(parts) == 0 && update.Kind != yaml.MappingNode {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "config_must_be_object"})
 			return
