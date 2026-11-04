@@ -58,14 +58,16 @@ func (c *Collector) probeClaude(ctx context.Context, auth *coreauth.Auth) (probe
 	return result, nil
 }
 
-func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *probeError) {
+var antigravityCodeAssistRequestBody = []byte(`{"metadata":{"ideType":"ANTIGRAVITY"}}`)
+
+func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
 	projectID := quotaMetadataString(auth.Metadata, "project_id", "projectId", "project")
 	if projectID == "" {
-		return nil, &probeError{code: "PROJECT_ID_UNAVAILABLE", message: "Credential project ID is unavailable.", retryable: false}
+		return probeResult{}, &probeError{code: "PROJECT_ID_UNAVAILABLE", message: "Credential project ID is unavailable.", retryable: false}
 	}
 	body, errMarshal := json.Marshal(map[string]string{"project": projectID})
 	if errMarshal != nil {
-		return nil, &probeError{code: "PROBE_REQUEST_INVALID", message: "Antigravity quota request could not be created.", retryable: false}
+		return probeResult{}, &probeError{code: "PROBE_REQUEST_INVALID", message: "Antigravity quota request could not be created.", retryable: false}
 	}
 	// Match the CPA inference User-Agent; outdated clients receive responses without the Gemini quota group.
 	configuredUserAgent := ""
@@ -78,6 +80,7 @@ func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (
 	headers := http.Header{"Content-Type": []string{"application/json"}, "User-Agent": []string{cpasdkauth.AntigravityRequestUserAgent(configuredUserAgent)}}
 	probeCtx, cancelProbe := context.WithTimeout(ctx, c.options.ProbeTimeout)
 	defer cancelProbe()
+	var windows []cluster.QuotaWindow
 	var lastError *probeError
 	for _, targetURL := range c.options.AntigravityURLs {
 		payload, _, errRequest := c.probeRequest(probeCtx, auth, http.MethodPost, targetURL, body, headers)
@@ -91,16 +94,38 @@ func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (
 			}
 			continue
 		}
-		windows, errParse := parseAntigravityWindows(payload, c.options.Now().UTC())
-		if errParse == nil && antigravityQuotaGroupsComplete(windows) {
-			return windows, nil
+		parsedWindows, errParse := parseAntigravityWindows(payload, c.options.Now().UTC())
+		if errParse == nil && antigravityQuotaGroupsComplete(parsedWindows) {
+			windows = parsedWindows
+			break
 		}
 		lastError = &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Antigravity quota response did not contain both usable weekly quota buckets.", retryable: true}
 	}
-	if lastError == nil {
-		lastError = &probeError{code: "PROVIDER_UNAVAILABLE", message: "Antigravity quota collector has no configured endpoint.", retryable: false}
+	if len(windows) == 0 {
+		if lastError == nil {
+			lastError = &probeError{code: "PROVIDER_UNAVAILABLE", message: "Antigravity quota collector has no configured endpoint.", retryable: false}
+		}
+		return probeResult{}, lastError
 	}
-	return nil, lastError
+
+	result := probeResult{windows: windows, replaceWindows: true, replacePlan: true}
+	if codeAssistURL := strings.TrimSpace(c.options.AntigravityCodeAssistURL); codeAssistURL != "" {
+		codeAssistPayload, _, errCodeAssist := c.probeRequest(ctx, auth, http.MethodPost, codeAssistURL, antigravityCodeAssistRequestBody, headers)
+		if errCodeAssist != nil {
+			result.partial = true
+			result.collectionError = probeCollectionError(errCodeAssist, c.options.Now().UTC())
+			result.replacePlan = false
+		} else if plan, errPlan := parseAntigravitySubscriptionPlan(codeAssistPayload); errPlan != nil {
+			planError := &probeError{code: "SUBSCRIPTION_RESPONSE_INVALID", message: "Antigravity subscription response could not be parsed.", retryable: true}
+			result.partial = true
+			result.collectionError = probeCollectionError(planError, c.options.Now().UTC())
+			result.replacePlan = false
+		} else {
+			result.plan = plan
+			result.replacePlan = true
+		}
+	}
+	return result, nil
 }
 
 func (c *Collector) probeKimi(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *probeError) {
@@ -520,6 +545,81 @@ func antigravityQuotaBucketSpec(bucketID string) (antigravityBucketSpec, bool) {
 		return antigravityBucketSpec{scopeID: "third-party", periodUnit: "week", periodValue: 1, windowSeconds: 7 * 24 * 60 * 60, priority: 3}, true
 	default:
 		return antigravityBucketSpec{}, false
+	}
+}
+
+type antigravitySubscriptionTier struct {
+	id   string
+	name string
+}
+
+func normalizeAntigravitySubscriptionTier(value any) *antigravitySubscriptionTier {
+	raw, ok := value.(map[string]any)
+	if !ok || raw == nil {
+		return nil
+	}
+	tier := &antigravitySubscriptionTier{
+		id:   quotaMetadataString(raw, "id"),
+		name: quotaMetadataString(raw, "name"),
+	}
+	if tier.id == "" && tier.name == "" {
+		return nil
+	}
+	return tier
+}
+
+func parseAntigravitySubscriptionPlan(body []byte) (*cluster.QuotaPlan, error) {
+	var decoded any
+	if errDecode := json.Unmarshal(body, &decoded); errDecode != nil {
+		return nil, fmt.Errorf("decode antigravity subscription response: %w", errDecode)
+	}
+	root, ok := decoded.(map[string]any)
+	if !ok || root == nil {
+		return nil, fmt.Errorf("antigravity subscription response is not a JSON object")
+	}
+	if _, hasModels := root["models"]; !hasModels {
+		if nested, okNested := root["body"].(map[string]any); okNested && nested != nil {
+			root = nested
+		} else if nestedText, okText := root["body"].(string); okText && strings.TrimSpace(nestedText) != "" {
+			var nestedParsed map[string]any
+			if json.Unmarshal([]byte(nestedText), &nestedParsed) == nil && nestedParsed != nil {
+				root = nestedParsed
+			}
+		}
+	}
+	if root["error"] != nil {
+		return nil, fmt.Errorf("antigravity subscription response contains an error")
+	}
+	currentTier := normalizeAntigravitySubscriptionTier(root["currentTier"])
+	if currentTier == nil {
+		currentTier = normalizeAntigravitySubscriptionTier(root["current_tier"])
+	}
+	paidTier := normalizeAntigravitySubscriptionTier(root["paidTier"])
+	if paidTier == nil {
+		paidTier = normalizeAntigravitySubscriptionTier(root["paid_tier"])
+	}
+	effectiveTier := currentTier
+	if paidTier != nil && paidTier.id != "" {
+		effectiveTier = paidTier
+	}
+	if effectiveTier == nil {
+		return nil, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(effectiveTier.id)) {
+	case "g1-ultra-tier":
+		return &cluster.QuotaPlan{Name: "Ultra", Premium: true}, nil
+	case "g1-ultra-lite-tier":
+		return &cluster.QuotaPlan{Name: "Ultra Lite", Premium: true}, nil
+	case "g1-pro-tier":
+		return &cluster.QuotaPlan{Name: "Pro", Premium: false}, nil
+	case "free-tier":
+		return &cluster.QuotaPlan{Name: "Free", Premium: false}, nil
+	default:
+		name := firstNonEmptyString(effectiveTier.name, effectiveTier.id)
+		if name == "" {
+			return nil, nil
+		}
+		return &cluster.QuotaPlan{Name: name, Premium: false}, nil
 	}
 }
 

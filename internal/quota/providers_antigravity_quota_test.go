@@ -322,3 +322,176 @@ func TestProbeAntigravityFallbacksShareDeadline(t *testing.T) {
 		t.Fatalf("shared fallback deadline elapsed = %v, want less than %v", elapsed, 2*probeTimeout)
 	}
 }
+
+func TestParseAntigravitySubscriptionPlans(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		body    string
+		plan    string
+		premium bool
+		invalid bool
+	}{
+		{
+			name:    "paid ultra overrides free current tier",
+			body:    `{"currentTier":{"id":"free-tier","name":"Antigravity"},"paidTier":{"id":"g1-ultra-tier","name":"Google AI Ultra"}}`,
+			plan:    "Ultra",
+			premium: true,
+		},
+		{
+			name:    "paid ultra lite",
+			body:    `{"current_tier":{"id":"free-tier"},"paid_tier":{"id":"g1-ultra-lite-tier","name":"Google AI Ultra Lite"}}`,
+			plan:    "Ultra Lite",
+			premium: true,
+		},
+		{
+			name:    "paid pro",
+			body:    `{"currentTier":{"id":"free-tier","name":"Antigravity"},"paidTier":{"id":"g1-pro-tier","name":"Google AI Pro"}}`,
+			plan:    "Pro",
+			premium: false,
+		},
+		{
+			name:    "free current tier without paid tier",
+			body:    `{"currentTier":{"id":"free-tier","name":"Antigravity"}}`,
+			plan:    "Free",
+			premium: false,
+		},
+		{
+			name:    "unknown tier falls back to tier name",
+			body:    `{"paidTier":{"id":"g1-enterprise-tier","name":"Enterprise Plus"}}`,
+			plan:    "Enterprise Plus",
+			premium: false,
+		},
+		{
+			name:    "unknown tier without name falls back to tier id",
+			body:    `{"currentTier":{"id":"custom-tier"}}`,
+			plan:    "custom-tier",
+			premium: false,
+		},
+		{
+			name: "missing tier metadata clears plan",
+			body: `{"cloudaicompanionProject":"project-123"}`,
+			plan: "",
+		},
+		{
+			name:    "in-band error rejected",
+			body:    `{"error":{"code":500,"message":"internal"}}`,
+			invalid: true,
+		},
+		{
+			name:    "invalid json rejected",
+			body:    `invalid`,
+			invalid: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan, errParse := parseAntigravitySubscriptionPlan([]byte(test.body))
+			if test.invalid {
+				if errParse == nil {
+					t.Fatalf("parseAntigravitySubscriptionPlan() succeeded with %+v, want error", plan)
+				}
+				return
+			}
+			if errParse != nil {
+				t.Fatalf("parseAntigravitySubscriptionPlan() error = %v", errParse)
+			}
+			if test.plan == "" {
+				if plan != nil {
+					t.Fatalf("plan = %+v, want nil", plan)
+				}
+				return
+			}
+			if plan == nil || plan.Name != test.plan || plan.Premium != test.premium {
+				t.Fatalf("plan = %+v, want %q premium=%v", plan, test.plan, test.premium)
+			}
+		})
+	}
+}
+
+func TestCollectorAntigravityPersistsSubscriptionPlanAndPreservesOnPartialFailure(t *testing.T) {
+	const quotaBody = `{
+		"groups": [
+			{"displayName":"Gemini models","buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-weekly","remainingFraction":0.9}]},
+			{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-5h","remainingFraction":0.7},{"bucketId":"3p-weekly","remainingFraction":0.85}]}
+		]
+	}`
+	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 7, 22, 6, 0, 0, 0, time.UTC)
+	seedCollectorProviderAuth(t, repo, "antigravity-plan", "antigravity", map[string]any{
+		"type": "antigravity", "access_token": "ag-secret", "project_id": "project-123",
+	})
+
+	var codeAssistStatus atomic.Int32
+	codeAssistStatus.Store(http.StatusOK)
+	var codeAssistBody atomic.Value
+	codeAssistBody.Store(`{"currentTier":{"id":"free-tier","name":"Antigravity"},"paidTier":{"id":"g1-ultra-tier","name":"Google AI Ultra"}}`)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/quota":
+			_, _ = w.Write([]byte(quotaBody))
+		case "/loadCodeAssist":
+			raw, _ := io.ReadAll(request.Body)
+			if strings.TrimSpace(string(raw)) != string(antigravityCodeAssistRequestBody) {
+				t.Errorf("loadCodeAssist body = %s, want %s", string(raw), string(antigravityCodeAssistRequestBody))
+			}
+			status := int(codeAssistStatus.Load())
+			w.WriteHeader(status)
+			if body, ok := codeAssistBody.Load().(string); ok {
+				_, _ = w.Write([]byte(body))
+			}
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner:                    "home-a",
+		Now:                      func() time.Time { return now },
+		AntigravityURLs:          []string{server.URL + "/quota"},
+		AntigravityCodeAssistURL: server.URL + "/loadCodeAssist",
+	})
+	collector.collect(context.Background())
+
+	first, errFirst := repo.GetQuotaCredential(context.Background(), "antigravity-plan", now.Add(time.Minute))
+	if errFirst != nil {
+		t.Fatalf("GetQuotaCredential(first) error = %v", errFirst)
+	}
+	if first.CollectionStatus != "success" || first.Plan == nil || first.Plan.Name != "Ultra" || !first.Plan.Premium {
+		t.Fatalf("first snapshot = %+v, want success with Ultra premium plan", first)
+	}
+
+	now = now.Add(31 * time.Minute)
+	codeAssistStatus.Store(http.StatusTooManyRequests)
+	codeAssistBody.Store(`{"error":"rate limited"}`)
+	accepted, errTrigger := collector.TriggerCollection(context.Background(), map[string]struct{}{"antigravity-plan": {}}, nil)
+	if errTrigger != nil || accepted != 1 {
+		t.Fatalf("TriggerCollection(partial) = %d, %v, want 1, nil", accepted, errTrigger)
+	}
+	collector.Wait()
+
+	second, errSecond := repo.GetQuotaCredential(context.Background(), "antigravity-plan", now.Add(time.Minute))
+	if errSecond != nil {
+		t.Fatalf("GetQuotaCredential(second) error = %v", errSecond)
+	}
+	if second.CollectionStatus != "partial" || second.Plan == nil || second.Plan.Name != "Ultra" || !second.Plan.Premium || second.Error == nil || second.Error.Code != "UPSTREAM_RATE_LIMITED" {
+		t.Fatalf("partial refresh snapshot = %+v, want partial with preserved Ultra plan", second)
+	}
+
+	now = now.Add(31 * time.Minute)
+	codeAssistStatus.Store(http.StatusOK)
+	codeAssistBody.Store(`{"currentTier":{"id":"free-tier","name":"Antigravity"},"paidTier":{"id":"g1-pro-tier","name":"Google AI Pro"}}`)
+	accepted, errTrigger = collector.TriggerCollection(context.Background(), map[string]struct{}{"antigravity-plan": {}}, nil)
+	if errTrigger != nil || accepted != 1 {
+		t.Fatalf("TriggerCollection(pro) = %d, %v, want 1, nil", accepted, errTrigger)
+	}
+	collector.Wait()
+
+	third, errThird := repo.GetQuotaCredential(context.Background(), "antigravity-plan", now.Add(time.Minute))
+	if errThird != nil {
+		t.Fatalf("GetQuotaCredential(third) error = %v", errThird)
+	}
+	if third.CollectionStatus != "success" || third.Plan == nil || third.Plan.Name != "Pro" || third.Plan.Premium {
+		t.Fatalf("pro refresh snapshot = %+v, want success with Pro non-premium plan", third)
+	}
+}
