@@ -136,11 +136,25 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 		}
 		windows, plan = monthlyWindows, monthlyPlan
 	}
+	// A free account reports the same weekly credits period as a subscription
+	// account but is not entitled to the weekly allowance. Check the subscription
+	// tier before applying weekly credits.
+	profileURL := strings.TrimSpace(c.options.XAIProfileURL)
+	if profileURL == "" {
+		profileURL = xaiProfileURLFromBillingURL(c.options.XAIBillingURL)
+	}
+	tier, tierKnown := "", false
+	if userPayload, _, errUser := c.probeRequest(ctx, auth, http.MethodGet, xaiProfileRequestURL(profileURL), nil, headers); errUser == nil {
+		tier, tierKnown = parseXAISubscriptionTier(userPayload)
+	}
+	if plan == nil && tierKnown {
+		plan = xaiPlanFromSubscriptionTier(tier)
+	}
 	// The weekly credits quota lives behind the format=credits billing variant
 	// and is the primary limit for subscription accounts; a weekly probe failure
 	// is non-fatal while the monthly response still yields usable windows.
 	weeklyPayload, _, errWeekly := c.probeRequest(ctx, auth, http.MethodGet, xaiWeeklyBillingURL(c.options.XAIBillingURL), nil, headers)
-	if errWeekly == nil {
+	if errWeekly == nil && (!tierKnown || xaiTierPaid(tier)) {
 		if weeklyWindow, ok := parseXAIWeeklyWindow(weeklyPayload, now); ok {
 			windows = append([]cluster.QuotaWindow{weeklyWindow}, windows...)
 		}
@@ -929,6 +943,82 @@ func xaiWeeklyBillingURL(monthlyURL string) string {
 	return parsed.String()
 }
 
+// xaiProfileURLFromBillingURL derives the profile endpoint from the billing
+// endpoint so tests and self-hosted endpoints keep working.
+func xaiProfileURLFromBillingURL(billingURL string) string {
+	parsed, errParse := url.Parse(billingURL)
+	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return xaiProfileURL
+	}
+	return parsed.Scheme + "://" + parsed.Host + "/v1/user"
+}
+
+// xaiProfileRequestURL adds the subscription profile selector. The base URL stays
+// query-free, matching the other collector endpoints.
+func xaiProfileRequestURL(profileURL string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(profileURL))
+	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
+		parsed, errParse = url.Parse(xaiProfileURL)
+		if errParse != nil {
+			return xaiProfileURL
+		}
+	}
+	query := parsed.Query()
+	query.Set("include", "subscription")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+// parseXAISubscriptionTier returns the tier reported by the xAI user profile.
+// The second result reports whether the field was present at all: a missing
+// field means the tier is unknown, while an explicit null or empty string means
+// the account is not on a paid plan.
+func parseXAISubscriptionTier(body []byte) (string, bool) {
+	if len(body) == 0 {
+		return "", false
+	}
+	var payload map[string]json.RawMessage
+	if errDecode := json.Unmarshal(body, &payload); errDecode != nil {
+		return "", false
+	}
+	raw, ok := payload["subscriptionTier"]
+	if !ok {
+		raw, ok = payload["subscription_tier"]
+		if !ok {
+			return "", false
+		}
+	}
+	var tier string
+	if errDecode := json.Unmarshal(raw, &tier); errDecode != nil {
+		return "", true
+	}
+	return strings.TrimSpace(tier), true
+}
+
+func xaiTierPaid(tier string) bool {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "", "free", "none":
+		return false
+	default:
+		return true
+	}
+}
+
+func xaiPlanFromSubscriptionTier(tier string) *cluster.QuotaPlan {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "", "free", "none":
+		return nil
+	case "supergrokplus", "supergrok_plus", "super_grok_plus":
+		return &cluster.QuotaPlan{Name: "SuperGrok Plus"}
+	case "supergrokheavy", "supergrok_heavy", "super_grok_heavy":
+		return &cluster.QuotaPlan{Name: "SuperGrok Heavy", Premium: true}
+	case "supergrok", "super_grok":
+		return &cluster.QuotaPlan{Name: "SuperGrok"}
+	default:
+		return &cluster.QuotaPlan{Name: tier}
+	}
+}
+
 // parseXAIWeeklyWindow maps the format=credits billing payload to the weekly
 // quota window. The weekly variant reports usage as a percent of the shared
 // weekly limit rather than a currency amount, so the window uses a 0-100 scale.
@@ -946,11 +1036,27 @@ func parseXAIWeeklyWindow(body []byte, observedAt time.Time) (cluster.QuotaWindo
 	if period == nil {
 		period = config.CurrentPeriodSnake
 	}
-	if usedPercent == nil {
-		return cluster.QuotaWindow{}, false
-	}
 	if period != nil && strings.Contains(strings.ToLower(period.Type), "monthly") {
 		return cluster.QuotaWindow{}, false
+	}
+	if usedPercent == nil {
+		if period == nil || !strings.Contains(strings.ToLower(period.Type), "weekly") {
+			return cluster.QuotaWindow{}, false
+		}
+		// proto3 JSON omits zero-valued scalars. The official Grok client treats
+		// a missing creditUsagePercent as 0% usage, so keep the weekly window
+		// instead of failing collection.
+		used := 0.0
+		limit := 100.0
+		window := cluster.QuotaWindow{ID: "xai-weekly-usage", Label: quotaStringPtr("Weekly Limit"), Scope: "account", Mode: "fixed", Status: "unknown", Unit: "percentage", Used: &used, Limit: &limit, PeriodUnit: "week", PeriodValue: quotaFloatPtr(1), Source: "active_probe", ObservedAt: observedAt, Priority: -10}
+		if period != nil {
+			window.ResetAt = parseProviderTime(period.End)
+		}
+		if window.ResetAt == nil {
+			window.ResetAt = parseProviderTime(firstNonEmptyString(config.BillingPeriodEnd, config.BillingEndSnake))
+		}
+		normalizeWindowValues(&window)
+		return window, true
 	}
 	used := math.Max(0, math.Min(100, *usedPercent))
 	limit := 100.0
