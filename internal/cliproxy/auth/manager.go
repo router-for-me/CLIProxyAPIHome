@@ -106,11 +106,12 @@ type Manager struct {
 	store    Store
 	selector Selector
 
-	mu          sync.RWMutex
-	updateLocks authUpdateLocks
-	auths       map[string]*Auth
-	indexAuth   map[string]*Auth
-	scheduler   *authScheduler
+	mu              sync.RWMutex
+	updateLocks     authUpdateLocks
+	auths           map[string]*Auth
+	indexAuth       map[string]*Auth
+	scheduler       *authScheduler
+	modelAliasHints modelAliasHintIndex
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -362,6 +363,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	delete(m.auths, id)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(id, nil)
 
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
@@ -687,6 +689,7 @@ func (m *Manager) removeAuthLocked(authID string) {
 	delete(m.auths, authID)
 	loop := m.refreshLoop
 	m.mu.Unlock()
+	m.modelAliasHints.replace(authID, nil)
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(authID)
 	}

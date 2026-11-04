@@ -4118,6 +4118,8 @@ Upgrade note: earlier Home versions merged these global rules into each OAuth cr
 
 To edit one channel, use `/config/oauth/model-alias/claude` with a raw alias array. To remove it, use `DELETE` on that path. v8 does not use the v0 `items`, `channel`, `provider`, or `aliases` wrappers. Writes return `{"status":"ok","config-version":8}`. As elsewhere in the config tree, `null` is retained rather than interpreted as deletion.
 
+When a downstream request uses an upstream model ID that is published under an alias, Home may append up to three visible public model IDs to an `auth_not_found` or `model_not_found` error, including a missing-price rejection. Hints cover API-key and OAuth aliases, include required credential prefixes, and respect the client key's credential, model, and model-specific channel scopes. Disabled credentials and unpublished or excluded models are omitted; a policy lookup failure omits the hint. The error code and routing rules remain unchanged.
+
 ## Config Field Reference
 
 The following paths use the v8 config layout. `/config` and `/config.yaml` support both settings and upstream provider credentials; OAuth auth files use `/credentials`. Client access keys are managed through `/access/api-keys`.

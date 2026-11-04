@@ -156,6 +156,10 @@ func resolveUpstreamModelFromAuthConfigModels(auth *Auth, requestedModel string)
 
 // modelAliasEntriesFromMetadata converts Home model metadata into alias entries.
 func modelAliasEntriesFromMetadata(raw any) []modelAliasEntry {
+	// Publication can reuse decoded aliases without changing stored metadata.
+	if entries, ok := raw.([]modelAliasEntry); ok {
+		return entries
+	}
 	if raw == nil {
 		return nil
 	}

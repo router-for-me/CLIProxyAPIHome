@@ -2,6 +2,7 @@ package errors
 
 const (
 	TypeError                   = "error"
+	TypeAuthNotFound            = "auth_not_found"
 	TypeModelNotFound           = "model_not_found"
 	TypeRequestRetryExceeded    = "request_retry_exceeded"
 	TypeUserCreditsInsufficient = "user_credits_insufficient"
