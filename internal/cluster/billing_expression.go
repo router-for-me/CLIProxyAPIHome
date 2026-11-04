@@ -207,6 +207,12 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 	if program.Uses(billingexpr.VarWebSearchCalls) {
 		details.WebSearchCalls = 0
 	}
+	if program.Uses(billingexpr.VarXSearchCalls) {
+		details.XSearchCalls = 0
+	}
+	if program.Uses(billingexpr.VarCodeExecutionCalls) {
+		details.CodeExecutionCalls = 0
+	}
 	if program.Uses(billingexpr.VarImages) {
 		details.Images = 0
 	}

@@ -1703,6 +1703,10 @@ func (b *BillingCostBreakdown) addUnits(name string, units int64, unitPrice *flo
 // addSurcharges bills per-unit counters with the rule's per-unit prices.
 func (b *BillingCostBreakdown) addSurcharges(details billingTokenDetails, snapshot BillingPriceSnapshot) {
 	b.addUnits("web_search_calls", details.WebSearchCalls, snapshot.WebSearchPricePerCall)
+	if strings.EqualFold(strings.TrimSpace(snapshot.Provider), "xai") {
+		b.addUnits("x_search_calls", details.XSearchCalls, snapshot.WebSearchPricePerCall)
+		b.addUnits("code_execution_calls", details.CodeExecutionCalls, snapshot.WebSearchPricePerCall)
+	}
 	b.addUnits("images", details.Images, snapshot.ImagePricePerImage)
 }
 
