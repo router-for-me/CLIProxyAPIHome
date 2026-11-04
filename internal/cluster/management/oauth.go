@@ -757,6 +757,14 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 				continue
 			}
 		}
+		if metadataPath == "weight" {
+			if value == nil {
+				delete(auth.Metadata, "weight")
+				touchedRoots["weight"] = struct{}{}
+				changed = true
+				continue
+			}
+		}
 		if metadataPath == "headers" {
 			applyOAuthHeadersPatch(auth, value)
 		} else if errSet := setOAuthMetadataValue(auth.Metadata, metadataPath, value); errSet != nil {
@@ -984,6 +992,9 @@ func syncOAuthMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct
 	if _, ok := touchedRoots["priority"]; ok {
 		syncOAuthPriorityAttribute(auth)
 	}
+	if _, ok := touchedRoots["weight"]; ok {
+		syncOAuthWeightAttribute(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncOAuthNoteAttribute(auth)
 	}
@@ -1034,6 +1045,21 @@ func syncOAuthPriorityAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+func syncOAuthWeightAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	weight, ok := oauthIntValue(auth.Metadata["weight"])
+	if !ok || weight < 0 {
+		delete(auth.Attributes, "weight")
+		return
+	}
+	auth.Attributes["weight"] = strconv.Itoa(weight)
 }
 
 func oauthIntValue(value any) (int, bool) {

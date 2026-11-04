@@ -33,7 +33,7 @@ func authWeight(auth *Auth) int64 {
 		}
 		return weight
 	}
-	if rawWeight, ok := auth.Metadata["weight"]; ok {
+	if rawWeight, ok := auth.Metadata["weight"]; ok && rawWeight != nil {
 		weight, errParse := credentialweight.ParseValue(rawWeight)
 		if errParse != nil {
 			return 0
