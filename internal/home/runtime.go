@@ -900,7 +900,7 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	}
 	allowedAuthIDs, allowedModelIDs, errAllowed := r.allowedDispatchIDsForAPIKey(ctx, apiKey, reqModel)
 	if errAllowed != nil {
-		return nil, errAllowed
+		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
 	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
 	if pinnedAuthID != "" {
@@ -935,7 +935,8 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if len(metadata) > 0 {
 		opts.Metadata = metadata
 	}
-	return r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	result, errDispatch := r.dispatchWithOptions(ctx, reqModel, opts, concurrencyCtx)
+	return result, r.withModelAliasHint(ctx, errDispatch, reqModel, apiKey)
 }
 
 func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts coreauth.Options, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
@@ -1177,6 +1178,44 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 		allowedModelIDs = modelIDs
 	}
 	return allowedAuthIDs, allowedModelIDs, nil
+}
+
+// withModelAliasHint preserves the original lookup error and adds only aliases
+// visible to this API key. Policy failures omit the optional hint.
+func (r *Runtime) withModelAliasHint(ctx context.Context, err error, reqModel, apiKey string) error {
+	if err == nil || r == nil || r.coreManager == nil {
+		return err
+	}
+	authErr, structured := err.(*coreauth.Error)
+	code := ""
+	if structured {
+		if authErr == nil || authErr.Upstream != nil {
+			return err
+		}
+		code = authErr.Code
+	} else {
+		code, _ = homeerrors.SplitRedisErrorMessage(err.Error())
+	}
+	if code != homeerrors.TypeAuthNotFound && code != homeerrors.TypeModelNotFound {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	policy, errPolicy := r.ModelAccessForAPIKey(ctx, apiKey)
+	if errPolicy != nil {
+		return err
+	}
+	hint := coreauth.ModelAliasHint(reqModel, r.coreManager.AliasesForUpstreamModel(reqModel, policy))
+	if hint == "" {
+		return err
+	}
+	if !structured {
+		return fmt.Errorf("%w; %s", err, hint)
+	}
+	annotated := *authErr
+	annotated.Message = strings.TrimSpace(annotated.Message) + "; " + hint
+	return &annotated
 }
 
 // supportsRequestedModel handles a supports requested model.

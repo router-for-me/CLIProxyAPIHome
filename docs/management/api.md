@@ -1982,6 +1982,8 @@ Upstream provider keys are configured through the v8 config tree. They are disti
 
 All paths support `GET`, `PUT`, `PATCH`, and `DELETE`. `GET` returns a raw group array. `PUT` and `PATCH` replace the entire array for that family; neither appends nor patches one key by index. `DELETE` removes that family and clears its provider-key records. Send `[]` to replace it with an empty list. Removing one key requires writing the remaining complete family list with retained `id` values. These writes return `{"status":"ok","config-version":8}`.
 
+JSON reads add a read-only `auth_index` to every key, equal to the key's credential `id`; a keyless `openai-compatibility` group carries it on the group. It is the selector `/requests/api-call` accepts as `auth_index`, matching CPA's v8 config reads. `GET /config.yaml` omits it, and writes drop `auth_index` and `auth-index` from groups and keys, so a read can be sent back unchanged.
+
 ### Native Provider Groups
 
 Example `PUT /config/api-keys/codex` body:
@@ -4117,6 +4119,8 @@ Upgrade note: earlier Home versions merged these global rules into each OAuth cr
 | `force-mapping` | boolean | Uses the mapped upstream name in response model fields. |
 
 To edit one channel, use `/config/oauth/model-alias/claude` with a raw alias array. To remove it, use `DELETE` on that path. v8 does not use the v0 `items`, `channel`, `provider`, or `aliases` wrappers. Writes return `{"status":"ok","config-version":8}`. As elsewhere in the config tree, `null` is retained rather than interpreted as deletion.
+
+When a downstream request uses an upstream model ID that is published under an alias, Home may append up to three visible public model IDs to an `auth_not_found` or `model_not_found` error, including a missing-price rejection. Hints cover API-key and OAuth aliases, include required credential prefixes, and respect the client key's credential, model, and model-specific channel scopes. Disabled credentials and unpublished or excluded models are omitted; a policy lookup failure omits the hint. The error code and routing rules remain unchanged.
 
 ## Config Field Reference
 

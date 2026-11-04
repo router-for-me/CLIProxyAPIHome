@@ -1973,6 +1973,8 @@ OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考�
 
 所有路径支持 `GET`、`PUT`、`PATCH` 和 `DELETE`。`GET` 直接返回分组数组。`PUT` 和 `PATCH` 都替换该家族的整个数组，不追加元素，也不按下标修改单个 key。`DELETE` 移除家族并清空其 provider-key 记录；也可提交 `[]` 清空列表。删除单个 key 时，需提交保留其他 key 及其 `id` 的完整家族列表。成功响应为 `{"status":"ok","config-version":8}`。
 
+JSON 读取会为每个 key 附加只读的 `auth_index`，值等于该 key 的凭证 `id`；无 key 的 `openai-compatibility` 分组则附加在分组上。它就是 `/requests/api-call` 接受的 `auth_index` 选择器，与 CPA 的 v8 配置读取一致。`GET /config.yaml` 不包含该字段；写入时会从分组和 key 上移除 `auth_index` 与 `auth-index`，因此读取结果可以原样写回。
+
 ### 原生 Provider 分组
 
 `PUT /config/api-keys/codex` 请求体示例：
@@ -4101,6 +4103,8 @@ Query 参数：
 | `force-mapping` | boolean | 响应模型字段使用映射后的上游名称。 |
 
 修改单个 channel 时，向 `/config/oauth/model-alias/claude` 提交原始别名数组；删除时对该路径执行 `DELETE`。v8 不使用 v0 的 `items`、`channel`、`provider`、`aliases` 包装。写入成功返回 `{"status":"ok","config-version":8}`。与其他配置树接口一致，`null` 保留为值，不表示删除。
+
+当下游请求使用了已通过别名发布的上游模型 ID 时，Home 可能在 `auth_not_found` 或 `model_not_found` 错误中附加最多三个可见的对外模型 ID，包括因缺少价格而拒绝的请求。提示覆盖 API Key 和 OAuth 别名，包含必要的凭据前缀，并遵守客户端 Key 的凭据、模型及模型专属渠道权限。禁用凭据、未发布或被排除的模型不会出现在提示中；权限查询失败时省略提示。错误码和路由规则保持不变。
 
 ## 配置字段参考
 
