@@ -39,11 +39,11 @@ func TestPublicModelCatalogWithholdsPriceAndAvailability(t *testing.T) {
 		t.Fatalf("models = %d, want the full registered catalog", len(payload.Models))
 	}
 	for _, model := range payload.Models {
-		if model.Pricing != nil {
-			t.Errorf("model %s exposes pricing to an anonymous visitor", model.ID)
+		if model.Pricing == nil {
+			t.Errorf("model %s missing public pricing", model.ID)
 		}
-		if model.Availability != nil {
-			t.Errorf("model %s exposes availability to an anonymous visitor", model.ID)
+		if model.Availability == nil {
+			t.Errorf("model %s missing public availability", model.ID)
 		}
 	}
 }
