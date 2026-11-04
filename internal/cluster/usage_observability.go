@@ -268,6 +268,7 @@ type UsageObservabilityRecord struct {
 	ReasoningEffort    string
 	ExecutorType       string
 	Tokens             UsageObservabilityTokens
+	ToolUsage          *UsageObservabilityToolUsage
 	Performance        UsageObservabilityPerformance
 	Client             UsageObservabilityClient
 	Credential         UsageObservabilityCredential
@@ -285,6 +286,21 @@ type UsageObservabilityTokens struct {
 	CacheCreationTokens int64
 	TotalTokens         int64
 	TokenBreakdown      UsageTokenBreakdown
+}
+
+type UsageObservabilityToolUsage struct {
+	WebSearchCalls         int64
+	WebSearchQueries       int64
+	WebFetchCalls          int64
+	XSearchCalls           int64
+	CodeExecutionCalls     int64
+	FileSearchCalls        int64
+	DocumentSearchCalls    int64
+	MCPCalls               int64
+	GoogleMapsChunks       int64
+	NumSourcesUsed         int64
+	NumServerSideToolsUsed int64
+	ImageGenerationCalls   int64
 }
 
 type UsageObservabilityPerformance struct {
@@ -2868,6 +2884,43 @@ func usageObservabilityEventType(row *usageObservabilityRecordRow, payload map[s
 	return "completion"
 }
 
+func usageObservabilityToolUsageFromPayload(rawPayload string) *UsageObservabilityToolUsage {
+	if strings.TrimSpace(rawPayload) == "" {
+		return nil
+	}
+	details := extractBillingTokenDetails("", rawPayload)
+	imgCalls := usagePayloadNonNegativeInt(rawPayload, "tool_usage_details.image_generation_calls", "server_side_tool_usage_details.image_generation_calls")
+	out := &UsageObservabilityToolUsage{
+		WebSearchCalls:         details.WebSearchCalls,
+		WebSearchQueries:       details.WebSearchQueries,
+		WebFetchCalls:          details.WebFetchCalls,
+		XSearchCalls:           details.XSearchCalls,
+		CodeExecutionCalls:     details.CodeExecutionCalls,
+		FileSearchCalls:        details.FileSearchCalls,
+		DocumentSearchCalls:    details.DocumentSearchCalls,
+		MCPCalls:               details.MCPCalls,
+		GoogleMapsChunks:       details.GoogleMapsChunks,
+		NumSourcesUsed:         details.NumSourcesUsed,
+		NumServerSideToolsUsed: details.NumServerSideToolsUsed,
+		ImageGenerationCalls:   imgCalls,
+	}
+	if out.WebSearchCalls <= 0 &&
+		out.WebSearchQueries <= 0 &&
+		out.WebFetchCalls <= 0 &&
+		out.XSearchCalls <= 0 &&
+		out.CodeExecutionCalls <= 0 &&
+		out.FileSearchCalls <= 0 &&
+		out.DocumentSearchCalls <= 0 &&
+		out.MCPCalls <= 0 &&
+		out.GoogleMapsChunks <= 0 &&
+		out.NumSourcesUsed <= 0 &&
+		out.NumServerSideToolsUsed <= 0 &&
+		out.ImageGenerationCalls <= 0 {
+		return nil
+	}
+	return out
+}
+
 func firstNonZeroInt(values ...int) int {
 	for _, value := range values {
 		if value != 0 {
@@ -3002,6 +3055,7 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 				row.UnclassifiedTokens,
 			),
 		},
+		ToolUsage:   usageObservabilityToolUsageFromPayload(string(row.PayloadJSON)),
 		Performance: usageObservabilityPerformance(row),
 		Client:      usageObservabilityClient(row, payload),
 		Credential:  usageObservabilityCredential(row),

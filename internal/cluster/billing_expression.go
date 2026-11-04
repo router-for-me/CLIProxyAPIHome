@@ -163,7 +163,7 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 	if errEval != nil {
 		return fmt.Errorf("evaluate pricing_expr: %w", errEval)
 	}
-	// Record the folded buckets for audit; their cost is carried by the expression item.
+	// Record the folded buckets and server-tool counters for audit; their cost is carried by the expression item.
 	for _, name := range []string{
 		billingexpr.VarInput, billingexpr.VarImageInput, billingexpr.VarAudioInput,
 		billingexpr.VarVideoInput, billingexpr.VarFileInput, billingexpr.VarImageCacheRead,
@@ -171,6 +171,10 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 		billingexpr.VarCacheWrite, billingexpr.VarCacheWrite30m, billingexpr.VarCacheWrite1h,
 		billingexpr.VarCacheWrite12h, billingexpr.VarOutput, billingexpr.VarReasoning,
 		billingexpr.VarImageOutput, billingexpr.VarAudioOutput, billingexpr.VarVideoOutput,
+		billingexpr.VarWebSearchCalls, billingexpr.VarWebSearchQueries, billingexpr.VarWebFetchCalls,
+		billingexpr.VarXSearchCalls, billingexpr.VarCodeExecutionCalls, billingexpr.VarFileSearchCalls,
+		billingexpr.VarDocumentSearchCalls, billingexpr.VarMCPCalls, billingexpr.VarGoogleMapsChunks,
+		billingexpr.VarNumSourcesUsed, billingexpr.VarNumServerSideToolsUsed,
 	} {
 		tokens := numbers[name]
 		if tokens <= 0 {

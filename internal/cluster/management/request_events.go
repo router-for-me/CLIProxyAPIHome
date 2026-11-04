@@ -193,6 +193,7 @@ func requestEventResponse(record *cluster.UsageObservabilityRecord) gin.H {
 		"error":                requestEventErrorResponse(record),
 		"tokens":               requestEventTokensResponse(record),
 		"token_breakdown":      usageTokenBreakdownResponse(record.Tokens.TokenBreakdown),
+		"tool_usage":           requestEventToolUsageResponse(record.ToolUsage),
 		"performance":          requestEventPerformanceResponse(record),
 		"billing":              requestEventBillingResponse(record),
 		"related":              requestEventRelatedResponse(record),
@@ -332,6 +333,26 @@ func requestEventTokensResponse(record *cluster.UsageObservabilityRecord) gin.H 
 		"cache_read_tokens":     record.Tokens.CacheReadTokens,
 		"cache_creation_tokens": record.Tokens.CacheCreationTokens,
 		"total_tokens":          record.Tokens.TotalTokens,
+	}
+}
+
+func requestEventToolUsageResponse(usage *cluster.UsageObservabilityToolUsage) any {
+	if usage == nil {
+		return nil
+	}
+	return gin.H{
+		"web_search_calls":           usage.WebSearchCalls,
+		"web_search_queries":         usage.WebSearchQueries,
+		"web_fetch_calls":            usage.WebFetchCalls,
+		"x_search_calls":             usage.XSearchCalls,
+		"code_execution_calls":       usage.CodeExecutionCalls,
+		"file_search_calls":          usage.FileSearchCalls,
+		"document_search_calls":      usage.DocumentSearchCalls,
+		"mcp_calls":                  usage.MCPCalls,
+		"google_maps_chunks":         usage.GoogleMapsChunks,
+		"num_sources_used":           usage.NumSourcesUsed,
+		"num_server_side_tools_used": usage.NumServerSideToolsUsed,
+		"image_generation_calls":     usage.ImageGenerationCalls,
 	}
 }
 
