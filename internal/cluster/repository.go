@@ -496,6 +496,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 			Quota:          auth.Quota,
 			ModelStates:    auth.ModelStates,
 			BaseURL:        record.BaseURL,
+			ProxyURL:       strings.TrimSpace(auth.ProxyURL),
 			ModelsHash:     record.ModelsHash,
 			Attributes:     auth.Attributes,
 			ModelMetadata:  modelMetadataFromAuth(auth),

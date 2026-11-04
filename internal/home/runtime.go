@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
@@ -61,6 +62,16 @@ type Runtime struct {
 	originalStore           coreauth.Store
 
 	cancel context.CancelFunc
+
+	antigravityProbeMu        sync.Mutex
+	antigravityProbeWg        sync.WaitGroup
+	antigravityAccountProbes  map[string]map[*antigravityAccountProbe]struct{}
+	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
+	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+	antigravityPersistPending map[string]*antigravityHintPersistRequest
+	antigravityRefreshWake    chan struct{}
+	antigravityContext        context.Context
+	antigravityCancel         context.CancelFunc
 
 	fileWatcher interface{ Stop() error }
 }
@@ -341,6 +352,12 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
+	r.cfgMu.Lock()
+	if r.antigravityCancel != nil {
+		r.antigravityCancel()
+	}
+	r.antigravityContext, r.antigravityCancel = runCtx, cancel
+	r.cfgMu.Unlock()
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -349,6 +366,8 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	}
 
 	registry.StartModelCatalogUpdaters(runCtx, r.Config().Models)
+	cpasdkauth.StartAntigravityVersionUpdater(runCtx)
+	go r.runAntigravityModelRefresh(runCtx)
 	r.registerModelRefreshCallback()
 	managementasset.SetCurrentConfig(r.cfg)
 	managementasset.StartAutoUpdater(context.Background(), configPath)
@@ -385,6 +404,16 @@ func (r *Runtime) Stop() {
 	if r == nil {
 		return
 	}
+	r.cfgMu.Lock()
+	antigravityCancel := r.antigravityCancel
+	r.antigravityCancel = nil
+	stoppedCtx, stopAntigravity := context.WithCancel(context.Background())
+	stopAntigravity()
+	r.antigravityContext = stoppedCtx
+	r.cfgMu.Unlock()
+	if antigravityCancel != nil {
+		antigravityCancel()
+	}
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
@@ -397,6 +426,8 @@ func (r *Runtime) Stop() {
 		r.pluginHost.ShutdownAll()
 	}
 	r.StopAutoRefresh()
+	r.cancelStaleAntigravityProbes("")
+	r.WaitAntigravityProbes()
 	if r.coreManager != nil {
 		r.coreManager.Shutdown()
 	}

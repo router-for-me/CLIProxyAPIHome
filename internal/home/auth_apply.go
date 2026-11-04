@@ -173,6 +173,7 @@ func (r *Runtime) applyCoreAuthRemove(ctx context.Context, authID string) {
 	if errDel := r.coreManager.Delete(ctx, authID); errDel != nil {
 		log.Errorf("failed to delete auth %s: %v", authID, errDel)
 	}
+	r.cancelStaleAntigravityProbes(authID)
 	registry.GetGlobalRegistry().UnregisterClient(authID)
 
 	if provider != "" {

@@ -626,6 +626,7 @@ type AuthIndex struct {
 	Quota          coreauth.QuotaState
 	ModelStates    map[string]*coreauth.ModelState
 	BaseURL        string
+	ProxyURL       string
 	ModelsHash     string
 	Attributes     map[string]string
 	ModelMetadata  map[string]any

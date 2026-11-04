@@ -111,6 +111,8 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 	r.cfg = cfg
 	r.authDir = cfg.AuthDir
 	r.cfgMu.Unlock()
+	r.cancelStaleAntigravityProbes("")
+	r.signalAntigravityModelRefresh()
 
 	if errReload := r.loadAuths(coreauth.WithSkipPersist(ctx)); errReload != nil {
 		if r.coreManager != nil {

@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const modelsRefreshInterval = 3 * time.Hour
+// ModelsRefreshInterval is the shared cadence for model catalogs and account entitlements.
+const ModelsRefreshInterval = 3 * time.Hour
+
+const modelsRefreshInterval = ModelsRefreshInterval
 
 var modelsFetchTimeout = 30 * time.Second
 
