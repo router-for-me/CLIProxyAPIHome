@@ -202,6 +202,17 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 			}
 		}
 	}
+	// Read using_api from auth file.
+	if rawUsingAPI, ok := metadata["using_api"]; ok {
+		switch v := rawUsingAPI.(type) {
+		case bool:
+			a.Attributes["using_api"] = strconv.FormatBool(v)
+		case string:
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil {
+				a.Attributes["using_api"] = strconv.FormatBool(parsed)
+			}
+		}
+	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
