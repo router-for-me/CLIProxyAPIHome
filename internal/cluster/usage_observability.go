@@ -2891,11 +2891,11 @@ func usageObservabilityToolUsageFromPayload(rawPayload string) *UsageObservabili
 	}
 	first := func(paths ...string) int64 {
 		for _, path := range paths {
-			if n := billingPayloadInt64(payload, path); n > 0 {
-				return n
+			if v := gjson.Get(payload, path); v.Exists() && v.Int() > 0 {
+				return v.Int()
 			}
-			if n := billingPayloadInt64(payload, "tokens."+path); n > 0 {
-				return n
+			if v := gjson.Get(payload, "tokens."+path); v.Exists() && v.Int() > 0 {
+				return v.Int()
 			}
 		}
 		return 0
