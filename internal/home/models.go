@@ -170,6 +170,7 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if r == nil || a == nil || a.ID == "" {
 		return
 	}
+	r.cancelStaleAntigravityProbes(a.ID)
 	if a.Disabled || a.Status == coreauth.StatusDisabled {
 		registry.GetGlobalRegistry().UnregisterClient(a.ID)
 		return
@@ -253,7 +254,14 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	case "antigravity":
-		models = registry.GetAntigravityModels()
+		expectedKey := r.antigravityCapabilityKey(a)
+		hints := r.cachedAntigravityHints(a)
+		if hints.ModelIDs != nil {
+			r.applyAntigravityModelHints(context.Background(), a, provider, hints, expectedKey)
+			r.asyncProbeAntigravityCapabilities(context.Background(), a, provider)
+			return
+		}
+		models = applyAntigravityFetchedModelCapabilities(registry.GetAntigravityModels(), hints)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if len(configModels) > 0 {
@@ -457,6 +465,9 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	models = applyOAuthModelAlias(cfg, provider, authKind, models)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix), candidates)
+	if provider == "antigravity" {
+		r.asyncProbeAntigravityCapabilities(context.Background(), a, key)
+	}
 }
 
 // oauthExcludedModels handles an oauth excluded models.
