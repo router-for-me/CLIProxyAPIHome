@@ -60,6 +60,7 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 		persisted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
 		if errPersist != nil {
 			log.Errorf("usage database write error: %v", errPersist)
+			return dispatch.Err("usage database write failed")
 		}
 		if persisted {
 			return dispatch.Integer(1)

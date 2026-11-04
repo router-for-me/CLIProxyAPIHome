@@ -858,6 +858,9 @@ func (r *Repository) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKe
 	if errBilling := ensureAPIKeyUserBillingAllowed(ctx, db, &record); errBilling != nil {
 		return nil, nil, errBilling
 	}
+	if errPriced := ensureAPIKeyModelPriced(ctx, db, &record, modelID); errPriced != nil {
+		return nil, nil, errPriced
+	}
 
 	baseChannelIDs, errBaseChannels := apiKeyChannelsFromJSON(record.Channels)
 	if errBaseChannels != nil {

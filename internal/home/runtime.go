@@ -60,9 +60,6 @@ type Runtime struct {
 	clusterRefresh          func(context.Context, string, string) ([]byte, error)
 	originalStore           coreauth.Store
 
-	clusterUsageQueueMu sync.Mutex
-	clusterUsageQueue   *usagePayloadQueue
-
 	cancel context.CancelFunc
 
 	fileWatcher interface{ Stop() error }
@@ -344,7 +341,6 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
-	r.startClusterUsageWriter(runCtx)
 
 	if !r.clusterAutoRefreshGated() && strings.TrimSpace(r.authDir) != "" {
 		if errEnsureAuthDir := os.MkdirAll(r.authDir, 0o755); errEnsureAuthDir != nil {
@@ -393,7 +389,6 @@ func (r *Runtime) Stop() {
 		r.cancel()
 		r.cancel = nil
 	}
-	r.stopClusterUsageWriter()
 	if r.fileWatcher != nil {
 		_ = r.fileWatcher.Stop()
 		r.fileWatcher = nil
@@ -543,12 +538,14 @@ func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
 		return false, nil
 	}
-	queue := r.getClusterUsageQueue()
-	if queue == nil {
-		return true, nil
+	store, ok := r.clusterAdapter.(clusterUsageStore)
+	if !ok || store == nil {
+		return false, fmt.Errorf("cluster usage store is unavailable")
 	}
-	if ok := queue.Push(payload, receivedAt); !ok {
-		log.Warnf("cluster usage queue is stopped; accepting usage without persistence")
+	// Acknowledge usage only after its database transaction commits. A failed
+	// write must reach the sender, not disappear from an in-memory queue.
+	if errStore := store.StoreUsagePayload(ctx, payload, receivedAt); errStore != nil {
+		return false, errStore
 	}
 	return true, nil
 }

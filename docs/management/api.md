@@ -1051,6 +1051,7 @@ Example request:
 | `password` | string | no | Non-empty plaintext is stored as a bcrypt hash. Existing valid bcrypt hashes are preserved for migration. Responses do not return password material; they return `password_set`. |
 | `credits` | number | no | User credit balance. Defaults to `0`. When a client API key is bound to this user and credits are `<= 0`, RESP `RPOP auth` returns `user_credits_insufficient`. For billing workflows, prefer `/billing/balance-records/recharge` and `/billing/balance-records/deduct` so balance changes have ledger records. |
 | `credits_unlimited` | boolean | no | When `true`, dispatch ignores the total `credits` balance and billing charges do not deduct it. Period limits still apply. Defaults to `false`. |
+| `billing_multiplier` | number or null | no | Non-negative multiplier applied to every charge for the user's API keys (for example `0.8` for a 20% discount, `0` for free). `null` clears it, which means `1`. Invalid values return `400` with code `invalid_limit`. User responses include the stored value. |
 | `timezone` | string | no | IANA timezone for calendar windows; default `Asia/Shanghai`. |
 | `limit_5h_credits` | number/null | no | 5-hour credits limit. `null` clears/disables. `0` blocks immediately. |
 | `window_mode_5h` | string | no | `first_use` (default; alias `fixed`) or `sliding`. |
@@ -1551,8 +1552,18 @@ Query parameters:
 | `user_id` | integer | Optional exact user ID filter. Alias: `uid`. |
 | `provider` | string | Optional provider filter. |
 | `model` | string | Optional model filter. |
+| `cost_diagnostic` | string | Optional zero-cost diagnostic filter: `unpriced_model`, `zero_price`, or `any` for every flagged charge. |
+| `auth_index` | string | Optional exact serving-credential filter. |
 | `limit` | integer | Optional page size. Default `50`, max `200`. |
 | `offset` | integer | Optional page offset. Negative values normalize to `0`. |
+
+Admin charge responses also include immutable charge-time fields: `billed_cache_read_tokens`, `billed_cache_write_tokens`, and `billed_reasoning_tokens` (the canonical buckets priced for complete v2 accounting, `null` for legacy accounting), and `cost_breakdown` (`{ "request": number, "items": { "<bucket>": { "tokens", "price_per_million", "cost" } }, "total": number }`). Charge amounts, balance deltas, and balances are quantized to 8 decimal places before they are stored, so `cost_breakdown.total` equals `amount`.
+
+Admin charge responses also include `base_amount` (the list value after rule multipliers and before the user `billing_multiplier`), `billing_multiplier`, and `auth_index` (the serving credential). `amount = round(base_amount * billing_multiplier, 8)`. Summing `base_amount` by `auth_index` values each credential's output independently of customer discounts, while `amount` is the revenue actually charged. `cost_breakdown` carries the same `base_total`, `billing_multiplier`, and the applied `reasoning_effort_multiplier`.
+
+Failed usage is billed only when the upstream reported consumed tokens (for example a client-cancelled `499` stream after the prompt was processed); such charges exclude `request_price` and per-unit surcharges and record `price_snapshot.failed_request: true` with `fail_status_code`. Failed usage without tokens is never charged. Requests to `/images/generations` or `/images/edits` bill at least one image at `image_price_per_image` when CPA omits `image_count`.
+
+Admin charge responses include `cost_diagnostic`. It is empty for normal charges, `unpriced_model` when billable usage matched no enabled price rule (billed at $0), and `zero_price` when it matched a rule whose prices produced $0. The same value is recorded as `price_snapshot.cost_diagnostic`.
 
 Response shape:
 
@@ -1578,7 +1589,7 @@ Response shape:
       "request_id": "req_xxx",
       "endpoint": "/v1/chat/completions",
       "matched_price_rule": "openai:gpt-5.5:priority:272001",
-      "price_snapshot": { "request_price": 0, "input_price_per_million": 2.5, "matched_service_tier": "priority", "min_input_tokens": 272001, "requested_service_tier": "priority", "response_service_tier": "default", "service_tier_source": "request", "effective_service_tier": "priority", "response_tier_fallback": false },
+      "price_snapshot": { "request_price": 0, "input_price_per_million": 2.5, "matched_service_tier": "priority", "min_input_tokens": 272001, "context_input_tokens": 300000, "price_model_source": "model", "requested_service_tier": "priority", "response_service_tier": "default", "service_tier_source": "request", "effective_service_tier": "priority", "response_tier_fallback": false },
       "cache_read_tokens": 0,
       "cache_write_tokens": 0
     }
@@ -1672,7 +1683,7 @@ Response:
 
 Lists model price rules.
 
-The response always includes `price_rule_schema_version: 2`, including when `items` is empty. Rules match exact normalized service tiers before the `*` compatibility wildcard, then select the greatest `min_input_tokens` not exceeding the usage record's original input-token count.
+The response always includes `price_rule_schema_version: 2`, including when `items` is empty. Rules match exact normalized service tiers before the `*` compatibility wildcard, then select the greatest `min_input_tokens` not exceeding the usage record's full prompt context (uncached input plus cache-read and cache-write tokens). Rule `provider` may be `*` to match every provider, and rule `model` may end with a single `*` to match by case-insensitive prefix (for example `gemini-3.5-*`, or `*` for every model); a `*` anywhere else is rejected with `400 invalid_body`. Model comparison is case-insensitive. Lookup tries the executed `model` and then the client-requested `alias` at each specificity level, most specific first: exact provider and exact model, exact provider and the longest matching model pattern, `*` provider and exact model, then `*` provider and the longest matching pattern. An exact alias therefore beats a model pattern. When nothing matches, the charge uses `default:zero`. `price_snapshot.price_match` records the level (`exact`, `model_pattern`, `any_provider`, or `any_provider_model_pattern`). The unpriced-model dispatch gate accepts exact and pattern rules.
 
 Query parameters:
 
@@ -1696,12 +1707,54 @@ Model price fields:
 | `cache_read_price_per_million` | number | Cache-read token price. |
 | `cache_write_price_per_million` | number | Cache-write token price. |
 | `request_price` | number | Per-request price. |
+| `cache_write_30m_price_per_million` | number or null | Price for 30-minute cache writes; `null` falls back to the cache-write price (or input price when that is zero). |
+| `cache_write_1h_price_per_million` | number or null | Price for 1-hour cache writes; `null` falls back to the 30-minute cache-write price. |
+| `cache_write_12h_price_per_million` | number or null | Price for 12-hour cache writes; `null` falls back to the 1-hour cache-write price. |
+| `reasoning_price_per_million` | number or null | Price for reasoning output tokens; `null` bills them at the output price. |
+| `image_input_price_per_million` | number or null | Price for image input tokens; `null` falls back to the input price. |
+| `image_output_price_per_million` | number or null | Price for image output tokens; `null` falls back to the output price. |
+| `audio_input_price_per_million` | number or null | Price for audio input tokens; `null` falls back to the input price. |
+| `audio_output_price_per_million` | number or null | Price for audio output tokens; `null` falls back to the output price. |
+| `web_search_price_per_call` | number or null | USD per web search call; `null` bills nothing. |
+| `image_price_per_image` | number or null | USD per generated image; `null` bills nothing. |
+| `reasoning_effort_multipliers` | object or null | Map from normalized reasoning effort to token-cost multiplier; usage whose `reasoning_effort` is absent from the map is not multiplied. |
 | `source` | string | Price source. |
 | `enabled` | boolean | Whether the rule is active. |
 | `note` | string | Operator note. |
 | `created_at` | string | Creation time. |
 | `updated_at` | string | Last update time. |
 | `revision` | integer | Monotonic rule revision used by import conflict detection. |
+
+Optional dimension prices apply to sub-buckets carved out of the canonical v2 buckets, so totals never change: `cache_write_30m`/`cache_write_1h`/`cache_write_12h` come from the cache-write bucket, `image_input`/`audio_input` from uncached input, `reasoning` from output, and `image_output`/`audio_output` from non-reasoning output. Home reads the optional counters `cache_creation_30m_tokens` (alias `cache_write_30m_tokens` or `cache_details.ephemeral_30m_input_tokens`), `cache_creation_1h_tokens` (alias `cache_write_1h_tokens` or `cache_details.ephemeral_1h_input_tokens`), `cache_creation_12h_tokens` (alias `cache_write_12h_tokens` or `cache_details.ephemeral_12h_input_tokens`), `image_input_tokens`, `image_output_tokens`, `audio_input_tokens`, and `audio_output_tokens` from the usage `tokens` object or structured payload fields and clamps each to its parent bucket. When no TTL sub-bucket is set and `cache_details.ttl` names `30m`, `1h`, or `12h`, the cache-write bucket is assigned to that TTL. When CPA does not report a counter, its bucket is empty and the parent price applies. An explicit `0` bills the bucket as free; `null` never undercharges.
+
+Per-unit surcharges use the counters `web_search_requests` (fallback `tool_usage_details.web_search_calls`) and `image_count` (fallback `tool_usage_details.image_generation_calls`), read from the usage `tokens` object or the payload top level. They are billed as `count * unit_price` items (`web_search_calls`, `images`) in `cost_breakdown`, added like `request_price`, and not scaled by `reasoning_effort_multipliers`. With no unit price configured they bill nothing.
+
+#### Pricing expressions
+
+`pricing_expr` (string, optional) replaces every price column of the rule, including `request_price` and the optional dimensions. An empty string clears it. Rule matching (provider, model, service tier, and `min_input_tokens`) is unchanged; `reasoning_effort_multipliers` and the user `billing_multiplier` still apply to the result.
+
+The expression evaluates to USD per million tokens: each token variable is multiplied by a `$/1M` coefficient, so `p * 3 + c * 15` bills $3/M uncached input and $15/M output. `usd(x)` adds a fixed USD amount, for example `req * usd(0.01)` per request.
+
+| Name | Meaning |
+| --- | --- |
+| `p` | Uncached text input tokens. |
+| `c` | Non-reasoning text output tokens. |
+| `r` | Reasoning output tokens. |
+| `cr` | Cache-read tokens. |
+| `cc`, `cc30m`, `cc1h`, `cc12h` | 5-minute, 30-minute, 1-hour, and 12-hour cache-write tokens. |
+| `img`, `imgo` (`img_o`), `ai`, `ao`, `vi`, `vo`, `fi` | Image input, image output, audio input, audio output, video input, video output, and file/document input tokens. |
+| `img_cr`, `acr` (`ai_cr`), `ct`, `apred`, `rpred` | Image cache-read, audio cache-read, cached text, accepted prediction, and rejected prediction tokens. |
+| `len`, `total` | Full prompt context (`uncached + cache read + cache write`) and total (`input + output`) tokens, for conditions. |
+| `req` | `1` on succeeded requests, `0` on failed requests. |
+| `ws`, `wsq`, `wf`, `xs`, `ce` (`ci`), `fs`, `ds`, `mcp`, `maps`, `src`, `st` | Server-side tool counters from `tool_usage_details`: web search calls/queries, web fetch, X search, code execution, file/collections search, document search, MCP calls, Google Maps grounding chunks, sources used, and total server-side tools used. When the expression does not reference `ws`, the rule's `web_search_price_per_call` still applies. |
+| `imgn` (`image_count`), `pmedia`, `cmedia`, `paudio`, `asec`, `upcost` | Generated images, prompt/completion media counts, prompt audio count (`media_counts`), audio/video seconds (`media_counts.audio_seconds`), and upstream USD cost (`cost_details`). When the expression does not reference `imgn`/`image_count`, the rule's `image_price_per_image` still applies. |
+| `tier`, `upstream_tier`, `speed`, `geo`, `cache_ttl`, `img_size`, `img_res`, `img_quality`, `img_ratio`, `img_tier`, `byok`, `response_model`, `effort`, `model`, `provider`, `endpoint` | Effective service tier, upstream service tier, inference speed, inference geography, cache TTL/retention, image size/resolution/quality/aspect ratio/normalized size tier (`1k`/`2k`/`4k`), BYOK flag, upstream response model, reasoning effort, executed model, provider, and endpoint strings. String `==` and `!=` are case-insensitive. |
+| `hour(tz)`, `minute(tz)`, `weekday(tz)`, `month(tz)`, `day(tz)` | Usage time in an IANA timezone literal (default `UTC`); `weekday` is `0` for Sunday. |
+| `tier(name, expr)`, `fixed(x)`, `usd(x)`, `u(path)`, `s(path)` (`param(path)`), `min(...)`, `max(...)`, `abs(x)`, `ceil(x)`, `floor(x)`, `round(x)`, `contains(s, sub)` (`has(s, sub)`) | Helpers. `tier(name, expr)` records `matched_tier` in `cost_breakdown`; `fixed(x)` bills `req * usd(x)`; `u(path)` and `s(path)` read numeric/string fields from the usage payload. Optional `v1:` prefix is accepted. |
+
+Operators are `+ - * /`, comparisons, `&& || !`, and `cond ? a : b`. Example: `len > 200000 ? p * 6 + c * 22.5 + cr * 0.6 : p * 3 + c * 15 + cr * 0.3`. Peak pricing example: `(hour('Asia/Shanghai') >= 9 && hour('Asia/Shanghai') < 18 ? 1 : 0.5) * (p * 2 + c * 8)`.
+
+Cached text (`ct`) is carved out of the cache-read bucket and clamped to its remaining tokens after image/audio cache reads, preventing double billing. Unreferenced token buckets fold into their parent before evaluation so no reported token is dropped: `ct` into `cr`, `cc12h` into `cc1h` (or `cc`), `cc1h` into `cc`, `cc`, `cr`, `img`, and `ai` into `p`, and `imgo`, `ao`, and `r` into `c`. To bill a bucket as free, reference it explicitly, for example `cr * 0`. Saving validates syntax, variable and function names, timezone literals, and a sample evaluation that must return a finite non-negative number; invalid expressions return `400 invalid_body`. If evaluation fails at charge time (for example division by zero), Home bills with the rule's price columns and sets `cost_diagnostic: pricing_expr_error` with `cost_breakdown.expression_error`. Successful charges record `price_snapshot.pricing_expr`, `cost_breakdown.pricing_expr`, the folded token counts as `expr:<name>` items, and the result as the `expression` item. User price ladders include `pricing_expr` on rungs that use it.
 
 ### POST `/billing/model-prices`
 
@@ -1720,6 +1773,18 @@ Request body fields:
 | `cache_read_price_per_million` | number | no | Non-negative cache-read token price. |
 | `cache_write_price_per_million` | number | no | Non-negative cache-write token price. |
 | `request_price` | number | no | Non-negative per-request price. |
+| `cache_write_30m_price_per_million` | number or null | no | Optional non-negative 30-minute cache-write price. On `PATCH`, `null` clears it. |
+| `cache_write_1h_price_per_million` | number or null | no | Optional non-negative 1-hour cache-write price. On `PATCH`, `null` clears it. |
+| `cache_write_12h_price_per_million` | number or null | no | Optional non-negative 12-hour cache-write price. On `PATCH`, `null` clears it. |
+| `reasoning_price_per_million` | number or null | no | Optional non-negative reasoning-output price. On `PATCH`, `null` clears it. |
+| `image_input_price_per_million` | number or null | no | Optional non-negative image-input price. On `PATCH`, `null` clears it. |
+| `image_output_price_per_million` | number or null | no | Optional non-negative image-output price. On `PATCH`, `null` clears it. |
+| `audio_input_price_per_million` | number or null | no | Optional non-negative audio-input price. On `PATCH`, `null` clears it. |
+| `audio_output_price_per_million` | number or null | no | Optional non-negative audio-output price. On `PATCH`, `null` clears it. |
+| `web_search_price_per_call` | number or null | no | Optional non-negative USD per web search call. On `PATCH`, `null` clears it. |
+| `image_price_per_image` | number or null | no | Optional non-negative USD per generated image. On `PATCH`, `null` clears it. |
+| `reasoning_effort_multipliers` | object | no | Optional map from reasoning effort (case-insensitive, for example `xhigh`) to a non-negative token-cost multiplier. The request price is not multiplied. On `PATCH`, `{}` clears it. |
+| `pricing_expr` | string | no | Optional pricing expression that replaces the price columns. See Pricing expressions. On `PATCH`, `""` clears it. |
 | `source` | string | no | Price source such as `manual`. |
 | `enabled` | boolean | no | Whether the rule is active. Defaults to `true`. |
 | `note` | string | no | Operator note. |
@@ -1754,27 +1819,31 @@ Response:
 
 ### GET `/billing/settings`
 
-Returns the DB-backed billing policy. `service_tier_source` is `request` by default and may be `request` or `response`. `report_timezone` is a supported IANA timezone and defaults to `UTC`; it is the default calendar timezone for Management Billing reports when a request does not provide a `timezone` override. Changing it affects future report boundaries and grouping only. It does not reprice historical charges, rewrite price snapshots, or change balances. In either tier-source mode, `auto`, `default`, and `standard` match the local Standard price tier.
+Returns the DB-backed billing policy. `model_source` is `request` by default and may be `request` or `response` (`request` matches the requested/routed model first and falls back to `response_model`; `response` matches `response_model` first and falls back to the request model). `service_tier_source` is `request` by default and may be `request` or `response`. `report_timezone` is a supported IANA timezone and defaults to `UTC`; it is the default calendar timezone for Management Billing reports when a request does not provide a `timezone` override. Changing it affects future report boundaries and grouping only. It does not reprice historical charges, rewrite price snapshots, or change balances. In either tier-source mode, `auto`, `default`, and `standard` match the local Standard price tier.
+
+`allow_unpriced_models` defaults to `false`. While false, dispatch for a user-owned API key fails with `model_not_found` (`model <id> has no configured price`) when no enabled price rule names the requested model for any provider. A rule whose prices are all zero counts as configured, so explicitly free models remain callable. API keys that are not owned by a user are not gated. Set it to `true` to allow unpriced models; their charges are recorded at $0 with `cost_diagnostic: unpriced_model`.
 
 ```json
-{ "service_tier_source": "request", "report_timezone": "UTC" }
+{ "model_source": "request", "service_tier_source": "request", "report_timezone": "UTC", "allow_unpriced_models": false }
 ```
 
 ### PATCH `/billing/settings`
 
-Partially updates billing settings. Both fields are optional. In `response` mode, a missing response tier falls back to the request tier and records that fallback in the charge price snapshot. Invalid tier-source values or unsupported timezone names return `400 invalid_body`.
+Partially updates billing settings. All fields are optional. In `response` mode, a missing response tier falls back to the request tier and records that fallback in the charge price snapshot. Invalid tier-source values or unsupported timezone names return `400 invalid_body`.
 
 ```json
-{ "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
+{ "model_source": "request", "service_tier_source": "response", "report_timezone": "Asia/Shanghai" }
 ```
 
-OpenAI defines an omitted `service_tier` as `auto`; `auto` is represented internally by Home and is not a literal Codex backend request value. See the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) and [Responses Create reference](https://developers.openai.com/api/reference/resources/responses/methods/create). Home stores the request `service_tier` and optional upstream `response_service_tier` so later billing policy can switch sources without re-ingesting usage. The default `request` source bills from `service_tier` (client-requested tier). In `response` mode, Home uses `response_service_tier` when present and falls back to the request tier when the upstream omits it. `auto`, `default`, and `standard` map to the local Standard price tier; configure `flex` or `priority` rules when those tiers are used.
+OpenAI defines an omitted `service_tier` as `auto`; `auto` is represented internally by Home and is not a literal Codex backend request value. See the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) and [Responses Create reference](https://developers.openai.com/api/reference/resources/responses/methods/create). Home stores the request `service_tier` and optional upstream `response_service_tier` so later billing policy can switch sources without re-ingesting usage. The default `request` source bills from the outbound tier CPA reports as `effective_service_tier` (the tier in the final upstream request after CPA config overrides) and falls back to `service_tier` (client-requested tier) when the payload omits it, so a request CPA upgraded to `priority` bills as priority and one CPA downgraded bills at the lower tier. Snapshots record it as `outbound_service_tier`. In `response` mode, Home uses `response_service_tier` when present and falls back to the request tier when the upstream omits it. `auto`, `default`, and `standard` map to the local Standard price tier; configure `flex` or `priority` rules when those tiers are used.
 
-Charge `price_snapshot` audit data includes `requested_service_tier`, optional `response_service_tier`, `service_tier_source`, `effective_service_tier`, `response_tier_fallback`, `matched_service_tier`, and `min_input_tokens`. Context-band selection uses the original total input count. In the OpenAI Responses protocol, `input_tokens` includes both cache-read and cache-write tokens. Home removes cache-read tokens from ordinary input before applying the cache-read price. When `cache_write_price_per_million` is positive, Home also removes cache-write tokens from ordinary input before applying that separate price; when the price is zero or omitted, those cache-write tokens remain billed as ordinary input. In the Anthropic Messages protocol, `input_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` are independent buckets, so Home prices them independently without subtracting either cache bucket from input. Cache-field compatibility backfills update usage counters only; existing immutable `billing_charge` snapshots and balances are not repriced automatically, so historical corrections require an explicit audited balance adjustment.
+Charge `price_snapshot` audit data includes `requested_service_tier`, optional `response_service_tier`, `service_tier_source`, `effective_service_tier`, `response_tier_fallback`, `matched_service_tier`, `min_input_tokens`, `context_input_tokens`, and `price_model_source` (`model` or `alias`, omitted when no rule matched). Context-band selection uses `context_input_tokens`, the full prompt context including cache-read and cache-write tokens, so Anthropic usage with large cache hits selects the same band as an equivalent uncached prompt. In the OpenAI Responses protocol, `input_tokens` includes both cache-read and cache-write tokens. Home removes cache-read tokens from ordinary input before applying the cache-read price. When `cache_write_price_per_million` is positive, Home also removes cache-write tokens from ordinary input before applying that separate price; when the price is zero or omitted, those cache-write tokens remain billed as ordinary input. In the Anthropic Messages protocol, `input_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` are independent buckets, so Home prices them independently without subtracting either cache bucket from input. Cache-field compatibility backfills update usage counters only; existing immutable `billing_charge` snapshots and balances are not repriced automatically, so historical corrections require an explicit audited balance adjustment.
 
 ### POST `/billing/model-prices/import/preview`
 
-Creates a server-side, immutable `models.dev` import preview. The server fetches and pins the source snapshot; clients provide targets, matching policy, aliases, row multipliers, and optional source-match overrides. Invalid request-controlled input returns `422 invalid_import_preview`, a catalog fetch failure returns `502 models_dev_fetch_failed`, and an internal preview persistence failure returns `500 billing_import_preview_failed`. A successful response contains `preview_id`, `preview_revision`, source provenance, `generated_at`, `expires_at`, explicit `atomic: true`, rows, and an exact summary.
+OpenRouter time-based pricing expressions retain image/audio, reasoning, and cache-write TTL token prices in every branch. Optional token prices use their parent rate when unset and remain free when explicitly zero, including when another branch configures the same dimension.
+
+Creates a server-side, immutable model-price import preview from `source` (`"models.dev"`, `"openrouter"`, `"litellm"`, or `"auto"`). The server fetches and pins the source snapshot (or parses inline `catalog_json` when provided); clients provide `targets` (or `auto_discover: true` to discover models from stored usage and rules), matching policy, aliases, row multipliers, and optional source-match overrides. Invalid request-controlled input returns `422 invalid_import_preview`, a catalog fetch failure returns `502 models_dev_fetch_failed`, and an internal preview persistence failure returns `500 billing_import_preview_failed`. A successful response contains `preview_id`, `preview_revision`, source provenance, `generated_at`, `expires_at`, explicit `atomic: true`, rows, and an exact summary.
 
 Preview targets currently describe only the wildcard base rule (`service_tier: "*"`, `min_input_tokens: 0`); other target scopes are rejected rather than silently rewritten. A matched row includes official prices, final multiplied prices, the exact `write_rule`, optional complete `existing_rule` snapshot with `revision`, and a machine-readable reason. Models.dev context bands create distinct wildcard rows at their inclusive lower bounds. `row_multipliers` apply to the exact returned row key, including a context-band key. Cache-read and cache-write prices are imported from the pinned catalog snapshot. When a cost object has an input price but omits `cache_read` or `cache_write`, Home derives the missing price as `input * 0.1` or `input * 1.25`, respectively; explicit values, including zero, are preserved. Unsupported dimensions, malformed or invalid prices/bands, duplicate bands, or a tier that omits a price dimension configured by its base rule make the whole target non-applicable; the server never imports a potentially undercharged subset.
 

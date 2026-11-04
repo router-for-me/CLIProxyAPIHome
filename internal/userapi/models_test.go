@@ -272,6 +272,38 @@ func TestAccessibleModelsReturnPriceLadderWithoutOperatorBookkeeping(t *testing.
 	if foreign.Pricing == nil || foreign.Pricing.Status != pricingStatusUnpublished {
 		t.Errorf("foreign-provider pricing = %+v, want unpublished", foreign.Pricing)
 	}
+
+	// Wildcard rules (provider="*" and trailing model pattern "mystery-*") must
+	// publish pricing for servable models using the same specificity as billing.
+	ctx := context.Background()
+	if _, errWildProv := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
+		Provider:              "*",
+		Model:                 "text-only-model",
+		ServiceTier:           "*",
+		InputPricePerMillion:  1.25,
+		OutputPricePerMillion: 5.0,
+		Enabled:               true,
+	}); errWildProv != nil {
+		t.Fatalf("CreateBillingModelPrice(provider=*) error = %v", errWildProv)
+	}
+	if _, errWildModel := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
+		Provider:              "openai",
+		Model:                 "mystery-*",
+		ServiceTier:           "*",
+		InputPricePerMillion:  0.75,
+		OutputPricePerMillion: 3.0,
+		Enabled:               true,
+	}); errWildModel != nil {
+		t.Fatalf("CreateBillingModelPrice(model=mystery-*) error = %v", errWildModel)
+	}
+	wildcardPayload := getUserModels(t, handler.ListAccessibleModels, "/models/accessible", createUserBillingBearerToken(t, handler, user.ID))
+	wildcardModels := indexUserModelsByID(wildcardPayload.Models)
+	if got := wildcardModels["text-only-model"].Pricing; got == nil || got.Status != pricingStatusPublished || len(got.Providers) != 1 || got.Providers[0].Provider != "openai" || got.Providers[0].Tiers[0].Rungs[0].InputPricePerMillion != 1.25 {
+		t.Fatalf("provider=* catalog pricing = %+v, want published openai @ 1.25", got)
+	}
+	if got := wildcardModels["mystery-model"].Pricing; got == nil || got.Status != pricingStatusPublished || len(got.Providers) != 1 || got.Providers[0].Provider != "openai" || got.Providers[0].Tiers[0].Rungs[0].InputPricePerMillion != 0.75 {
+		t.Fatalf("model=mystery-* catalog pricing = %+v, want published openai @ 0.75", got)
+	}
 }
 
 func TestAccessibleModelsReportInsufficientAvailabilityData(t *testing.T) {

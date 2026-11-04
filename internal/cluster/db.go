@@ -239,6 +239,11 @@ func autoMigrate(db *gorm.DB) error {
 func autoMigrateSchema(db *gorm.DB) error {
 	startedAt := time.Now()
 	isPostgres := db.Dialector.Name() == "postgres"
+	if db.Migrator().HasTable(&BillingChargeRecord{}) && !db.Migrator().HasColumn(&BillingChargeRecord{}, "billing_multiplier") {
+		if errAdd := db.Exec(`ALTER TABLE "billing_charge" ADD COLUMN "billing_multiplier" numeric NOT NULL DEFAULT 1`).Error; errAdd != nil {
+			return fmt.Errorf("add billing_charge.billing_multiplier column: %w", errAdd)
+		}
+	}
 	if errMigrate := db.AutoMigrate(databaseMigrationModels()...); errMigrate != nil {
 		log.WithFields(log.Fields{
 			"database_backend":            db.Dialector.Name(),

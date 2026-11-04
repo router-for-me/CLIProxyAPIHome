@@ -37,25 +37,26 @@ func (o *optionalJSONFloat) UnmarshalJSON(data []byte) error {
 }
 
 type userWriteRequest struct {
-	Username         *string           `json:"username"`
-	UserName         *string           `json:"user_name"`
-	UserNameDash     *string           `json:"user-name"`
-	Password         *string           `json:"password"`
-	Credits          *float64          `json:"credits"`
-	CreditsUnlimited *bool             `json:"credits_unlimited"`
-	Timezone         *string           `json:"timezone"`
-	Limit5h          optionalJSONFloat `json:"limit_5h_credits"`
-	WindowMode5h     *string           `json:"window_mode_5h"`
-	Limit1d          optionalJSONFloat `json:"limit_1d_credits"`
-	WindowMode1d     *string           `json:"window_mode_1d"`
-	Limit7d          optionalJSONFloat `json:"limit_7d_credits"`
-	WindowMode7d     *string           `json:"window_mode_7d"`
-	WeekResetDay     *int              `json:"week_reset_day"`
-	WeekResetHour    *int              `json:"week_reset_hour"`
-	Limit30d         optionalJSONFloat `json:"limit_30d_credits"`
-	WindowMode30d    *string           `json:"window_mode_30d"`
-	MFA              json.RawMessage   `json:"mfa"`
-	Passkey          json.RawMessage   `json:"passkey"`
+	Username          *string           `json:"username"`
+	UserName          *string           `json:"user_name"`
+	UserNameDash      *string           `json:"user-name"`
+	Password          *string           `json:"password"`
+	Credits           *float64          `json:"credits"`
+	CreditsUnlimited  *bool             `json:"credits_unlimited"`
+	BillingMultiplier optionalJSONFloat `json:"billing_multiplier"`
+	Timezone          *string           `json:"timezone"`
+	Limit5h           optionalJSONFloat `json:"limit_5h_credits"`
+	WindowMode5h      *string           `json:"window_mode_5h"`
+	Limit1d           optionalJSONFloat `json:"limit_1d_credits"`
+	WindowMode1d      *string           `json:"window_mode_1d"`
+	Limit7d           optionalJSONFloat `json:"limit_7d_credits"`
+	WindowMode7d      *string           `json:"window_mode_7d"`
+	WeekResetDay      *int              `json:"week_reset_day"`
+	WeekResetHour     *int              `json:"week_reset_hour"`
+	Limit30d          optionalJSONFloat `json:"limit_30d_credits"`
+	WindowMode30d     *string           `json:"window_mode_30d"`
+	MFA               json.RawMessage   `json:"mfa"`
+	Passkey           json.RawMessage   `json:"passkey"`
 }
 
 type userPeriodLimitResetRequest struct {
@@ -84,6 +85,7 @@ type userJSONFieldSpec struct {
 
 var userWriteJSONFieldSpecs = []userJSONFieldSpec{
 	{Field: "credits_unlimited", Code: userJSONFieldErrInvalidType, Expected: "a boolean or null", Type: userJSONFieldBoolean},
+	{Field: "billing_multiplier", Code: cluster.PeriodLimitErrInvalidLimit, Expected: "a number or null", Type: userJSONFieldNumber},
 	{Field: "timezone", Code: cluster.PeriodLimitErrInvalidTimezone, Expected: "a string or null", Type: userJSONFieldString},
 	{Field: "limit_5h_credits", Code: cluster.PeriodLimitErrInvalidLimit, Expected: "a number or null", Type: userJSONFieldNumber},
 	{Field: "window_mode_5h", Code: cluster.PeriodLimitErrInvalidWindowMode, Expected: "a string or null", Type: userJSONFieldString},
@@ -340,6 +342,7 @@ func userUpdateFromRequest(c *gin.Context, body userWriteRequest, requireUsernam
 	update.Password = password
 	update.Credits = body.Credits
 	update.CreditsUnlimited = body.CreditsUnlimited
+	update.BillingMultiplier = optionalFloatToUpdate(body.BillingMultiplier)
 	update.Timezone = body.Timezone
 	update.Limit5hCredits = optionalFloatToUpdate(body.Limit5h)
 	update.WindowMode5h = body.WindowMode5h
@@ -484,6 +487,7 @@ func userRecordToMap(record *cluster.UserRecord) gin.H {
 		"password_set":            record.Password != "",
 		"credits":                 record.Credits,
 		"credits_unlimited":       record.CreditsUnlimited,
+		"billing_multiplier":      record.BillingMultiplier,
 		"timezone":                timezone,
 		"limit_5h_credits":        record.Limit5hCredits,
 		"window_mode_5h":          windowMode5h,
