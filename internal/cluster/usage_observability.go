@@ -2885,24 +2885,38 @@ func usageObservabilityEventType(row *usageObservabilityRecordRow, payload map[s
 }
 
 func usageObservabilityToolUsageFromPayload(rawPayload string) *UsageObservabilityToolUsage {
-	if strings.TrimSpace(rawPayload) == "" {
+	payload := strings.TrimSpace(rawPayload)
+	if payload == "" {
 		return nil
 	}
-	details := extractBillingTokenDetails("", rawPayload)
-	imgCalls := usagePayloadNonNegativeInt(rawPayload, "tool_usage_details.image_generation_calls", "server_side_tool_usage_details.image_generation_calls")
+	first := func(paths ...string) int64 {
+		for _, path := range paths {
+			if n := billingPayloadInt64(payload, path); n > 0 {
+				return n
+			}
+			if n := billingPayloadInt64(payload, "tokens."+path); n > 0 {
+				return n
+			}
+		}
+		return 0
+	}
 	out := &UsageObservabilityToolUsage{
-		WebSearchCalls:         details.WebSearchCalls,
-		WebSearchQueries:       details.WebSearchQueries,
-		WebFetchCalls:          details.WebFetchCalls,
-		XSearchCalls:           details.XSearchCalls,
-		CodeExecutionCalls:     details.CodeExecutionCalls,
-		FileSearchCalls:        details.FileSearchCalls,
-		DocumentSearchCalls:    details.DocumentSearchCalls,
-		MCPCalls:               details.MCPCalls,
-		GoogleMapsChunks:       details.GoogleMapsChunks,
-		NumSourcesUsed:         details.NumSourcesUsed,
-		NumServerSideToolsUsed: details.NumServerSideToolsUsed,
-		ImageGenerationCalls:   imgCalls,
+		WebSearchCalls: first(
+			"web_search_requests",
+			"tool_usage_details.web_search_calls",
+			"server_tool_use.web_search_requests",
+		),
+		WebSearchQueries:       first("tool_usage_details.web_search_queries"),
+		WebFetchCalls:          first("tool_usage_details.web_fetch_calls", "server_tool_use.web_fetch_requests"),
+		XSearchCalls:           first("tool_usage_details.x_search_calls"),
+		CodeExecutionCalls:     first("tool_usage_details.code_execution_calls", "server_tool_use.code_execution_requests"),
+		FileSearchCalls:        first("tool_usage_details.file_search_calls", "server_tool_use.file_search_requests"),
+		DocumentSearchCalls:    first("tool_usage_details.document_search_calls"),
+		MCPCalls:               first("tool_usage_details.mcp_calls", "server_tool_use.mcp_requests"),
+		GoogleMapsChunks:       first("tool_usage_details.extra.google_maps_chunks", "google_maps_chunks"),
+		NumSourcesUsed:         first("tool_usage_details.num_sources_used", "num_sources_used"),
+		NumServerSideToolsUsed: first("tool_usage_details.num_server_side_tools_used", "num_server_side_tools_used"),
+		ImageGenerationCalls:   first("tool_usage_details.image_generation_calls", "server_side_tool_usage_details.image_generation_calls"),
 	}
 	if out.WebSearchCalls <= 0 &&
 		out.WebSearchQueries <= 0 &&
