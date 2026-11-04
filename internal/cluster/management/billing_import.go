@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
 const (
@@ -41,6 +42,14 @@ func (h *Handler) PreviewBillingModelPriceImport(c *gin.Context) {
 	}
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
+	if body.AutoDiscover && len(body.Targets) == 0 {
+		discovered, errDiscover := h.discoverBillingImportTargetsWithRegistry(ctx)
+		if errDiscover != nil {
+			respondError(c, http.StatusInternalServerError, "billing_import_preview_failed", errDiscover)
+			return
+		}
+		body.Targets = discovered
+	}
 	catalog, errCatalog := h.resolveBillingModelPriceImportCatalog(ctx, body)
 	if errCatalog != nil {
 		respondError(c, http.StatusBadGateway, "models_dev_fetch_failed", errCatalog)
@@ -870,6 +879,56 @@ func parseLiteLLMBillingImportCatalog(raw []byte, sourceURL string, fetchedAt ti
 	return catalog, nil
 }
 
+func (h *Handler) discoverBillingImportTargetsWithRegistry(ctx context.Context) ([]cluster.BillingModelPriceImportTarget, error) {
+	targets, errTargets := h.repo.DiscoverBillingImportTargets(ctx)
+	if errTargets != nil {
+		return nil, errTargets
+	}
+	seen := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		seen[strings.ToLower(strings.TrimSpace(t.Provider))+"::"+strings.TrimSpace(t.Model)] = struct{}{}
+	}
+	for _, def := range registry.GetGlobalRegistry().GetAvailableModelDefinitions() {
+		if def == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(def.ID)
+		if modelID == "" || strings.Contains(modelID, "*") {
+			continue
+		}
+		for _, rawProv := range def.Providers {
+			prov := strings.ToLower(strings.TrimSpace(rawProv))
+			if prov == "" || strings.Contains(prov, "*") {
+				continue
+			}
+			key := prov + "::" + modelID
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			targets = append(targets, cluster.BillingModelPriceImportTarget{
+				Provider:       prov,
+				Model:          modelID,
+				ServiceTier:    cluster.BillingServiceTierWildcard,
+				MinInputTokens: 0,
+				Label:          modelID,
+			})
+		}
+	}
+	return targets, nil
+}
+
+func canonicalBillingImportProvider(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "x-ai":
+		return "xai"
+	case "google-vertex", "vertex_ai":
+		return "vertex"
+	default:
+		return strings.ToLower(strings.TrimSpace(provider))
+	}
+}
+
 func mergeBillingImportCatalogs(catalogs []cluster.BillingModelPriceImportCatalog, fetchedAt time.Time) cluster.BillingModelPriceImportCatalog {
 	out := cluster.BillingModelPriceImportCatalog{
 		SourceURL: catalogs[0].SourceURL,
@@ -879,7 +938,7 @@ func mergeBillingImportCatalogs(catalogs []cluster.BillingModelPriceImportCatalo
 	indexByKey := make(map[string]int)
 	for _, cat := range catalogs {
 		for _, m := range cat.Models {
-			key := strings.ToLower(strings.TrimSpace(m.Provider)) + "::" + strings.ToLower(strings.TrimSpace(m.Model))
+			key := canonicalBillingImportProvider(m.Provider) + "::" + strings.ToLower(strings.TrimSpace(m.Model))
 			if idx, exists := indexByKey[key]; exists {
 				mergeBillingImportCatalogModel(&out.Models[idx], m)
 				continue
@@ -921,6 +980,10 @@ func mergeBillingImportCatalogModel(dst *cluster.BillingModelPriceImportCatalogM
 	}
 	if len(dst.ContextBands) == 0 && len(src.ContextBands) > 0 {
 		dst.ContextBands = src.ContextBands
+	}
+	for i := range dst.ContextBands {
+		fillPtr(&dst.ContextBands[i].Cost.WebSearch, src.Cost.WebSearch)
+		fillPtr(&dst.ContextBands[i].Cost.Image, src.Cost.Image)
 	}
 }
 

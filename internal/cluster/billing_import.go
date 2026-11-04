@@ -1392,6 +1392,14 @@ func billingImportVersionDelimiterVariants(model string) []string {
 	return out
 }
 
+func (r *Repository) DiscoverBillingImportTargets(ctx context.Context) ([]BillingModelPriceImportTarget, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	return r.discoverBillingImportTargets(contextOrBackground(ctx), db)
+}
+
 func (r *Repository) discoverBillingImportTargets(ctx context.Context, db *gorm.DB) ([]BillingModelPriceImportTarget, error) {
 	type pair struct {
 		Provider string
