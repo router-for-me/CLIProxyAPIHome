@@ -3186,6 +3186,7 @@ Key `UsageRecordSummary` fields:
 | `reasoning_effort` | string/null | Usage payload reasoning effort. |
 | `token_breakdown` | object | Canonical v2 mutually exclusive input/output/unclassified token buckets. Consume only when `capabilities.usage_token_breakdown_v2=true`. |
 | `client.client_ip` | string/null | Caller IP associated with the usage payload. This is not treated as the CPA node IP. |
+| `client.user_agent` | string/null | Caller User-Agent reported in the usage payload. |
 | `credential.api_key_preview` | string/null | Redacted provider API key preview when available; raw keys are never returned. |
 | `billing.balance_before` / `billing.balance_after` | number/null | Balance before and after the charge when linked to `billing_charge`. |
 | `runtime.home_ip` / `runtime.home_port` | string/integer/null | Home node identity that persisted the usage record. |

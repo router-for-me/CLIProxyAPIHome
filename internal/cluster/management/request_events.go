@@ -293,6 +293,7 @@ func requestEventClientResponse(record *cluster.UsageObservabilityRecord) gin.H 
 		"client_key_label":  record.Client.APIKeyLabel,
 		"client_key_masked": record.Client.APIKeyMasked,
 		"client_ip":         emptyStringAsNil(record.Client.ClientIP),
+		"user_agent":        emptyStringAsNil(record.Client.UserAgent),
 	}
 }
 
@@ -418,7 +419,7 @@ func requestEventFlattenedValue(item gin.H, key string) any {
 			credentialKey = key
 		}
 		return nestedMapValue(item, "credential", credentialKey)
-	case "user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip":
+	case "user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip", "user_agent":
 		return nestedMapValue(item, "client", key)
 	case "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens":
 		return nestedMapValue(item, "tokens", key)
@@ -467,7 +468,7 @@ func requestEventExportCSVHeader() []string {
 		"provider", "model", "original_model", "model_alias", "endpoint", "source", "executor_type", "service_tier", "reasoning_effort",
 		"home_ip", "home_port", "home_id", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label",
 		"credential_type", "credential_id", "auth_index", "credential_provider", "credential_label", "credential_source", "credential_api_key_preview",
-		"user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip",
+		"user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip", "user_agent",
 		"input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
 		"latency_ms", "ttft_ms", "tps", "amount", "currency", "charge_id", "matched_price_rule",
 		"error_status_code", "error_upstream_status_code", "error_reason", "error_message", "error_body_preview",

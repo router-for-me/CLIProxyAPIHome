@@ -3175,6 +3175,7 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 | `reasoning_effort` | string/null | usage payload 的 reasoning effort。 |
 | `token_breakdown` | object | Token Accounting v2 的互斥输入、输出和未分类 Token 桶；仅在 `capabilities.usage_token_breakdown_v2=true` 时消费。 |
 | `client.client_ip` | string/null | payload 中可关联的调用方 IP；不会被当作 CPA 节点 IP。 |
+| `client.user_agent` | string/null | payload 中上报的调用方 User-Agent。 |
 | `credential.api_key_preview` | string/null | 仅 provider API key 可用时返回脱敏 preview；不会返回 raw key。 |
 | `billing.balance_before` / `billing.balance_after` | number/null | 关联 `billing_charge` 时的扣款前后余额。 |
 | `runtime.home_ip` / `runtime.home_port` | string/integer/null | 写入 usage 的 Home 节点标识。 |

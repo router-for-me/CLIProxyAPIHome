@@ -300,6 +300,7 @@ type UsageObservabilityClient struct {
 	UserID       *uint
 	Username     string
 	ClientIP     string
+	UserAgent    string
 }
 
 type UsageObservabilityCredential struct {
@@ -3932,6 +3933,7 @@ func usageObservabilityClient(row *usageObservabilityRecordRow, payload map[stri
 		UserID:       normalizeOptionalUint(row.ClientUserID),
 		Username:     strings.TrimSpace(row.Username),
 		ClientIP:     firstStringFromPayload(payload, "client_ip", "client.ip", "remote_addr"),
+		UserAgent:    firstStringFromPayload(payload, "user_agent", "client.user_agent", "userAgent"),
 	}
 }
 

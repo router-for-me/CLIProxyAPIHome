@@ -587,6 +587,9 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 	if priority := priorityFromAuth(auth); priority != nil {
 		entry["priority"] = *priority
 	}
+	if weight := weightFromAuth(auth); weight != nil {
+		entry["weight"] = *weight
+	}
 	if note := noteFromAuth(auth); note != "" {
 		entry["note"] = note
 	}
@@ -1160,6 +1163,26 @@ func priorityFromAuth(auth *coreauth.Auth) *int {
 		if priorityRaw, ok := auth.Metadata["priority"].(float64); ok {
 			priority := int(priorityRaw)
 			return &priority
+		}
+	}
+	return nil
+}
+
+// weightFromAuth derives an explicit non-negative routing weight from auth.
+func weightFromAuth(auth *coreauth.Auth) *int {
+	if auth == nil {
+		return nil
+	}
+	if auth.Attributes != nil {
+		if weightRaw := strings.TrimSpace(auth.Attributes["weight"]); weightRaw != "" {
+			if weight, errAtoi := strconv.Atoi(weightRaw); errAtoi == nil && weight >= 0 {
+				return &weight
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		if weight, ok := oauthIntValue(auth.Metadata["weight"]); ok && weight >= 0 {
+			return &weight
 		}
 	}
 	return nil
