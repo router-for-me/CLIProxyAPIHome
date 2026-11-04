@@ -45,6 +45,7 @@ type billingSettingsRequest struct {
 	ServiceTierSource   *string `json:"service_tier_source"`
 	ReportTimezone      *string `json:"report_timezone"`
 	AllowUnpricedModels *bool   `json:"allow_unpriced_models"`
+	PublicModelPricing  *bool   `json:"public_model_pricing"`
 }
 
 type billingBalanceRequest struct {
@@ -283,6 +284,7 @@ func (h *Handler) UpdateBillingSettings(c *gin.Context) {
 		ServiceTierSource:   body.ServiceTierSource,
 		ReportTimezone:      body.ReportTimezone,
 		AllowUnpricedModels: body.AllowUnpricedModels,
+		PublicModelPricing:  body.PublicModelPricing,
 	})
 	if errSettings != nil {
 		if strings.Contains(errSettings.Error(), "model_source") || strings.Contains(errSettings.Error(), "service_tier_source") || strings.Contains(errSettings.Error(), "report_timezone") {

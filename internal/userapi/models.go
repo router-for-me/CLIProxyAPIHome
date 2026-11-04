@@ -85,6 +85,21 @@ func (h *Handler) ListModels(c *gin.Context) {
 	defer cancel()
 
 	models := availableUserModels()
+	settings, errSettings := h.repo.GetBillingSettings(ctx)
+	if errSettings != nil {
+		respondError(c, http.StatusInternalServerError, "billing_settings_load_failed", errSettings)
+		return
+	}
+
+	if !settings.PublicModelPricing {
+		items := make([]gin.H, 0, len(models))
+		for _, model := range models {
+			items = append(items, userModelResponse(model, nil))
+		}
+		c.JSON(http.StatusOK, gin.H{"models": items, "total": len(items)})
+		return
+	}
+
 	modelIDs := make([]string, 0, len(models))
 	for _, model := range models {
 		modelIDs = append(modelIDs, model.ID)

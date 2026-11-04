@@ -315,6 +315,9 @@ type BillingSettings struct {
 	// price rule. It defaults to false so a missing rule never silently bills $0;
 	// an explicit rule with zero prices is still allowed.
 	AllowUnpricedModels bool `json:"allow_unpriced_models"`
+	// PublicModelPricing exposes model price ladders and availability metrics on
+	// the unauthenticated public catalog endpoint (/user/models) when enabled.
+	PublicModelPricing bool `json:"public_model_pricing"`
 }
 
 type BillingSettingsPatch struct {
@@ -322,6 +325,7 @@ type BillingSettingsPatch struct {
 	ServiceTierSource   *string
 	ReportTimezone      *string
 	AllowUnpricedModels *bool
+	PublicModelPricing  *bool
 }
 
 func (r *Repository) GetBillingSettings(ctx context.Context) (BillingSettings, error) {
@@ -360,6 +364,9 @@ func (r *Repository) UpdateBillingSettings(ctx context.Context, patch BillingSet
 	}
 	if patch.AllowUnpricedModels != nil {
 		settings.AllowUnpricedModels = *patch.AllowUnpricedModels
+	}
+	if patch.PublicModelPricing != nil {
+		settings.PublicModelPricing = *patch.PublicModelPricing
 	}
 	raw, errMarshal := json.Marshal(settings)
 	if errMarshal != nil {

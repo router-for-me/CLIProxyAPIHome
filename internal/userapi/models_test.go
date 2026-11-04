@@ -39,11 +39,28 @@ func TestPublicModelCatalogWithholdsPriceAndAvailability(t *testing.T) {
 		t.Fatalf("models = %d, want the full registered catalog", len(payload.Models))
 	}
 	for _, model := range payload.Models {
+		if model.Pricing != nil {
+			t.Errorf("model %s exposes pricing to an anonymous visitor when public_model_pricing is false", model.ID)
+		}
+		if model.Availability != nil {
+			t.Errorf("model %s exposes availability to an anonymous visitor when public_model_pricing is false", model.ID)
+		}
+	}
+
+	publicPricing := true
+	if _, errPatch := handler.repo.UpdateBillingSettings(context.Background(), cluster.BillingSettingsPatch{
+		PublicModelPricing: &publicPricing,
+	}); errPatch != nil {
+		t.Fatalf("UpdateBillingSettings(public_model_pricing=true) error = %v", errPatch)
+	}
+
+	publicPayload := getUserModels(t, handler.ListModels, "/models", "")
+	for _, model := range publicPayload.Models {
 		if model.Pricing == nil {
-			t.Errorf("model %s missing public pricing", model.ID)
+			t.Errorf("model %s missing public pricing when public_model_pricing is true", model.ID)
 		}
 		if model.Availability == nil {
-			t.Errorf("model %s missing public availability", model.ID)
+			t.Errorf("model %s missing public availability when public_model_pricing is true", model.ID)
 		}
 	}
 }
