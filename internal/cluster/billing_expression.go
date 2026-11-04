@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -163,7 +164,7 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 	if errEval != nil {
 		return fmt.Errorf("evaluate pricing_expr: %w", errEval)
 	}
-	// Record the folded buckets and server-tool counters for audit; their cost is carried by the expression item.
+	// Record the folded buckets and server-tool counters with their marginal USD contribution.
 	for _, name := range []string{
 		billingexpr.VarInput, billingexpr.VarImageInput, billingexpr.VarAudioInput,
 		billingexpr.VarVideoInput, billingexpr.VarFileInput, billingexpr.VarImageCacheRead,
@@ -183,7 +184,19 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 		if cost.Items == nil {
 			cost.Items = make(map[string]BillingCostItem)
 		}
-		cost.Items["expr:"+name] = BillingCostItem{Tokens: int64(tokens)}
+		item := BillingCostItem{Tokens: int64(tokens)}
+		numbers[name] = 0
+		withoutAmount, _, errWithout := program.EvalUSDWithTrace(env)
+		numbers[name] = tokens
+		if errWithout == nil && amount > withoutAmount {
+			item.Cost = billingRoundAmount(amount - withoutAmount)
+			if isBillingExpressionUnitVar(name) {
+				item.PricePerMillion = billingRoundAmount(item.Cost / tokens)
+			} else {
+				item.PricePerMillion = billingRoundAmount(item.Cost * 1000000 / tokens)
+			}
+		}
+		cost.Items["expr:"+name] = item
 	}
 	if cost.Items == nil {
 		cost.Items = make(map[string]BillingCostItem)
@@ -202,6 +215,103 @@ func billingExpressionChargeCost(cost *BillingCostBreakdown, usage *UsageRecord,
 	cost.PricingExpr = program.Source()
 	cost.MatchedTier = matchedTier
 	return nil
+}
+
+func isBillingExpressionUnitVar(name string) bool {
+	switch name {
+	case billingexpr.VarWebSearchCalls, billingexpr.VarWebSearchQueries, billingexpr.VarWebFetchCalls,
+		billingexpr.VarXSearchCalls, billingexpr.VarCodeExecutionCalls, billingexpr.VarFileSearchCalls,
+		billingexpr.VarDocumentSearchCalls, billingexpr.VarMCPCalls, billingexpr.VarGoogleMapsChunks,
+		billingexpr.VarNumSourcesUsed, billingexpr.VarNumServerSideToolsUsed, billingexpr.VarImages:
+		return true
+	default:
+		return false
+	}
+}
+
+func enrichBillingCostBreakdownForObservability(rawBreakdown JSONB, rawPayload JSONB) JSONB {
+	if len(rawBreakdown) == 0 {
+		return nil
+	}
+	var bd BillingCostBreakdown
+	if errUnmarshal := json.Unmarshal(rawBreakdown, &bd); errUnmarshal != nil {
+		return rawBreakdown
+	}
+	if strings.TrimSpace(bd.PricingExpr) == "" {
+		return rawBreakdown
+	}
+	program, errCompile := billingexpr.Compile(bd.PricingExpr)
+	if errCompile != nil {
+		return rawBreakdown
+	}
+	if bd.Items == nil {
+		bd.Items = make(map[string]BillingCostItem)
+	}
+	numbers := make(map[string]float64)
+	for key, item := range bd.Items {
+		if strings.HasPrefix(key, "expr:") && item.Tokens > 0 {
+			numbers[strings.TrimPrefix(key, "expr:")] = float64(item.Tokens)
+		}
+	}
+	if toolUsage := usageObservabilityToolUsageFromPayload(string(rawPayload)); toolUsage != nil {
+		setIfPositive := func(name string, val int64) {
+			if val > 0 && numbers[name] == 0 {
+				numbers[name] = float64(val)
+			}
+		}
+		setIfPositive(billingexpr.VarWebSearchCalls, toolUsage.WebSearchCalls)
+		setIfPositive(billingexpr.VarWebSearchQueries, toolUsage.WebSearchQueries)
+		setIfPositive(billingexpr.VarWebFetchCalls, toolUsage.WebFetchCalls)
+		setIfPositive(billingexpr.VarXSearchCalls, toolUsage.XSearchCalls)
+		setIfPositive(billingexpr.VarCodeExecutionCalls, toolUsage.CodeExecutionCalls)
+		setIfPositive(billingexpr.VarFileSearchCalls, toolUsage.FileSearchCalls)
+		setIfPositive(billingexpr.VarDocumentSearchCalls, toolUsage.DocumentSearchCalls)
+		setIfPositive(billingexpr.VarMCPCalls, toolUsage.MCPCalls)
+		setIfPositive(billingexpr.VarGoogleMapsChunks, toolUsage.GoogleMapsChunks)
+		setIfPositive(billingexpr.VarNumSourcesUsed, toolUsage.NumSourcesUsed)
+		setIfPositive(billingexpr.VarNumServerSideToolsUsed, toolUsage.NumServerSideToolsUsed)
+	}
+	numbers[billingexpr.VarRequest] = 1
+	env := billingexpr.Env{Numbers: numbers}
+	totalAmount, _, errEval := program.EvalUSDWithTrace(env)
+	if errEval != nil {
+		return rawBreakdown
+	}
+	updated := false
+	for name, tokens := range numbers {
+		if name == billingexpr.VarRequest || tokens <= 0 {
+			continue
+		}
+		key := "expr:" + name
+		existing := bd.Items[key]
+		if existing.Cost > 0 {
+			continue
+		}
+		numbers[name] = 0
+		withoutAmount, _, errWithout := program.EvalUSDWithTrace(env)
+		numbers[name] = tokens
+		if errWithout == nil && totalAmount > withoutAmount {
+			costVal := billingRoundAmount(totalAmount - withoutAmount)
+			unitRate := billingRoundAmount(costVal * 1000000 / tokens)
+			if isBillingExpressionUnitVar(name) {
+				unitRate = billingRoundAmount(costVal / tokens)
+			}
+			bd.Items[key] = BillingCostItem{
+				Tokens:          int64(tokens),
+				PricePerMillion: unitRate,
+				Cost:            costVal,
+			}
+			updated = true
+		}
+	}
+	if !updated {
+		return rawBreakdown
+	}
+	encoded, errMarshal := json.Marshal(bd)
+	if errMarshal != nil {
+		return rawBreakdown
+	}
+	return JSONB(encoded)
 }
 
 // billingNormalizeImageSizeTier maps raw image resolution or WxH dimensions to

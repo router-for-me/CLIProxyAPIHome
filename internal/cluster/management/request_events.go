@@ -365,11 +365,18 @@ func requestEventPerformanceResponse(record *cluster.UsageObservabilityRecord) g
 }
 
 func requestEventBillingResponse(record *cluster.UsageObservabilityRecord) gin.H {
+	var costBreakdown any
+	if len(record.Billing.CostBreakdown) > 0 {
+		costBreakdown = record.Billing.CostBreakdown
+	}
 	return gin.H{
 		"amount":             optionalFloat64Value(record.Billing.Amount),
+		"base_amount":        optionalFloat64Value(record.Billing.BaseAmount),
+		"billing_multiplier": optionalFloat64Value(record.Billing.BillingMultiplier),
 		"currency":           emptyStringAsNil(record.Billing.Currency),
 		"charge_id":          emptyStringAsNil(record.Billing.ChargeID),
 		"matched_price_rule": emptyStringAsNil(record.Billing.MatchedPriceRule),
+		"cost_breakdown":     costBreakdown,
 	}
 }
 

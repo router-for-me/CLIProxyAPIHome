@@ -332,13 +332,16 @@ type UsageObservabilityCredential struct {
 }
 
 type UsageObservabilityBilling struct {
-	ChargeID         string
-	Amount           *float64
-	Currency         string
-	BillingBasis     string
-	MatchedPriceRule string
-	BalanceBefore    *float64
-	BalanceAfter     *float64
+	ChargeID          string
+	Amount            *float64
+	BaseAmount        *float64
+	BillingMultiplier *float64
+	Currency          string
+	BillingBasis      string
+	MatchedPriceRule  string
+	BalanceBefore     *float64
+	BalanceAfter      *float64
+	CostBreakdown     JSONB
 }
 
 type UsageObservabilityRuntime struct {
@@ -427,9 +430,12 @@ type usageObservabilityRecordRow struct {
 	Username                   string          `gorm:"column:username"`
 	ChargeID                   string          `gorm:"column:charge_id"`
 	Amount                     sql.NullFloat64 `gorm:"column:amount"`
+	BaseAmount                 sql.NullFloat64 `gorm:"column:base_amount"`
+	BillingMultiplier          sql.NullFloat64 `gorm:"column:billing_multiplier"`
 	MatchedPriceRule           string          `gorm:"column:matched_price_rule"`
 	BalanceBefore              sql.NullFloat64 `gorm:"column:balance_before"`
 	BalanceAfter               sql.NullFloat64 `gorm:"column:balance_after"`
+	CostBreakdown              JSONB           `gorm:"column:cost_breakdown"`
 	UsageAuthIndex             string          `gorm:"column:usage_auth_index"`
 	AuthUUID                   string          `gorm:"column:auth_uuid"`
 	AuthJSON                   JSONB           `gorm:"column:auth_json"`
@@ -2433,9 +2439,12 @@ func usageObservabilityRecordSelect() string {
 		"user"."username" AS username,
 		"billing_charge"."id" AS charge_id,
 		"billing_charge"."amount" AS amount,
+		"billing_charge"."base_amount" AS base_amount,
+		"billing_charge"."billing_multiplier" AS billing_multiplier,
 		"billing_charge"."matched_price_rule" AS matched_price_rule,
 		"billing_charge"."balance_before" AS balance_before,
 		"billing_charge"."balance_after" AS balance_after,
+		"billing_charge"."cost_breakdown" AS cost_breakdown,
 		COALESCE("auth_uuid"."uuid", "auth_by_index"."uuid", "auth_by_id"."uuid") AS auth_uuid,
 		COALESCE("auth_uuid"."auth_json", "auth_by_index"."auth_json", "auth_by_id"."auth_json") AS auth_json,
 		COALESCE("auth_uuid"."id", "auth_by_index"."id", "auth_by_id"."id") AS auth_id,
@@ -4104,9 +4113,20 @@ func usageObservabilityBilling(row *usageObservabilityRecordRow) UsageObservabil
 		balanceBefore := row.BalanceBefore.Float64
 		billing.BalanceBefore = &balanceBefore
 	}
+	if row.BaseAmount.Valid {
+		baseAmount := row.BaseAmount.Float64
+		billing.BaseAmount = &baseAmount
+	}
+	if row.BillingMultiplier.Valid {
+		billingMultiplier := row.BillingMultiplier.Float64
+		billing.BillingMultiplier = &billingMultiplier
+	}
 	if row.BalanceAfter.Valid {
 		balanceAfter := row.BalanceAfter.Float64
 		billing.BalanceAfter = &balanceAfter
+	}
+	if len(row.CostBreakdown) > 0 {
+		billing.CostBreakdown = enrichBillingCostBreakdownForObservability(row.CostBreakdown, row.PayloadJSON)
 	}
 	return billing
 }
