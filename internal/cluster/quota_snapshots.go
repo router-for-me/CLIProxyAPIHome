@@ -21,6 +21,7 @@ const (
 	quotaSnapshotSchemaVersion      = 1
 	antigravityQuotaSnapshotVersion = 3
 	codexQuotaSnapshotVersion       = 2
+	xaiQuotaSnapshotVersion         = 2
 )
 
 const (
@@ -55,6 +56,8 @@ func QuotaSnapshotVersion(provider string) int {
 		return antigravityQuotaSnapshotVersion
 	case "codex":
 		return codexQuotaSnapshotVersion
+	case "xai":
+		return xaiQuotaSnapshotVersion
 	default:
 		return quotaSnapshotSchemaVersion
 	}
@@ -1559,6 +1562,14 @@ func quotaPrimaryWindows(provider string, windows []QuotaWindow) []QuotaWindow {
 		return antigravityPrimaryWindows(items)
 	case "codex":
 		return codexPrimaryWindows(items)
+	case "xai":
+		if len(items) > 8 {
+			items = items[:8]
+		}
+		if items == nil {
+			return []QuotaWindow{}
+		}
+		return items
 	}
 	if len(items) > 2 {
 		items = items[:2]

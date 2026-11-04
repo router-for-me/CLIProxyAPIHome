@@ -245,7 +245,7 @@ func TestCollectorCollectsXAIWeeklyQuota(t *testing.T) {
 	seedCollectorProviderAuth(t, repo, "xai-weekly-probe", "xai", map[string]any{"type": "xai", "access_token": "xai-secret"})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Query().Get("format") == "credits" {
-			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":16,"currentPeriod":{"type":"weekly","start":"2026-07-09T20:46:00Z","end":"2026-07-16T20:46:00Z"}}}`))
+			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":16,"currentPeriod":{"type":"weekly","start":"2026-07-09T20:46:00Z","end":"2026-07-16T20:46:00Z"},"productUsage":[{"product":"GrokBuild","usagePercent":1}]}}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"config":{"monthlyLimit":0,"used":0,"onDemandCap":0}}`))
@@ -259,8 +259,11 @@ func TestCollectorCollectsXAIWeeklyQuota(t *testing.T) {
 	if errGet != nil {
 		t.Fatalf("GetQuotaCredential() error = %v", errGet)
 	}
-	if len(item.Windows) != 1 || item.Windows[0].ID != "xai-weekly-usage" {
+	if len(item.Windows) != 2 || item.Windows[0].ID != "xai-weekly-usage" || item.Windows[1].ID != "xai-product-grokbuild" {
 		t.Fatalf("weekly-only account got windows = %+v", item.Windows)
+	}
+	if item.Windows[1].Label == nil || *item.Windows[1].Label != "GrokBuild" || item.Windows[1].Used == nil || *item.Windows[1].Used != 1 {
+		t.Fatalf("unexpected product usage window: %+v", item.Windows[1])
 	}
 	weekly := item.Windows[0]
 	if weekly.Status != "healthy" || weekly.Remaining == nil || *weekly.Remaining != 84 {

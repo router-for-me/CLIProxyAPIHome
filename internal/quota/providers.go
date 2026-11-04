@@ -166,8 +166,8 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 	// is non-fatal while the monthly response still yields usable windows.
 	weeklyPayload, _, errWeekly := c.probeRequest(ctx, auth, http.MethodGet, xaiWeeklyBillingURL(c.options.XAIBillingURL), nil, headers)
 	if errWeekly == nil {
-		if weeklyWindow, ok := parseXAIWeeklyWindow(weeklyPayload, now); ok {
-			windows = append([]cluster.QuotaWindow{weeklyWindow}, windows...)
+		if weeklyWindows := parseXAIWeeklyWindows(weeklyPayload, now); len(weeklyWindows) > 0 {
+			windows = append(weeklyWindows, windows...)
 		}
 	}
 	if len(windows) == 0 {
@@ -927,20 +927,28 @@ type xaiBillingPeriod struct {
 	End   string `json:"end"`
 }
 
+type xaiBillingProductUsage struct {
+	Product           string    `json:"product"`
+	UsagePercent      flexFloat `json:"usagePercent"`
+	UsagePercentSnake flexFloat `json:"usage_percent"`
+}
+
 type xaiBillingConfig struct {
-	MonthlyLimit            flexFloat         `json:"monthlyLimit"`
-	MonthlyLimitSnake       flexFloat         `json:"monthly_limit"`
-	Used                    flexFloat         `json:"used"`
-	OnDemandCap             flexFloat         `json:"onDemandCap"`
-	OnDemandCapSnake        flexFloat         `json:"on_demand_cap"`
-	OnDemandUsed            flexFloat         `json:"onDemandUsed"`
-	OnDemandUsedSnake       flexFloat         `json:"on_demand_used"`
-	BillingPeriodEnd        string            `json:"billingPeriodEnd"`
-	BillingEndSnake         string            `json:"billing_period_end"`
-	CreditUsagePercent      flexFloat         `json:"creditUsagePercent"`
-	CreditUsagePercentSnake flexFloat         `json:"credit_usage_percent"`
-	CurrentPeriod           *xaiBillingPeriod `json:"currentPeriod"`
-	CurrentPeriodSnake      *xaiBillingPeriod `json:"current_period"`
+	MonthlyLimit            flexFloat                `json:"monthlyLimit"`
+	MonthlyLimitSnake       flexFloat                `json:"monthly_limit"`
+	Used                    flexFloat                `json:"used"`
+	OnDemandCap             flexFloat                `json:"onDemandCap"`
+	OnDemandCapSnake        flexFloat                `json:"on_demand_cap"`
+	OnDemandUsed            flexFloat                `json:"onDemandUsed"`
+	OnDemandUsedSnake       flexFloat                `json:"on_demand_used"`
+	BillingPeriodEnd        string                   `json:"billingPeriodEnd"`
+	BillingEndSnake         string                   `json:"billing_period_end"`
+	CreditUsagePercent      flexFloat                `json:"creditUsagePercent"`
+	CreditUsagePercentSnake flexFloat                `json:"credit_usage_percent"`
+	CurrentPeriod           *xaiBillingPeriod        `json:"currentPeriod"`
+	CurrentPeriodSnake      *xaiBillingPeriod        `json:"current_period"`
+	ProductUsage            []xaiBillingProductUsage `json:"productUsage"`
+	ProductUsageSnake       []xaiBillingProductUsage `json:"product_usage"`
 }
 
 const (
@@ -1063,6 +1071,86 @@ func parseXAIWeeklyWindow(body []byte, observedAt time.Time) (cluster.QuotaWindo
 	}
 	normalizeWindowValues(&window)
 	return window, true
+}
+
+func parseXAIWeeklyWindows(body []byte, observedAt time.Time) []cluster.QuotaWindow {
+	var windows []cluster.QuotaWindow
+	var resetAt *time.Time
+	if weeklyWindow, ok := parseXAIWeeklyWindow(body, observedAt); ok {
+		resetAt = weeklyWindow.ResetAt
+		windows = append(windows, weeklyWindow)
+	}
+	var payload xaiBillingPayload
+	if errDecode := json.Unmarshal(body, &payload); errDecode != nil || payload.Config == nil {
+		return windows
+	}
+	config := payload.Config
+	period := config.CurrentPeriod
+	if period == nil {
+		period = config.CurrentPeriodSnake
+	}
+	if period != nil && strings.Contains(strings.ToLower(period.Type), "monthly") {
+		return windows
+	}
+	if resetAt == nil && period != nil {
+		resetAt = parseProviderTime(period.End)
+	}
+	if resetAt == nil {
+		resetAt = parseProviderTime(firstNonEmptyString(config.BillingPeriodEnd, config.BillingEndSnake))
+	}
+	rawProducts := config.ProductUsage
+	if len(rawProducts) == 0 {
+		rawProducts = config.ProductUsageSnake
+	}
+	seen := make(map[string]int, len(rawProducts))
+	productWindows := make([]cluster.QuotaWindow, 0, len(rawProducts))
+	for index, item := range rawProducts {
+		product := strings.TrimSpace(item.Product)
+		if product == "" {
+			product = fmt.Sprintf("Product %d", index+1)
+		}
+		usedPercent := firstFloat(flexFloatValue(item.UsagePercent), flexFloatValue(item.UsagePercentSnake))
+		var usedPtr *float64
+		var limitPtr *float64
+		if usedPercent != nil && !math.IsNaN(*usedPercent) && !math.IsInf(*usedPercent, 0) {
+			used := math.Max(0, math.Min(100, *usedPercent))
+			limit := 100.0
+			usedPtr = &used
+			limitPtr = &limit
+		}
+		slug := quotaIDSlug(product)
+		if slug == "" {
+			slug = fmt.Sprintf("%d", index+1)
+		}
+		window := cluster.QuotaWindow{
+			ID:          "xai-product-" + slug,
+			Label:       quotaStringPtr(product),
+			Scope:       "account",
+			ScopeID:     quotaStringPtr("xai-product-usage"),
+			Mode:        "fixed",
+			Status:      "healthy",
+			Unit:        "percentage",
+			Used:        usedPtr,
+			Limit:       limitPtr,
+			ResetAt:     resetAt,
+			PeriodUnit:  "week",
+			PeriodValue: quotaFloatPtr(1),
+			Source:      "active_probe",
+			ObservedAt:  observedAt,
+			Priority:    20 + index,
+		}
+		if usedPtr != nil {
+			normalizeWindowValues(&window)
+		}
+		key := strings.ToLower(product)
+		if existingIdx, exists := seen[key]; exists {
+			productWindows[existingIdx] = window
+			continue
+		}
+		seen[key] = len(productWindows)
+		productWindows = append(productWindows, window)
+	}
+	return append(windows, productWindows...)
 }
 
 func normalizedProviderRatio(value float64) float64 {
