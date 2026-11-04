@@ -4126,7 +4126,7 @@ func usageObservabilityBilling(row *usageObservabilityRecordRow) UsageObservabil
 		billing.BalanceAfter = &balanceAfter
 	}
 	if len(row.CostBreakdown) > 0 {
-		billing.CostBreakdown = enrichBillingCostBreakdownForObservability(row.CostBreakdown, row.PayloadJSON)
+		billing.CostBreakdown = row.CostBreakdown
 	}
 	return billing
 }
