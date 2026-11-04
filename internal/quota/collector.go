@@ -3,6 +3,8 @@ package quota
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -45,6 +47,7 @@ const (
 	metaAPIVersionHeader       = "x-api-version"
 	metaAPIVersionValue        = "1.0.0"
 	metaMuseUserAgent          = "muse-code/1.0.2"
+	antigravityCodeAssistURL   = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 )
 
 var defaultAntigravityURLs = []string{
@@ -54,25 +57,26 @@ var defaultAntigravityURLs = []string{
 }
 
 type Options struct {
-	Owner                  string
-	HomeID                 string
-	GlobalProxyURL         string
-	GlobalProxyURLProvider func() string
-	PollInterval           time.Duration
-	ProbeTimeout           time.Duration
-	LeaseDuration          time.Duration
-	SnapshotFreshness      time.Duration
-	ProviderConcurrency    int
-	CodexUsageURL          string
-	CodexResetCreditsURL   string
-	ClaudeUsageURL         string
-	ClaudeProfileURL       string
-	KimiUsageURL           string
-	XAIBillingURL          string
-	MetaQuotaURL           string
-	AntigravityURLs        []string
-	Now                    func() time.Time
-	HTTPClient             func(*coreauth.Auth, time.Duration) (*http.Client, error)
+	Owner                    string
+	HomeID                   string
+	GlobalProxyURL           string
+	GlobalProxyURLProvider   func() string
+	PollInterval             time.Duration
+	ProbeTimeout             time.Duration
+	LeaseDuration            time.Duration
+	SnapshotFreshness        time.Duration
+	ProviderConcurrency      int
+	CodexUsageURL            string
+	CodexResetCreditsURL     string
+	ClaudeUsageURL           string
+	ClaudeProfileURL         string
+	KimiUsageURL             string
+	XAIBillingURL            string
+	MetaQuotaURL             string
+	AntigravityURLs          []string
+	AntigravityCodeAssistURL string
+	Now                      func() time.Time
+	HTTPClient               func(*coreauth.Auth, time.Duration) (*http.Client, error)
 }
 
 type Collector struct {
@@ -132,8 +136,12 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 	if strings.TrimSpace(options.MetaQuotaURL) == "" {
 		options.MetaQuotaURL = metaQuotaURL
 	}
-	if len(options.AntigravityURLs) == 0 {
+	hasDefaultAntigravityURLs := len(options.AntigravityURLs) == 0
+	if hasDefaultAntigravityURLs {
 		options.AntigravityURLs = append([]string(nil), defaultAntigravityURLs...)
+	}
+	if strings.TrimSpace(options.AntigravityCodeAssistURL) == "" && hasDefaultAntigravityURLs {
+		options.AntigravityCodeAssistURL = antigravityCodeAssistURL
 	}
 	if options.Now == nil {
 		options.Now = func() time.Time { return time.Now().UTC() }
@@ -389,8 +397,7 @@ func (c *Collector) probeCredential(ctx context.Context, auth *coreauth.Auth) (p
 	case "claude":
 		return c.probeClaude(ctx, auth)
 	case "antigravity":
-		windows, errProbe := c.probeAntigravity(ctx, auth)
-		return probeResult{windows: windows, replaceWindows: true, replacePlan: true}, errProbe
+		return c.probeAntigravity(ctx, auth)
 	case "kimi":
 		windows, errProbe := c.probeKimi(ctx, auth)
 		return probeResult{windows: windows, replaceWindows: true, replacePlan: true}, errProbe
@@ -457,11 +464,73 @@ func codexPlanFromAuth(auth *coreauth.Auth) *cluster.QuotaPlan {
 		return nil
 	}
 	if auth.Attributes != nil {
-		if plan := codexPlan(auth.Attributes["plan_type"]); plan != nil {
-			return plan
+		for _, key := range []string{"plan_type", "planType"} {
+			if plan := codexPlan(auth.Attributes[key]); plan != nil {
+				return plan
+			}
 		}
 	}
-	return codexPlan(quotaMetadataString(auth.Metadata, "plan_type", "planType"))
+	if plan := codexPlan(quotaMetadataString(auth.Metadata, "plan_type", "planType")); plan != nil {
+		return plan
+	}
+	return codexPlanFromIDToken(auth)
+}
+
+func codexPlanFromIDToken(auth *coreauth.Auth) *cluster.QuotaPlan {
+	if auth == nil {
+		return nil
+	}
+	var candidates []any
+	if auth.Metadata != nil {
+		candidates = append(candidates, auth.Metadata["id_token"], auth.Metadata["idToken"])
+	}
+	if auth.Attributes != nil {
+		candidates = append(candidates, auth.Attributes["id_token"], auth.Attributes["idToken"])
+	}
+	for _, candidate := range candidates {
+		payload := parseQuotaIDTokenPayload(candidate)
+		if payload == nil {
+			continue
+		}
+		if plan := codexPlan(quotaMetadataString(payload, "plan_type", "planType", "chatgpt_plan_type", "chatgptPlanType")); plan != nil {
+			return plan
+		}
+		if nested, ok := payload["https://api.openai.com/auth"].(map[string]any); ok {
+			if plan := codexPlan(quotaMetadataString(nested, "plan_type", "planType", "chatgpt_plan_type", "chatgptPlanType")); plan != nil {
+				return plan
+			}
+		}
+	}
+	return nil
+}
+
+func parseQuotaIDTokenPayload(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil
+		}
+		var direct map[string]any
+		if json.Unmarshal([]byte(trimmed), &direct) == nil && direct != nil {
+			return direct
+		}
+		parts := strings.Split(trimmed, ".")
+		if len(parts) < 2 {
+			return nil
+		}
+		decoded, errDecode := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+		if errDecode != nil {
+			return nil
+		}
+		var claims map[string]any
+		if json.Unmarshal(decoded, &claims) == nil && claims != nil {
+			return claims
+		}
+	}
+	return nil
 }
 
 func codexResetCreditsCountFallback(availableCount *int, observedAt time.Time) *cluster.QuotaResetCredits {

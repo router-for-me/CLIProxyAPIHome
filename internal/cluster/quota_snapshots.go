@@ -19,7 +19,7 @@ import (
 
 const (
 	quotaSnapshotSchemaVersion      = 1
-	antigravityQuotaSnapshotVersion = 2
+	antigravityQuotaSnapshotVersion = 3
 	codexQuotaSnapshotVersion       = 2
 )
 
