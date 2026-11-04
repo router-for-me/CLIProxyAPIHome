@@ -48,6 +48,7 @@ type Runtime struct {
 	accessManager           *access.Manager
 	coreManager             *coreauth.Manager
 	pluginHost              *sdkpluginhost.Host
+	pluginModelRegistryMu   sync.Mutex
 	pluginSyncMu            sync.Mutex
 	pluginStoreSync         map[string]pluginStoreSyncState
 	pluginStoreAuthResolver func(context.Context) ([]pluginstore.ResolvedAuthConfig, error)
