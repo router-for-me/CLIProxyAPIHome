@@ -596,21 +596,7 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	if localRefreshBlocked && !persistedRefreshBlocked {
 		local.StatusMessage = ""
 		local.LastError = nil
-		var latestModelError *ModelState
-		for _, state := range local.ModelStates {
-			if state == nil {
-				continue
-			}
-			activeError := state.LastError != nil ||
-				(state.Status == StatusError && state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)))
-			if !activeError {
-				continue
-			}
-			if latestModelError == nil || state.UpdatedAt.After(latestModelError.UpdatedAt) {
-				latestModelError = state
-			}
-		}
-		if latestModelError != nil {
+		if latestModelError := latestModelErrorState(local, now); latestModelError != nil {
 			local.Status = StatusError
 			local.StatusMessage = latestModelError.StatusMessage
 			local.LastError = cloneError(latestModelError.LastError)
@@ -813,25 +799,30 @@ func clearAggregatedAvailability(auth *Auth) {
 	auth.Quota = QuotaState{}
 }
 
-// hasModelError reports whether model error is present.
+// hasModelError reports whether a model error still holds the credential-level
+// status at error.
 func hasModelError(auth *Auth, now time.Time) bool {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return false
 	}
 	for _, state := range auth.ModelStates {
-		if state == nil {
-			continue
-		}
-		if state.LastError != nil {
+		if modelErrorHoldsCredentialStatus(state, now) {
 			return true
-		}
-		if state.Status == StatusError {
-			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {
-				return true
-			}
 		}
 	}
 	return false
+}
+
+// modelErrorHoldsCredentialStatus reports whether a model state should keep the
+// credential shown as errored: the model is still cooling down after a failure
+// that is not specific to that model. An expired cooldown, a failure that never
+// blocked dispatch, or an unknown or unsupported model leaves only a historical
+// model record, so a later success on another model can restore the credential.
+func modelErrorHoldsCredentialStatus(state *ModelState, now time.Time) bool {
+	if state == nil || state.Status != StatusError || !state.Unavailable || !state.NextRetryAfter.After(now) {
+		return false
+	}
+	return statusCodeFromResult(state.LastError) != http.StatusNotFound && !isModelSupportResultError(state.LastError)
 }
 
 // cloneError clones an error.

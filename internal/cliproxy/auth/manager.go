@@ -2002,12 +2002,7 @@ func latestModelErrorState(auth *Auth, now time.Time) *ModelState {
 	}
 	var latest *ModelState
 	for _, state := range auth.ModelStates {
-		if state == nil {
-			continue
-		}
-		activeError := state.LastError != nil ||
-			(state.Status == StatusError && state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)))
-		if !activeError {
+		if !modelErrorHoldsCredentialStatus(state, now) {
 			continue
 		}
 		if latest == nil || state.UpdatedAt.After(latest.UpdatedAt) {

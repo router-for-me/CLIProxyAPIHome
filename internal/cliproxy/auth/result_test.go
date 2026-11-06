@@ -164,6 +164,75 @@ func TestMarkResultUnauthorizedUsesRecoverableCooldown(t *testing.T) {
 	}
 }
 
+func TestMarkResultSuccessIgnoresStaleModelErrors(t *testing.T) {
+	now := time.Now()
+	rateLimited := &Error{Message: "rate limited", HTTPStatus: http.StatusTooManyRequests}
+	tests := []struct {
+		name       string
+		state      *ModelState
+		wantStatus Status
+	}{
+		{
+			name:       "expired quota cooldown",
+			state:      &ModelState{Status: StatusError, StatusMessage: rateLimited.Message, LastError: rateLimited},
+			wantStatus: StatusActive,
+		},
+		{
+			name: "unknown model suspension",
+			state: &ModelState{
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(12 * time.Hour),
+				LastError:      &Error{Message: "model: retired-model", HTTPStatus: http.StatusNotFound},
+			},
+			wantStatus: StatusActive,
+		},
+		{
+			name: "active upstream cooldown",
+			state: &ModelState{
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Minute),
+				LastError:      &Error{Message: "upstream unavailable", HTTPStatus: http.StatusServiceUnavailable},
+			},
+			wantStatus: StatusError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			auth := &Auth{
+				ID:            "auth-stale-model-error",
+				Index:         "auth-stale-model-error",
+				Provider:      "claude",
+				Status:        StatusError,
+				StatusMessage: rateLimited.Message,
+				LastError:     rateLimited,
+				ModelStates:   map[string]*ModelState{"old-model": tt.state},
+			}
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+
+			manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "claude", Model: "new-model", Success: true})
+
+			updated, ok := manager.GetByID(auth.ID)
+			if !ok || updated == nil {
+				t.Fatal("updated auth not found")
+			}
+			if updated.Status != tt.wantStatus {
+				t.Fatalf("Status = %q (%q), want %q", updated.Status, updated.StatusMessage, tt.wantStatus)
+			}
+			if tt.wantStatus == StatusActive && (updated.StatusMessage != "" || updated.LastError != nil) {
+				t.Fatalf("active auth kept error %q / %#v", updated.StatusMessage, updated.LastError)
+			}
+			if updated.ModelStates["old-model"] == nil || updated.ModelStates["old-model"].LastError == nil {
+				t.Fatal("old-model error record was dropped")
+			}
+		})
+	}
+}
+
 func TestNewUsageResultScopesGoogleResetTimestampToAntigravity(t *testing.T) {
 	resetAt := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
 	body := `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","metadata":{"quotaResetTimeStamp":"` + resetAt.Format(time.RFC3339Nano) + `"}},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}`
