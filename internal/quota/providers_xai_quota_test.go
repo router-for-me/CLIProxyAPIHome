@@ -183,7 +183,7 @@ func TestCollectorPersistsXAIPlanAndSendsCLIHeaders(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
 	seedCollectorProviderAuth(t, repo, "xai-plan-probe", "xai", map[string]any{"type": "xai", "access_token": "xai-secret", "sub": "xai-user"})
-	requestHeaders := make(chan http.Header, 2)
+	requestHeaders := make(chan http.Header, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		requestHeaders <- request.Header.Clone()
 		_, _ = w.Write([]byte(`{"config":{"monthlyLimit":{"val":150000},"used":{"val":15000},"onDemandCap":{"val":5000},"onDemandUsed":{"val":1200},"billingPeriodEnd":"2026-08-01T00:00:00Z"}}`))
@@ -214,17 +214,29 @@ func TestCollectorPersistsXAIPlanAndSendsCLIHeaders(t *testing.T) {
 	}
 }
 
-func TestCollectorClearsStaleXAIPlan(t *testing.T) {
+func TestCollectorClearsPaidXAIQuotaAfterConfirmedFreeProfile(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
 	seedCollectorProviderAuth(t, repo, "xai-plan-clear", "xai", map[string]any{"type": "xai", "access_token": "xai-secret"})
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) == 1 {
+	var round atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			if round.Load() == 0 {
+				_, _ = w.Write([]byte(`{"subscriptionTier":"SuperGrokHeavy"}`))
+			} else {
+				_, _ = w.Write([]byte(`{"subscriptionTier":null}`))
+			}
+			return
+		}
+		if r.URL.Query().Get("format") == "credits" {
+			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":1,"currentPeriod":{"type":"weekly"}}}`))
+			return
+		}
+		if round.Load() == 0 {
 			_, _ = w.Write([]byte(`{"config":{"monthlyLimit":150000,"used":1000}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"config":{"monthlyLimit":20000,"used":1000}}`))
+		_, _ = w.Write([]byte(`{"config":{"monthlyLimit":0,"used":0}}`))
 	}))
 	defer server.Close()
 
@@ -236,6 +248,7 @@ func TestCollectorClearsStaleXAIPlan(t *testing.T) {
 	}
 
 	now = now.Add(31 * time.Minute)
+	round.Store(1)
 	accepted, errTrigger := collector.TriggerCollection(context.Background(), map[string]struct{}{"xai-plan-clear": {}}, nil)
 	if errTrigger != nil || accepted != 1 {
 		t.Fatalf("TriggerCollection() = %d, %v, want 1, nil", accepted, errTrigger)
@@ -245,8 +258,8 @@ func TestCollectorClearsStaleXAIPlan(t *testing.T) {
 	if errSecond != nil {
 		t.Fatalf("GetQuotaCredential() after plan change error = %v", errSecond)
 	}
-	if second.Plan != nil {
-		t.Fatalf("stale plan was retained: %+v", second.Plan)
+	if second.Plan == nil || second.Plan.Name != "Free" || len(second.Windows) != 0 || second.CollectionStatus != "success" || second.QuotaStatus != "unknown" {
+		t.Fatalf("paid quota was retained after a confirmed downgrade: %+v", second)
 	}
 }
 
@@ -314,6 +327,10 @@ func TestCollectorCollectsXAIWeeklyQuota(t *testing.T) {
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
 	seedCollectorProviderAuth(t, repo, "xai-weekly-probe", "xai", map[string]any{"type": "xai", "access_token": "xai-secret"})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"subscriptionTier":"SuperGrokPlus"}`))
+			return
+		}
 		if request.URL.Query().Get("format") == "credits" {
 			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":16,"currentPeriod":{"type":"weekly","start":"2026-07-09T20:46:00Z","end":"2026-07-16T20:46:00Z"},"productUsage":[{"product":"GrokBuild","usagePercent":1}]}}`))
 			return
@@ -339,8 +356,8 @@ func TestCollectorCollectsXAIWeeklyQuota(t *testing.T) {
 	if weekly.Status != "healthy" || weekly.Remaining == nil || *weekly.Remaining != 84 {
 		t.Fatalf("unexpected weekly window state: %+v", weekly)
 	}
-	if item.Plan != nil {
-		t.Fatalf("weekly-only account must not get a subscription plan: %+v", item.Plan)
+	if item.Plan == nil || item.Plan.Name != "SuperGrok Plus" {
+		t.Fatalf("weekly-only account lost its confirmed subscription: %+v", item.Plan)
 	}
 }
 
@@ -406,6 +423,10 @@ func TestCollectorKeepsXAIPlanWhenMonthlyProbeFails(t *testing.T) {
 	seedCollectorProviderAuth(t, repo, "xai-monthly-fail", "xai", map[string]any{"type": "xai", "access_token": "xai-secret"})
 	var monthlyRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		if request.URL.Query().Get("format") == "credits" {
 			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":16,"currentPeriod":{"type":"weekly","end":"2026-07-16T20:46:00Z"}}}`))
 			return

@@ -173,6 +173,8 @@ func TestCollectorSupportsClaudeAntigravityKimiAndXAI(t *testing.T) {
 			_, _ = w.Write([]byte(`{"user":{"userId":"user-1","region":"REGION_OVERSEA"},"usage":{"limit":"100","used":"44","remaining":"56","resetTime":"2026-07-21T13:09:11Z"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","used":"10","remaining":"90","resetTime":"2026-07-19T14:09:11Z"}}],"totalQuota":{"limit":"100","remaining":"99"}}`))
 		case "/xai":
 			_, _ = w.Write([]byte(`{"config":{"monthlyLimit":{"val":20000},"used":{"val":167},"billingPeriodEnd":"2026-08-01T00:00:00Z"}}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"subscriptionTier":null}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

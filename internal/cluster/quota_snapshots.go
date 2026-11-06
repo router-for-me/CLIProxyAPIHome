@@ -21,7 +21,7 @@ const (
 	quotaSnapshotSchemaVersion      = 1
 	antigravityQuotaSnapshotVersion = 3
 	codexQuotaSnapshotVersion       = 2
-	xaiQuotaSnapshotVersion         = 2
+	xaiQuotaSnapshotVersion         = 3
 )
 
 const (

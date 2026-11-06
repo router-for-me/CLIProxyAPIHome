@@ -74,6 +74,7 @@ type Options struct {
 	DevinQuotaURL            string
 	KimiUsageURL             string
 	XAIBillingURL            string
+	XAIProfileURL            string
 	MetaQuotaURL             string
 	AntigravityURLs          []string
 	AntigravityCodeAssistURL string
@@ -137,6 +138,9 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 	}
 	if strings.TrimSpace(options.XAIBillingURL) == "" {
 		options.XAIBillingURL = xaiBillingURL
+	}
+	if strings.TrimSpace(options.XAIProfileURL) == "" {
+		options.XAIProfileURL = xaiSiblingEndpoint(options.XAIBillingURL, "user")
 	}
 	if strings.TrimSpace(options.MetaQuotaURL) == "" {
 		options.MetaQuotaURL = metaQuotaURL
