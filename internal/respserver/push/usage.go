@@ -54,17 +54,19 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	}
 	payload = enrichedPayload
 
-	// Always update scheduler state before queuing persistence so cooldowns are applied even if log persistence fails.
 	if env.Runtime != nil {
-		env.Runtime.RecordUsagePayload(ctx, payload)
-		persisted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
+		persisted, inserted, errPersist := env.Runtime.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
 		if errPersist != nil {
 			log.Errorf("usage database write error: %v", errPersist)
 			return dispatch.Err("usage database write failed")
 		}
 		if persisted {
+			if inserted {
+				env.Runtime.RecordUsagePayload(ctx, payload)
+			}
 			return dispatch.Integer(1)
 		}
+		env.Runtime.RecordUsagePayload(ctx, payload)
 	}
 
 	if errAppend := appendUsageLog(payload); errAppend != nil {

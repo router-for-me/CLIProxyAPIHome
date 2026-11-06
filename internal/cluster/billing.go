@@ -792,6 +792,17 @@ func (r *Repository) createBillingChargeForUsageTx(ctx context.Context, tx *gorm
 
 	ctx = contextOrBackground(ctx)
 	payloadHash := billingPayloadHash(payload)
+	if hashCandidates := billingPayloadHashCandidates(payload, string(usage.PayloadJSON)); len(hashCandidates) > 1 {
+		var existingCount int64
+		if errCheck := tx.WithContext(ctx).Model(&BillingChargeRecord{}).
+			Where("payload_hash IN ?", hashCandidates).
+			Count(&existingCount).Error; errCheck != nil {
+			return errCheck
+		}
+		if existingCount > 0 {
+			return nil
+		}
+	}
 	apiKey, errAPIKey := billingAPIKeyByValue(ctx, tx, usage.APIKey)
 	if errAPIKey != nil {
 		return errAPIKey
@@ -2146,8 +2157,40 @@ func billingID(prefix string) string {
 }
 
 func billingPayloadHash(payload string) string {
+	if dedupeKey, errDedupe := usagePayloadDedupeKey(payload); errDedupe == nil && dedupeKey != "" {
+		sum := sha256.Sum256([]byte(dedupeKey))
+		return hex.EncodeToString(sum[:])
+	}
+	return legacyBillingPayloadHash(payload)
+}
+
+func legacyBillingPayloadHash(payload string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(payload)))
 	return hex.EncodeToString(sum[:])
+}
+
+func billingPayloadHashCandidates(payloads ...string) []string {
+	seen := make(map[string]struct{}, len(payloads)*2)
+	candidates := make([]string, 0, len(payloads)*2)
+	add := func(hash string) {
+		if hash == "" {
+			return
+		}
+		if _, exists := seen[hash]; exists {
+			return
+		}
+		seen[hash] = struct{}{}
+		candidates = append(candidates, hash)
+	}
+	for _, payload := range payloads {
+		trimmed := strings.TrimSpace(payload)
+		if trimmed == "" {
+			continue
+		}
+		add(billingPayloadHash(trimmed))
+		add(legacyBillingPayloadHash(trimmed))
+	}
+	return candidates
 }
 
 func billingJSONB(value any) (JSONB, error) {

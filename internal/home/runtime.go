@@ -186,6 +186,10 @@ type clusterUsageStore interface {
 	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
 }
 
+type clusterUsageOutcomeStore interface {
+	StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
+}
+
 type appLogStore interface {
 	StoreAppLogPayload(ctx context.Context, clientIP string, payload string) error
 }
@@ -566,19 +570,33 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 
 // PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
 func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
+	persisted, _, errPersist := r.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
+	return persisted, errPersist
+}
+
+// PersistClusterUsagePayloadOutcome stores a cluster usage payload with its trusted receive time
+// and reports whether the payload was newly inserted (false when deduplicated).
+func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, bool, error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
-		return false, nil
+		return false, false, nil
+	}
+	if outcomeStore, ok := r.clusterAdapter.(clusterUsageOutcomeStore); ok && outcomeStore != nil {
+		inserted, errStore := outcomeStore.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
+		if errStore != nil {
+			return false, false, errStore
+		}
+		return true, inserted, nil
 	}
 	store, ok := r.clusterAdapter.(clusterUsageStore)
 	if !ok || store == nil {
-		return false, fmt.Errorf("cluster usage store is unavailable")
+		return false, false, fmt.Errorf("cluster usage store is unavailable")
 	}
 	// Acknowledge usage only after its database transaction commits. A failed
 	// write must reach the sender, not disappear from an in-memory queue.
 	if errStore := store.StoreUsagePayload(ctx, payload, receivedAt); errStore != nil {
-		return false, errStore
+		return false, false, errStore
 	}
-	return true, nil
+	return true, true, nil
 }
 
 // PersistAppLogPayload stores a CPA app log payload in the runtime database.

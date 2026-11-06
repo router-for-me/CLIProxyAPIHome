@@ -639,19 +639,55 @@ func TestAppendUsageDuplicatePayloadDoesNotDoubleCharge(t *testing.T) {
 		t.Fatalf("AppendUsage(second) error = %v", errSecond)
 	}
 
+	// Simulate CPA failover retry to another Home instance or connection IP (and reordered JSON keys as in PostgreSQL JSONB).
+	failoverPayload := `{"tokens":{"total_tokens":1,"input_tokens":1},"request_id":"req-1","api_key":"client-key","model":"gpt-4.1-mini","provider":"openai","timestamp":"2026-06-10T01:02:03Z","cpa_node_id":"node-b","cpa_ip":"10.0.0.9","home":{"port":9327}}`
+	if _, inserted, errThird := repo.AppendUsageWithRuntimeOutcome(ctx, failoverPayload, UsageRuntimeMetadata{HomeIP: "192.0.2.11", HomePort: 9327}); errThird != nil || inserted {
+		t.Fatalf("AppendUsageWithRuntimeOutcome(failover duplicate) inserted=%v error = %v, want false/nil", inserted, errThird)
+	}
+
+	execPayloadA := `{"timestamp":"2026-06-10T01:02:04Z","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key","request_id":"req-2","execution_id":"exec-retry-1","tokens":{"input_tokens":1,"total_tokens":1}}`
+	execPayloadB := `{"timestamp":"2026-06-10T01:02:04Z","provider":"openai","model":"gpt-4.1-mini","api_key":"client-key","request_id":"req-2","execution_id":"exec-retry-1","cpa_node_id":"node-2","tokens":{"input_tokens":1,"total_tokens":1}}`
+	firstExec, insertedFirst, errExecFirst := repo.AppendUsageWithRuntimeOutcome(ctx, execPayloadA, UsageRuntimeMetadata{HomeIP: "192.0.2.10", HomePort: 8327})
+	if errExecFirst != nil || !insertedFirst {
+		t.Fatalf("AppendUsageWithRuntimeOutcome(exec first) inserted=%v error = %v", insertedFirst, errExecFirst)
+	}
+	db, errDB := repo.database()
+	if errDB != nil {
+		t.Fatalf("database() error = %v", errDB)
+	}
+	// Simulate a pre-upgrade billing_charge row that used legacyBillingPayloadHash(rawPayload).
+	if errLegacyHash := db.Model(&BillingChargeRecord{}).Where("usage_id = ?", firstExec.ID).Update("payload_hash", legacyBillingPayloadHash(execPayloadA)).Error; errLegacyHash != nil {
+		t.Fatalf("Update(payload_hash legacy) error = %v", errLegacyHash)
+	}
+	secondExec, insertedSecond, errExecSecond := repo.AppendUsageWithRuntimeOutcome(ctx, execPayloadB, UsageRuntimeMetadata{HomeIP: "192.0.2.11", HomePort: 9327})
+	if errExecSecond != nil || insertedSecond {
+		t.Fatalf("AppendUsageWithRuntimeOutcome(exec duplicate) inserted=%v error = %v, want false/nil", insertedSecond, errExecSecond)
+	}
+	if secondExec == nil || secondExec.ID != firstExec.ID {
+		t.Fatalf("deduplicated usage id = %+v, want %d", secondExec, firstExec.ID)
+	}
+
+	var usageCount int64
+	if errCount := db.Model(&UsageRecord{}).Count(&usageCount).Error; errCount != nil {
+		t.Fatalf("Count(usage) error = %v", errCount)
+	}
+	if usageCount != 2 {
+		t.Fatalf("usage count = %d, want 2", usageCount)
+	}
+
 	charges, errCharges := repo.ListBillingCharges(ctx, BillingChargeQuery{UserID: &user.ID, Limit: 10})
 	if errCharges != nil {
 		t.Fatalf("ListBillingCharges() error = %v", errCharges)
 	}
-	if len(charges.Records) != 1 {
-		t.Fatalf("charge count = %d, want 1", len(charges.Records))
+	if len(charges.Records) != 2 {
+		t.Fatalf("charge count = %d, want 2", len(charges.Records))
 	}
 	updated, errUser := repo.GetUser(ctx, user.ID)
 	if errUser != nil {
 		t.Fatalf("GetUser() error = %v", errUser)
 	}
-	if updated.Credits != 9 {
-		t.Fatalf("credits = %v, want 9", updated.Credits)
+	if updated.Credits != 8 {
+		t.Fatalf("credits = %v, want 8", updated.Credits)
 	}
 }
 

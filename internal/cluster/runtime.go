@@ -135,8 +135,14 @@ func (a *RuntimeAdapter) LoadConfigYAML(ctx context.Context) ([]byte, error) {
 
 // StoreUsagePayload stores an usage payload with its trusted Home receive time.
 func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error {
+	_, errStore := a.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
+	return errStore
+}
+
+// StoreUsagePayloadOutcome stores an usage payload and reports whether it was newly inserted.
+func (a *RuntimeAdapter) StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
 	if !a.Enabled() {
-		return fmt.Errorf("cluster runtime adapter is disabled")
+		return false, fmt.Errorf("cluster runtime adapter is disabled")
 	}
 	a.mu.RLock()
 	metadata := UsageRuntimeMetadata{
@@ -145,8 +151,8 @@ func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, 
 		ReceivedAt: receivedAt,
 	}
 	a.mu.RUnlock()
-	_, errAppend := a.repo.AppendUsageWithRuntime(ctx, payload, metadata)
-	return errAppend
+	_, inserted, errAppend := a.repo.AppendUsageWithRuntimeOutcome(ctx, payload, metadata)
+	return inserted, errAppend
 }
 
 // StoreAppLogPayload stores a CPA app log payload.
