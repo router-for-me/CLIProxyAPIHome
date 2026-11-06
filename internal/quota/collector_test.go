@@ -364,6 +364,7 @@ func TestQuotaRetryAfterSupportsSecondsAndHTTPDate(t *testing.T) {
 		want  time.Duration
 	}{
 		{value: "120", want: 2 * time.Minute},
+		{value: "9223372036854775807", want: time.Duration(1<<63 - 1)},
 		{value: now.Add(3 * time.Minute).Format(http.TimeFormat), want: 3 * time.Minute},
 		{value: "invalid", want: 0},
 	} {

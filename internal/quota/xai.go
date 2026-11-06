@@ -138,6 +138,38 @@ func xaiCurrentWeeklyPeriod(config *xaiBillingConfig) *xaiBillingPeriod {
 	return period
 }
 
+func xaiWeeklyPeriodIsCurrent(config *xaiBillingConfig, observedAt time.Time) bool {
+	if config.CurrentPeriod != nil && config.CurrentPeriodSnake != nil && *config.CurrentPeriod != *config.CurrentPeriodSnake {
+		return false
+	}
+	period := xaiCurrentWeeklyPeriod(config)
+	endValue := firstNonEmptyString(config.BillingPeriodEnd, config.BillingEndSnake)
+	if period != nil {
+		switch strings.ToLower(strings.TrimSpace(period.Type)) {
+		case "", "weekly", "usage_period_type_weekly":
+		default:
+			return false
+		}
+		if period.End != "" {
+			endValue = period.End
+		}
+	}
+	var end *time.Time
+	if endValue != "" {
+		end = parseProviderTime(endValue)
+		if end == nil || !end.After(observedAt) {
+			return false
+		}
+	}
+	if period != nil && period.Start != "" {
+		start := parseProviderTime(period.Start)
+		if start == nil || start.After(observedAt) || end != nil && !start.Before(*end) {
+			return false
+		}
+	}
+	return true
+}
+
 func xaiCanInferZeroUsage(config *xaiBillingConfig, observedAt time.Time) bool {
 	if config.CreditUsagePercent.present || config.CreditUsagePercentSnake.present {
 		return false
@@ -176,24 +208,37 @@ func xaiInvalidResponse(message string) *probeError {
 }
 
 func xaiCollectionFailure(failures ...*probeError) *probeError {
-	for _, code := range []string{"UPSTREAM_CLIENT_OUTDATED", "UPSTREAM_AUTH_REJECTED", "UPSTREAM_RATE_LIMITED"} {
-		for _, failure := range failures {
-			if failure != nil && failure.code == code {
-				return failure
-			}
-		}
-	}
+	var selected *probeError
 	for _, failure := range failures {
-		if failure != nil && failure.code != "UPSTREAM_RESPONSE_INVALID" {
-			return failure
+		if failure != nil && (selected == nil || xaiFailurePriority(failure.code) < xaiFailurePriority(selected.code)) {
+			selected = failure
 		}
 	}
+	if selected == nil {
+		return nil
+	}
+	result := *selected
 	for _, failure := range failures {
-		if failure != nil {
-			return failure
+		if failure != nil && failure.retryAfter > result.retryAfter {
+			result.retryAfter = failure.retryAfter
 		}
 	}
-	return nil
+	return &result
+}
+
+func xaiFailurePriority(code string) int {
+	switch code {
+	case "UPSTREAM_CLIENT_OUTDATED":
+		return 0
+	case "UPSTREAM_AUTH_REJECTED":
+		return 1
+	case "UPSTREAM_RATE_LIMITED":
+		return 2
+	case "UPSTREAM_RESPONSE_INVALID":
+		return 4
+	default:
+		return 3
+	}
 }
 
 func xaiHasObservedAmount(windows []cluster.QuotaWindow) bool {
@@ -231,6 +276,12 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 	}
 	requests.Wait()
 	now := c.options.Now().UTC()
+	var retryAfter time.Duration
+	for _, response := range responses {
+		if response.err != nil && response.err.retryAfter > retryAfter {
+			retryAfter = response.err.retryAfter
+		}
+	}
 	errMonthly, errWeekly, errProfile := responses[0].err, responses[1].err, responses[2].err
 	var windows []cluster.QuotaWindow
 	var plan *cluster.QuotaPlan
@@ -273,15 +324,19 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 			}
 		}
 	}
-	failedWithoutAmounts := !xaiHasObservedAmount(windows) && (errMonthly != nil || errWeekly != nil || errProfile != nil)
+	failure := xaiCollectionFailure(errMonthly, errWeekly, errProfile)
+	if failure != nil && retryAfter > failure.retryAfter {
+		failure.retryAfter = retryAfter
+	}
+	failedWithoutAmounts := !xaiHasObservedAmount(windows) && failure != nil
 	if failedWithoutAmounts || len(windows) == 0 && !(subscription.entitlement == xaiEntitlementFree && errMonthly == nil) {
-		if failure := xaiCollectionFailure(errMonthly, errWeekly, errProfile); failure != nil {
+		if failure != nil {
 			return probeResult{}, failure
 		}
 		return probeResult{}, xaiInvalidResponse("xAI billing response did not contain usable quota.")
 	}
-	result := probeResult{windows: windows, plan: plan, replaceWindows: true, replacePlan: plan != nil}
-	if failure := xaiCollectionFailure(errMonthly, errWeekly, errProfile); failure != nil {
+	result := probeResult{windows: windows, plan: plan, replaceWindows: true, replacePlan: plan != nil, validUntil: quotaWindowResetDeadline(windows, now), retryAfter: retryAfter}
+	if failure != nil {
 		result.partial = true
 		result.collectionError = probeCollectionError(failure, now)
 	}

@@ -2723,6 +2723,8 @@ Home 先调用匹配插件。插件接管请求时，成功以 `200` 直接返�
 | `header` | object string to string | 否 | 请求头；包含 `$TOKEN$` 的 header value 会替换为选中 auth token。`Host` 会设置 request host override。 |
 | `data` | string | 否 | 原始请求体字符串。`$TOKEN$` 会替换为所选凭证的 token，并安全转义 JSON 字符串值。 |
 
+替换 `$TOKEN$` 的请求仅跟随同源重定向（相同 scheme、host 与有效端口）；不安全重定向返回 HTTP `502`，不会继续转发凭证。
+
 Token 替换更严格：只要任意 header 或请求体包含 `$TOKEN$`，`auth_index` 就必须解析到 DB auth 或 runtime auth，否则返回：
 
 ```json
@@ -2903,7 +2905,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credentials.in
 
 ### 额度快照通用约定
 
-Devin 使用 Connect-RPC JSON 调用 `https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，将数据库中的 `api_key` 或 `session_token` 放入 `metadata.apiKey`。从 `userStatus.planStatus` 生成稳定的 `devin-daily` 和 `devin-weekly` 账号窗口，分别记录日／周剩余比例、周期以及 Unix 秒重置时间。`planInfo.planName` 和 `planEnd` 提供套餐名称与可选订阅到期时间。可选套餐字段异常不影响有效额度；套餐缺失或无法识别时保留上次套餐，零值或非法到期时间不输出。接受数值字符串；缺失或非法余量保持未知，不补成零。仅有一个有效周期时标记 `partial`；完全没有额度或重置事实时采集失败并保留旧快照。采集不触发凭证刷新。额度探测收到 HTTP `426` 时记录 `UPSTREAM_CLIENT_OUTDATED`，与授权失败分开表示。
+Devin 使用 Connect-RPC JSON 调用 `https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，将数据库中的 `api_key` 或 `session_token` 放入 `metadata.apiKey`。从 `userStatus.planStatus` 生成稳定的 `devin-daily` 和 `devin-weekly` 账号窗口，分别记录日／周剩余比例、周期以及 Unix 秒重置时间。`planInfo.planName` 和 `planEnd` 提供套餐名称与可选订阅到期时间。可选套餐字段异常不影响有效额度；套餐缺失或无法识别时保留上次套餐，零值或非法到期时间不输出。接受数值字符串；缺失或非法余量保持未知，不补成零。只持久化包含有效剩余额度数值的周期；部分响应标记 `partial`，与仍有效的旧周期合并，未观测周期保留原数值、采集时间与有效期。完全没有有效剩余额度数值（包括仅有重置时间）的响应按采集失败处理并保留旧快照。已提供的重置时间过期时忽略该周期。快照有效期不超过默认有效期与下次已观测重置时间中的较早者。采集不触发凭证刷新。额度探测收到 HTTP `426` 时记录 `UPSTREAM_CLIENT_OUTDATED`，与授权失败分开表示。
 
 额度快照接口是纯只读 DB 视图。读取不会请求上游 Provider、刷新 OAuth token、改变调度优先级或消费队列。凭证存在但从未产生快照且从未尝试采集时返回 `quota_status=unknown`、`freshness=never`、空窗口和 HTTP `200`。如果第一次采集在获得任何可用额度事实前失败，则返回 `quota_status=error`、`freshness=never` 和 `collection_status=failed`。Provider 明确不在当前采集规划内时返回 `unsupported`。凭证删除后不再可见，对应额度表记录同时删除；凭证 Provider 或凭证类型发生变化时，也会清除旧身份的额度快照。
 
@@ -2917,12 +2919,12 @@ xAI 在单次探测超时内并行查询三个固定 Grok CLI endpoint：billing
 
 - 套餐资格与账单数值分别判断。订阅档位明确为 null、空字符串、`Free` 或 `None` 时记录为 `Free`，忽略所有周额度及产品用量窗口，即使 credits 响应包含周期或百分比。已确认免费且月度响应有效但没有额度时，采集成功，清除旧付费额度，返回空窗口与 `quota_status=unknown`。
 - 已识别付费档位包括 `SuperGrok`、`SuperGrokPlus`、`SuperGrokPro`、`SuperGrokHeavy`、`XPremiumPlus`；兼容大小写、分隔符和 `SUBSCRIPTION_TIER_` 前缀。profile 套餐优先于月度上限推导（15000 cents -> SuperGrok，150000 cents -> SuperGrok Heavy）。订阅字段缺失、畸形、查询失败或未知档位都不能确认付费资格；未知字符串保留为套餐名称，其他情况保留可用的月度推导或上次套餐。
-- 有效的显式 `creditUsagePercent`（0–100）生成 `xai-weekly-usage`，以当前周期结束时间作为重置时间。仅当本次 profile 确认已识别付费档位、响应明确为周周期且结束时间在未来、可选开始时间有效且不在未来、产品用量不与零值矛盾时，省略的百分比才按零用量处理。显式 null、非法或越界数值、冲突的别名字段、非法周期均不能推导出剩余 100%。产品数值缺失或非法时保持未知，不补成零；产品百分比表示同一额度的用量明细，不是独立配额。
+- 有效的显式 `creditUsagePercent`（0–100）生成 `xai-weekly-usage`，以当前周期结束时间作为重置时间。无论数值显式返回还是按省略字段推导，已提供的周周期元数据必须有效且相互一致；结束时间过期或非法、开始时间在未来、周期类型错误或别名冲突时，忽略整个周额度及产品用量观测。显式有效数值缺少重置元数据时，重置时间保持未知。快照有效期不超过下次已观测重置时间。仅当本次 profile 确认已识别付费档位、响应明确为周周期且结束时间在未来、可选开始时间有效且不在未来、产品用量不与零值矛盾时，省略的百分比才按零用量处理。显式 null、非法或越界数值、冲突的别名字段、非法周期均不能推导出剩余 100%。产品数值缺失或非法时保持未知，不补成零；产品百分比表示同一额度的用量明细，不是独立配额。
 - `monthlyLimit` 为正数时才生成月度 USD 窗口 `xai-monthly-spend`；零值或缺失不表示耗尽。正数 `onDemandCap` 生成 `xai-on-demand`，优先使用显式或推导出的用量，无法确定时保持未知；cap 缺失或为零时不输出该窗口。
-- 任一组件查询失败或数据不完整时，保留其他可用数值并返回 `partial`。完全没有有效用量数值的失败或不完整采集保留旧快照、套餐及采集时间，并遵循正常重试退避。客户端需升级、授权失败及限流错误优先于笼统的解析错误；后续采集成功时清除错误及失败计数。已确认免费且额度为空的成功快照按上述规则替换旧值。
+- 任一组件查询失败或数据不完整时，保留其他可用数值并返回 `partial`。完全没有有效用量数值的失败或不完整采集保留旧快照、套餐及采集时间，并遵循正常重试退避。客户端需升级、授权失败及限流错误优先于笼统的解析错误。部分成功和整次失败均遵守所有失败组件中最长的 `Retry-After`，不受展示哪条错误影响；它只延后定时采集，不延长额度有效期。后续采集成功时清除错误及失败计数。已确认免费且额度为空的成功快照按上述规则替换旧值。
 - 低于 v3 的 xAI 快照在下一次满足活动门控的定时扫描中触发重采集，即使旧快照仍在有效期内。升级尝试在请求前记录，失败后遵循正常退避；成功时原子替换旧额度。
 
-collector 直接读取 DB 凭证，不接受 HMC 提交 URL。探测前会重新解析最新 DB 凭证，并直接使用其中当前保存的 access token，不会调用 OAuth 刷新；凭证刷新仍由独立的 runtime 刷新子系统负责。全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及因 OAuth 刷新失败而被阻断调度的凭证不会被主动探测；模型执行 cooldown 不会阻止额度采集，额度采集自身的重试退避（`next_probe_at`）会推迟定时扫描但不会阻断人工强制重采集。冷却过期或刷新阻断解除后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
+collector 直接读取 DB 凭证，不接受 HMC 提交 URL。携带凭证的额度请求仅跟随原 scheme、host 及有效端口相同的重定向；跨源重定向及 HTTPS 降级会在转发请求前被拒绝。探测前会重新解析最新 DB 凭证，并直接使用其中当前保存的 access token，不会调用 OAuth 刷新；凭证刷新仍由独立的 runtime 刷新子系统负责。全局代理使用热更新后的当前配置，凭证级代理仍优先。统一使用 20 秒 timeout、PostgreSQL 下每个 Provider 并发上限 3（SQLite 下全局为 1）、单凭证 DB 租约，以及从 5 分钟开始、带凭证级 jitter、约 1 小时封顶的指数退避；`Retry-After` 可延后下次尝试。禁用凭证以及因 OAuth 刷新失败而被阻断调度的凭证不会被主动探测；模型执行 cooldown 不会阻止额度采集，额度采集自身的重试退避（`next_probe_at`）会推迟定时扫描但不会阻断人工强制重采集。冷却过期或刷新阻断解除后，持久化的 unavailable/error 状态不再永久阻止恢复探测。成功快照默认 30 分钟有效。探测失败时保留最后已知窗口，只写结构化脱敏错误。
 
 凭证核心字段：
 

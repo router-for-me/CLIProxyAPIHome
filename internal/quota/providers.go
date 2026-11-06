@@ -1004,7 +1004,7 @@ func parseXAIWeeklyWindow(body []byte, observedAt time.Time) (cluster.QuotaWindo
 func xaiWeeklyWindow(config *xaiBillingConfig, observedAt time.Time, entitlement xaiWeeklyEntitlement) (cluster.QuotaWindow, bool) {
 	usedPercent := xaiPercentageValue(config.CreditUsagePercent, config.CreditUsagePercentSnake)
 	period := xaiCurrentWeeklyPeriod(config)
-	if entitlement == xaiEntitlementFree || period != nil && strings.Contains(strings.ToLower(period.Type), "monthly") {
+	if entitlement == xaiEntitlementFree || !xaiWeeklyPeriodIsCurrent(config, observedAt) {
 		return cluster.QuotaWindow{}, false
 	}
 	if usedPercent == nil {
@@ -1034,7 +1034,7 @@ func parseXAIWeeklyWindows(body []byte, observedAt time.Time) []cluster.QuotaWin
 }
 
 func xaiWeeklyWindows(config *xaiBillingConfig, observedAt time.Time, entitlement xaiWeeklyEntitlement) []cluster.QuotaWindow {
-	if entitlement == xaiEntitlementFree {
+	if entitlement == xaiEntitlementFree || !xaiWeeklyPeriodIsCurrent(config, observedAt) {
 		return nil
 	}
 	var windows []cluster.QuotaWindow

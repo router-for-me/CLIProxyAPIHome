@@ -45,6 +45,7 @@ func TestParseXAIUsageWindowsWithPlanAndOnDemand(t *testing.T) {
 
 func TestCollectorXAIKeepsWeeklyQuotaAfterMalformedMonthlyResponse(t *testing.T) {
 	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
 	seedCollectorProviderAuth(t, repo, "xai-invalid-monthly", "xai", map[string]any{"type": "xai", "access_token": "test"})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Grok-Client-Version") != "1.0.70" || r.Header.Get("User-Agent") != "grok-pager/1.0.70 grok-shell/1.0.70 (macos; aarch64)" {
@@ -57,9 +58,9 @@ func TestCollectorXAIKeepsWeeklyQuotaAfterMalformedMonthlyResponse(t *testing.T)
 		_, _ = w.Write([]byte(`{"config":`))
 	}))
 	defer server.Close()
-	collector := NewCollector(repo, Options{Owner: "xai-invalid-monthly-test", XAIBillingURL: server.URL})
+	collector := NewCollector(repo, Options{Owner: "xai-invalid-monthly-test", XAIBillingURL: server.URL, Now: func() time.Time { return now }})
 	collector.collect(context.Background())
-	item, errGet := repo.GetQuotaCredential(context.Background(), "xai-invalid-monthly", time.Now())
+	item, errGet := repo.GetQuotaCredential(context.Background(), "xai-invalid-monthly", now)
 	if errGet != nil || item.CollectionStatus != "partial" || len(item.Windows) != 2 || item.Windows[0].Remaining == nil || *item.Windows[0].Remaining != 99 {
 		t.Fatalf("weekly quota was lost after malformed monthly response: %+v error=%v", item, errGet)
 	}

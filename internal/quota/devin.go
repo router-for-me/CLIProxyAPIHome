@@ -41,11 +41,18 @@ func (c *Collector) probeDevin(ctx context.Context, auth *coreauth.Auth) (probeR
 	}
 	now := c.options.Now().UTC()
 	windows, plan, errParse := parseDevinQuota(payload, now)
+	amounts := windows[:0]
+	for _, window := range windows {
+		if window.RemainingRatio != nil {
+			amounts = append(amounts, window)
+		}
+	}
+	windows = amounts
 	if errParse != nil || len(windows) == 0 {
 		return probeResult{}, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Devin quota response did not contain usable daily or weekly quota.", retryable: true}
 	}
-	result := probeResult{windows: windows, plan: plan, replaceWindows: true, replacePlan: plan != nil}
-	if len(windows) < 2 || windows[0].RemainingRatio == nil || windows[1].RemainingRatio == nil {
+	result := probeResult{windows: windows, plan: plan, replaceWindows: len(windows) == 2, replacePlan: plan != nil, validUntil: quotaWindowResetDeadline(windows, now)}
+	if len(windows) < 2 {
 		result.partial = true
 		result.collectionError = probeCollectionError(&probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Devin quota response did not contain both daily and weekly remaining amounts.", retryable: true}, now)
 	}
@@ -85,6 +92,9 @@ func parseDevinQuota(body []byte, observedAt time.Time) ([]cluster.QuotaWindow, 
 		if seconds := flexFloatValue(bucket.reset); seconds != nil && *seconds > 0 && *seconds <= 253402300799 && math.Trunc(*seconds) == *seconds {
 			reset := time.Unix(int64(*seconds), 0).UTC()
 			resetAt = &reset
+		}
+		if resetAt != nil && !resetAt.After(observedAt) {
+			continue
 		}
 		if remaining == nil && resetAt == nil {
 			continue

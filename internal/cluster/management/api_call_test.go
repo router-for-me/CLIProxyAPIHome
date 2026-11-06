@@ -75,6 +75,74 @@ func TestAPICallBodyTokenEscapesJSON(t *testing.T) {
 	}
 }
 
+func TestAPICallTokenBodyRedirectPolicy(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	auth := &coreauth.Auth{ID: "devin-redirect", Index: "devin-redirect", Provider: "devin", Metadata: map[string]any{"type": "devin", "session_token": "synthetic-session"}}
+	if _, errUpsert := handler.repo.UpsertAuth(context.Background(), auth, "test"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+	engine := gin.New()
+	engine.POST("/requests/api-call", handler.APICall)
+	for _, test := range []struct {
+		name                  string
+		status                int
+		sameOrigin, withToken bool
+		wantStatus            int
+	}{
+		{"same origin 307", http.StatusTemporaryRedirect, true, true, http.StatusOK},
+		{"same origin 308", http.StatusPermanentRedirect, true, true, http.StatusOK},
+		{"cross origin 307", http.StatusTemporaryRedirect, false, true, http.StatusBadGateway},
+		{"cross origin 308", http.StatusPermanentRedirect, false, true, http.StatusBadGateway},
+		{"public redirect", http.StatusTemporaryRedirect, false, false, http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			receive := func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				body, errRead := io.ReadAll(r.Body)
+				if errRead != nil || test.withToken && !strings.Contains(string(body), "synthetic-session") {
+					t.Error("allowed redirect lost the request body")
+				}
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			}
+			destination := httptest.NewServer(http.HandlerFunc(receive))
+			defer destination.Close()
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/final" {
+					receive(w, r)
+					return
+				}
+				target := strings.Replace(destination.URL, "127.0.0.1", "localhost", 1)
+				if test.sameOrigin {
+					target = "/final"
+				}
+				http.Redirect(w, r, target, test.status)
+			}))
+			defer origin.Close()
+			data := "public"
+			if test.withToken {
+				data = `{"apiKey":"$TOKEN$"}`
+			}
+			payload, errMarshal := json.Marshal(map[string]any{"auth_index": auth.ID, "method": "POST", "url": origin.URL, "data": data})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/requests/api-call", strings.NewReader(string(payload)))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			wantCalls := int32(0)
+			if test.wantStatus == http.StatusOK {
+				wantCalls = 1
+			}
+			if response.Code != test.wantStatus || calls.Load() != wantCalls {
+				t.Fatalf("redirect status=%d calls=%d, want status=%d calls=%d", response.Code, calls.Load(), test.wantStatus, wantCalls)
+			}
+		})
+	}
+}
+
 func TestAPICallAuthMatchesOAuthFileName(t *testing.T) {
 	t.Parallel()
 

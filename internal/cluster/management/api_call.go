@@ -78,7 +78,8 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
-	if apiCallHeadersNeedToken(reqHeaders) || strings.Contains(body.Data, "$TOKEN$") {
+	requiresToken := apiCallHeadersNeedToken(reqHeaders) || strings.Contains(body.Data, "$TOKEN$")
+	if requiresToken {
 		if authIndex == "" || auth == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "auth not found"})
 			return
@@ -124,6 +125,9 @@ func (h *Handler) APICall(c *gin.Context) {
 	httpClient := &http.Client{
 		Timeout:   defaultAPICallTimeout,
 		Transport: h.apiCallTransport(auth),
+	}
+	if requiresToken {
+		httpClient.CheckRedirect = proxyutil.SameOriginRedirectPolicy(nil)
 	}
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {

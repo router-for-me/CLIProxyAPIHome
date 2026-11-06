@@ -36,7 +36,7 @@ func TestParseDevinQuotaDailyWeeklyAndPlan(t *testing.T) {
 }
 
 func TestParseDevinQuotaDoesNotInventMissingRemaining(t *testing.T) {
-	now := time.Now().UTC()
+	now := time.Date(2026, 11, 6, 5, 0, 0, 0, time.UTC)
 	for _, body := range []string{
 		`{"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":0,"weeklyQuotaResetAtUnix":1794153600}}}`,
 		`{"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":"0","weeklyQuotaRemainingPercent":101,"weeklyQuotaResetAtUnix":"1794153600"}}}`,
@@ -58,10 +58,19 @@ func TestParseDevinQuotaDoesNotInventMissingRemaining(t *testing.T) {
 	}
 }
 
+func TestParseDevinQuotaRejectsExpiredCycle(t *testing.T) {
+	now := time.Date(2026, 11, 6, 5, 0, 0, 0, time.UTC)
+	body := strings.Replace(devinQuotaFixture, `"dailyQuotaResetAtUnix":"1793980800"`, `"dailyQuotaResetAtUnix":1`, 1)
+	windows, _, errParse := parseDevinQuota([]byte(body), now)
+	if errParse != nil || len(windows) != 1 || windows[0].ID != "devin-weekly" || windows[0].Remaining == nil || *windows[0].Remaining != 83 {
+		t.Fatalf("expired daily cycle survived or current weekly cycle was lost: windows=%+v error=%v", windows, errParse)
+	}
+}
+
 func TestCollectorPersistsDevinBodyAuthenticatedQuota(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	seedCollectorProviderAuth(t, repo, "devin-quota", "devin", map[string]any{"type": "devin", "auth_kind": "oauth", "api_key": "devin-session-token$test"})
-	now := time.Now().UTC()
+	now := time.Date(2026, 11, 6, 5, 0, 0, 0, time.UTC)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -104,7 +113,7 @@ func TestCollectorDevinRetainsPlanWhenOptionalMetadataIsInvalid(t *testing.T) {
 		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
-	now := time.Now().UTC()
+	now := time.Date(2026, 11, 6, 5, 0, 0, 0, time.UTC)
 	collector := NewCollector(repo, Options{Owner: "devin-plan-retained-test", DevinQuotaURL: server.URL, Now: func() time.Time { return now }})
 	collector.collect(context.Background())
 	now = now.Add(time.Minute)
@@ -118,7 +127,7 @@ func TestCollectorDevinRetainsPlanWhenOptionalMetadataIsInvalid(t *testing.T) {
 func TestParseDevinQuotaIgnoresInvalidSubscriptionExpiry(t *testing.T) {
 	for _, expiry := range []string{`null`, `123`, `"0001-01-01T00:00:00Z"`, `"not-a-date"`} {
 		body := strings.Replace(devinQuotaFixture, `"2026-11-11T08:42:00Z"`, expiry, 1)
-		windows, plan, errParse := parseDevinQuota([]byte(body), time.Now())
+		windows, plan, errParse := parseDevinQuota([]byte(body), time.Date(2026, 11, 6, 5, 0, 0, 0, time.UTC))
 		if errParse != nil || len(windows) != 2 || plan == nil || plan.ExpiresAt != nil {
 			t.Fatalf("invalid optional plan expiry discarded quota: windows=%d plan=%+v error=%v", len(windows), plan, errParse)
 		}
@@ -149,7 +158,7 @@ func TestCollectorDevinMissingTokenAndPartialQuota(t *testing.T) {
 			t.Fatalf("ineligible Devin credential was accepted")
 		}
 	}
-	_, _, errInvalid := parseDevinQuota([]byte(strings.Repeat("x", 5)), time.Now())
+	_, _, errInvalid := parseDevinQuota([]byte(strings.Repeat("x", 5)), time.Date(2026, 11, 6, 5, 0, 0, 0, time.UTC))
 	if errInvalid == nil {
 		t.Fatal("malformed upstream JSON was accepted")
 	}

@@ -351,6 +351,13 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 	}
 	observedAt := c.options.Now().UTC()
 	expiresAt := observedAt.Add(c.options.SnapshotFreshness)
+	if result.validUntil != nil && result.validUntil.Before(expiresAt) {
+		expiresAt = result.validUntil.UTC()
+	}
+	nextProbeAt := expiresAt
+	if retryAt := observedAt.Add(result.retryAfter); result.retryAfter > 0 && retryAt.After(nextProbeAt) {
+		nextProbeAt = retryAt
+	}
 	status := quotaWindowAggregateStatus(result.windows)
 	collectionStatus := "success"
 	if result.partial {
@@ -360,7 +367,7 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 	input := cluster.QuotaSnapshotWrite{
 		CredentialID: auth.ID, QuotaStatus: status, CollectionStatus: collectionStatus, Source: "active_probe",
 		ObservedAt: &observedAt, MaxAcceptedObservedAt: &observedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
-		NextProbeAt: &expiresAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: result.replacePlan, ParserVersion: snapshotVersion, CollectorVersion: snapshotVersion,
+		NextProbeAt: &nextProbeAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: result.replacePlan, ParserVersion: snapshotVersion, CollectorVersion: snapshotVersion,
 		ResetCredits: result.resetCredits, ReplaceResetCredits: result.replaceResetCredits,
 		ExpectedProbeOwner: c.options.Owner, ClearProbeLease: true, ReplaceWindows: result.replaceWindows, Windows: result.windows,
 	}
@@ -397,6 +404,18 @@ type probeResult struct {
 	replacePlan         bool
 	replaceResetCredits bool
 	collectionError     *cluster.QuotaCollectionError
+	retryAfter          time.Duration
+	validUntil          *time.Time
+}
+
+func quotaWindowResetDeadline(windows []cluster.QuotaWindow, observedAt time.Time) *time.Time {
+	var deadline *time.Time
+	for _, window := range windows {
+		if window.ResetAt != nil && window.ResetAt.After(observedAt) && (deadline == nil || window.ResetAt.Before(*deadline)) {
+			deadline = window.ResetAt
+		}
+	}
+	return deadline
 }
 
 func (c *Collector) probeCredential(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
@@ -599,7 +618,10 @@ func (c *Collector) probeHTTPRequest(ctx context.Context, auth *coreauth.Auth, m
 	if errClient != nil {
 		return nil, nil, &probeError{code: "PROBE_TRANSPORT_INVALID", message: "Credential proxy configuration is invalid.", retryable: false}
 	}
-	resp, errDo := client.Do(req)
+	// A client factory may share its client across concurrent probes.
+	requestClient := *client
+	requestClient.CheckRedirect = proxyutil.SameOriginRedirectPolicy(client.CheckRedirect)
+	resp, errDo := requestClient.Do(req)
 	if errDo != nil {
 		return nil, nil, &probeError{code: "UPSTREAM_UNAVAILABLE", message: "Upstream quota endpoint is unavailable.", retryable: true}
 	}
@@ -639,10 +661,10 @@ func (c *Collector) failProbe(ctx context.Context, credentialID string, failure 
 			}
 		}
 	}
+	delay = quotaBackoffWithJitter(delay, credentialID)
 	if failure.retryAfter > delay {
 		delay = failure.retryAfter
 	}
-	delay = quotaBackoffWithJitter(delay, credentialID)
 	nextProbeAt := now.Add(delay)
 	occurredAt := now
 	collectionError := cluster.QuotaCollectionError{Code: failure.code, Message: failure.message, Retryable: failure.retryable, OccurredAt: &occurredAt}
@@ -832,6 +854,10 @@ func quotaRetryAfter(headers http.Header, now time.Time) time.Duration {
 		return 0
 	}
 	if seconds, errSeconds := strconv.ParseInt(value, 10, 64); errSeconds == nil && seconds > 0 {
+		const maxDelay = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDelay/time.Second) {
+			return maxDelay
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if retryAt, errTime := http.ParseTime(value); errTime == nil && retryAt.After(now) {
