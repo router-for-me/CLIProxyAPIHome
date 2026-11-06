@@ -284,10 +284,10 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 	}
 	errMonthly, errWeekly, errProfile := responses[0].err, responses[1].err, responses[2].err
 	var windows []cluster.QuotaWindow
-	var plan *cluster.QuotaPlan
+	var fallbackPlan *cluster.QuotaPlan
 	if errMonthly == nil {
 		var errParse error
-		windows, plan, errParse = parseXAIUsageWindows(responses[0].body, now)
+		windows, fallbackPlan, errParse = parseXAIUsageWindows(responses[0].body, now)
 		if errParse != nil {
 			errMonthly = xaiInvalidResponse("xAI monthly billing response could not be parsed.")
 		} else {
@@ -306,9 +306,6 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 		if errParse != nil {
 			errProfile = xaiInvalidResponse("xAI subscription eligibility could not be confirmed.")
 		}
-	}
-	if subscription.plan != nil {
-		plan = subscription.plan
 	}
 	if subscription.entitlement == xaiEntitlementFree {
 		// Free profiles may return a credits period without entitlement to that allowance.
@@ -345,7 +342,7 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 		}
 		return probeResult{}, xaiInvalidResponse("xAI billing response did not contain usable quota.")
 	}
-	result := probeResult{windows: windows, plan: plan, replaceWindows: true, replacePlan: plan != nil, validUntil: quotaWindowResetDeadline(windows, now), retryAfter: retryAfter}
+	result := probeResult{windows: windows, plan: subscription.plan, fallbackPlan: fallbackPlan, replaceWindows: true, replacePlan: subscription.plan != nil, boundWindowLifetimes: true, retryAfter: retryAfter}
 	if errMonthly != nil {
 		result.preserveWindowPrefixes = append(result.preserveWindowPrefixes, "xai-monthly-", "xai-on-demand")
 	}

@@ -240,6 +240,7 @@ type QuotaSnapshotWrite struct {
 	Error                  *QuotaCollectionError
 	Runtime                *QuotaRuntime
 	Plan                   *QuotaPlan
+	FallbackPlan           *QuotaPlan
 	ReplacePlan            bool
 	ResetCredits           *QuotaResetCredits
 	ReplaceResetCredits    bool
@@ -335,6 +336,10 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 		existingObservationInvalid := errExisting == nil && input.MaxAcceptedObservedAt != nil && existing.ObservedAt != nil && existing.ObservedAt.After(input.MaxAcceptedObservedAt.UTC())
 		if errExisting == nil && !existingObservationInvalid && quotaObservationIsOlder(existing.ObservedAt, input.ObservedAt) {
 			return nil
+		}
+		// Resolve heuristics under the snapshot lock, without replacing a known plan.
+		if input.Plan == nil && !input.ReplacePlan && existing.PlanName == "" {
+			input.Plan = input.FallbackPlan
 		}
 
 		record, errRecord := quotaSnapshotRecordFromWrite(input)
@@ -550,7 +555,7 @@ func quotaWindowRecordIsCurrent(window QuotaWindowRecord, snapshot QuotaSnapshot
 	if expiresAt == nil {
 		expiresAt = snapshot.ExpiresAt
 	}
-	return now != nil && expiresAt != nil && expiresAt.After(*now)
+	return now != nil && expiresAt != nil && expiresAt.After(*now) && (window.ResetAt == nil || window.ResetAt.After(*now))
 }
 
 func createQuotaSnapshotRecord(tx *gorm.DB, record *QuotaSnapshotRecord, input QuotaSnapshotWrite) (bool, error) {
@@ -641,24 +646,11 @@ func quotaAuthoritativeSnapshotFreshAndComplete(existing QuotaSnapshotRecord, ob
 }
 
 func quotaWindowRecordAggregateStatus(windows []QuotaWindowRecord) string {
-	status := "unknown"
+	items := make([]QuotaWindow, 0, len(windows))
 	for _, window := range windows {
-		switch window.Status {
-		case "exhausted":
-			return "exhausted"
-		case "low":
-			status = "low"
-		case "error":
-			if status != "low" {
-				status = "error"
-			}
-		case "healthy":
-			if status == "unknown" {
-				status = "healthy"
-			}
-		}
+		items = append(items, QuotaWindow{ScopeID: quotaOptionalString(window.ScopeID), Status: window.Status})
 	}
-	return status
+	return AggregateQuotaWindowStatus(items)
 }
 
 func quotaWindowRecordAggregateSource(windows []QuotaWindowRecord) string {
@@ -1157,7 +1149,7 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 		}
 		displayWindows = validWindows
 		if len(displayWindows) > 0 {
-			item.QuotaStatus = quotaWindowAggregateDTOStatus(displayWindows)
+			item.QuotaStatus = AggregateQuotaWindowStatus(displayWindows)
 			item.Source = quotaOptionalString(quotaWindowAggregateDTOSource(displayWindows))
 		}
 	}
@@ -1189,9 +1181,13 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 	return item
 }
 
-func quotaWindowAggregateDTOStatus(windows []QuotaWindow) string {
+// AggregateQuotaWindowStatus summarizes independent limits, excluding shared-pool breakdowns.
+func AggregateQuotaWindowStatus(windows []QuotaWindow) string {
 	status := "unknown"
 	for _, window := range windows {
+		if strings.EqualFold(quotaStringValue(window.ScopeID), "xai-product-usage") {
+			continue
+		}
 		switch window.Status {
 		case "exhausted":
 			return "exhausted"
@@ -1264,11 +1260,17 @@ func validateQuotaSnapshotWrite(input *QuotaSnapshotWrite) error {
 	if input.Source != "" && !quotaAllowed(input.Source, "response_header", "active_probe", "mixed") {
 		return fmt.Errorf("unsupported quota source %q", input.Source)
 	}
-	if input.Plan != nil {
-		input.Plan.Name = quotaBoundedText(input.Plan.Name, 64)
-		if input.Plan.Name == "" {
+	for _, plan := range []*QuotaPlan{input.Plan, input.FallbackPlan} {
+		if plan == nil {
+			continue
+		}
+		plan.Name = quotaBoundedText(plan.Name, 64)
+		if plan.Name == "" {
 			return fmt.Errorf("quota plan name is required")
 		}
+	}
+	if input.FallbackPlan != nil && (input.Source != "active_probe" || !input.ClearProbeLease || strings.TrimSpace(input.ExpectedProbeOwner) == "") {
+		return fmt.Errorf("fallback quota plans require a leased active probe")
 	}
 	if len(input.PreserveWindowPrefixes) > 0 {
 		if input.Source != "active_probe" || !input.ReplaceWindows || input.ObservedAt == nil {

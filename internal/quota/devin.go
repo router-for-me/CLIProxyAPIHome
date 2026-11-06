@@ -51,7 +51,7 @@ func (c *Collector) probeDevin(ctx context.Context, auth *coreauth.Auth) (probeR
 	if errParse != nil || len(windows) == 0 {
 		return probeResult{}, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Devin quota response did not contain usable daily or weekly quota.", retryable: true}
 	}
-	result := probeResult{windows: windows, plan: plan, replaceWindows: len(windows) == 2, replacePlan: plan != nil, validUntil: quotaWindowResetDeadline(windows, now)}
+	result := probeResult{windows: windows, plan: plan, replaceWindows: len(windows) == 2, replacePlan: plan != nil, boundWindowLifetimes: true}
 	if len(windows) < 2 {
 		result.partial = true
 		result.collectionError = probeCollectionError(&probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Devin quota response did not contain both daily and weekly remaining amounts.", retryable: true}, now)
