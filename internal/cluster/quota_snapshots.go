@@ -88,6 +88,7 @@ type QuotaSnapshotRecord struct {
 	CPANodeLabel        string     `gorm:"column:cpa_node_label;size:256"`
 	PlanName            string     `gorm:"column:plan_name;size:64"`
 	PlanPremium         *bool      `gorm:"column:plan_premium"`
+	PlanExpiresAt       *time.Time `gorm:"column:plan_expires_at"`
 	ResetCredits        JSONB      `gorm:"column:reset_credits"`
 	ProbeLeaseOwner     string     `gorm:"column:probe_lease_owner;size:256"`
 	ProbeLeaseExpiresAt *time.Time `gorm:"column:probe_lease_expires_at;index"`
@@ -173,8 +174,9 @@ type QuotaRuntime struct {
 // QuotaPlan carries subscription plan metadata derived from a provider's quota
 // response (for example Codex Pro 20x or xAI SuperGrok Heavy).
 type QuotaPlan struct {
-	Name    string `json:"name"`
-	Premium bool   `json:"premium"`
+	Name      string     `json:"name"`
+	Premium   bool       `json:"premium"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // QuotaResetCredit describes one available provider-issued quota reset credit.
@@ -356,6 +358,7 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			if input.Plan == nil && !input.ReplacePlan {
 				record.PlanName = existing.PlanName
 				record.PlanPremium = existing.PlanPremium
+				record.PlanExpiresAt = quotaUTC(existing.PlanExpiresAt)
 			}
 			if !input.ReplaceResetCredits && len(existing.ResetCredits) > 0 {
 				record.ResetCredits = append(JSONB(nil), existing.ResetCredits...)
@@ -1088,7 +1091,7 @@ func quotaCredentialFromAuth(record AuthRecord, auth *coreauth.Auth, snapshot Qu
 		item.Runtime = &QuotaRuntime{HomeID: snapshot.HomeID, HomeLabel: snapshot.HomeLabel, CPANodeID: snapshot.CPANodeID, CPANodeLabel: snapshot.CPANodeLabel}
 	}
 	if snapshot.PlanName != "" {
-		item.Plan = &QuotaPlan{Name: snapshot.PlanName, Premium: snapshot.PlanPremium != nil && *snapshot.PlanPremium}
+		item.Plan = &QuotaPlan{Name: snapshot.PlanName, Premium: snapshot.PlanPremium != nil && *snapshot.PlanPremium, ExpiresAt: quotaUTC(snapshot.PlanExpiresAt)}
 	}
 	item.ResetCredits = quotaResetCreditsFromJSON(snapshot.ResetCredits)
 	item.PrimaryWindows = quotaPrimaryWindows(provider, displayWindows)
@@ -1291,6 +1294,7 @@ func quotaSnapshotRecordFromWrite(input QuotaSnapshotWrite) (QuotaSnapshotRecord
 		record.PlanName = quotaBoundedText(input.Plan.Name, 64)
 		premium := input.Plan.Premium
 		record.PlanPremium = &premium
+		record.PlanExpiresAt = quotaUTC(input.Plan.ExpiresAt)
 	}
 	if input.ResetCredits != nil {
 		resetCredits, errResetCredits := quotaResetCreditsJSON(input.ResetCredits)
@@ -1824,7 +1828,7 @@ func quotaCredentialStatus(record AuthRecord, now time.Time) string {
 
 func quotaProviderPlanned(provider string) bool {
 	switch normalizeQuotaProviderID(provider) {
-	case "claude", "antigravity", "codex", "kimi", "xai", "meta":
+	case "claude", "antigravity", "codex", "devin", "kimi", "xai", "meta":
 		return true
 	default:
 		return false

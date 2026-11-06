@@ -157,16 +157,20 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 	if errMonthly == nil {
 		monthlyWindows, monthlyPlan, errParse := parseXAIUsageWindows(monthlyPayload, now)
 		if errParse != nil {
-			return probeResult{}, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI billing response did not contain usable quota.", retryable: true}
+			errMonthly = &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI billing response did not contain usable quota.", retryable: true}
+		} else {
+			windows, plan = monthlyWindows, monthlyPlan
 		}
-		windows, plan = monthlyWindows, monthlyPlan
 	}
 	// The weekly credits quota lives behind the format=credits billing variant
 	// and is the primary limit for subscription accounts; a weekly probe failure
 	// is non-fatal while the monthly response still yields usable windows.
 	weeklyPayload, _, errWeekly := c.probeRequest(ctx, auth, http.MethodGet, xaiWeeklyBillingURL(c.options.XAIBillingURL), nil, headers)
 	if errWeekly == nil {
-		if weeklyWindows := parseXAIWeeklyWindows(weeklyPayload, now); len(weeklyWindows) > 0 {
+		var weeklyBilling xaiBillingPayload
+		if errDecode := json.Unmarshal(weeklyPayload, &weeklyBilling); errDecode != nil || weeklyBilling.Config == nil {
+			errWeekly = &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI weekly quota response could not be parsed.", retryable: true}
+		} else if weeklyWindows := parseXAIWeeklyWindows(weeklyPayload, now); len(weeklyWindows) > 0 {
 			windows = append(weeklyWindows, windows...)
 		}
 	}
@@ -187,6 +191,9 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 		result.partial = true
 		result.collectionError = probeCollectionError(errMonthly, now)
 		result.replacePlan = false
+	} else if errWeekly != nil {
+		result.partial = true
+		result.collectionError = probeCollectionError(errWeekly, now)
 	}
 	return result, nil
 }
@@ -976,7 +983,7 @@ func parseXAIUsageWindows(body []byte, observedAt time.Time) ([]cluster.QuotaWin
 		return nil, nil, fmt.Errorf("decode xai billing response: %w", errDecode)
 	}
 	if payload.Config == nil {
-		return nil, nil, nil
+		return nil, nil, fmt.Errorf("xai billing response is missing config")
 	}
 	config := payload.Config
 	monthlyLimitCents := firstFloat(flexFloatValue(config.MonthlyLimit), flexFloatValue(config.MonthlyLimitSnake))
@@ -1128,7 +1135,7 @@ func parseXAIWeeklyWindows(body []byte, observedAt time.Time) []cluster.QuotaWin
 			Scope:       "account",
 			ScopeID:     quotaStringPtr("xai-product-usage"),
 			Mode:        "fixed",
-			Status:      "healthy",
+			Status:      "unknown",
 			Unit:        "percentage",
 			Used:        usedPtr,
 			Limit:       limitPtr,

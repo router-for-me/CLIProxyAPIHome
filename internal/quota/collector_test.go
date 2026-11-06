@@ -22,6 +22,28 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+func TestQuotaProbeBearerAuthorizationReplacesCallerHeaders(t *testing.T) {
+	received := make(chan []string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- append([]string(nil), r.Header.Values("Authorization")...)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	collector := NewCollector(newCollectorTestRepository(t), Options{Owner: "header-test"})
+	headers := http.Header{"authorization": []string{"stale-lowercase"}, "Authorization": []string{"stale-canonical"}}
+	_, _, errProbe := collector.probeRequestWithToken(context.Background(), &coreauth.Auth{}, "test-token", http.MethodGet, server.URL, nil, headers)
+	if errProbe != nil {
+		t.Fatalf("quota request failed: %v", errProbe)
+	}
+	values := <-received
+	if len(values) != 1 || values[0] != "Bearer test-token" {
+		t.Fatal("quota request must send exactly one current bearer credential")
+	}
+	if headers["authorization"][0] != "stale-lowercase" || headers["Authorization"][0] != "stale-canonical" {
+		t.Fatal("quota request mutated the caller's header map")
+	}
+}
+
 func TestCollectorPersistsCodexActiveProbeSnapshot(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 16, 4, 0, 0, 0, time.UTC)

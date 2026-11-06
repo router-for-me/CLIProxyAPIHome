@@ -1,11 +1,79 @@
 package management
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 )
+
+func TestAPICallResolvesDevinTokenInBody(t *testing.T) {
+	handler, closeRepo := newUsageObservabilityTestHandler(t)
+	defer closeRepo()
+	auth := &coreauth.Auth{ID: "devin-body", Index: "devin-body", Provider: "devin", Metadata: map[string]any{"type": "devin", "auth_kind": "oauth", "session_token": "devin-session-token$test"}}
+	if _, errUpsert := handler.repo.UpsertAuth(context.Background(), auth, "test"); errUpsert != nil {
+		t.Fatalf("seed Devin credential: %v", errUpsert)
+	}
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil || string(body) != `{"metadata":{"apiKey":"devin-session-token$test"}}` {
+			t.Errorf("Devin token was not substituted into the request body")
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	engine := gin.New()
+	engine.POST("/requests/api-call", handler.APICall)
+	for _, selector := range []string{"devin-body", "missing"} {
+		payload, errMarshal := json.Marshal(map[string]any{
+			"authIndex": selector, "method": "POST", "url": upstream.URL,
+			"header": map[string]string{"Content-Type": "application/json"},
+			"data":   `{"metadata":{"apiKey":"$TOKEN$"}}`,
+		})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/requests/api-call", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, req)
+		wantStatus := http.StatusOK
+		if selector == "missing" {
+			wantStatus = http.StatusBadRequest
+		}
+		if response.Code != wantStatus {
+			t.Fatalf("API call status=%d, want %d", response.Code, wantStatus)
+		}
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("unresolved token reached upstream: requests=%d", upstreamCalls.Load())
+	}
+}
+
+func TestAPICallBodyTokenEscapesJSON(t *testing.T) {
+	const token = "session\"\\\n\tvalue"
+	data := apiCallBodyWithToken(`{"metadata":{"apiKey":"$TOKEN$"}}`, token)
+	var parsed struct {
+		Metadata struct {
+			APIKey string `json:"apiKey"`
+		} `json:"metadata"`
+	}
+	if errDecode := json.Unmarshal([]byte(data), &parsed); errDecode != nil || parsed.Metadata.APIKey != token {
+		t.Fatal("body token did not preserve JSON validity and token contents")
+	}
+	if apiCallBodyWithToken("plain:$TOKEN$", token) != "plain:"+token {
+		t.Fatal("non-JSON request body was unexpectedly escaped")
+	}
+}
 
 func TestAPICallAuthMatchesOAuthFileName(t *testing.T) {
 	t.Parallel()

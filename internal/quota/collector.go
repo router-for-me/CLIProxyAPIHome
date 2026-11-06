@@ -35,6 +35,7 @@ const (
 	codexResetCreditsURL       = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 	claudeUsageURL             = "https://api.anthropic.com/api/oauth/usage"
 	claudeProfileURL           = "https://api.anthropic.com/api/oauth/profile"
+	devinQuotaURL              = "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 	kimiUsageURL               = "https://api.kimi.com/coding/v1/usages"
 	xaiBillingURL              = "https://cli-chat-proxy.grok.com/v1/billing"
 	metaQuotaURL               = "https://api.meta.ai/muse-code/key"
@@ -42,8 +43,8 @@ const (
 	xaiTokenAuthHeader         = "X-XAI-Token-Auth"
 	xaiTokenAuthValue          = "xai-grok-cli"
 	xaiClientVersionHeader     = "x-grok-client-version"
-	xaiClientVersionValue      = "0.2.93"
-	xaiGrokUserAgent           = "xai-grok-workspace/0.2.93"
+	xaiClientVersionValue      = "1.0.70"
+	xaiGrokUserAgent           = "grok-pager/" + xaiClientVersionValue + " grok-shell/" + xaiClientVersionValue + " (macos; aarch64)"
 	metaAPIVersionHeader       = "x-api-version"
 	metaAPIVersionValue        = "1.0.0"
 	metaMuseUserAgent          = "muse-code/1.0.2"
@@ -70,6 +71,7 @@ type Options struct {
 	CodexResetCreditsURL     string
 	ClaudeUsageURL           string
 	ClaudeProfileURL         string
+	DevinQuotaURL            string
 	KimiUsageURL             string
 	XAIBillingURL            string
 	MetaQuotaURL             string
@@ -126,6 +128,9 @@ func NewCollector(repo *cluster.Repository, options Options) *Collector {
 	}
 	if strings.TrimSpace(options.ClaudeProfileURL) == "" {
 		options.ClaudeProfileURL = claudeProfileURL
+	}
+	if strings.TrimSpace(options.DevinQuotaURL) == "" {
+		options.DevinQuotaURL = devinQuotaURL
 	}
 	if strings.TrimSpace(options.KimiUsageURL) == "" {
 		options.KimiUsageURL = kimiUsageURL
@@ -396,6 +401,8 @@ func (c *Collector) probeCredential(ctx context.Context, auth *coreauth.Auth) (p
 		return c.probeCodex(ctx, auth)
 	case "claude":
 		return c.probeClaude(ctx, auth)
+	case "devin":
+		return c.probeDevin(ctx, auth)
 	case "antigravity":
 		return c.probeAntigravity(ctx, auth)
 	case "kimi":
@@ -558,6 +565,21 @@ func (c *Collector) probeRequestWithToken(ctx context.Context, auth *coreauth.Au
 	if token == "" {
 		return nil, nil, &probeError{code: "AUTH_TOKEN_UNAVAILABLE", message: "Credential access token is unavailable.", retryable: true}
 	}
+	headers = headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	for key := range headers {
+		if strings.EqualFold(key, "Authorization") {
+			delete(headers, key)
+		}
+	}
+	headers.Set("Authorization", "Bearer "+token)
+	return c.probeHTTPRequest(ctx, auth, method, targetURL, body, headers)
+}
+
+// probeHTTPRequest shares transport and safe error handling with body-authenticated collectors.
+func (c *Collector) probeHTTPRequest(ctx context.Context, auth *coreauth.Auth, method string, targetURL string, body []byte, headers http.Header) ([]byte, http.Header, *probeError) {
 	requestCtx, cancel := context.WithTimeout(ctx, c.options.ProbeTimeout)
 	defer cancel()
 	req, errRequest := http.NewRequestWithContext(requestCtx, method, targetURL, bytes.NewReader(body))
@@ -569,7 +591,6 @@ func (c *Collector) probeRequestWithToken(ctx context.Context, auth *coreauth.Au
 			req.Header.Add(key, value)
 		}
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 	client, errClient := c.options.HTTPClient(auth, c.options.ProbeTimeout)
 	if errClient != nil {
 		return nil, nil, &probeError{code: "PROBE_TRANSPORT_INVALID", message: "Credential proxy configuration is invalid.", retryable: false}
@@ -662,7 +683,7 @@ func quotaProbeEligible(auth *coreauth.Auth) bool {
 		return false
 	}
 	switch normalizedQuotaProvider(auth.Provider) {
-	case "codex", "claude", "antigravity", "kimi", "xai", "meta":
+	case "codex", "claude", "antigravity", "devin", "kimi", "xai", "meta":
 		return true
 	default:
 		return false
@@ -821,6 +842,8 @@ func quotaHTTPProbeError(status int, requestID string) *probeError {
 		return &probeError{code: "UPSTREAM_AUTH_REJECTED", message: "Upstream rejected the credential.", retryable: true, statusCode: status, requestID: requestID}
 	case http.StatusTooManyRequests:
 		return &probeError{code: "UPSTREAM_RATE_LIMITED", message: "Upstream quota endpoint rate limited the probe.", retryable: true, statusCode: status, requestID: requestID}
+	case http.StatusUpgradeRequired:
+		return &probeError{code: "UPSTREAM_CLIENT_OUTDATED", message: "Upstream quota endpoint requires a newer client version.", retryable: false, statusCode: status, requestID: requestID}
 	default:
 		return &probeError{code: "UPSTREAM_UNAVAILABLE", message: "Upstream quota endpoint returned an unavailable response.", retryable: status >= 500, statusCode: status, requestID: requestID}
 	}

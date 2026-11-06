@@ -43,6 +43,76 @@ func TestParseXAIUsageWindowsWithPlanAndOnDemand(t *testing.T) {
 	}
 }
 
+func TestCollectorXAIKeepsWeeklyQuotaAfterMalformedMonthlyResponse(t *testing.T) {
+	repo := newCollectorTestRepository(t)
+	seedCollectorProviderAuth(t, repo, "xai-invalid-monthly", "xai", map[string]any{"type": "xai", "access_token": "test"})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Grok-Client-Version") != "1.0.70" || r.Header.Get("User-Agent") != "grok-pager/1.0.70 grok-shell/1.0.70 (macos; aarch64)" {
+			t.Errorf("outdated Grok CLI identity headers")
+		}
+		if r.URL.Query().Get("format") == "credits" {
+			_, _ = w.Write([]byte(`{"config":{"creditUsagePercent":1,"currentPeriod":{"type":"weekly","end":"2026-11-12T12:15:00Z"},"productUsage":[{"product":"GrokBuild","usagePercent":1}]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"config":`))
+	}))
+	defer server.Close()
+	collector := NewCollector(repo, Options{Owner: "xai-invalid-monthly-test", XAIBillingURL: server.URL})
+	collector.collect(context.Background())
+	item, errGet := repo.GetQuotaCredential(context.Background(), "xai-invalid-monthly", time.Now())
+	if errGet != nil || item.CollectionStatus != "partial" || len(item.Windows) != 2 || item.Windows[0].Remaining == nil || *item.Windows[0].Remaining != 99 {
+		t.Fatalf("weekly quota was lost after malformed monthly response: %+v error=%v", item, errGet)
+	}
+	if item.Error == nil || item.Error.Code != "UPSTREAM_RESPONSE_INVALID" || item.Windows[1].ID != "xai-product-grokbuild" {
+		t.Fatalf("partial error or product usage was lost: %+v", item)
+	}
+}
+
+func TestQuotaHTTPProbeErrorReportsOutdatedClient(t *testing.T) {
+	failure := quotaHTTPProbeError(http.StatusUpgradeRequired, "request-1")
+	if failure.code != "UPSTREAM_CLIENT_OUTDATED" || failure.statusCode != 426 || failure.retryable {
+		t.Fatalf("unexpected outdated-client error: %+v", failure)
+	}
+}
+
+func TestParseXAIWeeklyQuotaRequiresObservedUsage(t *testing.T) {
+	window, ok := parseXAIWeeklyWindow([]byte(`{"config":{"currentPeriod":{"type":"weekly","end":"2026-11-12T12:15:00Z"}}}`), time.Now())
+	if ok {
+		t.Fatalf("weekly allowance inferred without observed usage or subscription entitlement: %+v", window)
+	}
+}
+
+func TestCollectorXAIKeepsMonthlyQuotaAfterInvalidWeeklyShape(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `[]`, `{"config":[]}`} {
+		t.Run(body, func(t *testing.T) {
+			repo := newCollectorTestRepository(t)
+			seedCollectorProviderAuth(t, repo, "xai-weekly-invalid-shape", "xai", map[string]any{"type": "xai", "access_token": "test"})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("format") == "credits" {
+					_, _ = w.Write([]byte(body))
+					return
+				}
+				_, _ = w.Write([]byte(`{"config":{"monthlyLimit":15000,"used":100}}`))
+			}))
+			defer server.Close()
+			collector := NewCollector(repo, Options{Owner: "xai-weekly-shape-test", XAIBillingURL: server.URL})
+			collector.collect(context.Background())
+			item, errGet := repo.GetQuotaCredential(context.Background(), "xai-weekly-invalid-shape", time.Now())
+			if errGet != nil || item.CollectionStatus != "partial" || item.Error == nil || item.Error.Code != "UPSTREAM_RESPONSE_INVALID" || len(item.Windows) != 1 || item.Plan == nil {
+				t.Fatalf("weekly response shape failure discarded monthly quota or went unreported: item=%+v error=%v", item, errGet)
+			}
+		})
+	}
+}
+
+func TestParseXAIUsageRejectsMissingBillingConfig(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `{"config":null}`} {
+		if _, _, errParse := parseXAIUsageWindows([]byte(body), time.Now()); errParse == nil {
+			t.Fatal("missing monthly config was accepted as an authoritative empty plan")
+		}
+	}
+}
+
 func TestParseXAIUsageWindowsAcceptsSnakeCaseAndScalarValues(t *testing.T) {
 	now := time.Date(2026, 7, 16, 8, 0, 0, 0, time.UTC)
 	body := []byte(`{
@@ -296,6 +366,9 @@ func TestCollectorToleratesXAIWeeklyProbeFailure(t *testing.T) {
 	}
 	if len(item.Windows) != 1 || item.Windows[0].ID != "xai-monthly-spend" {
 		t.Fatalf("monthly windows lost after weekly probe failure: %+v", item.Windows)
+	}
+	if item.CollectionStatus != "partial" || item.Error == nil {
+		t.Fatalf("weekly probe failure was hidden: %+v", item)
 	}
 	if item.Plan == nil || item.Plan.Name != "SuperGrok" {
 		t.Fatalf("plan lost after weekly probe failure: %+v", item.Plan)
