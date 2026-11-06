@@ -10,7 +10,7 @@ import (
 // currentDatabaseVersion is shared by the live schema migration gate and the
 // portable snapshot format. Increment it for every required startup migration
 // or snapshot format change, and retain mappings for prior snapshot formats.
-const currentDatabaseVersion = 15
+const currentDatabaseVersion = 16
 
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
@@ -325,6 +325,43 @@ func (databaseSnapshotV14BillingChargeRecord) TableName() string {
 	return "billing_charge"
 }
 
+// databaseSnapshotV15QuotaSnapshotRecord freezes quota rows before plan expiry was added.
+type databaseSnapshotV15QuotaSnapshotRecord struct {
+	CredentialID        string     `gorm:"column:credential_id;primaryKey;size:128"`
+	QuotaStatus         string     `gorm:"column:quota_status;not null;size:32;index"`
+	CollectionStatus    string     `gorm:"column:collection_status;not null;size:32;index"`
+	Source              string     `gorm:"column:source;size:32;index"`
+	ObservedAt          *time.Time `gorm:"column:observed_at;index"`
+	ExpiresAt           *time.Time `gorm:"column:expires_at;index"`
+	LastAttemptAt       *time.Time `gorm:"column:last_attempt_at"`
+	LastSuccessAt       *time.Time `gorm:"column:last_success_at"`
+	NextProbeAt         *time.Time `gorm:"column:next_probe_at;index"`
+	LastActiveProbeAt   *time.Time `gorm:"column:last_active_probe_at" json:"-"`
+	ProbeActivityAt     *time.Time `gorm:"column:probe_activity_at" json:"-"`
+	ConsecutiveFailure  int        `gorm:"column:consecutive_failures;not null;default:0"`
+	ErrorCode           string     `gorm:"column:error_code;size:128"`
+	ErrorMessage        string     `gorm:"column:error_message;size:500"`
+	ErrorRetryable      bool       `gorm:"column:error_retryable;not null;default:false"`
+	ErrorOccurredAt     *time.Time `gorm:"column:error_occurred_at"`
+	ErrorStatusCode     int        `gorm:"column:error_status_code;not null;default:0"`
+	ErrorRequestID      string     `gorm:"column:error_request_id;size:128"`
+	HomeID              string     `gorm:"column:home_id;size:256"`
+	HomeLabel           string     `gorm:"column:home_label;size:256"`
+	CPANodeID           string     `gorm:"column:cpa_node_id;size:256"`
+	CPANodeLabel        string     `gorm:"column:cpa_node_label;size:256"`
+	PlanName            string     `gorm:"column:plan_name;size:64"`
+	PlanPremium         *bool      `gorm:"column:plan_premium"`
+	ResetCredits        JSONB      `gorm:"column:reset_credits"`
+	ProbeLeaseOwner     string     `gorm:"column:probe_lease_owner;size:256"`
+	ProbeLeaseExpiresAt *time.Time `gorm:"column:probe_lease_expires_at;index"`
+	ParserVersion       int        `gorm:"column:parser_version;not null;default:1"`
+	CollectorVersion    int        `gorm:"column:collector_version;not null;default:1"`
+	CreatedAt           time.Time  `gorm:"column:created_at"`
+	UpdatedAt           time.Time  `gorm:"column:updated_at"`
+}
+
+func (databaseSnapshotV15QuotaSnapshotRecord) TableName() string { return "quota_snapshot" }
+
 var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[databaseSnapshotV4AuthRecord]("auth", []string{"uuid"}, false, true),
 	newDatabaseModel[ConfigRecord]("config", []string{"key"}, false, true),
@@ -346,7 +383,7 @@ var databaseSnapshotV1Models = []databaseModel{
 	newDatabaseModel[databaseSnapshotV1CPANodeRecord]("cpa_node", []string{"home_ip", "home_port", "node_key"}, false, false),
 	newDatabaseModel[ClusterEventRecord]("cluster_events", []string{"id"}, true, false),
 	newDatabaseModel[databaseSnapshotV4UsageRecord]("usage", []string{"id"}, true, true),
-	newDatabaseModel[QuotaSnapshotRecord]("quota_snapshot", []string{"credential_id"}, false, true),
+	newDatabaseModel[databaseSnapshotV15QuotaSnapshotRecord]("quota_snapshot", []string{"credential_id"}, false, true),
 	newDatabaseModel[QuotaWindowRecord]("quota_window", []string{"credential_id", "window_id"}, false, true),
 	newDatabaseModel[databaseSnapshotV14BillingModelPriceRecord]("billing_model_price", []string{"id"}, false, true),
 	newDatabaseModel[BillingModelPriceImportPreviewRecord]("billing_model_price_import_preview", []string{"id"}, false, true),
@@ -375,6 +412,9 @@ var databaseSnapshotV5Models = databaseSnapshotV5ModelRegistry()
 
 // databaseSnapshotV6Models is the frozen database snapshot format v6..v14 registry.
 var databaseSnapshotV6Models = databaseSnapshotV6ModelRegistry()
+
+// databaseSnapshotV15Models keeps the portable format used before plan expiry.
+var databaseSnapshotV15Models = databaseSnapshotV15ModelRegistry()
 
 // homeDatabaseModels is the current database snapshot registry.
 var homeDatabaseModels = currentDatabaseModels()
@@ -456,7 +496,7 @@ func databaseSnapshotV6ModelRegistry() []databaseModel {
 	return models
 }
 
-func currentDatabaseModels() []databaseModel {
+func databaseSnapshotV15ModelRegistry() []databaseModel {
 	models := append([]databaseModel(nil), databaseSnapshotV6Models...)
 	for index := range models {
 		switch models[index].name {
@@ -466,6 +506,17 @@ func currentDatabaseModels() []databaseModel {
 			models[index] = newDatabaseModel[BillingModelPriceRecord]("billing_model_price", []string{"id"}, false, true)
 		case "billing_charge":
 			models[index] = newDatabaseModel[BillingChargeRecord]("billing_charge", []string{"id"}, false, true)
+		}
+	}
+	return models
+}
+
+func currentDatabaseModels() []databaseModel {
+	models := append([]databaseModel(nil), databaseSnapshotV15Models...)
+	for index := range models {
+		if models[index].name == "quota_snapshot" {
+			models[index] = newDatabaseModel[QuotaSnapshotRecord]("quota_snapshot", []string{"credential_id"}, false, true)
+			break
 		}
 	}
 	return models
@@ -487,6 +538,8 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 		// Versions 7 through 14 add migrations, indexes, and transient tables;
 		// portable table shapes still match v6.
 		return databaseSnapshotV6Models, true
+	case 15:
+		return databaseSnapshotV15Models, true
 	case currentDatabaseVersion:
 		return homeDatabaseModels, true
 	default:

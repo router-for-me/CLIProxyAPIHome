@@ -22,6 +22,28 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+func TestQuotaProbeBearerAuthorizationReplacesCallerHeaders(t *testing.T) {
+	received := make(chan []string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- append([]string(nil), r.Header.Values("Authorization")...)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	collector := NewCollector(newCollectorTestRepository(t), Options{Owner: "header-test"})
+	headers := http.Header{"authorization": []string{"stale-lowercase"}, "Authorization": []string{"stale-canonical"}}
+	_, _, errProbe := collector.probeRequestWithToken(context.Background(), &coreauth.Auth{}, "test-token", http.MethodGet, server.URL, nil, headers)
+	if errProbe != nil {
+		t.Fatalf("quota request failed: %v", errProbe)
+	}
+	values := <-received
+	if len(values) != 1 || values[0] != "Bearer test-token" {
+		t.Fatal("quota request must send exactly one current bearer credential")
+	}
+	if headers["authorization"][0] != "stale-lowercase" || headers["Authorization"][0] != "stale-canonical" {
+		t.Fatal("quota request mutated the caller's header map")
+	}
+}
+
 func TestCollectorPersistsCodexActiveProbeSnapshot(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 16, 4, 0, 0, 0, time.UTC)
@@ -151,6 +173,8 @@ func TestCollectorSupportsClaudeAntigravityKimiAndXAI(t *testing.T) {
 			_, _ = w.Write([]byte(`{"user":{"userId":"user-1","region":"REGION_OVERSEA"},"usage":{"limit":"100","used":"44","remaining":"56","resetTime":"2026-07-21T13:09:11Z"},"limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},"detail":{"limit":"100","used":"10","remaining":"90","resetTime":"2026-07-19T14:09:11Z"}}],"totalQuota":{"limit":"100","remaining":"99"}}`))
 		case "/xai":
 			_, _ = w.Write([]byte(`{"config":{"monthlyLimit":{"val":20000},"used":{"val":167},"billingPeriodEnd":"2026-08-01T00:00:00Z"}}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"subscriptionTier":null}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -340,6 +364,7 @@ func TestQuotaRetryAfterSupportsSecondsAndHTTPDate(t *testing.T) {
 		want  time.Duration
 	}{
 		{value: "120", want: 2 * time.Minute},
+		{value: "9223372036854775807", want: time.Duration(1<<63 - 1)},
 		{value: now.Add(3 * time.Minute).Format(http.TimeFormat), want: 3 * time.Minute},
 		{value: "invalid", want: 0},
 	} {

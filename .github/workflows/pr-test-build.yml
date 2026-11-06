@@ -38,8 +38,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify cluster and management behavior
-        run: go test -v ./internal/cluster/...
+      - name: Verify transport, quota, cluster and management behavior
+        run: go test -v ./internal/proxyutil ./internal/quota ./internal/cluster/...
       - name: Build
         run: |
           CGO_ENABLED=1 go build -o test-output ./cmd/home
