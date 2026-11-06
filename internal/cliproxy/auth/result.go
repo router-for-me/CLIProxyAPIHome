@@ -87,6 +87,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	} else {
 		auth.Failed++
 	}
+	if !result.Success && result.Error != nil && result.Error.Code == ErrorCodeRequestScoped {
+		// Count the request failure without publishing a stale credential snapshot
+		// or adopting shared availability state through the status-based paths.
+		m.mu.Unlock()
+		unlockUpdate()
+		return
+	}
 	localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
 		!isModelSupportResultError(result.Error) &&
 		disableCooling &&
@@ -207,7 +214,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
-	if isRequestScopedNotFoundResultError(result.Error) {
+	if (result.Error != nil && result.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(result.Error) {
 		return transition
 	}
 	if isStreamTruncatedResultError(result.Error) {

@@ -11,6 +11,10 @@ type UpstreamResponse struct {
 // stays 502, but the credential must not cool because of it.
 const ErrorCodeStreamTruncated = "stream_truncated"
 
+// ErrorCodeRequestScoped marks failures belonging to one downstream request.
+// They must not change credential or model availability.
+const ErrorCodeRequestScoped = "request_scoped"
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.
