@@ -224,30 +224,32 @@ type QuotaCredentialSnapshot struct {
 }
 
 type QuotaSnapshotWrite struct {
-	CredentialID          string
-	QuotaStatus           string
-	CollectionStatus      string
-	Source                string
-	ObservedAt            *time.Time
-	ReceivedAt            *time.Time
-	MaxAcceptedObservedAt *time.Time
-	ExpiresAt             *time.Time
-	LastAttemptAt         *time.Time
-	LastSuccessAt         *time.Time
-	NextProbeAt           *time.Time
-	ConsecutiveFailure    int
-	Error                 *QuotaCollectionError
-	Runtime               *QuotaRuntime
-	Plan                  *QuotaPlan
-	ReplacePlan           bool
-	ResetCredits          *QuotaResetCredits
-	ReplaceResetCredits   bool
-	ParserVersion         int
-	CollectorVersion      int
-	ExpectedProbeOwner    string
-	ClearProbeLease       bool
-	ReplaceWindows        bool
-	Windows               []QuotaWindow
+	CredentialID           string
+	QuotaStatus            string
+	CollectionStatus       string
+	Source                 string
+	ObservedAt             *time.Time
+	ReceivedAt             *time.Time
+	MaxAcceptedObservedAt  *time.Time
+	ExpiresAt              *time.Time
+	LastAttemptAt          *time.Time
+	LastSuccessAt          *time.Time
+	NextProbeAt            *time.Time
+	NextProbeNotBefore     *time.Time
+	ConsecutiveFailure     int
+	Error                  *QuotaCollectionError
+	Runtime                *QuotaRuntime
+	Plan                   *QuotaPlan
+	ReplacePlan            bool
+	ResetCredits           *QuotaResetCredits
+	ReplaceResetCredits    bool
+	ParserVersion          int
+	CollectorVersion       int
+	ExpectedProbeOwner     string
+	ClearProbeLease        bool
+	ReplaceWindows         bool
+	PreserveWindowPrefixes []string
+	Windows                []QuotaWindow
 }
 
 type QuotaListQuery struct {
@@ -402,7 +404,17 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			}
 		}
 
-		if input.ReplaceWindows {
+		if input.ReplaceWindows && len(input.PreserveWindowPrefixes) > 0 {
+			if existing.ExpiresAt != nil {
+				if errBackfill := tx.Model(&QuotaWindowRecord{}).Where("credential_id = ? AND expires_at IS NULL", input.CredentialID).
+					Update("expires_at", existing.ExpiresAt.UTC()).Error; errBackfill != nil {
+					return errBackfill
+				}
+			}
+			if errReplace := replaceQuotaWindowsPreserving(tx, input, existing); errReplace != nil {
+				return errReplace
+			}
+		} else if input.ReplaceWindows {
 			windowIDs := make([]string, 0, len(input.Windows))
 			for _, window := range input.Windows {
 				windowIDs = append(windowIDs, window.ID)
@@ -444,6 +456,12 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			if errCurrent == nil && !currentObservationInvalid && current.ObservedAt.After(window.ObservedAt) {
 				continue
 			}
+			// Failed components can return metadata without a trustworthy new amount.
+			if errCurrent == nil && quotaWindowMatchesPrefixes(window.ID, input.PreserveWindowPrefixes) && quotaWindowRecordIsCurrent(current, existing, input.ObservedAt) &&
+				!window.IsUnlimited && window.Used == nil && window.Remaining == nil && window.UsedRatio == nil && window.RemainingRatio == nil &&
+				(current.IsUnlimited || current.Used != nil || current.Remaining != nil || current.UsedRatio != nil || current.RemainingRatio != nil) {
+				continue
+			}
 			if errCurrent == nil {
 				windowRecord.CreatedAt = current.CreatedAt
 			}
@@ -454,7 +472,7 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 				return errSave
 			}
 		}
-		if !input.ReplaceWindows && len(input.Windows) > 0 {
+		if (!input.ReplaceWindows || len(input.PreserveWindowPrefixes) > 0) && len(input.Windows) > 0 {
 			var merged []QuotaWindowRecord
 			mergedQuery := tx.Where("credential_id = ?", input.CredentialID)
 			if input.ObservedAt != nil {
@@ -463,9 +481,27 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 			if errFind := mergedQuery.Find(&merged).Error; errFind != nil {
 				return errFind
 			}
-			if errUpdate := tx.Model(&QuotaSnapshotRecord{}).Where("credential_id = ?", input.CredentialID).Updates(map[string]any{
+			updates := map[string]any{
 				"quota_status": quotaWindowRecordAggregateStatus(merged), "source": quotaWindowRecordAggregateSource(merged), "updated_at": time.Now().UTC(),
-			}).Error; errUpdate != nil {
+			}
+			if input.Source == "active_probe" && input.ClearProbeLease && input.ExpectedProbeOwner != "" && record.ExpiresAt != nil {
+				// Retained windows must not gain freshness or postpone recollection.
+				deadline := record.ExpiresAt.UTC()
+				for _, window := range merged {
+					if window.ExpiresAt != nil && window.ExpiresAt.Before(deadline) {
+						deadline = window.ExpiresAt.UTC()
+					}
+				}
+				if deadline.Before(*record.ExpiresAt) {
+					updates["expires_at"] = deadline
+					nextProbeAt := deadline
+					if input.NextProbeNotBefore != nil && input.NextProbeNotBefore.After(nextProbeAt) {
+						nextProbeAt = input.NextProbeNotBefore.UTC()
+					}
+					updates["next_probe_at"] = nextProbeAt
+				}
+			}
+			if errUpdate := tx.Model(&QuotaSnapshotRecord{}).Where("credential_id = ?", input.CredentialID).Updates(updates).Error; errUpdate != nil {
 				return errUpdate
 			}
 		}
@@ -473,6 +509,48 @@ func upsertQuotaSnapshotDB(ctx context.Context, db *gorm.DB, input QuotaSnapshot
 		return nil
 	})
 	return updated, errTransaction
+}
+
+func replaceQuotaWindowsPreserving(tx *gorm.DB, input QuotaSnapshotWrite, existing QuotaSnapshotRecord) error {
+	var stored []QuotaWindowRecord
+	if errFind := tx.Where("credential_id = ?", input.CredentialID).Find(&stored).Error; errFind != nil {
+		return errFind
+	}
+	incoming := make(map[string]struct{}, len(input.Windows))
+	for _, window := range input.Windows {
+		incoming[window.ID] = struct{}{}
+	}
+	var remove []string
+	for _, window := range stored {
+		if _, present := incoming[window.WindowID]; present {
+			continue
+		}
+		if quotaWindowMatchesPrefixes(window.WindowID, input.PreserveWindowPrefixes) && quotaWindowRecordIsCurrent(window, existing, input.ObservedAt) {
+			continue
+		}
+		remove = append(remove, window.WindowID)
+	}
+	if len(remove) == 0 {
+		return nil
+	}
+	return tx.Where("credential_id = ? AND window_id IN ?", input.CredentialID, remove).Delete(&QuotaWindowRecord{}).Error
+}
+
+func quotaWindowMatchesPrefixes(id string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func quotaWindowRecordIsCurrent(window QuotaWindowRecord, snapshot QuotaSnapshotRecord, now *time.Time) bool {
+	expiresAt := window.ExpiresAt
+	if expiresAt == nil {
+		expiresAt = snapshot.ExpiresAt
+	}
+	return now != nil && expiresAt != nil && expiresAt.After(*now)
 }
 
 func createQuotaSnapshotRecord(tx *gorm.DB, record *QuotaSnapshotRecord, input QuotaSnapshotWrite) (bool, error) {
@@ -1191,6 +1269,23 @@ func validateQuotaSnapshotWrite(input *QuotaSnapshotWrite) error {
 		if input.Plan.Name == "" {
 			return fmt.Errorf("quota plan name is required")
 		}
+	}
+	if len(input.PreserveWindowPrefixes) > 0 {
+		if input.Source != "active_probe" || !input.ReplaceWindows || input.ObservedAt == nil {
+			return fmt.Errorf("preserved quota windows require an active replacement observation")
+		}
+		for _, prefix := range input.PreserveWindowPrefixes {
+			if strings.TrimSpace(prefix) == "" || len(prefix) > quotaWindowTextMaxLength {
+				return fmt.Errorf("invalid preserved quota window prefix")
+			}
+		}
+	}
+	if input.NextProbeNotBefore != nil {
+		if input.NextProbeNotBefore.IsZero() {
+			return fmt.Errorf("quota next probe lower bound must not be zero")
+		}
+		notBefore := input.NextProbeNotBefore.UTC()
+		input.NextProbeNotBefore = &notBefore
 	}
 	if errResetCredits := normalizeQuotaResetCredits(input.ResetCredits); errResetCredits != nil {
 		return errResetCredits

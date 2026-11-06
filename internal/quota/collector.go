@@ -351,12 +351,30 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 	}
 	observedAt := c.options.Now().UTC()
 	expiresAt := observedAt.Add(c.options.SnapshotFreshness)
-	if result.validUntil != nil && result.validUntil.Before(expiresAt) {
-		expiresAt = result.validUntil.UTC()
+	if result.validUntil != nil {
+		// A reset ends that window's lifetime, not every other cycle's lifetime.
+		for index := range result.windows {
+			window := &result.windows[index]
+			if window.ExpiresAt == nil {
+				deadline := expiresAt
+				if window.ResetAt != nil && window.ResetAt.After(observedAt) && window.ResetAt.Before(deadline) {
+					deadline = window.ResetAt.UTC()
+				}
+				window.ExpiresAt = &deadline
+			}
+		}
+		if result.validUntil.Before(expiresAt) {
+			expiresAt = result.validUntil.UTC()
+		}
 	}
 	nextProbeAt := expiresAt
-	if retryAt := observedAt.Add(result.retryAfter); result.retryAfter > 0 && retryAt.After(nextProbeAt) {
-		nextProbeAt = retryAt
+	var nextProbeNotBefore *time.Time
+	if result.retryAfter > 0 {
+		retryAt := observedAt.Add(result.retryAfter)
+		nextProbeNotBefore = &retryAt
+		if retryAt.After(nextProbeAt) {
+			nextProbeAt = retryAt
+		}
 	}
 	status := quotaWindowAggregateStatus(result.windows)
 	collectionStatus := "success"
@@ -367,9 +385,9 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 	input := cluster.QuotaSnapshotWrite{
 		CredentialID: auth.ID, QuotaStatus: status, CollectionStatus: collectionStatus, Source: "active_probe",
 		ObservedAt: &observedAt, MaxAcceptedObservedAt: &observedAt, ExpiresAt: &expiresAt, LastAttemptAt: &observedAt, LastSuccessAt: &observedAt,
-		NextProbeAt: &nextProbeAt, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: result.replacePlan, ParserVersion: snapshotVersion, CollectorVersion: snapshotVersion,
+		NextProbeAt: &nextProbeAt, NextProbeNotBefore: nextProbeNotBefore, ConsecutiveFailure: 0, Error: result.collectionError, Plan: result.plan, ReplacePlan: result.replacePlan, ParserVersion: snapshotVersion, CollectorVersion: snapshotVersion,
 		ResetCredits: result.resetCredits, ReplaceResetCredits: result.replaceResetCredits,
-		ExpectedProbeOwner: c.options.Owner, ClearProbeLease: true, ReplaceWindows: result.replaceWindows, Windows: result.windows,
+		ExpectedProbeOwner: c.options.Owner, ClearProbeLease: true, ReplaceWindows: result.replaceWindows, PreserveWindowPrefixes: result.preserveWindowPrefixes, Windows: result.windows,
 	}
 	if strings.TrimSpace(c.options.HomeID) != "" {
 		input.Runtime = &cluster.QuotaRuntime{HomeID: c.options.HomeID, HomeLabel: c.options.HomeID}
@@ -396,16 +414,17 @@ func (c *Collector) collectCredential(ctx context.Context, auth *coreauth.Auth, 
 }
 
 type probeResult struct {
-	windows             []cluster.QuotaWindow
-	plan                *cluster.QuotaPlan
-	resetCredits        *cluster.QuotaResetCredits
-	partial             bool
-	replaceWindows      bool
-	replacePlan         bool
-	replaceResetCredits bool
-	collectionError     *cluster.QuotaCollectionError
-	retryAfter          time.Duration
-	validUntil          *time.Time
+	windows                []cluster.QuotaWindow
+	plan                   *cluster.QuotaPlan
+	resetCredits           *cluster.QuotaResetCredits
+	partial                bool
+	replaceWindows         bool
+	preserveWindowPrefixes []string
+	replacePlan            bool
+	replaceResetCredits    bool
+	collectionError        *cluster.QuotaCollectionError
+	retryAfter             time.Duration
+	validUntil             *time.Time
 }
 
 func quotaWindowResetDeadline(windows []cluster.QuotaWindow, observedAt time.Time) *time.Time {

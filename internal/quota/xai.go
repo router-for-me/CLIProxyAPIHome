@@ -290,6 +290,13 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 		windows, plan, errParse = parseXAIUsageWindows(responses[0].body, now)
 		if errParse != nil {
 			errMonthly = xaiInvalidResponse("xAI monthly billing response could not be parsed.")
+		} else {
+			for _, window := range windows {
+				if window.Used == nil && window.Remaining == nil {
+					errMonthly = xaiInvalidResponse("xAI monthly remaining quota is unavailable.")
+					break
+				}
+			}
 		}
 	}
 	var subscription xaiSubscription
@@ -314,12 +321,15 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 			weekly := xaiWeeklyWindows(payload.Config, now, subscription.entitlement)
 			windows = append(weekly, windows...)
 			complete := false
+			productsComplete := true
 			for _, window := range weekly {
 				if window.ID == "xai-weekly-usage" && window.Used != nil {
 					complete = true
+				} else if window.ID != "xai-weekly-usage" && window.Used == nil {
+					productsComplete = false
 				}
 			}
-			if !complete {
+			if !complete || !productsComplete {
 				errWeekly = xaiInvalidResponse("xAI weekly remaining quota is unavailable.")
 			}
 		}
@@ -336,6 +346,12 @@ func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeRes
 		return probeResult{}, xaiInvalidResponse("xAI billing response did not contain usable quota.")
 	}
 	result := probeResult{windows: windows, plan: plan, replaceWindows: true, replacePlan: plan != nil, validUntil: quotaWindowResetDeadline(windows, now), retryAfter: retryAfter}
+	if errMonthly != nil {
+		result.preserveWindowPrefixes = append(result.preserveWindowPrefixes, "xai-monthly-", "xai-on-demand")
+	}
+	if errWeekly != nil {
+		result.preserveWindowPrefixes = append(result.preserveWindowPrefixes, "xai-weekly-", "xai-product-")
+	}
 	if failure != nil {
 		result.partial = true
 		result.collectionError = probeCollectionError(failure, now)
