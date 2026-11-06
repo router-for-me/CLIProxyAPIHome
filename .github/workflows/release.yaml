@@ -5,13 +5,19 @@ on:
     # run only against tags
     tags:
       - '*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to rebuild'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   GH_REPO: ${{ github.repository }}
-  GO_VERSION: '1.26.4'
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   PANEL_REPOSITORY: router-for-me/Home-Management-Center
 
 jobs:
@@ -57,9 +63,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           fetch-tags: true
-      - name: Create release
+      - name: Prepare release notes and draft
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -88,24 +95,24 @@ jobs:
 
           git fetch --force --tags
           previous_tag=""
-          if previous_tag_value="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null)"; then
+          if previous_tag_value="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null)"; then
             previous_tag="$previous_tag_value"
-            changelog_range="${previous_tag}..${GITHUB_REF_NAME}"
+            changelog_range="${previous_tag}..${RELEASE_TAG}"
           else
-            changelog_range="$GITHUB_REF_NAME"
+            changelog_range="$RELEASE_TAG"
           fi
 
           git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
             grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
 
           gh api "repos/${GH_REPO}/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" \
+            -f tag_name="$RELEASE_TAG" \
             --jq .body > "$generated_notes_file"
           if [[ ! -s "$generated_notes_file" ]]; then
             if [[ -n "$previous_tag" ]]; then
-              printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME" > "$generated_notes_file"
+              printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$RELEASE_TAG" > "$generated_notes_file"
             else
-              printf '**Full Changelog**: https://github.com/%s/commits/%s\n' "$GH_REPO" "$GITHUB_REF_NAME" > "$generated_notes_file"
+              printf '**Full Changelog**: https://github.com/%s/commits/%s\n' "$GH_REPO" "$RELEASE_TAG" > "$generated_notes_file"
             fi
           fi
 
@@ -124,10 +131,10 @@ jobs:
             cat "$changelog_notes_file"
           } > "$updated_notes_file"
 
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$updated_notes_file"
           else
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
+            gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$updated_notes_file"
           fi
 
   build-hosted:
@@ -165,6 +172,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - name: Refresh models catalog
         shell: bash
@@ -177,7 +185,7 @@ jobs:
         run: git fetch --force --tags
       - uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
           cache: true
       - uses: actions/cache@v4
         with:
@@ -196,7 +204,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build archive
@@ -247,7 +255,7 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
 
   build-linux-glibc:
     name: build linux-${{ matrix.goarch }} glibc
@@ -270,6 +278,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - name: Refresh models catalog
         shell: bash
@@ -288,7 +297,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build archive
@@ -309,18 +318,20 @@ jobs:
           docker run --rm \
             -v "$PWD:/src" \
             -w /src \
-            -e GO_VERSION \
             -e GOARCH \
             -e RELEASE_VERSION \
             -e COMMIT \
             -e BUILD_DATE \
             "$MANYLINUX_IMAGE" \
             bash -euo pipefail -c '
-              go_archive="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
+              go_version="$(sed -n "s/^go //p" go.mod)"
+              test -n "$go_version"
+              go_archive="go${go_version}.linux-${GOARCH}.tar.gz"
               curl -fsSL "https://go.dev/dl/${go_archive}" -o "/tmp/${go_archive}"
               rm -rf /usr/local/go
               tar -C /usr/local -xzf "/tmp/${go_archive}"
               export PATH="/usr/local/go/bin:${PATH}"
+              export GOTOOLCHAIN=local
 
               CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
@@ -357,7 +368,7 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
 
   build-linux-no-plugin:
     name: build linux-${{ matrix.goarch }} no-plugin
@@ -376,6 +387,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - name: Refresh models catalog
         shell: bash
@@ -388,7 +400,7 @@ jobs:
         run: git fetch --force --tags
       - uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
           cache: true
       - uses: actions/cache@v4
         with:
@@ -407,7 +419,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build archive
@@ -454,7 +466,7 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
 
   build-freebsd:
     name: build ${{ matrix.target }}
@@ -482,6 +494,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - name: Refresh models catalog
         run: |
@@ -491,7 +504,7 @@ jobs:
         run: git fetch --force --tags
       - uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
           cache: true
       - uses: actions/cache@v4
         with:
@@ -507,18 +520,14 @@ jobs:
           name: management-panel-static
           path: internal/managementasset/static
       - name: Generate Build Metadata
-        id: metadata
         run: |
           set -euo pipefail
-          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${RELEASE_TAG#v}"
           commit="$(git rev-parse --short HEAD)"
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
           echo "COMMIT=$commit" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$build_date" >> "$GITHUB_ENV"
-          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "build_date=$build_date" >> "$GITHUB_OUTPUT"
       - name: Prepare FreeBSD output
         shell: bash
         run: |
@@ -529,22 +538,30 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang lld wget
+          sudo apt-get install -y clang lld curl xz-utils
       - name: Build FreeBSD binary with CGO
         if: ${{ matrix.cgo_enabled }}
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        with:
-          dir: .
-          packages: ./cmd/home/
-          targets: ${{ env.TARGET }}
-          out-dir: dist/${{ env.TARGET }}/bin
-          output: cli-proxy-api
-          flags: >-
-            -ldflags=-s -w
-            -X main.Version=${{ steps.metadata.outputs.release_version }}
-            -X main.Commit=${{ steps.metadata.outputs.commit }}
-            -X main.BuildDate=${{ steps.metadata.outputs.build_date }}
+        shell: bash
+        env:
+          FREEBSD_BASE_SHA256: e38b5cf756d60086a6c2f736eff19cc7685f7e2313e31d14342fc8df57200a92
+        run: |
+          set -euo pipefail
+          sysroot_dir="${RUNNER_TEMP}/freebsd-${GOARCH}-14.3"
+          base_archive="${RUNNER_TEMP}/freebsd-${GOARCH}-base.txz"
+          curl -fL --retry 3 \
+            https://archive.freebsd.org/old-releases/amd64/14.3-RELEASE/base.txz \
+            -o "$base_archive"
+          printf '%s  %s\n' "$FREEBSD_BASE_SHA256" "$base_archive" | sha256sum --check
+          mkdir -p "$sysroot_dir" "dist/${TARGET}/bin"
+          tar --no-same-owner -xJf "$base_archive" -C "$sysroot_dir" ./lib ./usr/include ./usr/lib
+
+          CGO_ENABLED=1 GOOS=freebsd GOARCH="$GOARCH" \
+            CC="clang --target=x86_64-unknown-freebsd14.3 --sysroot=${sysroot_dir}" \
+            CGO_LDFLAGS=-fuse-ld=lld \
+            go build -buildvcs=false \
+              -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+              -o "dist/${TARGET}/bin/cli-proxy-api" ./cmd/home/
       - name: Build FreeBSD no-plugin binary
         if: ${{ !matrix.cgo_enabled }}
         shell: bash
@@ -585,11 +602,10 @@ jobs:
             printf '%s\n' "${assets[@]}" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
 
-  publish-checksums:
+  publish-release:
     runs-on: ubuntu-latest
-    if: always()
     needs:
       - build-hosted
       - build-linux-glibc
@@ -600,7 +616,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Publish final checksums
+      - name: Verify archives and publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -609,9 +625,10 @@ jobs:
           cd dist
           shopt -s nullglob
           archives=(CLIProxyAPIHome_*.tar.gz CLIProxyAPIHome_*.zip)
-          if [[ ${#archives[@]} -eq 0 ]]; then
-            echo "No release archives found"
-            exit 0
+          if [[ ${#archives[@]} -ne 10 ]]; then
+            printf 'Expected 10 release archives, found %s\n' "${#archives[@]}" >&2
+            exit 1
           fi
           sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-          gh release upload "$GITHUB_REF_NAME" checksums.txt --clobber
+          gh release upload "$RELEASE_TAG" checksums.txt --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
