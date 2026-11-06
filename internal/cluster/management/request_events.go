@@ -183,6 +183,7 @@ func requestEventResponse(record *cluster.UsageObservabilityRecord) gin.H {
 		"original_model":       record.OriginalModel,
 		"model_alias":          requestEventModelAlias(record),
 		"endpoint":             record.Endpoint,
+		"stream":               record.Stream,
 		"source":               emptyStringAsNil(record.Source),
 		"executor_type":        record.ExecutorType,
 		"service_tier":         emptyStringAsNil(record.ServiceTier),

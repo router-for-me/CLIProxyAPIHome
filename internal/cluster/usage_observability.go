@@ -264,6 +264,7 @@ type UsageObservabilityRecord struct {
 	Model              string
 	OriginalModel      string
 	Endpoint           string
+	Stream             *bool
 	ServiceTier        string
 	ReasoningEffort    string
 	ExecutorType       string
@@ -3054,6 +3055,7 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 		Model:              strings.TrimSpace(row.Model),
 		OriginalModel:      firstNonEmptyUsageObservabilityString(row.Alias, row.Model),
 		Endpoint:           strings.TrimSpace(row.Endpoint),
+		Stream:             optionalBoolFromPayload(payload, "stream"),
 		ServiceTier:        strings.TrimSpace(row.ServiceTier),
 		ReasoningEffort:    strings.TrimSpace(row.ReasoningEffort),
 		ExecutorType:       strings.TrimSpace(row.ExecutorType),
@@ -4327,6 +4329,13 @@ func firstBoolFromPayload(payload map[string]any, paths ...string) (bool, bool) 
 		}
 	}
 	return false, false
+}
+
+func optionalBoolFromPayload(payload map[string]any, paths ...string) *bool {
+	if value, ok := firstBoolFromPayload(payload, paths...); ok {
+		return &value
+	}
+	return nil
 }
 
 func firstArrayLengthFromPayload(payload map[string]any, paths ...string) *int {
