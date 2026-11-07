@@ -100,6 +100,13 @@ func journalRefresh(ctx context.Context, journal RefreshJournal, token string, r
 		return nil, errRun
 	}
 	receipt := refreshReceipt{Tokens: value}
+	if errRun == nil && value != nil && value.RefreshToken == "" {
+		// Omitted refresh tokens retain the submitted grant. Save it explicitly
+		// so late callers do not retain an earlier grant from their own auth.
+		tokens := *value
+		tokens.RefreshToken = token
+		receipt.Tokens = &tokens
+	}
 	if errRun != nil {
 		receipt.Tokens = nil
 		var rejected *codexRefreshResponseError
@@ -138,6 +145,7 @@ func completeRefresh(ctx context.Context, journal RefreshJournal, key, owner str
 func readRefreshReceipt(ctx context.Context, journal RefreshJournal, key, token string) (*CodexTokenData, error) {
 	seen := make(map[string]bool)
 	var value *CodexTokenData
+	grant := token
 	for len(seen) < 1024 {
 		if seen[key] {
 			return nil, journalOutcome(token, "receipt_cycle", nil)
@@ -169,11 +177,17 @@ func readRefreshReceipt(ctx context.Context, journal RefreshJournal, key, token 
 		if value == nil || strings.TrimSpace(value.AccessToken) == "" {
 			return nil, journalOutcome(token, "receipt_decode", fmt.Errorf("invalid refresh receipt"))
 		}
+		if value.RefreshToken == "" {
+			// Older receipts may omit it; the chain identifies the grant used
+			// for this exchange, which can differ from the caller's old grant.
+			value.RefreshToken = grant
+		}
 		next := refreshGrantFingerprint(ClientID, value.RefreshToken)
 		if strings.TrimSpace(value.RefreshToken) == "" || next == key {
 			return usableRefreshReceipt(token, value)
 		}
 		key = next
+		grant = value.RefreshToken
 	}
 	return nil, journalOutcome(token, "receipt_chain_limit", nil)
 }
