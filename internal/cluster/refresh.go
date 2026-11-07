@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	log "github.com/sirupsen/logrus"
@@ -456,12 +457,17 @@ func (c *RefreshController) finalizeRefreshLease(ctx context.Context, targetUUID
 		if current.Attributes == nil || current.Attributes[refreshLeaseAttribute] != leaseID {
 			return false
 		}
+		if refreshed != nil && strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
+			// Preserve grant safety even when an operator disables the credential or
+			// replaces only its access token while the exchange is in flight.
+			codexauth.MergeRefreshOutcomes(current.Metadata, refreshed.Metadata)
+		}
 		if current.Disabled || current.Status == coreauth.StatusDisabled {
 			clearRefreshLease(current)
 			disabledTarget = true
 			return true
 		}
-		if coreauth.AuthIsNewerThanObserved(current, coreauth.AccessTokenSHA256(leased)) {
+		if coreauth.AuthIsNewerThanObserved(current, coreauth.AccessTokenSHA256(leased)) || codexRefreshGrantReplaced(current, leased) {
 			clearRefreshLease(current)
 			if beforeClaim != nil && current.NextRefreshAfter.Equal(leased.NextRefreshAfter) {
 				current.NextRefreshAfter = beforeClaim.NextRefreshAfter
@@ -534,6 +540,18 @@ func clearRefreshLease(auth *coreauth.Auth) {
 	}
 }
 
+func codexRefreshGrantReplaced(current, before *coreauth.Auth) bool {
+	if current == nil || before == nil || !strings.EqualFold(strings.TrimSpace(before.Provider), "codex") {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
+		return true
+	}
+	currentToken, _ := current.Metadata["refresh_token"].(string)
+	beforeToken, _ := before.Metadata["refresh_token"].(string)
+	return strings.TrimSpace(currentToken) != strings.TrimSpace(beforeToken)
+}
+
 func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefresh error, now time.Time) *coreauth.Auth {
 	if current == nil {
 		return refreshed
@@ -543,6 +561,9 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 		return merged
 	}
 	refreshed = refreshed.Clone()
+	if codexRefreshGrantReplaced(current, base) {
+		return merged
+	}
 	if errRefresh == nil {
 		if base == nil {
 			base = &coreauth.Auth{}
@@ -578,6 +599,9 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 
 	// Preserve concurrent model and quota details while applying only the
 	// credential-level refresh transition to the latest persisted snapshot.
+	if strings.EqualFold(strings.TrimSpace(merged.Provider), "codex") {
+		codexauth.MergeRefreshOutcomes(merged.Metadata, refreshed.Metadata)
+	}
 	merged.LastRefreshedAt = refreshed.LastRefreshedAt
 	merged.NextRefreshAfter = refreshed.NextRefreshAfter
 	refreshError := refreshed.LastRefreshError

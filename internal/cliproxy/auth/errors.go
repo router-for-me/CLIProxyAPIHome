@@ -15,6 +15,9 @@ const ErrorCodeStreamTruncated = "stream_truncated"
 // They must not change credential or model availability.
 const ErrorCodeRequestScoped = "request_scoped"
 
+// ErrorCodeRefreshOutcomeUnknown requires replacement or reconciliation of a refresh grant.
+const ErrorCodeRefreshOutcomeUnknown = "refresh_outcome_unknown"
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

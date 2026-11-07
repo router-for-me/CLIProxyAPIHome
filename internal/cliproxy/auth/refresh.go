@@ -60,6 +60,9 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	if refreshToken == "" {
 		return auth, nil
 	}
+	if errOutcome := codexauth.RefreshOutcomeUnknown(auth.Metadata, false); errOutcome != nil {
+		return nil, builtInRefreshError("codex", "provider_refresh", errOutcome)
+	}
 	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
