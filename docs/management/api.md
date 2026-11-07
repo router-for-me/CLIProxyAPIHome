@@ -2473,6 +2473,8 @@ Single-credential success returns `{"ok":true,"auth":{...}}`, where `auth` has t
 
 Batch requests return `200` even when individual refreshes fail; inspect `results[].success`. Invalid input returns `400`, an unknown single credential returns `404`, a failed single refresh returns `500 refresh_failed`, and an unavailable coordinator returns `503`.
 
+An interrupted or unreadable Codex refresh can leave its outcome unknown. Home records `refresh_outcome_unknown` separately from an explicit rejected grant and will not resubmit unchanged refresh credentials, including on subsequent manual attempts. Reconnect Codex or import replacement refresh credentials to recover; waiting for a retry backoff does not resolve an unknown exchange.
+
 ### GET `/oauth/auth-url`
 
 Creates a provider login URL or device-flow session. Required query `provider` is trimmed and case-insensitive for built-in providers.

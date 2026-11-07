@@ -157,7 +157,7 @@ func (c *RefreshController) RefreshNowObserved(ctx context.Context, authIndex, o
 				if errSync := c.syncForwardedAuth(refreshCtx, forwardAuthUUID); errSync != nil {
 					log.Warnf("cluster refresh forwarded auth sync failed | auth=%s err=%v", forwardAuthUUID, errSync)
 					switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
-					case "authentication_error", "refresh_temporarily_unavailable", "refresh_unsupported":
+					case "authentication_error", "refresh_temporarily_unavailable", "refresh_unsupported", coreauth.ErrorCodeRefreshOutcomeUnknown:
 						if errFailClosed := c.applyForwardedRefreshFailureInMemory(refreshCtx, forwardAuthUUID, authErr); errFailClosed != nil {
 							log.Warnf("cluster refresh forwarded auth fail-closed update failed | auth=%s err=%v", forwardAuthUUID, errFailClosed)
 						}
@@ -242,14 +242,14 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 		auth.Quota = coreauth.QuotaState{}
 		auth.UpdatedAt = now
 		auth.LastError = lastError
-	case "refresh_temporarily_unavailable":
+	case "refresh_temporarily_unavailable", coreauth.ErrorCodeRefreshOutcomeUnknown:
 		if strings.TrimSpace(lastError.Message) == "" {
 			lastError.Message = "credential refresh temporarily unavailable"
 		}
 		if lastError.HTTPStatus == 0 {
 			lastError.HTTPStatus = http.StatusServiceUnavailable
 		}
-		lastError.Retryable = true
+		lastError.Retryable = lastError.Code != coreauth.ErrorCodeRefreshOutcomeUnknown
 		coreauth.ApplyRefreshFailureState(auth, lastError, now)
 	case "refresh_unsupported":
 		if strings.TrimSpace(lastError.Message) == "" {
@@ -339,7 +339,7 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 				}
 				if refreshError != nil {
 					switch strings.ToLower(strings.TrimSpace(refreshError.Code)) {
-					case "refresh_temporarily_unavailable", "refresh_unsupported":
+					case "refresh_temporarily_unavailable", "refresh_unsupported", coreauth.ErrorCodeRefreshOutcomeUnknown:
 						refreshErr = refreshError
 					}
 				}
