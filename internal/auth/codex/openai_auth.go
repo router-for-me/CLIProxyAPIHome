@@ -85,7 +85,22 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result, errRefresh, _ := codexRefreshGroup.Do(refreshGrantFingerprint(ClientID, refreshToken), func() (any, error) {
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
+	journal := refreshJournalFrom(ctx)
+	key := refreshGrantFingerprint(ClientID, refreshToken)
+	if journal != nil {
+		// The database claim remains the cross-process barrier; local results
+		// must not be shared between different authoritative repositories.
+		key = fmt.Sprintf("%p:%s", journal, key)
+	}
+	result, errRefresh, _ := codexRefreshGroup.Do(key, func() (any, error) {
+		if journal != nil {
+			return journalRefresh(ctx, journal, refreshToken, func() (*CodexTokenData, error) {
+				return o.refreshTokens(ctx, refreshToken)
+			})
+		}
 		if errOutcome := unresolvedRefreshOutcome(ClientID, refreshToken); errOutcome != nil {
 			return nil, errOutcome
 		}

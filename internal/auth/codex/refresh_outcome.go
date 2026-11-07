@@ -33,7 +33,9 @@ func (e *RefreshOutcomeUnknownError) Stage() string { return e.stage }
 // NewRefreshOutcomeUnknownError records which grant must not be replayed.
 func NewRefreshOutcomeUnknownError(clientID, refreshToken, stage string, cause error) *RefreshOutcomeUnknownError {
 	switch stage {
-	case "transport", "response_read", "response_status", "response_decode", "response_validate":
+	case "transport", "response_read", "response_status", "response_decode", "response_validate",
+		"pending", "claim", "claim_release", "receipt_read", "receipt_write", "receipt_encode",
+		"receipt_decode", "receipt_expired", "receipt_cycle", "receipt_chain_limit":
 	default:
 		stage = "transport"
 	}

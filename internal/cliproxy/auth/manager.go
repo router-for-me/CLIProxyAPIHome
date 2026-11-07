@@ -2723,7 +2723,7 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
 	now = time.Now().UTC()
@@ -2844,7 +2844,7 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
 	}
 	cancelRefresh()
 	now := time.Now().UTC()
