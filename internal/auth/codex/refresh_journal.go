@@ -52,9 +52,9 @@ func PreserveRefreshOutcome(ctx context.Context, token string, outcome error) er
 		return outcome
 	}
 	var unknown *RefreshOutcomeUnknownError
-	if errors.As(outcome, &unknown) && (unknown.Stage() == "claim" || unknown.Stage() == "claim_release") {
-		// These attempts never submitted a request. Let the database arbitrate
-		// again: an existing claim still blocks, an absent claim can be acquired.
+	if errors.As(outcome, &unknown) && isJournalObservationStage(unknown.Stage()) {
+		// Defer observations to the journal. In particular, a pending owner
+		// may subsequently prove non-submission and release its claim.
 		return nil
 	}
 	key := refreshGrantFingerprint(ClientID, token)

@@ -53,6 +53,17 @@ func refreshGrantFingerprint(clientID, refreshToken string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// Journal observations do not establish that this caller submitted a request.
+// A retained claim still blocks; an absent claim may reflect a qualified release.
+func isJournalObservationStage(stage string) bool {
+	switch stage {
+	case "claim", "claim_release", "pending", "receipt_read":
+		return true
+	default:
+		return false
+	}
+}
+
 // Unresolved grants must not expire from this cache: elapsed time does not prove
 // that an earlier exchange had no effect. Credential owners also persist this
 // state in metadata for subsequent processes.
@@ -163,7 +174,14 @@ func RecordRefreshOutcomeUnknown(metadata map[string]any, err error) bool {
 		if outcome == nil {
 			continue
 		}
-		outcomes[partition] = map[string]any{"grant_sha256": outcome.grant, "stage": outcome.stage}
+		previousState, _ := previous[partition].(map[string]any)
+		previousGrant, _ := previousState["grant_sha256"].(string)
+		previousStage, _ := previousState["stage"].(string)
+		// A later journal failure must not erase evidence of an earlier
+		// submitted exchange, even if no journal entry could be persisted.
+		if previousGrant != outcome.grant || !isJournalObservationStage(outcome.stage) || isJournalObservationStage(previousStage) {
+			outcomes[partition] = map[string]any{"grant_sha256": outcome.grant, "stage": outcome.stage}
+		}
 		matched = true
 	}
 	if matched {

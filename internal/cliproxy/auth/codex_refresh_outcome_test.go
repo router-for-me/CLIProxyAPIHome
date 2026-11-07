@@ -66,3 +66,45 @@ func TestCodexUnknownOutcomeStateDoesNotInheritCauseRejection(t *testing.T) {
 		}
 	}
 }
+
+type codexOutcomePersistenceStore struct {
+	deadlinePresent bool
+	canceledAtSave  bool
+	saved           bool
+}
+
+func (*codexOutcomePersistenceStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+func (*codexOutcomePersistenceStore) Delete(context.Context, string) error  { return nil }
+func (s *codexOutcomePersistenceStore) Save(ctx context.Context, auth *Auth) (string, error) {
+	_, s.deadlinePresent = ctx.Deadline()
+	s.canceledAtSave = ctx.Err() != nil
+	s.saved = true
+	return auth.ID, nil
+}
+
+func TestCodexCanceledUnknownOutcomePersistenceRemainsBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = refreshTestRoundTripper(func(*http.Request) (*http.Response, error) {
+		cancel()
+		return nil, io.ErrUnexpectedEOF
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	store := &codexOutcomePersistenceStore{}
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{ID: t.Name(), Index: t.Name(), Provider: "codex", Status: StatusActive,
+		Metadata: map[string]any{"access_token": "previous", "refresh_token": t.Name()},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	_, errRefresh := manager.RefreshNowObserved(ctx, auth.Index, "")
+	var authErr *Error
+	if !errors.As(errRefresh, &authErr) || authErr.Code != ErrorCodeRefreshOutcomeUnknown {
+		t.Fatalf("unknown outcome was lost after cancellation: %v", errRefresh)
+	}
+	if !store.saved || store.canceledAtSave || !store.deadlinePresent {
+		t.Fatalf("result persistence must ignore caller cancellation and retain a deadline: saved=%t canceled=%t deadline=%t", store.saved, store.canceledAtSave, store.deadlinePresent)
+	}
+}

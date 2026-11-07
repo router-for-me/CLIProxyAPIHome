@@ -2736,7 +2736,9 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 		logCredentialRefreshFailure(ctx, snapshot, refreshFailure)
 		persistCtx := ctx
 		if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
-			persistCtx = context.WithoutCancel(ctx)
+			var cancelPersist context.CancelFunc
+			persistCtx, cancelPersist = withRefreshProviderTimeout(context.WithoutCancel(ctx))
+			defer cancelPersist()
 		}
 		updatedPersisted, errUpdate := m.Update(persistCtx, snapshot)
 		if errUpdate != nil {
