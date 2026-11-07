@@ -44,7 +44,7 @@ func TestUsagePushRespondsWithErrorOnDatabaseFailure(t *testing.T) {
 	runtime := &home.Runtime{}
 	runtime.SetClusterAdapter(adapter)
 	env := dispatch.Env{Runtime: runtime}
-	args := []string{"LPUSH", "usage", `{"provider":"claude","execution_id":"exec-1"}`}
+	args := []string{"LPUSH", "usage", `{"timestamp":"2026-11-06T10:27:15Z","provider":"claude","execution_id":"exec-1"}`}
 	if reply := handleUsage(context.Background(), env, args); reply.Kind != dispatch.ReplyKindRedisError {
 		t.Fatalf("database failure reply = %+v", reply)
 	}

@@ -3,6 +3,7 @@ package push
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	log "github.com/sirupsen/logrus"
@@ -55,18 +57,40 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	payload = enrichedPayload
 
 	if env.Runtime != nil {
+		ctx = coreauth.WithUsageFeedback(ctx)
 		persisted, inserted, errPersist := env.Runtime.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
 		if errPersist != nil {
 			log.Errorf("usage database write error: %v", errPersist)
+			// Drain only durably admitted feedback. Unknown lookup/commit outcomes
+			// fail closed; a full batch is drained before the new event retries.
+			if !errors.Is(errPersist, cluster.ErrUsageWriteAborted) && !errors.Is(errPersist, cluster.ErrUsageFeedbackBacklog) {
+				return dispatch.Err("usage database write failed")
+			}
+			if errFeedback := env.Runtime.ApplyUsagePayloadFeedback(ctx, payload); errFeedback != nil {
+				log.Errorf("usage feedback error: %v", errFeedback)
+				return dispatch.Err("usage feedback failed")
+			}
 			return dispatch.Err("usage database write failed")
 		}
 		if persisted {
+			var errFeedback error
 			if inserted {
-				env.Runtime.RecordUsagePayload(ctx, payload)
+				errFeedback = env.Runtime.RecordUsagePayload(ctx, payload)
+			} else if coreauth.UsageFeedbackFromContext(ctx).NeedsFeedback {
+				// Usage may have committed while its auth update failed. Repair only
+				// the pending feedback, without another request count or charge.
+				errFeedback = env.Runtime.ApplyUsagePayloadFeedback(ctx, payload)
+			}
+			if errFeedback != nil {
+				log.Errorf("usage feedback error: %v", errFeedback)
+				return dispatch.Err("usage feedback failed")
 			}
 			return dispatch.Integer(1)
 		}
-		env.Runtime.RecordUsagePayload(ctx, payload)
+		if errRecord := env.Runtime.RecordUsagePayload(ctx, payload); errRecord != nil {
+			log.Errorf("usage feedback error: %v", errRecord)
+			return dispatch.Err("usage feedback failed")
+		}
 	}
 
 	if errAppend := appendUsageLog(payload); errAppend != nil {

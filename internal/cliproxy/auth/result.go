@@ -32,6 +32,8 @@ type Result struct {
 	RetryAfter        *time.Duration
 	ResetAt           *time.Time
 	AccessTokenSHA256 string
+	// SkipRequestStats retries feedback without counting the delivery as a new request.
+	SkipRequestStats bool
 }
 
 // markResultTransition captures the registry side effects derived from a result transition.
@@ -44,10 +46,10 @@ type markResultTransition struct {
 }
 
 // MarkResult records a downstream execution result and updates auth cooldown state.
-func (m *Manager) MarkResult(ctx context.Context, result Result) {
+func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	// Keep validation before state changes so failures leave existing data intact.
 	if m == nil || (strings.TrimSpace(result.AuthID) == "" && strings.TrimSpace(result.AuthIndex) == "") {
-		return
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -62,13 +64,26 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	disableCooling := false
 	resultModel := canonicalModelKey(result.Model)
 	if resultModel == "" {
-		return
+		return nil
 	}
+	feedback := UsageFeedbackFromContext(ctx)
+	tracked := feedback != nil && feedback.ScopeKey != ""
 	resultAuthID := m.resultAuthID(result)
 	if resultAuthID == "" {
-		return
+		if tracked {
+			return fmt.Errorf("auth manager: usage feedback credential is not loaded")
+		}
+		return nil
 	}
 	now := time.Now()
+	feedbackCtx := ctx
+	if feedback != nil {
+		// The batch belongs only to this result mutation, not follow-up maintenance.
+		ctx = context.WithValue(ctx, usageFeedbackContextKey{}, nil)
+	}
+	if result.SkipRequestStats && !result.RequestScoped() && (feedback == nil || feedback.ScopeKey == "") {
+		return fmt.Errorf("usage feedback observation is unavailable")
+	}
 
 	unlockUpdate := m.updateLocks.lock(resultAuthID)
 	m.mu.Lock()
@@ -76,23 +91,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if auth == nil || auth.ID != resultAuthID {
 		m.mu.Unlock()
 		unlockUpdate()
-		return
+		if tracked {
+			return fmt.Errorf("auth manager: usage feedback credential is not loaded")
+		}
+		return nil
 	}
 	var mutator StateMutator
 	stateMutatorAvailable := false
 	disableCooling = m.quotaCooldownDisabledForAuth(auth)
-	auth.recordRecentRequest(now, result.Success)
-	if result.Success {
-		auth.Success++
-	} else {
-		auth.Failed++
+	if !result.SkipRequestStats {
+		auth.recordRecentRequest(now, result.Success)
+		if result.Success {
+			auth.Success++
+		} else {
+			auth.Failed++
+		}
 	}
-	if !result.Success && result.Error != nil && result.Error.Code == ErrorCodeRequestScoped {
+	if result.RequestScoped() {
 		// Count the request failure without publishing a stale credential snapshot
 		// or adopting shared availability state through the status-based paths.
 		m.mu.Unlock()
 		unlockUpdate()
-		return
+		return nil
 	}
 	localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
 		!isModelSupportResultError(result.Error) &&
@@ -103,13 +123,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if stateMutator, ok := m.store.(StateMutator); ok {
 		stateMutatorAvailable = true
-		if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
+		if tracked || m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
 			mutator = stateMutator
 		}
 	}
-	// A locally clean token-versioned success has no state to clear. Drop its
-	// transition rather than enqueue a stale row or read the database per success;
-	// cluster events reconcile any newer authoritative state.
+	if tracked && mutator == nil {
+		m.mu.Unlock()
+		unlockUpdate()
+		return fmt.Errorf("auth manager: transactional usage feedback store is unavailable")
+	}
+	// Untracked callers retain their existing fast path. Tracked feedback is
+	// completed transactionally, even when the auth state itself needs no write.
 	if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
 		transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
 		if localOnlyDisabledQuota {
@@ -123,10 +147,26 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
 		// results reported to other Home nodes cannot clobber the shared state.
-		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
+		adoptResult := result
+		persisted, errMutate := mutator.MutateAuthState(feedbackCtx, resultAuthID, func(persisted *Auth) bool {
 			before := availabilityFingerprint(persisted, resultModel)
 			baseVersion := persisted.StateVersion
-			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
+			if tracked {
+				// Replay the original state machine, not a lossy latest-result summary.
+				// Earlier successes reset quota before later failures compute backoff.
+				for _, pending := range feedback.Pending {
+					if isTokenVersionFencedResult(pending) && AuthIsNewerThanObserved(persisted, pending.AccessTokenSHA256) {
+						continue
+					}
+					adoptResult = pending
+					if isTokenVersionedSuccessResult(pending) && !authHasClearableAvailabilityState(persisted, resultModel, now) {
+						continue
+					}
+					transition = m.applyResultTransition(persisted, pending, resultModel, now, disableCooling)
+				}
+			} else {
+				transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
+			}
 			changed := availabilityFingerprint(persisted, resultModel) != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
@@ -137,18 +177,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			return changed
 		})
 		if errMutate != nil {
-			log.Warnf("auth manager: persisted result transition failed for %s: %v", resultAuthID, errMutate)
-			return
+			return fmt.Errorf("auth manager: persist result transition for %s: %w", resultAuthID, errMutate)
 		}
 		if persisted == nil {
-			log.Warnf("auth manager: persisted result transition returned no auth for %s", resultAuthID)
-			return
+			return fmt.Errorf("auth manager: persisted result transition returned no auth for %s", resultAuthID)
 		}
 		if transitionVersion > 0 && persisted.StateVersion > transitionVersion {
 			transition = markResultTransition{}
 		}
 		var adopted bool
-		authSnapshot, adopted = m.adoptPersistedResultState(result, resultModel, persisted, now)
+		// Use the last eligible transition's token fence, not a stale triggering
+		// delivery. Local token and revision guards remain in force.
+		authSnapshot, adopted = m.adoptPersistedResultState(adoptResult, resultModel, persisted, now)
 		if !adopted {
 			transition = markResultTransition{}
 		}
@@ -164,13 +204,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.queueRefreshReschedule(authSnapshot.ID)
 	}
 	resultStatus := statusCodeFromResult(result.Error)
-	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
+	if tracked || resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
 		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
-		return
+		return nil
 	}
 	if transition.clearModelQuota || transition.setModelQuota || transition.shouldResumeModel || transition.shouldSuspendModel {
 		m.ReconcileRegistryModelStates(ctx, resultAuthID)
 	}
+	return nil
 }
 
 // applyResultTransition applies the result state machine to the provided auth
@@ -183,6 +224,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 	if isTokenVersionFencedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
+		return transition
+	}
+	if result.RequestScoped() {
 		return transition
 	}
 	preserveRefreshAcquisition := RefreshBlocksDispatch(auth)
@@ -214,9 +258,6 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
-	if (result.Error != nil && result.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(result.Error) {
-		return transition
-	}
 	if isStreamTruncatedResultError(result.Error) {
 		// A truncated accepted stream already submitted its generation
 		// upstream; record the failure without cooling the credential/model.
@@ -1002,25 +1043,25 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 		nextLevel = level
 	}
 
-	provider := strings.ToLower(strings.TrimSpace(result.Provider))
-	if provider != "antigravity" && provider != "codex" {
-		return deadline, nextLevel
-	}
-	if result.ResetAt != nil && result.ResetAt.After(now) {
-		resetAt := result.ResetAt.UTC()
-		if resetAt.Sub(now) <= providerQuotaHintMaxHorizon {
-			if resetAt.After(deadline) {
-				deadline = resetAt
-			}
-			return deadline, nextLevel
-		}
-	}
-	if result.RetryAfter != nil && *result.RetryAfter > 0 && *result.RetryAfter <= providerQuotaHintMaxHorizon {
-		if retryAt := now.Add(*result.RetryAfter); retryAt.After(deadline) {
-			deadline = retryAt
-		}
+	if resetAt := result.QuotaResetTime(now); resetAt.After(deadline) {
+		deadline = resetAt
 	}
 	return deadline, nextLevel
+}
+
+// QuotaResetTime normalizes a supported provider hint to a bounded absolute deadline.
+func (r Result) QuotaResetTime(now time.Time) time.Time {
+	provider := strings.ToLower(strings.TrimSpace(r.Provider))
+	if provider != "antigravity" && provider != "codex" {
+		return time.Time{}
+	}
+	if r.ResetAt != nil && r.ResetAt.After(now) && r.ResetAt.Sub(now) <= providerQuotaHintMaxHorizon {
+		return r.ResetAt.UTC()
+	}
+	if r.RetryAfter != nil && *r.RetryAfter > 0 && *r.RetryAfter <= providerQuotaHintMaxHorizon {
+		return now.Add(*r.RetryAfter).UTC()
+	}
+	return time.Time{}
 }
 
 // NewUsageResult creates a new usage result.

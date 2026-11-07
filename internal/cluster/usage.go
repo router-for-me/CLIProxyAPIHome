@@ -6,12 +6,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strconv"
 	"strings"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -339,6 +341,11 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 	return record, errAppend
 }
 
+// ErrUsageWriteAborted marks a failed insert or billing write after the transaction
+// confirmed the event was new. Lookup, locking and commit errors remain unmarked
+// because they do not establish whether scheduling feedback would be a replay.
+var ErrUsageWriteAborted = errors.New("new usage write aborted after deduplication")
+
 // AppendUsageWithRuntimeOutcome appends usage with trusted Home/CPA runtime metadata
 // and reports whether this call committed a new usage row (false when deduplicated).
 func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload string, metadata UsageRuntimeMetadata) (*UsageRecord, bool, error) {
@@ -372,9 +379,13 @@ func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload 
 		record.QuotaIdentityVersion = quotaCredentialIdentityVersion(resolved)
 		record.QuotaIdentityKey = identityKey
 	}
+	feedback := coreauth.UsageFeedbackFromContext(ctx)
+	prepareUsageFeedback(payload, dedupeKey, record, feedback)
+	tracked := false
 	inserted := false
+	var writeErr error
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if errLock := lockUsageIngestionTx(ctx, tx, dedupeKey); errLock != nil {
+		if errLock := lockUsageIngestionTx(ctx, tx, usageIngestionAdvisoryLockNamespace, dedupeKey); errLock != nil {
 			return errLock
 		}
 		existing, found, errExisting := findExistingUsageRecordTx(ctx, tx, record, payload)
@@ -383,20 +394,53 @@ func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload 
 		}
 		if found {
 			record = existing
-			return nil
+			storedKey, errStoredKey := usagePayloadDedupeKey(string(record.PayloadJSON))
+			if errStoredKey != nil {
+				return errStoredKey
+			}
+			prepareUsageFeedback(string(record.PayloadJSON), storedKey, record, feedback)
 		}
-		inserted = true
-		if errCreate := tx.WithContext(ctx).Create(record).Error; errCreate != nil {
-			return errCreate
+		feedbackRecord, feedbackScope, errStage := stageUsageFeedbackTx(ctx, tx, found)
+		if errStage != nil {
+			return errStage
 		}
-		if errBilling := r.createBillingChargeForUsageTx(ctx, tx, record, payload); errBilling != nil {
-			return errBilling
+		tracked = feedback != nil && feedback.ScopeKey != ""
+		if found {
+			return storeUsageFeedbackTx(tx, feedbackRecord, feedbackScope, feedback, true)
 		}
-		return nil
+		if tracked {
+			// Keep the scope lock while usage/accounting rolls back. The pending
+			// event is stored below, outside this savepoint, with its actual outcome.
+			if errSavepoint := tx.SavePoint("usage_ingestion").Error; errSavepoint != nil {
+				return errSavepoint
+			}
+		}
+		writeErr = tx.WithContext(ctx).Create(record).Error
+		if writeErr == nil {
+			writeErr = r.createBillingChargeForUsageTx(ctx, tx, record, payload)
+		}
+		if writeErr != nil {
+			if !tracked {
+				return writeErr
+			}
+			if errRollback := tx.RollbackTo("usage_ingestion").Error; errRollback != nil {
+				return fmt.Errorf("rollback usage write (%v): %w", writeErr, errRollback)
+			}
+		} else {
+			inserted = true
+		}
+		return storeUsageFeedbackTx(tx, feedbackRecord, feedbackScope, feedback, inserted)
 	})
 	if errTransaction != nil {
+		if !tracked && writeErr != nil {
+			return nil, false, fmt.Errorf("%w: %w", ErrUsageWriteAborted, errTransaction)
+		}
 		return nil, false, errTransaction
 	}
+	if writeErr != nil {
+		return nil, false, fmt.Errorf("%w: %w", ErrUsageWriteAborted, writeErr)
+	}
+
 	if inserted {
 		if errQuota := upsertQuotaFromUsageRecord(ctx, db, record, metadata); errQuota != nil {
 			log.WithError(errQuota).Warn("usage quota observation ignored")
@@ -410,7 +454,7 @@ const (
 	usageDedupeCandidateBatchSize             = 128
 )
 
-func lockUsageIngestionTx(ctx context.Context, tx *gorm.DB, dedupeKey string) error {
+func lockUsageIngestionTx(ctx context.Context, tx *gorm.DB, namespace int32, dedupeKey string) error {
 	if tx == nil || tx.Dialector == nil || tx.Dialector.Name() != "postgres" {
 		return nil
 	}
@@ -418,7 +462,7 @@ func lockUsageIngestionTx(ctx context.Context, tx *gorm.DB, dedupeKey string) er
 	_, _ = hasher.Write([]byte(dedupeKey))
 	lockKey := int32(hasher.Sum32())
 	return tx.WithContext(contextOrBackground(ctx)).
-		Exec("SELECT pg_advisory_xact_lock(?, ?)", usageIngestionAdvisoryLockNamespace, lockKey).Error
+		Exec("SELECT pg_advisory_xact_lock(?, ?)", namespace, lockKey).Error
 }
 
 func findExistingUsageRecordTx(ctx context.Context, tx *gorm.DB, candidate *UsageRecord, rawPayload string) (*UsageRecord, bool, error) {
