@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
@@ -2203,6 +2204,9 @@ func copyUpstreamResponse(target *Error, errRefresh error) bool {
 // proxies and provider edges can return them for transient failures.
 func isTerminalRefreshAuthError(errRefresh error) bool {
 	if errRefresh == nil || errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
+		return false
+	}
+	if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
 		return false
 	}
 	var authErr *Error
