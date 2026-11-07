@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -17,7 +18,7 @@ func TestOAuthV8DatabaseSessions(t *testing.T) {
 	h := NewHandler(repo, nil, "127.0.0.1", 0)
 	engine := gin.New()
 	engine.GET("/v8/management/oauth/auth-url", h.StartOAuthV8)
-	engine.GET("/v8/management/oauth/callback", h.PostOAuthCallback)
+	engine.GET("/v8/management/oauth/callback", h.PostOAuthCallbackV8)
 	engine.GET("/v0/management/get-auth-status", h.GetAuthStatus)
 	engine.DELETE("/v8/management/oauth/session", h.CancelAuthSession)
 	request := func(method, path string, status int) *httptest.ResponseRecorder {
@@ -40,9 +41,17 @@ func TestOAuthV8DatabaseSessions(t *testing.T) {
 	if login.State == "" || login.URL == "" {
 		t.Fatal("missing OAuth login")
 	}
+	loginURL, errURL := url.Parse(login.URL)
+	if errURL != nil || loginURL.Host != "auth.openai.com" || loginURL.Path != "/oauth/authorize" {
+		t.Fatalf("default Codex browser flow URL = %q, error=%v", login.URL, errURL)
+	}
 	session, errSession := repo.GetOAuthSession(context.Background(), login.State)
 	if errSession != nil || session == nil || session.Provider != "codex" || session.Status != "" {
 		t.Fatalf("login was not persisted: %v", errSession)
+	}
+	data, errData := cluster.OAuthSessionData(session)
+	if errData != nil || data["flow"] == "device" {
+		t.Fatalf("default Codex flow session data = %v, error=%v", data, errData)
 	}
 	request("GET", "/v0/management/get-auth-status?state="+login.State, 200)
 	request("DELETE", "/v8/management/oauth/session?state="+login.State, 200)
