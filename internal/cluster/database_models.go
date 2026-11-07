@@ -10,7 +10,7 @@ import (
 // currentDatabaseVersion is shared by the live schema migration gate and the
 // portable snapshot format. Increment it for every required startup migration
 // or snapshot format change, and retain mappings for prior snapshot formats.
-const currentDatabaseVersion = 16
+const currentDatabaseVersion = 17
 
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
@@ -416,6 +416,9 @@ var databaseSnapshotV6Models = databaseSnapshotV6ModelRegistry()
 // databaseSnapshotV15Models keeps the portable format used before plan expiry.
 var databaseSnapshotV15Models = databaseSnapshotV15ModelRegistry()
 
+// databaseSnapshotV16Models freezes the format before the refresh journal.
+var databaseSnapshotV16Models = databaseSnapshotV16ModelRegistry()
+
 // homeDatabaseModels is the current database snapshot registry.
 var homeDatabaseModels = currentDatabaseModels()
 
@@ -511,7 +514,7 @@ func databaseSnapshotV15ModelRegistry() []databaseModel {
 	return models
 }
 
-func currentDatabaseModels() []databaseModel {
+func databaseSnapshotV16ModelRegistry() []databaseModel {
 	models := append([]databaseModel(nil), databaseSnapshotV15Models...)
 	for index := range models {
 		if models[index].name == "quota_snapshot" {
@@ -520,6 +523,12 @@ func currentDatabaseModels() []databaseModel {
 		}
 	}
 	return models
+}
+
+func currentDatabaseModels() []databaseModel {
+	return append(append([]databaseModel(nil), databaseSnapshotV16Models...),
+		newDatabaseModel[CodexRefreshRecord]("codex_refresh_journal", []string{"grant_sha256"}, false, true),
+	)
 }
 
 func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
@@ -540,6 +549,8 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 		return databaseSnapshotV6Models, true
 	case 15:
 		return databaseSnapshotV15Models, true
+	case 16:
+		return databaseSnapshotV16Models, true
 	case currentDatabaseVersion:
 		return homeDatabaseModels, true
 	default:

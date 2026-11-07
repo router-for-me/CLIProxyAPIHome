@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // OAuth configuration constants for OpenAI Codex refresh.
@@ -31,6 +32,8 @@ const (
 type CodexAuth struct {
 	httpClient *http.Client
 }
+
+var codexRefreshGroup singleflight.Group
 
 type codexRefreshResponseError struct {
 	statusCode   int
@@ -79,7 +82,46 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
+	journal := refreshJournalFrom(ctx)
+	key := refreshGrantFingerprint(ClientID, refreshToken)
+	if journal != nil {
+		// The database claim remains the cross-process barrier; local results
+		// must not be shared between different authoritative repositories.
+		key = fmt.Sprintf("%p:%s", journal, key)
+	}
+	result, errRefresh, _ := codexRefreshGroup.Do(key, func() (any, error) {
+		if journal != nil {
+			return journalRefresh(ctx, journal, refreshToken, func() (*CodexTokenData, error) {
+				return o.refreshTokens(ctx, refreshToken)
+			})
+		}
+		if errOutcome := unresolvedRefreshOutcome(ClientID, refreshToken); errOutcome != nil {
+			return nil, errOutcome
+		}
+		tokens, errTokens := o.refreshTokens(ctx, refreshToken)
+		rememberRefreshOutcome(errTokens)
+		return tokens, errTokens
+	})
+	if errRefresh != nil {
+		return nil, errRefresh
+	}
+	tokens, ok := result.(*CodexTokenData)
+	if !ok || tokens == nil {
+		return nil, fmt.Errorf("token refresh failed: invalid single-flight result")
+	}
+	return tokens, nil
+}
 
+func (o *CodexAuth) refreshTokens(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
 	data := url.Values{
 		"client_id":     {ClientID},
 		"grant_type":    {"refresh_token"},
@@ -95,9 +137,12 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := o.httpClient.Do(req)
+	resp, err := doRefreshRequest(o.httpClient, req)
 	if err != nil {
-		return nil, fmt.Errorf("token refresh request failed: %w", err)
+		if refreshRequestNotSent(err) {
+			return nil, fmt.Errorf("token refresh request failed before submission: %w", err)
+		}
+		return nil, NewRefreshOutcomeUnknownError(ClientID, refreshToken, "transport", err)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -107,11 +152,15 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read refresh response: %w", err)
+		return nil, NewRefreshOutcomeUnknownError(ClientID, refreshToken, "response_read", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, newCodexRefreshResponseError(resp.StatusCode, body)
+		errResponse := newCodexRefreshResponseError(resp.StatusCode, body)
+		if isNonRetryableRefreshErr(errResponse) {
+			return nil, errResponse
+		}
+		return nil, NewRefreshOutcomeUnknownError(ClientID, refreshToken, "response_status", fmt.Errorf("token refresh response status %d", resp.StatusCode))
 	}
 
 	var tokenResp struct {
@@ -123,7 +172,10 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
+		return nil, NewRefreshOutcomeUnknownError(ClientID, refreshToken, "response_decode", err)
+	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" || tokenResp.ExpiresIn <= 0 {
+		return nil, NewRefreshOutcomeUnknownError(ClientID, refreshToken, "response_validate", nil)
 	}
 
 	// Extract account ID from ID token
@@ -149,10 +201,15 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}, nil
 }
 
-// RefreshTokensWithRetry refreshes tokens with a built-in retry mechanism.
-// It attempts to refresh the tokens up to a specified maximum number of retries,
-// with an exponential backoff strategy to handle transient network errors.
+// RefreshTokensWithRetry retries only failures known to precede submission.
+// A rotating refresh grant must not be replayed after an uncertain exchange.
 func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*CodexTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -169,13 +226,13 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 		if err == nil {
 			return tokenData, nil
 		}
-		if isNonRetryableRefreshErr(err) {
-			log.Warnf("Token refresh attempt %d failed with a non-retryable provider response", attempt+1)
+		if isNonRetryableRefreshErr(err) || !refreshRequestNotSent(err) {
+			log.Warnf("Token refresh attempt %d stopped without replay", attempt+1)
 			return nil, err
 		}
 
 		lastErr = err
-		log.Warnf("Token refresh attempt %d failed with a retryable provider response", attempt+1)
+		log.Warnf("Token refresh attempt %d failed before submission", attempt+1)
 	}
 
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
@@ -219,6 +276,9 @@ func codexTerminalRefreshCode(code, description string) string {
 func isNonRetryableRefreshErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	if IsRefreshOutcomeUnknown(err) {
+		return true
 	}
 	var responseErr *codexRefreshResponseError
 	if errors.As(err, &responseErr) && responseErr != nil {

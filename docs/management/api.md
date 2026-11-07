@@ -2473,6 +2473,10 @@ Single-credential success returns `{"ok":true,"auth":{...}}`, where `auth` has t
 
 Batch requests return `200` even when individual refreshes fail; inspect `results[].success`. Invalid input returns `400`, an unknown single credential returns `404`, a failed single refresh returns `500 refresh_failed`, and an unavailable coordinator returns `503`.
 
+An interrupted or unreadable Codex refresh can leave its outcome unknown. Home claims each refresh grant in its database before sending the request. Pending or unknown grants are not resubmitted after a lease expires, a restart, or deletion and re-import of the same credentials. Only a proven pre-submission failure releases a claim. Home records `refresh_outcome_unknown` separately from an explicit rejected grant. Reconnect Codex or import replacement refresh credentials to recover; waiting for a retry backoff does not resolve an unknown exchange.
+
+Successful refresh results are saved before updated credentials are published. Later callers with the old grant reuse an unexpired result and follow recorded rotations. An expired result requires recovery, including when the provider returned the same refresh token. The `codex_refresh_journal` table is part of database snapshot format v17 and contains credentials; protect and retain it with the auth database across backups and migrations. Auth-directory exports alone do not preserve this history. Stop older Home processes before upgrading, and do not refresh the same grants through deployments or external clients that do not share this database protocol. Startup migration preserves existing grant-matched metadata fences in the journal. A legacy lease alone does not identify the consumed grant; earlier exchanges without grant-specific evidence cannot be reconstructed.
+
 ### GET `/oauth/auth-url`
 
 Creates a provider login URL or device-flow session. Required query `provider` is trimmed and case-insensitive for built-in providers.
