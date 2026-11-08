@@ -400,10 +400,6 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 	changed := false
 	ctx = contextOrBackground(ctx)
 	errTransaction := db.WithContext(ctx).Transaction(func(txDB *gorm.DB) error {
-		feedbackRecord, feedbackScope, errFeedback := loadUsageFeedbackTx(ctx, txDB)
-		if errFeedback != nil {
-			return errFeedback
-		}
 		existing := &AuthRecord{}
 		errFirst := txDB.Clauses(clause.Locking{Strength: "UPDATE"}).Where("uuid = ?", uuid).First(existing).Error
 		if errFirst != nil {
@@ -417,25 +413,11 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		auth.ID = uuid
 		auth.Index = uuid
 
-		applyFeedback := true
-		if feedbackScope != nil {
-			// Compare with the live identity only after acquiring the auth row lock.
-			// Restores and identity changes cannot commit between this check and
-			// mutation; stale entries still complete atomically with the batch.
-			feedback := coreauth.UsageFeedbackFromContext(ctx)
-			identityVersion := quotaCredentialIdentityVersion(*existing)
-			for _, event := range feedbackScope.Pending {
-				if event.QuotaIdentityVersion == identityVersion {
-					feedback.Pending = append(feedback.Pending, event.Result)
-				}
-			}
-			applyFeedback = len(feedback.Pending) > 0
-		}
-		changed = applyFeedback && mutate(auth)
+		changed = mutate(auth)
 		if !changed {
 			outAuth = auth
 			outRecord = existing
-			return completeUsageFeedbackTx(txDB, feedbackRecord, feedbackScope)
+			return nil
 		}
 
 		record, errRecord := AuthToRecord(auth)
@@ -463,9 +445,6 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		}
 		outAuth = auth
 		outRecord = record
-		if errComplete := completeUsageFeedbackTx(txDB, feedbackRecord, feedbackScope); errComplete != nil {
-			return errComplete
-		}
 		return appendEvent(txDB, "auth", op, uuid, record.Version)
 	})
 	if errTransaction != nil {

@@ -133,14 +133,9 @@ func (a *RuntimeAdapter) LoadConfigYAML(ctx context.Context) ([]byte, error) {
 	return payload, nil
 }
 
-// StoreUsagePayload stores an usage payload with its trusted Home receive time.
-func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error {
-	_, errStore := a.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
-	return errStore
-}
-
-// StoreUsagePayloadOutcome stores an usage payload and reports whether it was newly inserted.
-func (a *RuntimeAdapter) StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
+// StoreUsagePayload stores an usage payload with its trusted Home receive time
+// and reports whether it was newly inserted (false when deduplicated).
+func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
 	if !a.Enabled() {
 		return false, fmt.Errorf("cluster runtime adapter is disabled")
 	}

@@ -2,8 +2,10 @@ package home
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/tidwall/gjson"
@@ -14,8 +16,9 @@ func (r *Runtime) RecordUsagePayload(ctx context.Context, payload string) error 
 	return r.recordUsagePayload(ctx, payload, false)
 }
 
-// ApplyUsagePayloadFeedback repairs scheduler feedback without counting an
-// uncommitted or already counted delivery as a new request.
+// ApplyUsagePayloadFeedback applies scheduler feedback for a redelivered usage
+// event without counting it as a new request. The result state machine fences
+// replays by event time, so applying an already-processed event is a no-op.
 func (r *Runtime) ApplyUsagePayloadFeedback(ctx context.Context, payload string) error {
 	return r.recordUsagePayload(ctx, payload, true)
 }
@@ -28,13 +31,6 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 	payload = strings.TrimSpace(payload)
 	if payload == "" || !gjson.Valid(payload) {
 		return fmt.Errorf("invalid usage json")
-	}
-
-	if feedback := coreauth.UsageFeedbackFromContext(ctx); feedback != nil && feedback.ScopeKey != "" {
-		// Recovered feedback is authoritative even when retry routing fields are absent.
-		result := feedback.Result
-		result.SkipRequestStats = skipRequestStats
-		return r.coreManager.MarkResult(ctx, result)
 	}
 
 	authIndex := strings.TrimSpace(gjson.Get(payload, "auth_index").String())
@@ -61,6 +57,39 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 
 	result := coreauth.NewUsageResultWithCode(authIndex, provider, model, statusCode, body, failCode)
 	result.AccessTokenSHA256 = strings.TrimSpace(gjson.Get(payload, "access_token_sha256").String())
+	result.ObservedAt = usagePayloadObservedAt(payload)
 	result.SkipRequestStats = skipRequestStats
+	errMark := r.coreManager.MarkResult(ctx, result)
+	if !errors.Is(errMark, coreauth.ErrAuthNotLoaded) {
+		return errMark
+	}
+	// The credential can exist in the database before this Home has applied
+	// the cluster event that introduces it. Load the authoritative record once;
+	// a credential that no longer exists keeps the delivery acknowledged.
+	if r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
+		return nil
+	}
+	auth, errLoad := r.clusterAdapter.GetFullAuth(ctx, authIndex)
+	if errors.Is(errLoad, coreauth.ErrFullAuthNotFound) || (errLoad == nil && auth == nil) {
+		return nil
+	}
+	if errLoad != nil {
+		return errLoad
+	}
+	r.applyCoreAuthAddOrUpdate(coreauth.WithSkipPersist(ctx), auth)
 	return r.coreManager.MarkResult(ctx, result)
+}
+
+// usagePayloadObservedAt returns the completion time of the reported execution,
+// or zero when the payload carries no parsable timestamp.
+func usagePayloadObservedAt(payload string) time.Time {
+	raw := strings.TrimSpace(gjson.Get(payload, "timestamp").String())
+	if raw == "" {
+		return time.Time{}
+	}
+	started, errParse := time.Parse(time.RFC3339Nano, raw)
+	if errParse != nil {
+		return time.Time{}
+	}
+	return started.Add(time.Duration(gjson.Get(payload, "latency_ms").Int()) * time.Millisecond).UTC()
 }

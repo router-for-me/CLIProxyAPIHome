@@ -3,7 +3,6 @@ package push
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	log "github.com/sirupsen/logrus"
@@ -57,28 +55,21 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	payload = enrichedPayload
 
 	if env.Runtime != nil {
-		ctx = coreauth.WithUsageFeedback(ctx)
-		persisted, inserted, errPersist := env.Runtime.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
+		persisted, inserted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
 		if errPersist != nil {
+			// Nothing is acknowledged: CPA redelivers and the dedupe key resolves
+			// whether the usage row already committed.
 			log.Errorf("usage database write error: %v", errPersist)
-			// Drain only durably admitted feedback. Unknown lookup/commit outcomes
-			// fail closed; a full batch is drained before the new event retries.
-			if !errors.Is(errPersist, cluster.ErrUsageWriteAborted) && !errors.Is(errPersist, cluster.ErrUsageFeedbackBacklog) {
-				return dispatch.Err("usage database write failed")
-			}
-			if errFeedback := env.Runtime.ApplyUsagePayloadFeedback(ctx, payload); errFeedback != nil {
-				log.Errorf("usage feedback error: %v", errFeedback)
-				return dispatch.Err("usage feedback failed")
-			}
 			return dispatch.Err("usage database write failed")
 		}
 		if persisted {
+			// A deduplicated delivery still applies feedback: the first attempt may
+			// have committed usage but failed before the scheduler update. Replays
+			// of fully processed events are fenced by event time inside MarkResult.
 			var errFeedback error
 			if inserted {
 				errFeedback = env.Runtime.RecordUsagePayload(ctx, payload)
-			} else if coreauth.UsageFeedbackFromContext(ctx).NeedsFeedback {
-				// Usage may have committed while its auth update failed. Repair only
-				// the pending feedback, without another request count or charge.
+			} else {
 				errFeedback = env.Runtime.ApplyUsagePayloadFeedback(ctx, payload)
 			}
 			if errFeedback != nil {

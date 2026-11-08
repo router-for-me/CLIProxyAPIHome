@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -32,9 +33,17 @@ type Result struct {
 	RetryAfter        *time.Duration
 	ResetAt           *time.Time
 	AccessTokenSHA256 string
+	// ObservedAt is the event time of the usage result. Non-zero values fence
+	// replayed or out-of-order deliveries against the model state.
+	ObservedAt time.Time
 	// SkipRequestStats retries feedback without counting the delivery as a new request.
 	SkipRequestStats bool
 }
+
+// ErrAuthNotLoaded reports a result for a credential this manager has not
+// loaded. Callers that can resolve the authoritative credential should load it
+// and retry instead of dropping the result.
+var ErrAuthNotLoaded = errors.New("auth manager: credential is not loaded")
 
 // markResultTransition captures the registry side effects derived from a result transition.
 type markResultTransition struct {
@@ -66,24 +75,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	if resultModel == "" {
 		return nil
 	}
-	feedback := UsageFeedbackFromContext(ctx)
-	tracked := feedback != nil && feedback.ScopeKey != ""
 	resultAuthID := m.resultAuthID(result)
 	if resultAuthID == "" {
-		if tracked {
-			return fmt.Errorf("auth manager: usage feedback credential is not loaded")
-		}
-		return nil
+		return ErrAuthNotLoaded
 	}
 	now := time.Now()
-	feedbackCtx := ctx
-	if feedback != nil {
-		// The batch belongs only to this result mutation, not follow-up maintenance.
-		ctx = context.WithValue(ctx, usageFeedbackContextKey{}, nil)
-	}
-	if result.SkipRequestStats && !result.RequestScoped() && (feedback == nil || feedback.ScopeKey == "") {
-		return fmt.Errorf("usage feedback observation is unavailable")
-	}
 
 	unlockUpdate := m.updateLocks.lock(resultAuthID)
 	m.mu.Lock()
@@ -91,10 +87,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	if auth == nil || auth.ID != resultAuthID {
 		m.mu.Unlock()
 		unlockUpdate()
-		if tracked {
-			return fmt.Errorf("auth manager: usage feedback credential is not loaded")
-		}
-		return nil
+		return ErrAuthNotLoaded
 	}
 	var mutator StateMutator
 	stateMutatorAvailable := false
@@ -107,9 +100,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 			auth.Failed++
 		}
 	}
-	if result.RequestScoped() {
+	if result.RequestScoped() || resultObservationStale(auth, result, resultModel) {
 		// Count the request failure without publishing a stale credential snapshot
 		// or adopting shared availability state through the status-based paths.
+		// The local model state never runs ahead of the persisted one, so a
+		// locally fenced result is also fenced in the database.
 		m.mu.Unlock()
 		unlockUpdate()
 		return nil
@@ -123,17 +118,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	}
 	if stateMutator, ok := m.store.(StateMutator); ok {
 		stateMutatorAvailable = true
-		if tracked || m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
+		if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
 			mutator = stateMutator
 		}
 	}
-	if tracked && mutator == nil {
-		m.mu.Unlock()
-		unlockUpdate()
-		return fmt.Errorf("auth manager: transactional usage feedback store is unavailable")
-	}
-	// Untracked callers retain their existing fast path. Tracked feedback is
-	// completed transactionally, even when the auth state itself needs no write.
+	// A locally clean token-versioned success has no state to clear. Drop its
+	// transition rather than enqueue a stale row or read the database per success;
+	// cluster events reconcile any newer authoritative state.
 	if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
 		transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
 		if localOnlyDisabledQuota {
@@ -147,26 +138,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
 		// results reported to other Home nodes cannot clobber the shared state.
-		adoptResult := result
-		persisted, errMutate := mutator.MutateAuthState(feedbackCtx, resultAuthID, func(persisted *Auth) bool {
+		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
 			before := availabilityFingerprint(persisted, resultModel)
 			baseVersion := persisted.StateVersion
-			if tracked {
-				// Replay the original state machine, not a lossy latest-result summary.
-				// Earlier successes reset quota before later failures compute backoff.
-				for _, pending := range feedback.Pending {
-					if isTokenVersionFencedResult(pending) && AuthIsNewerThanObserved(persisted, pending.AccessTokenSHA256) {
-						continue
-					}
-					adoptResult = pending
-					if isTokenVersionedSuccessResult(pending) && !authHasClearableAvailabilityState(persisted, resultModel, now) {
-						continue
-					}
-					transition = m.applyResultTransition(persisted, pending, resultModel, now, disableCooling)
-				}
-			} else {
-				transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
-			}
+			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
 			changed := availabilityFingerprint(persisted, resultModel) != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
@@ -186,9 +161,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 			transition = markResultTransition{}
 		}
 		var adopted bool
-		// Use the last eligible transition's token fence, not a stale triggering
-		// delivery. Local token and revision guards remain in force.
-		authSnapshot, adopted = m.adoptPersistedResultState(adoptResult, resultModel, persisted, now)
+		authSnapshot, adopted = m.adoptPersistedResultState(result, resultModel, persisted, now)
 		if !adopted {
 			transition = markResultTransition{}
 		}
@@ -204,7 +177,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 		m.queueRefreshReschedule(authSnapshot.ID)
 	}
 	resultStatus := statusCodeFromResult(result.Error)
-	if tracked || resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
+	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
 		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
 		return nil
 	}
@@ -226,7 +199,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if isTokenVersionFencedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
 		return transition
 	}
-	if result.RequestScoped() {
+	if result.RequestScoped() || resultObservationStale(auth, result, resultModel) {
 		return transition
 	}
 	preserveRefreshAcquisition := RefreshBlocksDispatch(auth)
@@ -239,6 +212,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if result.Success {
 		state := ensureModelState(auth, resultModel)
 		resetModelState(state, now)
+		markModelObserved(state, result)
 		updateAggregatedAvailability(auth, now)
 		if preserveRefreshAcquisition {
 			auth.Status = refreshStatus
@@ -262,6 +236,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		// A truncated accepted stream already submitted its generation
 		// upstream; record the failure without cooling the credential/model.
 		state := ensureModelState(auth, resultModel)
+		markModelObserved(state, result)
 		state.Status = StatusError
 		state.UpdatedAt = now
 		if result.Error != nil {
@@ -274,6 +249,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 	state := ensureModelState(auth, resultModel)
+	markModelObserved(state, result)
 	state.Unavailable = true
 	state.Status = StatusError
 	state.UpdatedAt = now
@@ -358,6 +334,32 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		auth.RuntimeRefreshBlocked = refreshRuntimeBlocked
 	}
 	return transition
+}
+
+// RequestScoped reports failures which must not participate in credential feedback.
+func (r Result) RequestScoped() bool {
+	return !r.Success && ((r.Error != nil && r.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(r.Error))
+}
+
+// resultObservationStale reports whether a timestamped result is older than, or
+// a replay of, the newest result already applied to the model. Results without
+// an event time are never fenced.
+func resultObservationStale(auth *Auth, result Result, resultModel string) bool {
+	if auth == nil || result.ObservedAt.IsZero() {
+		return false
+	}
+	state := auth.ModelStates[resultModel]
+	return state != nil && !state.LastObservedAt.IsZero() && !result.ObservedAt.After(state.LastObservedAt)
+}
+
+// markModelObserved advances the model's observation fence to the result event time.
+func markModelObserved(state *ModelState, result Result) {
+	if state == nil || result.ObservedAt.IsZero() {
+		return
+	}
+	if result.ObservedAt.After(state.LastObservedAt) {
+		state.LastObservedAt = result.ObservedAt.UTC()
+	}
 }
 
 // resultNeedsGlobalTransition reports whether the result must be applied to
@@ -1043,14 +1045,20 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 		nextLevel = level
 	}
 
-	if resetAt := result.QuotaResetTime(now); resetAt.After(deadline) {
+	// Anchor relative provider hints to the event time so a redelivered 429
+	// does not restart the provider reset window.
+	hintAnchor := now
+	if !result.ObservedAt.IsZero() && result.ObservedAt.Before(now) {
+		hintAnchor = result.ObservedAt
+	}
+	if resetAt := result.quotaResetTime(hintAnchor); resetAt.After(deadline) {
 		deadline = resetAt
 	}
 	return deadline, nextLevel
 }
 
-// QuotaResetTime normalizes a supported provider hint to a bounded absolute deadline.
-func (r Result) QuotaResetTime(now time.Time) time.Time {
+// quotaResetTime normalizes a supported provider hint to a bounded absolute deadline.
+func (r Result) quotaResetTime(now time.Time) time.Time {
 	provider := strings.ToLower(strings.TrimSpace(r.Provider))
 	if provider != "antigravity" && provider != "codex" {
 		return time.Time{}
