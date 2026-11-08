@@ -974,19 +974,16 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
-	// Database-backed admissions commit the binding and the concurrency counter
-	// in one transaction. Standalone dispatch without a limiter can CAS directly.
-	// Legacy custom admitters without a shared store retain selector-side commits.
-	if r.concurrencyAdmitter == nil || r.sessionAffinityStore != nil {
-		opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
-	}
+	// Database-backed admissions commit the binding and concurrency counter in
+	// one transaction. Local/custom stores are committed separately below, but
+	// weighted reservations always remain owned by dispatch until admission ends.
+	opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
+	defer func() { opts.SessionAffinity.Finish(false) }()
 	var lastCandidateError error
 	for {
+		opts.SessionAffinity.Reset()
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
-		}
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = coreauth.SessionAffinitySelection{}
 		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
@@ -1035,8 +1032,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if opts.SessionAffinity != nil {
 			binding = opts.SessionAffinity.Commit
 		}
-		// Explicitly installed local/custom selectors cannot participate in the
-		// database admission transaction. Keep their selector-side CAS behavior.
+		// Local/custom stores cannot participate in the database admission
+		// transaction. Commit their binding before admission instead.
 		if binding != nil && r.concurrencyAdmitter != nil && opts.SessionAffinity.Store != r.sessionAffinityStore {
 			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
 			if errSwap != nil {
@@ -1077,6 +1074,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				if !admission.Accounted {
 					return nil, fmt.Errorf("home runtime: concurrency admission result mismatch")
 				}
+				opts.SessionAffinity.Finish(true)
 				result.Concurrency.Accounted = true
 				result.AdmissionFenceFailure = fmt.Errorf("home runtime: concurrency admission result mismatch")
 				return result, nil
@@ -1091,6 +1089,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				continue
 			}
 		}
+		opts.SessionAffinity.Finish(true)
 		return result, nil
 	}
 }

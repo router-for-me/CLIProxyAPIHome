@@ -447,6 +447,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	opts.SessionAffinity.Finish(false)
+	var reservation *weightedReservation
+	defer func() { reservation.finish(false) }()
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
@@ -464,6 +467,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
+	weighted, _ := s.fallback.(*WeightedRoundRobinSelector)
+	var weightedKey string
+	if weighted != nil {
+		weightedKey = weightedStateKey(provider, model, opts)
+	}
 	cacheKey := sessionBindingKey(provider, primaryID, model)
 	for {
 		if errContext := ctx.Err(); errContext != nil {
@@ -497,15 +505,21 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 		}
-		if selected == nil {
+		if weighted != nil {
+			authID := ""
+			if selected != nil {
+				authID = selected.ID
+			}
+			selected, reservation = weighted.reserve(weightedKey, available, authID)
+		} else if selected == nil {
 			var errPick error
 			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)
 			if errPick != nil {
 				return nil, errPick
 			}
-			if selected == nil {
-				return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
-			}
+		}
+		if selected == nil {
+			return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
 		}
 		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
 		if !active && binding.Revision != "" {
@@ -514,6 +528,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if opts.SessionAffinity != nil {
 			opts.SessionAffinity.Store = s.store
 			opts.SessionAffinity.Commit = &commit
+			// Dispatch now owns confirmation or rollback of the reservation.
+			opts.SessionAffinity.reservation = reservation
+			reservation = nil
 			entry.Debugf("session-affinity: candidate selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), selected.ID, provider, model)
 			return selected, nil
 		}
@@ -522,11 +539,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
 		}
 		if swapped {
+			reservation.finish(true)
 			entry.Infof("session-affinity: binding selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), selected.ID, provider, model)
 			return selected, nil
 		}
-		// Another request won the binding. Re-read it instead of returning a
-		// credential selected from a stale snapshot.
+		// Another request won the binding. Release speculative credit before
+		// re-reading it instead of returning a stale credential.
+		reservation.finish(false)
+		reservation = nil
 	}
 }
 

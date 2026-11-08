@@ -18,8 +18,22 @@ type WeightedRoundRobinSelector struct {
 }
 
 type smoothWeightedState struct {
-	current map[string]int64
-	weights map[string]int64
+	current    map[string]int64
+	weights    map[string]int64
+	pending    map[string]int64
+	generation uint64
+}
+
+// weightedReservation keeps speculative credit separate from committed, clamped
+// credit, so rolling back a request never undoes another request's accounting.
+type weightedReservation struct {
+	selector   *WeightedRoundRobinSelector
+	state      *smoothWeightedState
+	generation uint64
+	weights    map[string]int64
+	authID     string
+	total      int64
+	finished   bool
 }
 
 func authWeight(auth *Auth) int64 {
@@ -59,14 +73,97 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
-	stateModel := model
-	if requested, ok := opts.Metadata[RequestedModelMetadataKey].(string); ok && strings.TrimSpace(requested) != "" {
-		stateModel = requested
+	picked, reservation := s.reserve(weightedStateKey(provider, model, opts), available, "")
+	if picked == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
 	}
-	key := provider + ":" + canonicalModelKey(stateModel)
+	reservation.finish(true)
+	return picked, nil
+}
 
+func weightedStateKey(provider, model string, opts Options) string {
+	if requested, ok := opts.Metadata[RequestedModelMetadataKey].(string); ok && strings.TrimSpace(requested) != "" {
+		model = requested
+	}
+	return provider + ":" + canonicalModelKey(model)
+}
+
+// reserve selects and reserves credit atomically. A non-empty authID preserves a
+// sticky binding; otherwise committed and pending credits both guide selection.
+func (s *WeightedRoundRobinSelector) reserve(key string, available []*Auth, authID string) (*Auth, *weightedReservation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	state := s.stateFor(key)
+	weights := authWeightVector(available)
+	state.prepare(weights)
+	var picked *Auth
+	var pickedCurrent, total int64
+	for _, auth := range available {
+		if auth == nil || weights[auth.ID] <= 0 {
+			continue
+		}
+		total = saturatingAddInt64(total, weights[auth.ID])
+		if authID != "" && auth.ID != authID {
+			continue
+		}
+		current := saturatingAddInt64(state.current[auth.ID], state.pending[auth.ID])
+		current = saturatingAddInt64(current, weights[auth.ID])
+		if picked == nil || current > pickedCurrent {
+			picked, pickedCurrent = auth, current
+		}
+	}
+	if picked == nil {
+		return nil, nil
+	}
+	state.adjustPending(weights, picked.ID, total, false)
+	return picked, &weightedReservation{
+		selector: s, state: state, generation: state.generation,
+		weights: weights, authID: picked.ID, total: total,
+	}
+}
+
+// finish confirms or releases a reservation exactly once. Pending deltas are not
+// clamped: applying and then reversing a clamped delta would lose prior credit.
+func (r *weightedReservation) finish(committed bool) {
+	if r == nil {
+		return
+	}
+	r.selector.mu.Lock()
+	defer r.selector.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	// A configuration reset already discarded this generation's pending credit.
+	if r.state.generation != r.generation {
+		return
+	}
+	r.state.adjustPending(r.weights, r.authID, r.total, true)
+	if committed {
+		r.state.charge(r.weights, r.authID)
+	}
+}
+
+// adjustPending updates only this reservation's delta, including on rollback.
+// Must be called with the selector mutex held.
+func (s *smoothWeightedState) adjustPending(weights map[string]int64, authID string, total int64, release bool) {
+	for id, weight := range weights {
+		delta := weight
+		if id == authID {
+			delta -= total
+		}
+		if release {
+			delta = -delta
+		}
+		s.pending[id] = saturatingAddInt64(s.pending[id], delta)
+		if s.pending[id] == 0 {
+			delete(s.pending, id)
+		}
+	}
+}
+
+// stateFor returns a model's accumulator with s.mu held.
+func (s *WeightedRoundRobinSelector) stateFor(key string) *smoothWeightedState {
 	if s.states == nil {
 		s.states = make(map[string]*smoothWeightedState)
 	}
@@ -82,13 +179,7 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 		state = &smoothWeightedState{}
 		s.states[key] = state
 	}
-	weights := authWeightVector(available)
-	state.prepare(weights)
-	picked := pickSmoothWeightedAuth(available, state.current)
-	if picked == nil {
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
-	}
-	return picked, nil
+	return state
 }
 
 // maxSmoothWeightedStateEntries bounds a single accumulator map so credentials that are
@@ -104,6 +195,8 @@ const maxSmoothWeightedStateEntries = 1024
 func (s *smoothWeightedState) prepare(weights map[string]int64) {
 	if s.current == nil || weightsConfigChanged(s.weights, weights) {
 		s.current = make(map[string]int64, len(weights))
+		s.pending = make(map[string]int64, len(weights))
+		s.generation++
 	}
 	if s.weights == nil {
 		s.weights = make(map[string]int64, len(weights))
@@ -160,27 +253,29 @@ func authWeightVector(auths []*Auth) map[string]int64 {
 	return weights
 }
 
-func pickSmoothWeightedAuth(auths []*Auth, current map[string]int64) *Auth {
-	var picked *Auth
-	var pickedCurrent int64
+// maxSmoothWeightedCreditRounds bounds compensation after a long sticky session.
+const maxSmoothWeightedCreditRounds int64 = 32
+
+func (s *smoothWeightedState) charge(weights map[string]int64, authID string) {
 	var totalWeight int64
-	for _, auth := range auths {
-		weight := authWeight(auth)
-		if auth == nil || weight <= 0 {
-			continue
-		}
-		current[auth.ID] = saturatingAddInt64(current[auth.ID], weight)
+	for id, weight := range weights {
+		s.current[id] = saturatingAddInt64(s.current[id], weight)
 		totalWeight = saturatingAddInt64(totalWeight, weight)
-		if picked == nil || current[auth.ID] > pickedCurrent {
-			picked = auth
-			pickedCurrent = current[auth.ID]
+	}
+	s.current[authID] = saturatingAddInt64(s.current[authID], -totalWeight)
+	limit := int64(math.MaxInt64)
+	if totalWeight <= math.MaxInt64/maxSmoothWeightedCreditRounds {
+		limit = totalWeight * maxSmoothWeightedCreditRounds
+	}
+	// Preserve temporarily excluded credentials' credits. Clamping deliberately
+	// trades exact historical compensation for a bounded correction window.
+	for id := range weights {
+		if s.current[id] > limit {
+			s.current[id] = limit
+		} else if s.current[id] < -limit {
+			s.current[id] = -limit
 		}
 	}
-	if picked == nil {
-		return nil
-	}
-	current[picked.ID] = saturatingAddInt64(current[picked.ID], -totalWeight)
-	return picked
 }
 
 func saturatingAddInt64(value, delta int64) int64 {

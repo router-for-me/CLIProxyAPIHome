@@ -2040,6 +2040,8 @@ Set `routing.strategy` to `weighted-round-robin` to enable weighted credential s
 
 Each key can specify integer `weight`; omission defaults to `1`, the maximum is `1000000`, and non-positive values exclude the credential only while weighted routing is active. Weight belongs to each key, not to the group. Explicit `null`, strings, and fractional values are invalid in config key lists. OAuth/file credentials can carry a top-level numeric `weight` in their uploaded auth JSON.
 
+With `routing.session-affinity` enabled, sticky requests (including parent-session inheritance) also consume weighted credits. Existing bindings are not moved for balancing; new or reselected sessions favor under-served credentials. Committed credits are capped at ±32 times the eligible pool's total weight to bound compensation after long sessions, so request ratios are approximate rather than guaranteed. Credits remain local to each Home process and reset on restart or selector replacement; shared database bindings are unchanged. Session-bound selections reserve credits atomically so concurrent requests see pending allocations. Successful binding/admission confirms the reservation; failure or retry releases it without consuming committed credits.
+
 ### Provider-specific Key Options
 
 | Field | Provider | Meaning |

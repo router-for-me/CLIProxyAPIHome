@@ -1323,6 +1323,12 @@ func (m *Manager) useSchedulerFastPath() bool {
 
 // Dispatch processes dispatch.
 func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedModel string, opts Options) (*DispatchDecision, error) {
+	selectionReturned := false
+	defer func() {
+		if !selectionReturned {
+			opts.SessionAffinity.Finish(false)
+		}
+	}()
 	// Build the candidate view before applying availability rules.
 	if m == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "manager is nil"}
@@ -1418,6 +1424,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 
 	tried := cloneAuthIDSet(excludedAuthIDs)
 	for {
+		opts.SessionAffinity.Reset()
 		now := time.Now()
 		m.mu.RLock()
 		selector := m.selector
@@ -1477,9 +1484,6 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
 		}
 
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = SessionAffinitySelection{}
-		}
 		var auth *Auth
 		if pluginScheduler != nil {
 			pluginAuth, handled, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths)
@@ -1551,6 +1555,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		if upstream == "" {
 			upstream = routeModel
 		}
+		selectionReturned = true
 		return &DispatchDecision{
 			Auth:          fullAuth.Clone(),
 			Provider:      providerKey,

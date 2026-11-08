@@ -39,6 +39,27 @@ type SessionAffinityStore interface {
 // SessionAffinitySelection defers binding changes until dispatch is prepared and
 // admitted. Each dispatch attempt owns its selection; selectors must not share it.
 type SessionAffinitySelection struct {
-	Store  SessionAffinityStore
-	Commit *SessionAffinityCommit
+	Store       SessionAffinityStore
+	Commit      *SessionAffinityCommit
+	reservation *weightedReservation
+}
+
+// Reset releases any pending reservation before clearing selection metadata.
+// It is safe to call repeatedly, including with a nil selection.
+func (s *SessionAffinitySelection) Reset() {
+	if s == nil {
+		return
+	}
+	s.Finish(false)
+	*s = SessionAffinitySelection{}
+}
+
+// Finish confirms weighted credit after successful binding/admission, or releases
+// it on failure/retry. Dispatch must finish each selection before discarding it.
+// It is safe to call repeatedly, including with a nil selection.
+func (s *SessionAffinitySelection) Finish(committed bool) {
+	if s != nil {
+		s.reservation.finish(committed)
+		s.reservation = nil
+	}
 }
