@@ -2465,6 +2465,8 @@ Selector 字段：
 
 Codex 刷新对临时网络错误、响应读取或解析失败、未返回有效 access token 等情况进行有限次数重试。重试耗尽后进入正常刷新退避，后续仍可再次尝试。提供方明确拒绝凭证（`invalid_grant`、refresh token 过期、撤销或已复用）时仍需要恢复凭证；仅未获取到 access token 不再要求更换凭证。
 
+并发 Codex 刷新的等待方会独立响应自身取消或超时，不会取消共享刷新或其他调用者。发起方保留刷新结果，包括已返回的令牌轮换结果。
+
 Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_refresh_outcomes` metadata 和 `codex_refresh_journal` 记录不再阻止刷新。日志表仅为兼容旧数据库和快照（包括 v17 备份）而保留；历史回执可能包含凭证，已有数据库备份仍需妥善保护。
 
 ### GET `/oauth/auth-url`
