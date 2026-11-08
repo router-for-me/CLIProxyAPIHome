@@ -882,22 +882,16 @@ func clearAggregatedAvailability(auth *Auth) {
 	auth.Quota = QuotaState{}
 }
 
-// hasModelError reports whether model error is present.
+// hasModelError reports whether a model error still keeps the credential in
+// error. Only errors inside their cooldown count; once the model can be
+// requested again, its LastError remains model diagnostic history only.
 func hasModelError(auth *Auth, now time.Time) bool {
-	if auth == nil || len(auth.ModelStates) == 0 {
+	if auth == nil {
 		return false
 	}
 	for _, state := range auth.ModelStates {
-		if state == nil {
-			continue
-		}
-		if state.LastError != nil {
+		if state != nil && state.Status == StatusError && state.NextRetryAfter.After(now) {
 			return true
-		}
-		if state.Status == StatusError {
-			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {
-				return true
-			}
 		}
 	}
 	return false
