@@ -75,7 +75,7 @@ func (s *failingCooldownMutationStore) Delete(context.Context, string) error {
 	return nil
 }
 
-func (s *failingCooldownMutationStore) MutateAuthState(context.Context, string, func(*coreauth.Auth) bool) (*coreauth.Auth, error) {
+func (s *failingCooldownMutationStore) MutateAuthState(context.Context, string, func(*coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, error) {
 	s.attempts++
 	return nil, s.err
 }

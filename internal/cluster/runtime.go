@@ -380,7 +380,7 @@ func (a *RuntimeAdapter) SaveWithStateVersion(ctx context.Context, auth *coreaut
 // MutateAuthState implements coreauth.StateMutator. It applies mutate to the
 // persisted auth row under the cluster write lock so availability transitions
 // stay atomic across Home nodes, then refreshes the local index and cache.
-func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate func(auth *coreauth.Auth) bool) (*coreauth.Auth, error) {
+func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate func(auth *coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, error) {
 	// Keep validation before state changes so failures leave existing data intact.
 	if !a.Enabled() {
 		return nil, fmt.Errorf("cluster runtime adapter is disabled")
@@ -389,7 +389,10 @@ func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate 
 	if uuid == "" {
 		return nil, fmt.Errorf("cluster auth uuid is required")
 	}
-	auth, record, changed, errMutate := a.repo.MutateAuth(ctx, uuid, "update", mutate)
+	auth, record, changed, errMutate := a.repo.mutateAuthState(ctx, uuid, "update", mutate)
+	if errors.Is(errMutate, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("%w: %w", coreauth.ErrAuthNotFound, errMutate)
+	}
 	if errMutate != nil {
 		return nil, errMutate
 	}

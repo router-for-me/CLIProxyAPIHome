@@ -379,6 +379,22 @@ func (r *Repository) WithAuthRefreshLock(ctx context.Context, uuid string, fn fu
 // backoff escalation atomic across the cluster. The returned auth and record
 // reflect the post-transaction row state.
 func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mutate func(auth *coreauth.Auth) bool) (*coreauth.Auth, *AuthRecord, bool, error) {
+	if mutate == nil {
+		return nil, nil, false, fmt.Errorf("cluster auth mutate callback is nil")
+	}
+	// Existing callers always publish changed credentials, including explicit
+	// revision fences for resets and refresh operations.
+	return r.mutateAuthState(ctx, uuid, op, func(auth *coreauth.Auth) coreauth.StateMutation {
+		if mutate(auth) {
+			return coreauth.StateMutationChanged
+		}
+		return coreauth.StateMutationUnchanged
+	})
+}
+
+// mutateAuthState persists observation fences without issuing a reload event.
+// Both kinds of writes advance the revision under the same auth row lock.
+func (r *Repository) mutateAuthState(ctx context.Context, uuid string, op string, mutate func(auth *coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, *AuthRecord, bool, error) {
 	// Keep validation before state changes so failures leave existing data intact.
 	db, errDB := r.database()
 	if errDB != nil {
@@ -413,7 +429,14 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		auth.ID = uuid
 		auth.Index = uuid
 
-		changed = mutate(auth)
+		mutation := mutate(auth)
+		switch mutation {
+		case coreauth.StateMutationUnchanged:
+		case coreauth.StateMutationChanged, coreauth.StateMutationObservation:
+			changed = true
+		default:
+			return fmt.Errorf("invalid auth state mutation: %d", mutation)
+		}
 		if !changed {
 			outAuth = auth
 			outRecord = existing
@@ -445,6 +468,9 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		}
 		outAuth = auth
 		outRecord = record
+		if mutation == coreauth.StateMutationObservation {
+			return nil
+		}
 		return appendEvent(txDB, "auth", op, uuid, record.Version)
 	})
 	if errTransaction != nil {

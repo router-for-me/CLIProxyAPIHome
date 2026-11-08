@@ -664,29 +664,29 @@ func (r *Runtime) persistAntigravityCapabilityHints(ctx context.Context, auth *c
 		}
 		alreadyCurrent := false
 		changed := false
-		updated, errMutate := mutator.MutateAuthState(ctx, auth.ID, func(existing *coreauth.Auth) bool {
+		updated, errMutate := mutator.MutateAuthState(ctx, auth.ID, func(existing *coreauth.Auth) coreauth.StateMutation {
 			if existing == nil || existing.Disabled || existing.Status == coreauth.StatusDisabled ||
 				!strings.EqualFold(strings.TrimSpace(existing.Provider), "antigravity") ||
 				r.antigravityCapabilityKey(existing) != expectedKey {
-				return false
+				return coreauth.StateMutationUnchanged
 			}
 			antigravityCapabilityMu.RLock()
 			currentEntry := antigravityCapabilityCache[expectedKey]
 			valid := currentEntry.hints.ModelIDs != nil && currentEntry.hints.revision == hints.revision && currentEntry.persistedRevision < hints.revision
 			antigravityCapabilityMu.RUnlock()
 			if !valid {
-				return false
+				return coreauth.StateMutationUnchanged
 			}
 			if existing.Metadata != nil && persistedAntigravityHintsEqual(existing.Metadata[antigravityPersistedHintsMetaKey], value) {
 				alreadyCurrent = true
-				return false
+				return coreauth.StateMutationUnchanged
 			}
 			if existing.Metadata == nil {
 				existing.Metadata = make(map[string]any)
 			}
 			existing.Metadata[antigravityPersistedHintsMetaKey] = value
 			changed = true
-			return true
+			return coreauth.StateMutationChanged
 		})
 		if errMutate != nil {
 			return false

@@ -128,7 +128,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
 		transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
 		if localOnlyDisabledQuota {
-			skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
+			localAvailabilityAfter := availabilityFingerprint(auth, resultModel)
+			// With cooling disabled, advancing a local observation alone must not
+			// enqueue a full auth save or publish a reload event.
+			localAvailabilityBefore.modelObservedAt, localAvailabilityAfter.modelObservedAt = time.Time{}, time.Time{}
+			skipResultPersist = localAvailabilityAfter == localAvailabilityBefore
 		}
 		authSnapshot = auth.Clone()
 	}
@@ -138,18 +142,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
 		// results reported to other Home nodes cannot clobber the shared state.
-		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
+		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) StateMutation {
 			before := availabilityFingerprint(persisted, resultModel)
 			baseVersion := persisted.StateVersion
 			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
-			changed := availabilityFingerprint(persisted, resultModel) != before
+			after := availabilityFingerprint(persisted, resultModel)
+			changed := after != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
 				if changed {
 					transitionVersion++
 				}
 			}
-			return changed
+			if !changed {
+				return StateMutationUnchanged
+			}
+			// Peers read the authoritative fence before applying timestamped results.
+			// Advancing it alone must not trigger a full credential reload per request.
+			before.modelObservedAt, after.modelObservedAt = time.Time{}, time.Time{}
+			if before == after {
+				return StateMutationObservation
+			}
+			return StateMutationChanged
 		})
 		if errMutate != nil {
 			return fmt.Errorf("auth manager: persist result transition for %s: %w", resultAuthID, errMutate)
@@ -367,6 +381,8 @@ func markModelObserved(state *ModelState, result Result) {
 // atomic across Home nodes. Unauthorized transitions must preserve credentials
 // that may be refreshed concurrently, while quota (429) and clearing successes
 // need shared availability state. Other failures stay on the local path.
+// Clean successes stay database-free; in-window quota failures persist only
+// their observation fence so a redelivery cannot reopen an expired window.
 func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultModel string, now time.Time, disableCooling bool) bool {
 	if auth == nil {
 		return false
@@ -402,7 +418,8 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	return state == nil ||
 		!state.NextRetryAfter.Equal(next) ||
 		!state.Quota.NextRecoverAt.Equal(next) ||
-		state.Quota.BackoffLevel != nextBackoffLevel
+		state.Quota.BackoffLevel != nextBackoffLevel ||
+		result.ObservedAt.After(state.LastObservedAt)
 }
 
 // disabledQuotaStateAlreadyApplied reports whether a disabled-cooling 429 can
@@ -484,20 +501,21 @@ type quotaFingerprint struct {
 // availabilityFingerprintValue condenses the fields of an auth (and one model
 // state) that determine scheduling availability, so state mutations can
 // cheaply detect whether a transition changed anything worth persisting.
-// Volatile fields such as LastError, StatusMessage, and UpdatedAt are
-// intentionally excluded to keep in-window failures write-free.
+// Observation fences are included because they must survive cross-node replays.
+// Volatile diagnostics such as LastError, StatusMessage, and UpdatedAt are excluded.
 type availabilityFingerprintValue struct {
-	status         Status
-	disabled       bool
-	unavailable    bool
-	nextRetryUnix  int64
-	quota          quotaFingerprint
-	modelPresent   bool
-	modelStatus    Status
-	modelUnavail   bool
-	modelRetryUnix int64
-	modelResetUnix int64
-	modelQuota     quotaFingerprint
+	status          Status
+	disabled        bool
+	unavailable     bool
+	nextRetryUnix   int64
+	quota           quotaFingerprint
+	modelPresent    bool
+	modelStatus     Status
+	modelUnavail    bool
+	modelRetryUnix  int64
+	modelResetUnix  int64
+	modelObservedAt time.Time
+	modelQuota      quotaFingerprint
 }
 
 // fingerprintUnix normalizes a time for fingerprint comparison.
@@ -537,6 +555,7 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 			fp.modelUnavail = state.Unavailable
 			fp.modelRetryUnix = fingerprintUnix(state.NextRetryAfter)
 			fp.modelResetUnix = fingerprintUnix(state.QuotaResetAt)
+			fp.modelObservedAt = state.LastObservedAt
 			fp.modelQuota = fingerprintQuota(state.Quota)
 		}
 	}
