@@ -2475,7 +2475,7 @@ Batch requests return `200` even when individual refreshes fail; inspect `result
 
 Codex refresh uses bounded provider retries for transient transport, response-read, decoding, and missing-access-token failures. Exhausted attempts enter the normal refresh backoff and remain retryable. Explicit grant rejection (`invalid_grant`, expired, revoked, or reused refresh tokens) still requires credential recovery. A missing access token alone does not require replacement credentials.
 
-Home retains its existing refresh lease coordination and concurrent credential-update protections. Legacy `codex_refresh_outcomes` metadata and `codex_refresh_journal` entries no longer block refresh attempts. The journal table remains in database/snapshot format v17 for compatibility only; historical receipts can contain credentials, so protect existing database backups accordingly.
+Home retains its existing refresh lease coordination and concurrent credential-update protections. Legacy `codex_refresh_outcomes` metadata and `codex_refresh_journal` entries no longer block refresh attempts. The legacy journal table remains part of database snapshots for compatibility with v17 backups; historical receipts can contain credentials, so protect existing database backups accordingly.
 
 ### GET `/oauth/auth-url`
 

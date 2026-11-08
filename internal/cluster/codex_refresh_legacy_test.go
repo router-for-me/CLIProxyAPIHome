@@ -62,7 +62,7 @@ func TestCodexRefreshIgnoresLegacyPendingJournal(t *testing.T) {
 
 func TestCodexLegacyJournalSnapshotCompatibility(t *testing.T) {
 	ctx := context.Background()
-	for _, version := range []int{16, currentDatabaseVersion} {
+	for _, version := range []int{16, 17, currentDatabaseVersion} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			repo := newRefreshTestRepository(t)
 			const key = "legacy-grant"
@@ -99,7 +99,7 @@ func TestCodexLegacyJournalSnapshotCompatibility(t *testing.T) {
 			}
 			var before, after any
 			if len(records) != 1 || json.Unmarshal([]byte(receipt), &before) != nil || json.Unmarshal([]byte(records[0].Receipt), &after) != nil || !reflect.DeepEqual(before, after) {
-				t.Fatal("v17 snapshot lost legacy journal data")
+				t.Fatalf("v%d snapshot lost legacy journal data", version)
 			}
 		})
 	}
