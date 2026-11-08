@@ -144,6 +144,9 @@ type ModelState struct {
 	// QuotaResetAt marks an operator reset so peers can merge it without
 	// discarding unrelated local execution errors.
 	QuotaResetAt time.Time `json:"quota_reset_at,omitzero"`
+	// LastObservedAt is the event time of the newest usage result applied to
+	// this model. Older or replayed results are fenced by it.
+	LastObservedAt time.Time `json:"last_observed_at,omitzero"`
 }
 
 // recentRequestBucketID handles a recent request bucket id.

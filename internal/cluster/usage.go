@@ -3,11 +3,9 @@ package cluster
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +14,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -34,6 +33,10 @@ type UsageRecord struct {
 	TTFTMS    int64     `gorm:"column:ttft_ms;not null;default:0"`
 	Source    string    `gorm:"column:source;index:idx_usage_source;index:idx_usage_source_time,priority:1"`
 	AuthIndex string    `gorm:"column:auth_index;index:idx_usage_auth_index;index:idx_usage_auth_time,priority:1"`
+	// DedupeKey identifies one CPA execution so redelivered payloads collapse onto
+	// the first committed row. Rows written before the column existed keep an
+	// empty key and stay outside the partial unique index.
+	DedupeKey string `gorm:"column:dedupe_key;not null;default:'';size:80;index:idx_usage_dedupe_key,unique,where:dedupe_key <> ''"`
 	// Quota identity fields fence activity from concurrent credential replacement;
 	// the key also protects rolling upgrades where an older Home cannot advance the generation.
 	QuotaCredentialID    string `gorm:"column:quota_credential_id;not null;default:''"`
@@ -341,15 +344,18 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 
 // AppendUsageWithRuntimeOutcome appends usage with trusted Home/CPA runtime metadata
 // and reports whether this call committed a new usage row (false when deduplicated).
+// Deduplication relies on the unique dedupe_key index, so concurrent and
+// cross-node redeliveries are resolved by the database without extra locking.
 func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload string, metadata UsageRuntimeMetadata) (*UsageRecord, bool, error) {
-	dedupeKey, errDedupeKey := usagePayloadDedupeKey(payload)
-	if errDedupeKey != nil {
-		return nil, false, errDedupeKey
-	}
 	record, errRecord := UsageRecordFromPayloadWithRuntime(payload, metadata)
 	if errRecord != nil {
 		return nil, false, errRecord
 	}
+	dedupeKey, errDedupeKey := usagePayloadDedupeKey(payload)
+	if errDedupeKey != nil {
+		return nil, false, errDedupeKey
+	}
+	record.DedupeKey = dedupeKey
 
 	db, errDB := r.database()
 	if errDB != nil {
@@ -374,25 +380,25 @@ func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload 
 	}
 	inserted := false
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if errLock := lockUsageIngestionTx(ctx, tx, dedupeKey); errLock != nil {
-			return errLock
+		insert := tx.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns:     []clause.Column{{Name: "dedupe_key"}},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "dedupe_key <> ''"}}},
+			DoNothing:   true,
+		}).Create(record)
+		if insert.Error != nil {
+			return insert.Error
 		}
-		existing, found, errExisting := findExistingUsageRecordTx(ctx, tx, record, payload)
-		if errExisting != nil {
-			return errExisting
-		}
-		if found {
+		if insert.RowsAffected == 0 {
+			existing := &UsageRecord{}
+			// Keep the partial-index predicate explicit for indexed lookups.
+			if errExisting := tx.WithContext(ctx).Where("dedupe_key <> '' AND dedupe_key = ?", dedupeKey).First(existing).Error; errExisting != nil {
+				return errExisting
+			}
 			record = existing
 			return nil
 		}
 		inserted = true
-		if errCreate := tx.WithContext(ctx).Create(record).Error; errCreate != nil {
-			return errCreate
-		}
-		if errBilling := r.createBillingChargeForUsageTx(ctx, tx, record, payload); errBilling != nil {
-			return errBilling
-		}
-		return nil
+		return r.createBillingChargeForUsageTx(ctx, tx, record, payload)
 	})
 	if errTransaction != nil {
 		return nil, false, errTransaction
@@ -405,129 +411,22 @@ func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload 
 	return record, inserted, nil
 }
 
-const (
-	usageIngestionAdvisoryLockNamespace int32 = 0x55534749 // "USGI"
-	usageDedupeCandidateBatchSize             = 128
-)
-
-func lockUsageIngestionTx(ctx context.Context, tx *gorm.DB, dedupeKey string) error {
-	if tx == nil || tx.Dialector == nil || tx.Dialector.Name() != "postgres" {
-		return nil
-	}
-	hasher := fnv.New32a()
-	_, _ = hasher.Write([]byte(dedupeKey))
-	lockKey := int32(hasher.Sum32())
-	return tx.WithContext(contextOrBackground(ctx)).
-		Exec("SELECT pg_advisory_xact_lock(?, ?)", usageIngestionAdvisoryLockNamespace, lockKey).Error
-}
-
-func findExistingUsageRecordTx(ctx context.Context, tx *gorm.DB, candidate *UsageRecord, rawPayload string) (*UsageRecord, bool, error) {
-	if tx == nil || candidate == nil {
-		return nil, false, nil
-	}
-	ctx = contextOrBackground(ctx)
-	candidatePayload := string(candidate.PayloadJSON)
-	execID := usagePayloadExecutionID(candidatePayload)
-	dedupeKey, errDedupe := usagePayloadDedupeKey(candidatePayload)
-	if errDedupe != nil {
-		return nil, false, errDedupe
-	}
-
-	var cursorID uint
-	for {
-		var candidates []UsageRecord
-		query := tx.WithContext(ctx).Where("timestamp = ? AND id > ?", candidate.Timestamp, cursorID)
-		if candidate.RequestID != "" {
-			query = query.Where("request_id = ?", candidate.RequestID)
-		} else {
-			query = query.Where("(request_id = '' OR request_id IS NULL)")
-		}
-		if errFind := query.Order("id ASC").Limit(usageDedupeCandidateBatchSize).Find(&candidates).Error; errFind != nil {
-			return nil, false, errFind
-		}
-		if len(candidates) == 0 {
-			break
-		}
-		for index := range candidates {
-			existing := &candidates[index]
-			existingPayload := string(existing.PayloadJSON)
-			if execID != "" {
-				if usagePayloadExecutionID(existingPayload) == execID {
-					return existing, true, nil
-				}
-				continue
-			}
-			if usagePayloadExecutionID(existingPayload) != "" {
-				continue
-			}
-			if existingKey, errKey := usagePayloadDedupeKey(existingPayload); errKey == nil && existingKey == dedupeKey {
-				return existing, true, nil
-			}
-		}
-		if len(candidates) < usageDedupeCandidateBatchSize {
-			break
-		}
-		cursorID = candidates[len(candidates)-1].ID
-	}
-
-	hashCandidates := billingPayloadHashCandidates(rawPayload, candidatePayload)
-	if len(hashCandidates) > 0 {
-		var charges []BillingChargeRecord
-		if errCharge := tx.WithContext(ctx).
-			Select("usage_id").
-			Where("payload_hash IN ?", hashCandidates).
-			Limit(1).
-			Find(&charges).Error; errCharge != nil {
-			return nil, false, errCharge
-		}
-		if len(charges) > 0 && charges[0].UsageID > 0 {
-			var existingRows []UsageRecord
-			if errUsage := tx.WithContext(ctx).
-				Where("id = ?", charges[0].UsageID).
-				Limit(1).
-				Find(&existingRows).Error; errUsage != nil {
-				return nil, false, errUsage
-			}
-			if len(existingRows) > 0 {
-				return &existingRows[0], true, nil
-			}
-		}
-	}
-	return nil, false, nil
-}
-
-func usagePayloadExecutionID(payload string) string {
-	for _, path := range []string{"execution_id", "execution.id", "executionId"} {
-		value := gjson.Get(payload, path)
-		if value.Type == gjson.String {
-			if trimmed := strings.TrimSpace(value.String()); trimmed != "" {
-				return trimmed
-			}
-		}
-	}
-	return ""
-}
-
+// usagePayloadDedupeKey identifies one CPA execution. Modern payloads carry an
+// execution_id; legacy payloads fall back to a canonical hash of the payload
+// with secrets and Home-added runtime metadata removed, so the same event
+// redelivered to another Home node still yields the same key. The caller has
+// already validated the payload JSON.
 func usagePayloadDedupeKey(payload string) (string, error) {
-	payload = strings.TrimSpace(payload)
-	if payload == "" {
-		return "", fmt.Errorf("usage payload is empty")
-	}
-	if !json.Valid([]byte(payload)) {
-		return "", fmt.Errorf("usage payload is invalid json")
+	if executionID := strings.TrimSpace(gjson.Get(payload, "execution_id").String()); executionID != "" {
+		sum := sha256.Sum256([]byte(executionID))
+		return "exec:" + hex.EncodeToString(sum[:]), nil
 	}
 	sanitized, errSanitize := SanitizeUsagePayloadSecrets(payload)
 	if errSanitize != nil {
 		return "", errSanitize
 	}
-	if executionID := usagePayloadExecutionID(sanitized); executionID != "" {
-		var lengthPrefix [4]byte
-		binary.BigEndian.PutUint32(lengthPrefix[:], uint32(len(executionID)))
-		sum := sha256.Sum256(append(append([]byte("exec:"), lengthPrefix[:]...), executionID...))
-		return "exec:" + hex.EncodeToString(sum[:]), nil
-	}
 	canonical := canonicalizeUsageDedupeJSON(stripUsageRuntimeMetadataFields(sanitized))
-	sum := sha256.Sum256([]byte("payload:" + strings.TrimSpace(canonical)))
+	sum := sha256.Sum256([]byte(canonical))
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 

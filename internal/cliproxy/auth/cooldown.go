@@ -68,9 +68,12 @@ func (m *Manager) mutateCooldownState(ctx context.Context, credentialID string, 
 		return result, ErrCooldownMutationUnsupported
 	}
 
-	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) bool {
+	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) StateMutation {
 		result.changed = mutate(auth)
-		return result.changed || persistUnchanged
+		if result.changed || persistUnchanged {
+			return StateMutationChanged
+		}
+		return StateMutationUnchanged
 	})
 	if errMutate != nil {
 		return result, errMutate
