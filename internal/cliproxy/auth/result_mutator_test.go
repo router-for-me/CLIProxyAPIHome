@@ -1264,3 +1264,67 @@ func TestMarkResultReconcilesCoolingDisabledDuringQuotaMutation(t *testing.T) {
 		t.Fatalf("mutation attempts = %d, want quota transition plus compensating clear", attempts)
 	}
 }
+
+func TestMarkResultOtherModelSuccessClearsCredentialErrorAfterCooldown(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusServiceUnavailable} {
+		for _, cooling := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/cooling=%v", status, cooling), func(t *testing.T) {
+				ctx := context.Background()
+				const authID = "auth-expired-model-error"
+				now := time.Now().UTC()
+				retryAt := now.Add(-10 * time.Minute)
+				if cooling {
+					retryAt = now.Add(10 * time.Minute)
+				}
+				modelErr := &Error{Message: "model failure", HTTPStatus: status}
+				state := &ModelState{
+					Status: StatusError, StatusMessage: modelErr.Message, Unavailable: true, NextRetryAfter: retryAt,
+					LastError: cloneError(modelErr), UpdatedAt: now.Add(-20 * time.Minute),
+				}
+				if status == http.StatusTooManyRequests {
+					state.Quota = QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota", NextRecoverAt: retryAt, BackoffLevel: 1}
+				}
+				seed := &Auth{
+					ID: authID, Index: authID, Provider: "codex", StateVersion: 1,
+					Status: StatusError, StatusMessage: modelErr.Message, LastError: cloneError(modelErr),
+					Metadata:    map[string]any{"access_token": "token"},
+					ModelStates: map[string]*ModelState{"gpt-5": state},
+				}
+				store := &fakeMutatorStore{persisted: seed.Clone()}
+				manager := NewManager(store, nil, nil)
+				// Home nodes hold a runtime projection without credential secrets or messages.
+				projection := seed.Clone()
+				projection.Metadata, projection.StatusMessage, projection.LastError = nil, "", nil
+				projection.RuntimeProjection = true
+				if _, errRegister := manager.Register(WithSkipPersist(ctx), projection); errRegister != nil {
+					t.Fatal(errRegister)
+				}
+
+				for i := 0; i < 2; i++ {
+					success := Result{AuthID: authID, Provider: "codex", Model: "gpt-5-mini", Success: true, ObservedAt: now.Add(time.Duration(i) * time.Second), AccessTokenSHA256: AccessTokenSHA256(seed)}
+					if errMark := manager.MarkResult(ctx, success); errMark != nil {
+						t.Fatal(errMark)
+					}
+				}
+
+				persisted := store.persistedSnapshot()
+				local, _ := manager.GetByID(authID)
+				if cooling {
+					if persisted.Status != StatusError || local.Status != StatusError || store.mutationAttemptCount() != 0 {
+						t.Fatalf("cooling: persisted=%s local=%s attempts=%d, want error without transactions", persisted.Status, local.Status, store.mutationAttemptCount())
+					}
+					return
+				}
+				if persisted.Status != StatusActive || persisted.StatusMessage != "" || persisted.LastError != nil || local.Status != StatusActive {
+					t.Fatalf("expired: persisted=%s %q %v local=%s, want active", persisted.Status, persisted.StatusMessage, persisted.LastError, local.Status)
+				}
+				if persisted.ModelStates["gpt-5"].LastError == nil {
+					t.Fatal("expired model error history was dropped")
+				}
+				if attempts := store.mutationAttemptCount(); attempts != 1 {
+					t.Fatalf("mutation attempts = %d, want one clearing transition", attempts)
+				}
+			})
+		}
+	}
+}
