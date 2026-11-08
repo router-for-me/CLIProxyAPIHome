@@ -135,7 +135,7 @@ func (f *fakeAntigravityClusterAdapter) LoadConfigYAML(context.Context) ([]byte,
 	return nil, nil
 }
 
-func (f *fakeAntigravityClusterAdapter) MutateAuthState(_ context.Context, id string, mutate func(*coreauth.Auth) bool) (*coreauth.Auth, error) {
+func (f *fakeAntigravityClusterAdapter) MutateAuthState(_ context.Context, id string, mutate func(*coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	current, ok := f.full[id]
@@ -143,7 +143,7 @@ func (f *fakeAntigravityClusterAdapter) MutateAuthState(_ context.Context, id st
 		return nil, nil
 	}
 	clone := current.Clone()
-	if !mutate(clone) {
+	if mutate(clone) == coreauth.StateMutationUnchanged {
 		return nil, nil
 	}
 	f.mutates++

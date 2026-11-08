@@ -284,6 +284,7 @@ func runCustomMigrations(db *gorm.DB) error {
 		{name: "migrate_user_unique_email", run: migrateUserUniqueEmail},
 		{name: "migrate_auth_next_retry_after", run: migrateAuthNextRetryAfter},
 		{name: "migrate_usage_observability_indexes", run: migrateUsageObservabilityIndexes},
+		{name: "migrate_usage_dedupe_keys", run: migrateUsageDedupeKeys},
 		{name: "migrate_usage_provider_api_key_sources", run: migrateUsageProviderAPIKeySources},
 		{name: "migrate_usage_service_tiers", run: migrateUsageServiceTiers},
 		{name: "migrate_legacy_api_keys", run: migrateLegacyAPIKeys},
