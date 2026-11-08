@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestDispatchRejectsUnpricedModelForUserKeyByDefault(t *testing.T) {
+func TestDispatchAllowsUnpricedModelForUserKeyByDefault(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -27,9 +27,8 @@ func TestDispatchRejectsUnpricedModelForUserKeyByDefault(t *testing.T) {
 		t.Fatalf("CreateAPIKey() error = %v", errCreateKey)
 	}
 
-	_, _, errAllowed := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "gpt-new")
-	if errAllowed == nil || !strings.Contains(errAllowed.Error(), "model_not_found") || !strings.Contains(errAllowed.Error(), "no configured price") {
-		t.Fatalf("unpriced dispatch error = %v, want model price not configured", errAllowed)
+	if _, _, errAllowed := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "gpt-new"); errAllowed != nil {
+		t.Fatalf("unpriced dispatch error = %v, want allowed", errAllowed)
 	}
 	if _, _, errAdmin := repo.AllowedDispatchIDsForAPIKeyModel(ctx, "admin-key", "gpt-new"); errAdmin != nil {
 		t.Fatalf("admin key dispatch error = %v, want no billing gate", errAdmin)
@@ -43,12 +42,12 @@ func TestDispatchRejectsUnpricedModelForUserKeyByDefault(t *testing.T) {
 		t.Fatalf("zero-priced dispatch error = %v, want allowed", errPriced)
 	}
 	if _, _, errPrefixed := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "aistudio/gpt-new"); errPrefixed != nil {
-		t.Fatalf("prefixed model dispatch error = %v, want allowed via bare model price", errPrefixed)
+		t.Fatalf("prefixed model dispatch error = %v, want allowed", errPrefixed)
 	}
 
-	// Disabled rules do not count as configured.
-	if _, _, errDisabled := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "gpt-other"); errDisabled == nil {
-		t.Fatal("dispatch for another unpriced model succeeded")
+	// A price configured for one model does not restrict dispatch of other models.
+	if _, _, errUnpriced := repo.AllowedDispatchIDsForAPIKeyModel(ctx, userKey, "gpt-other"); errUnpriced != nil {
+		t.Fatalf("dispatch for another unpriced model error = %v, want allowed", errUnpriced)
 	}
 	allow := true
 	if _, errSettings := repo.UpdateBillingSettings(ctx, BillingSettingsPatch{AllowUnpricedModels: &allow}); errSettings != nil {
