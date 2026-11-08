@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	log "github.com/sirupsen/logrus"
@@ -249,7 +248,11 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 		if lastError.HTTPStatus == 0 {
 			lastError.HTTPStatus = http.StatusServiceUnavailable
 		}
-		lastError.Retryable = lastError.Code != coreauth.ErrorCodeRefreshOutcomeUnknown
+		lastError.Retryable = true
+		if lastError.Code == coreauth.ErrorCodeRefreshOutcomeUnknown {
+			lastError.Code = "refresh_temporarily_unavailable"
+			lastError.Message = "credential refresh temporarily unavailable"
+		}
 		coreauth.ApplyRefreshFailureState(auth, lastError, now)
 	case "refresh_unsupported":
 		if strings.TrimSpace(lastError.Message) == "" {
@@ -457,11 +460,6 @@ func (c *RefreshController) finalizeRefreshLease(ctx context.Context, targetUUID
 		if current.Attributes == nil || current.Attributes[refreshLeaseAttribute] != leaseID {
 			return false
 		}
-		if refreshed != nil && strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
-			// Preserve grant safety even when an operator disables the credential or
-			// replaces only its access token while the exchange is in flight.
-			codexauth.MergeRefreshOutcomes(current.Metadata, refreshed.Metadata)
-		}
 		if current.Disabled || current.Status == coreauth.StatusDisabled {
 			clearRefreshLease(current)
 			disabledTarget = true
@@ -599,9 +597,6 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 
 	// Preserve concurrent model and quota details while applying only the
 	// credential-level refresh transition to the latest persisted snapshot.
-	if strings.EqualFold(strings.TrimSpace(merged.Provider), "codex") {
-		codexauth.MergeRefreshOutcomes(merged.Metadata, refreshed.Metadata)
-	}
 	merged.LastRefreshedAt = refreshed.LastRefreshedAt
 	merged.NextRefreshAfter = refreshed.NextRefreshAfter
 	refreshError := refreshed.LastRefreshError

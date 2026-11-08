@@ -15,7 +15,8 @@ const ErrorCodeStreamTruncated = "stream_truncated"
 // They must not change credential or model availability.
 const ErrorCodeRequestScoped = "request_scoped"
 
-// ErrorCodeRefreshOutcomeUnknown requires replacement or reconciliation of a refresh grant.
+// ErrorCodeRefreshOutcomeUnknown identifies legacy refresh diagnostics.
+// New failures use the normal transient refresh error and bounded backoff.
 const ErrorCodeRefreshOutcomeUnknown = "refresh_outcome_unknown"
 
 // Error describes an authentication related failure in a provider agnostic format.
