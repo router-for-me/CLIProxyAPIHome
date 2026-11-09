@@ -398,17 +398,19 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
-	store    SessionAffinityStore
-	ttl      time.Duration
+	fallback         Selector
+	cache            *SessionCache
+	store            SessionAffinityStore
+	ttl              time.Duration
+	subagentAffinity bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
-	Store    SessionAffinityStore
+	Fallback         Selector
+	TTL              time.Duration
+	Store            SessionAffinityStore
+	SubagentAffinity *bool
 }
 
 // NewSessionAffinitySelectorWithConfig creates a selector with custom configuration.
@@ -419,7 +421,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
-	selector := &SessionAffinitySelector{fallback: cfg.Fallback, store: cfg.Store, ttl: cfg.TTL}
+	selector := &SessionAffinitySelector{
+		fallback: cfg.Fallback, store: cfg.Store, ttl: cfg.TTL,
+		subagentAffinity: cfg.SubagentAffinity == nil || *cfg.SubagentAffinity,
+	}
 	if selector.store == nil {
 		selector.cache = NewSessionCache(cfg.TTL)
 		selector.store = selector.cache
@@ -473,6 +478,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		weightedKey = weightedStateKey(provider, model, opts)
 	}
 	cacheKey := sessionBindingKey(provider, primaryID, model)
+	inheritFallback := s.subagentAffinity || !sessionFallbackIsSubagent(primaryID, fallbackID, opts)
 	for {
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
@@ -491,7 +497,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 		}
-		if selected == nil && !active && fallbackID != "" && fallbackID != primaryID {
+		if selected == nil && !active && inheritFallback && fallbackID != "" && fallbackID != primaryID {
 			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
 			if errParent != nil {
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)

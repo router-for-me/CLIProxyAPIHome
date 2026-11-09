@@ -175,8 +175,10 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
-  # CPA compatibility option for inheriting a parent session's upstream credential.
-  # Home retains its existing session scheduling policy.
+  # Allow unbound child sessions to inherit an eligible parent's credential for the same model.
+  # Default: true; ignored when session-affinity is false. False uses normal selection,
+  # but preserves existing child bindings, forks, compaction, and content-hash fallbacks.
+  # Upgrade every Home node before relying on this switch across the cluster.
   # session-affinity-subagents: true
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).

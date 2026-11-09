@@ -4193,6 +4193,7 @@ Query 参数：
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
 | `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
 | `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
+| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承同 provider、同模型的父凭证，默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
 | `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
@@ -4240,7 +4241,6 @@ Query 参数：
 | `server.discovery.advertise-management` | boolean | 是否广播管理接口，默认 `false`。 |
 | `credentials.concurrency` | object | Home 并发限制生命周期和释放调优；revision 只读，见配置章节。 |
 | `credentials.in-flight` | object | 观测快照、过期、大小及暂存限制。 |
-| `routing.session-affinity-subagents` | optional boolean | CPA 的父会话凭证继承兼容选项；Home 继续管理自己的会话层级。 |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA 兼容设置；Home 运行时冷却状态由数据库持久化。 |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | 随配置携带的 CPA 临时错误冷却设置。 |
 | `oauth.providers.aistudio.ws-auth` | boolean | Home 规范化为 `false`。 |

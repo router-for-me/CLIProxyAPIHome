@@ -4209,6 +4209,7 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `routing.strategy` | string | `round-robin`, `weighted-round-robin`, or `fill-first`. |
 | `routing.session-affinity` | boolean | Database-backed session-sticky credential routing, shared across Home nodes using the same database. Bindings survive config reloads and restarts; unavailable credentials may be reselected. Upgrade all Home nodes to enable cluster-wide consistency. |
 | `routing.session-affinity-ttl` | string | Session-to-auth idle timeout, renewed by successful dispatches. Default: `1h`. |
+| `routing.session-affinity-subagents` | optional boolean | Controls Home parent-credential inheritance for unbound child sessions within the same provider/model. Default: `true`; ignored when `session-affinity` is disabled. `false` uses normal credential selection without clearing existing child bindings or disabling fork, compaction, and content-hash fallbacks; it does not force a different credential from the parent. Applies on config reload. Upgrade all Home nodes before relying on this switch cluster-wide. CPA must forward fork/compaction markers (`node_kind` / `X-Node-Kind`) when they are not present in the original headers. |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
 | `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate with zero-width characters in system instructions. |
@@ -4256,7 +4257,6 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `server.discovery.advertise-management` | boolean | Advertises management endpoints; defaults to `false`. |
 | `credentials.concurrency` | object | Home-owned limiter lifecycle and release tuning. Revision fields are read-only; see the configuration section. |
 | `credentials.in-flight` | object | Observation snapshot, staleness, size, and staging limits. |
-| `routing.session-affinity-subagents` | optional boolean | CPA compatibility option for parent-session credential inheritance; Home continues to manage its own session hierarchy. |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA compatibility setting; Home runtime cooldown state is DB-backed. |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | CPA transient-error cooldown setting carried with configuration. |
 | `oauth.providers.aistudio.ws-auth` | boolean | Home normalizes this to `false`. |
