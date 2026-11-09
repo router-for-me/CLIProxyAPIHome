@@ -200,6 +200,9 @@ func testSessionCleanupConcurrentRenewal(t *testing.T, reader, writer *Repositor
 	}
 	started, release := make(chan struct{}), make(chan struct{})
 	if errRegister := reader.db.Callback().Delete().Before("gorm:delete").Register("test_cleanup_renewal", func(tx *gorm.DB) {
+		if tx.Statement.Table != (SessionAffinityRecord{}).TableName() {
+			return
+		}
 		close(started)
 		select {
 		case <-release:

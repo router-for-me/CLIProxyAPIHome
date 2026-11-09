@@ -26,6 +26,10 @@ type SessionAffinityCommit struct {
 	ExpiredAt time.Time
 	AuthID    string
 	TTL       time.Duration
+	// SessionKey and Provider record a successful selection for cross-model
+	// Guardian inheritance. SessionKey hashes the session without its model or provider.
+	SessionKey string
+	Provider   string
 }
 
 // SessionAffinityStore provides authoritative reads and atomic conditional writes.
@@ -33,6 +37,9 @@ type SessionAffinityCommit struct {
 // until deleted so stale writers cannot overwrite a newer binding.
 type SessionAffinityStore interface {
 	LoadSessionBinding(context.Context, string) (SessionBinding, error)
+	// LoadLatestSessionBinding returns the latest live selection across models
+	// on the supplied real credential providers, without renewing its lease.
+	LoadLatestSessionBinding(context.Context, string, []string) (SessionBinding, error)
 	CompareAndSwapSessionBinding(context.Context, SessionAffinityCommit) (bool, error)
 }
 

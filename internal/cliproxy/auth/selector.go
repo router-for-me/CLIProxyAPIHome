@@ -478,7 +478,28 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		weightedKey = weightedStateKey(provider, model, opts)
 	}
 	cacheKey := sessionBindingKey(provider, primaryID, model)
-	inheritFallback := s.subagentAffinity || !sessionFallbackIsSubagent(primaryID, fallbackID, opts)
+	isSubagent := sessionFallbackIsSubagent(primaryID, fallbackID, opts)
+	inheritFallback := s.subagentAffinity || !isSubagent
+	guardian := s.subagentAffinity && isSubagent && strings.EqualFold(sessionHeaderValue(opts.Headers, "X-Openai-Subagent"), "guardian")
+	// Sticky bindings outrank priority, including on later Guardian turns that
+	// omit their parent header. Only cold/failover selection uses the highest tier.
+	var bindingCandidates []*Auth
+	var parentProviders []string
+	providers := make(map[string]bool)
+	requestProvider := sessionSelectionProvider(nil, provider)
+	for _, auth := range auths {
+		if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
+			continue
+		}
+		bindingCandidates = append(bindingCandidates, auth)
+		if guardian {
+			realProvider := sessionSelectionProvider(auth, provider)
+			if realProvider != "" && realProvider != "mixed" && (requestProvider == "mixed" || realProvider == requestProvider) && !providers[realProvider] {
+				providers[realProvider] = true
+				parentProviders = append(parentProviders, realProvider)
+			}
+		}
+	}
 	for {
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
@@ -490,8 +511,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		var selected *Auth
 		active := time.Now().Before(binding.ExpiresAt)
 		if active {
-			for _, auth := range available {
+			for _, auth := range bindingCandidates {
 				if auth.ID == binding.AuthID {
+					selected = auth
+					break
+				}
+			}
+		}
+		if selected == nil && !active && guardian {
+			parent, errParent := s.store.LoadLatestSessionBinding(ctx, sessionBindingKey("", fallbackID, ""), parentProviders)
+			if errParent != nil {
+				return nil, fmt.Errorf("load Guardian parent session binding: %w", errParent)
+			}
+			for _, auth := range bindingCandidates {
+				if auth.ID == parent.AuthID {
 					selected = auth
 					break
 				}
@@ -503,7 +536,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
 			}
 			if time.Now().Before(parent.ExpiresAt) {
-				for _, auth := range available {
+				for _, auth := range bindingCandidates {
 					if auth.ID == parent.AuthID {
 						selected = auth
 						break
@@ -516,7 +549,22 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			if selected != nil {
 				authID = selected.ID
 			}
-			selected, reservation = weighted.reserve(weightedKey, available, authID)
+			pool := available
+			if selected != nil {
+				inPool := false
+				for _, auth := range pool {
+					if auth.ID == selected.ID {
+						inPool = true
+						break
+					}
+				}
+				if !inPool {
+					// Charge a lower-priority sticky credential without adding
+					// unrelated lower tiers to the normal weighted credit pool.
+					pool = append(append([]*Auth(nil), pool...), selected)
+				}
+			}
+			selected, reservation = weighted.reserve(weightedKey, pool, authID)
 		} else if selected == nil {
 			var errPick error
 			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)
@@ -528,6 +576,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
 		}
 		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
+		if realProvider := sessionSelectionProvider(selected, provider); realProvider != "" && realProvider != "mixed" {
+			commit.SessionKey = sessionBindingKey("", primaryID, "")
+			commit.Provider = realProvider
+		}
 		if !active && binding.Revision != "" {
 			commit.ExpiredAt = binding.ExpiresAt
 		}

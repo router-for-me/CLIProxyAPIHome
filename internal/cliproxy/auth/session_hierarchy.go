@@ -6,6 +6,23 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// sessionSelectionProvider identifies the real credential provider, never the
+// mixed scheduling pool. Guardian inheritance must not cross provider boundaries.
+func sessionSelectionProvider(auth *Auth, fallback string) string {
+	provider := fallback
+	if auth != nil && strings.TrimSpace(auth.Provider) != "" {
+		provider = auth.Provider
+	}
+	switch normalized := strings.ToLower(strings.TrimSpace(provider)); normalized {
+	case "kimi.com":
+		return "kimi"
+	case "kimi.ai":
+		return "kimi-ai"
+	default:
+		return normalized
+	}
+}
+
 // sessionFallbackIsSubagent distinguishes child-session inheritance from content
 // continuity. Disabling subagent affinity must not disable forks or hash aliases.
 func sessionFallbackIsSubagent(primaryID, fallbackID string, opts Options) bool {

@@ -10,20 +10,24 @@ import (
 
 // sessionEntry stores auth binding with expiration.
 type sessionEntry struct {
-	authID    string
-	revision  string
-	expiresAt time.Time
+	authID     string
+	revision   string
+	expiresAt  time.Time
+	sessionKey string
+	provider   string
+	selection  uint64
 }
 
 const defaultMaxSessionCacheEntries = 65536
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
 type SessionCache struct {
-	mu       sync.RWMutex
-	entries  map[string]sessionEntry
-	ttl      time.Duration
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	mu                sync.RWMutex
+	entries           map[string]sessionEntry
+	ttl               time.Duration
+	stopCh            chan struct{}
+	stopOnce          sync.Once
+	selectionSequence uint64
 }
 
 // NewSessionCache creates a cache with the specified TTL.
@@ -138,6 +142,30 @@ func (c *SessionCache) LoadSessionBinding(ctx context.Context, key string) (Sess
 	return SessionBinding{AuthID: entry.authID, Revision: entry.revision, ExpiresAt: entry.expiresAt}, nil
 }
 
+// LoadLatestSessionBinding observes selection order, not completion or TTL refresh order.
+func (c *SessionCache) LoadLatestSessionBinding(ctx context.Context, sessionKey string, providers []string) (SessionBinding, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return SessionBinding{}, ctx.Err()
+	}
+	if sessionKey == "" || len(providers) == 0 {
+		return SessionBinding{}, nil
+	}
+	allowed := make(map[string]bool, len(providers))
+	for _, provider := range providers {
+		allowed[provider] = true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	now := time.Now()
+	var latest sessionEntry
+	for _, entry := range c.entries {
+		if entry.sessionKey == sessionKey && allowed[entry.provider] && now.Before(entry.expiresAt) && entry.selection > latest.selection {
+			latest = entry
+		}
+	}
+	return SessionBinding{AuthID: latest.authID, Revision: latest.revision, ExpiresAt: latest.expiresAt}, nil
+}
+
 // CompareAndSwapSessionBinding prevents concurrent first requests from returning
 // independently selected credentials, including after a binding has been evicted.
 func (c *SessionCache) CompareAndSwapSessionBinding(ctx context.Context, commit SessionAffinityCommit) (bool, error) {
@@ -159,8 +187,10 @@ func (c *SessionCache) CompareAndSwapSessionBinding(ctx context.Context, commit 
 		revision = uuid.NewString()
 	}
 	c.pruneLocked()
+	c.selectionSequence++
 	c.entries[commit.Key] = sessionEntry{
 		authID: commit.AuthID, revision: revision, expiresAt: now.Add(commit.TTL),
+		sessionKey: commit.SessionKey, provider: commit.Provider, selection: c.selectionSequence,
 	}
 	return true, nil
 }

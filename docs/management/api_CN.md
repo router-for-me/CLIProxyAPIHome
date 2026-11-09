@@ -4193,7 +4193,7 @@ Query 参数：
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
 | `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
 | `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
-| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承同 provider、同模型的父凭证，默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
+| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承父凭证。普通子会话仅在同 provider、同模型内继承；Guardian 请求（`X-Openai-Subagent: guardian`，大小写不敏感）可跨模型继承父会话在合格真实 provider 上最近的有效选择，已有子绑定优先。默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
 | `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
@@ -4223,6 +4223,8 @@ Query 参数：
 | `requests.payload.override` | array of `PayloadRule` | 覆盖 JSON payload params。 |
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
+
+Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 新增会过期的选择元数据（不纳入可移植快照）；升级前的绑定在下一次成功派发时补充该信息。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
 
 ### v8 补充字段
 

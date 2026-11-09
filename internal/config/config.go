@@ -327,6 +327,7 @@ type RoutingConfig struct {
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 
 	// SessionAffinitySubagents controls initial parent-credential inheritance for child sessions.
+	// Guardian children may inherit the parent's latest eligible selection across models.
 	// Defaults to true; ignored when SessionAffinity is false. Existing child bindings,
 	// conversational forks, compaction, and content-hash fallbacks are unaffected.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
