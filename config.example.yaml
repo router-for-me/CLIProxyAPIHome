@@ -162,6 +162,7 @@ routing:
   # Sticky requests (including inherited bindings) consume credits without moving bindings.
   # Each eligible credential set keeps separate credits; returning to a set resumes them.
   # Sticky accounting uses available peers in the bound credential's priority tier,
+  # and pinned requests use the eligible pool before pinning within that priority tier,
   # so lower-priority bindings never change ratios among higher-priority credentials.
   # Settled credits are capped at +/-32 times the pool total; ratios are approximate.
   # In-flight offsets stay intact until the pool settles, including a final rollback.

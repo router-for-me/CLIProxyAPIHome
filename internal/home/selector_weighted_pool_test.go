@@ -38,6 +38,7 @@ func TestWeightedSessionAffinityDispatchPoolIsolationAndOverload(t *testing.T) {
 					}
 				}
 				runtime := &Runtime{coreManager: manager, sessionAffinityStore: store}
+				manager.SetPluginScheduler(runtime)
 				if admitted {
 					runtime.SetConcurrencyAdmitter(ConcurrencyAdmitterFunc(func(ctx context.Context, req ConcurrencyAdmissionRequest) (ConcurrencyAdmissionResult, error) {
 						if swapped, errSwap := store.CompareAndSwapSessionBinding(ctx, *req.SessionAffinity); errSwap != nil {
@@ -86,6 +87,106 @@ func TestWeightedSessionAffinityDispatchPoolIsolationAndOverload(t *testing.T) {
 					t.Fatalf("fresh dispatch distribution=%v, want b=750 c=250", counts)
 				}
 			})
+		}
+	}
+}
+
+func TestWeightedSessionAffinityPinnedDispatchCompensation(t *testing.T) {
+	for _, admitted := range []bool{false, true} {
+		for _, channelScoped := range []bool{false, true} {
+			for _, mode := range []string{"sticky", "cold", "no-session"} {
+				t.Run(fmt.Sprintf("%s/channel=%t/admitted=%t", mode, channelScoped, admitted), func(t *testing.T) {
+					store := coreauth.NewSessionCache(time.Hour)
+					t.Cleanup(store.Stop)
+					selector := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+						Fallback: &coreauth.WeightedRoundRobinSelector{}, Store: store,
+					})
+					manager := coreauth.NewManager(nil, selector, nil)
+					aID, bID, cID := t.Name()+"-a", t.Name()+"-b", t.Name()+"-c"
+					lowerID := t.Name() + "-lower"
+					auths := []*coreauth.Auth{
+						{ID: aID, Provider: "openai", Status: coreauth.StatusActive, Attributes: map[string]string{"weight": "3", "priority": "1"}},
+						{ID: bID, Provider: "openai", Status: coreauth.StatusActive, Attributes: map[string]string{"weight": "1", "priority": "1"}},
+						{ID: lowerID, Provider: "openai", Status: coreauth.StatusActive, Attributes: map[string]string{"weight": "100", "priority": "0"}},
+					}
+					if channelScoped {
+						auths = append(auths, &coreauth.Auth{ID: cID, Provider: "openai", Status: coreauth.StatusActive, Attributes: map[string]string{"weight": "100", "priority": "1"}})
+					}
+					for _, auth := range auths {
+						registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt"}})
+						t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+						if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+							t.Fatal(errRegister)
+						}
+					}
+					runtime := &Runtime{coreManager: manager, sessionAffinityStore: store}
+					manager.SetPluginScheduler(runtime)
+					if channelScoped {
+						runtime.clusterAdapter = &modelChannelDispatchTestAdapter{
+							allowedAuthIDs:  []string{aID, bID, lowerID},
+							allowedModelIDs: []string{"gpt"},
+						}
+					}
+					if admitted {
+						runtime.SetConcurrencyAdmitter(ConcurrencyAdmitterFunc(func(ctx context.Context, req ConcurrencyAdmissionRequest) (ConcurrencyAdmissionResult, error) {
+							if req.SessionAffinity != nil {
+								if swapped, errSwap := store.CompareAndSwapSessionBinding(ctx, *req.SessionAffinity); errSwap != nil {
+									return ConcurrencyAdmissionResult{}, errSwap
+								} else if !swapped {
+									return ConcurrencyAdmissionResult{}, coreauth.ErrSessionAffinityConflict
+								}
+							}
+							return ConcurrencyAdmissionResult{CredentialID: req.CredentialID, Model: req.Model, Accounted: true}, nil
+						}))
+					}
+					stickyHeaders := http.Header{"X-Session-ID": {"pinned-session"}}
+					if mode == "sticky" {
+						seed, errSeed := runtime.DispatchForAPIKeyWithConcurrency(t.Context(), "gpt", stickyHeaders, "client-key", "", nil, bID, DispatchConcurrencyContext{})
+						if errSeed != nil || seed == nil || seed.AuthID != bID {
+							t.Fatalf("seed pinned binding: result=%v err=%v", seed, errSeed)
+						}
+					}
+					pinnedCount := 4
+					if mode == "sticky" {
+						pinnedCount = 3
+					}
+					for i := range pinnedCount {
+						var headers http.Header
+						if mode != "no-session" {
+							headers = stickyHeaders
+						}
+						res, errDispatch := runtime.DispatchForAPIKeyWithConcurrency(t.Context(), "gpt", headers, "client-key", "", nil, bID, DispatchConcurrencyContext{})
+						if errDispatch != nil || res == nil || res.AuthID != bID {
+							t.Fatalf("pinned dispatch %d: result=%v err=%v", i, res, errDispatch)
+						}
+					}
+					for _, invalidPin := range []string{cID, "missing"} {
+						if res, errInvalid := runtime.DispatchForAPIKeyWithConcurrency(t.Context(), "gpt", stickyHeaders, "client-key", "", nil, invalidPin, DispatchConcurrencyContext{}); errInvalid == nil || res != nil {
+							t.Fatalf("invalid pin %q succeeded: result=%v err=%v", invalidPin, res, errInvalid)
+						}
+					}
+					if res, errLower := runtime.DispatchForAPIKeyWithConcurrency(t.Context(), "gpt", http.Header{"X-Session-ID": {"lower-pinned"}}, "client-key", "", nil, lowerID, DispatchConcurrencyContext{}); errLower != nil || res == nil || res.AuthID != lowerID {
+						t.Fatalf("lower-priority pin: result=%v err=%v", res, errLower)
+					}
+					counts := map[string]int{}
+					for i := range 12 {
+						res, errFresh := runtime.DispatchForAPIKeyWithConcurrency(t.Context(), "gpt", http.Header{"X-Session-ID": {fmt.Sprintf("fresh-%d", i)}}, "client-key", "", nil, "", DispatchConcurrencyContext{})
+						if errFresh != nil || res == nil {
+							t.Fatalf("fresh dispatch %d: result=%v err=%v", i, res, errFresh)
+						}
+						counts[res.AuthID]++
+					}
+					if counts[aID] != 12 || counts[bID] != 0 {
+						t.Fatalf("fresh compensation counts=%v, want a=12 b=0", counts)
+					}
+					if mode != "no-session" {
+						res, errSticky := runtime.DispatchForAPIKeyWithConcurrency(t.Context(), "gpt", stickyHeaders, "client-key", "", nil, "", DispatchConcurrencyContext{})
+						if errSticky != nil || res == nil || res.AuthID != bID {
+							t.Fatalf("pinned session binding was not preserved: result=%v err=%v", res, errSticky)
+						}
+					}
+				})
+			}
 		}
 	}
 }

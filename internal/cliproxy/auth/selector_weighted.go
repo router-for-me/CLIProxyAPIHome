@@ -13,6 +13,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/credentialweight"
 )
 
+// weightedAccountingPoolKey carries the manager-validated pre-pin pool. It affects
+// accounting only; the selector still receives pin-filtered selection candidates.
+type weightedAccountingPoolKey struct{}
+
 // WeightedRoundRobinSelector provides smooth weighted round-robin selection.
 type WeightedRoundRobinSelector struct {
 	mu         sync.Mutex
@@ -83,6 +87,56 @@ func weightedStateKey(provider, model string, opts Options) string {
 		model = requested
 	}
 	return provider + ":" + canonicalModelKey(model)
+}
+
+func (s *SessionAffinitySelector) reserveWeighted(ctx context.Context, weighted *WeightedRoundRobinSelector, weightedKey, model string, opts Options, available, bindingCandidates []*Auth, selected *Auth, now time.Time) (*Auth, *weightedReservation, error) {
+	authID := ""
+	pool := available
+	if accountingAuths, ok := ctx.Value(weightedAccountingPoolKey{}).([]*Auth); ok {
+		pinnedID := pinnedAuthIDFromOptions(opts)
+		if selected == nil {
+			candidates := bindingCandidates
+			if len(candidates) == 0 {
+				candidates = available
+			}
+			for _, auth := range candidates {
+				if auth != nil && auth.ID == pinnedID {
+					selected = auth
+					break
+				}
+			}
+		}
+		if selected == nil || selected.ID != pinnedID || authWeight(selected) <= 0 {
+			return nil, nil, &Error{Code: "auth_unavailable", Message: "pinned auth is not available for weighted accounting"}
+		}
+		authID = selected.ID
+		priority := authPriority(selected)
+		pool = nil
+		for _, auth := range positiveWeightAuths(filterConcurrencyExcludedAuths(accountingAuths, model, opts)) {
+			if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
+				continue
+			}
+			if authPriority(auth) == priority {
+				pool = append(pool, auth)
+			}
+		}
+	} else if selected != nil {
+		authID = selected.ID
+		// Sticky traffic only charges available peers in its own priority
+		// tier, never credentials competing in a higher-priority pool.
+		pool = nil
+		priority := authPriority(selected)
+		for _, auth := range bindingCandidates {
+			if authPriority(auth) == priority {
+				pool = append(pool, auth)
+			}
+		}
+	}
+	picked, reservation := weighted.reserve(weightedKey, pool, authID)
+	if picked == nil {
+		return nil, nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
+	}
+	return picked, reservation, nil
 }
 
 // weightedPoolMember stores each ID once, with parallel accounting values in a

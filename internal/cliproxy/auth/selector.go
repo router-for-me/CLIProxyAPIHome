@@ -456,8 +456,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	var reservation *weightedReservation
 	defer func() { reservation.finish(false) }()
 	entry := selectorLogEntry(ctx)
+	weighted, _ := s.fallback.(*WeightedRoundRobinSelector)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
+	if primaryID == "" && weighted == nil {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
@@ -472,10 +473,22 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	weighted, _ := s.fallback.(*WeightedRoundRobinSelector)
 	var weightedKey string
 	if weighted != nil {
 		weightedKey = weightedStateKey(provider, model, opts)
+	}
+	if primaryID == "" {
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		selected, pending, errReserve := s.reserveWeighted(ctx, weighted, weightedKey, model, opts, available, nil, nil, now)
+		if errReserve != nil {
+			return nil, errReserve
+		}
+		if opts.SessionAffinity != nil {
+			opts.SessionAffinity.reservation = pending
+			return selected, nil
+		}
+		pending.finish(true)
+		return selected, nil
 	}
 	cacheKey := sessionBindingKey(provider, primaryID, model)
 	isSubagent := sessionFallbackIsSubagent(primaryID, fallbackID, opts)
@@ -545,23 +558,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if weighted != nil {
-			authID := ""
-			if selected != nil {
-				authID = selected.ID
+			var errReserve error
+			selected, reservation, errReserve = s.reserveWeighted(ctx, weighted, weightedKey, model, opts, available, bindingCandidates, selected, now)
+			if errReserve != nil {
+				return nil, errReserve
 			}
-			pool := available
-			if selected != nil {
-				// Sticky traffic only charges available peers in its own priority
-				// tier, never credentials competing in a higher-priority pool.
-				pool = nil
-				priority := authPriority(selected)
-				for _, auth := range bindingCandidates {
-					if authPriority(auth) == priority {
-						pool = append(pool, auth)
-					}
-				}
-			}
-			selected, reservation = weighted.reserve(weightedKey, pool, authID)
 		} else if selected == nil {
 			var errPick error
 			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)

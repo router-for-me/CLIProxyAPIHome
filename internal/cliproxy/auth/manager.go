@@ -1411,7 +1411,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	}
 
 	filterWeights := !m.hasPluginScheduler()
+	unpinnedAllowedAuthIDs := unpinnedAllowedAuthIDsFromOptions(opts)
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
+	pinnedAuthID := pinnedAuthIDFromOptions(opts)
 	normalizedProviders := normalizeProviderKeys(providers)
 	if len(normalizedProviders) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1429,8 +1431,16 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		m.mu.RLock()
 		selector := m.selector
 		pluginScheduler := m.pluginScheduler
+		trackPinnedAccounting := false
+		if affinitySelector, ok := selector.(*SessionAffinitySelector); ok && affinitySelector != nil && pinnedAuthID != "" && filterWeights {
+			_, trackPinnedAccounting = affinitySelector.fallback.(*WeightedRoundRobinSelector)
+		}
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
+		var accountingAuths []*Auth
+		if trackPinnedAccounting {
+			accountingAuths = make([]*Auth, 0, len(m.auths))
+		}
 		totalCandidates := 0
 		cooldownCount := 0
 		var earliest time.Time
@@ -1447,7 +1457,10 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
 				continue
 			}
-			if !authAllowedByID(candidate.ID, allowedAuthIDs) {
+			if !authAllowedByID(candidate.ID, unpinnedAllowedAuthIDs) {
+				continue
+			}
+			if !trackPinnedAccounting && !authAllowedByID(candidate.ID, allowedAuthIDs) {
 				continue
 			}
 			providerKey := strings.ToLower(strings.TrimSpace(candidate.Provider))
@@ -1460,10 +1473,13 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if routeKey != "" && (registryRef == nil || !registryRef.ClientSupportsModel(candidate.ID, routeKey)) {
 				continue
 			}
-			totalCandidates++
+			pinnedAllowed := authAllowedByID(candidate.ID, allowedAuthIDs)
+			if pinnedAllowed {
+				totalCandidates++
+			}
 			dispatchCandidate, okCandidate, reason, next := m.buildDispatchCandidate(candidate, providerKey, routeModel, credentialPolicy, now)
 			if !okCandidate {
-				if reason == blockReasonCooldown {
+				if pinnedAllowed && reason == blockReasonCooldown {
 					cooldownCount++
 					if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 						earliest = next
@@ -1472,6 +1488,13 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				continue
 			}
 			if concurrencyCandidateExcluded(opts, candidate.ID, dispatchCandidate.upstreamKey) {
+				continue
+			}
+			// Pinning restricts selection, not the eligible pool used for accounting.
+			if trackPinnedAccounting {
+				accountingAuths = append(accountingAuths, dispatchCandidate.availabilityAuth)
+			}
+			if !pinnedAllowed {
 				continue
 			}
 			dispatchCandidates = append(dispatchCandidates, dispatchCandidate)
@@ -1506,8 +1529,12 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				}
 			}
 			if auth == nil {
+				selectorCtx := ctx
+				if len(accountingAuths) > 0 {
+					selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
+				}
 				var errPick error
-				auth, errPick = selector.Pick(ctx, providerForSelector, selectionArgForSelector(selector, routeModel), opts, availableAuths)
+				auth, errPick = selector.Pick(selectorCtx, providerForSelector, selectionArgForSelector(selector, routeModel), opts, availableAuths)
 				if errPick != nil {
 					return nil, errPick
 				}

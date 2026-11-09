@@ -905,23 +905,12 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if errAllowed != nil {
 		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
-	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
-	if pinnedAuthID != "" {
-		pinnedAllowed := allowedAuthIDs == nil
-		for _, allowedAuthID := range allowedAuthIDs {
-			if strings.TrimSpace(allowedAuthID) == pinnedAuthID {
-				pinnedAllowed = true
-				break
-			}
-		}
-		allowedAuthIDs = []string{}
-		if pinnedAllowed {
-			allowedAuthIDs = append(allowedAuthIDs, pinnedAuthID)
-		}
-	}
 	metadata := make(map[string]any)
 	if allowedAuthIDs != nil {
 		metadata[coreauth.AllowedAuthIDsMetadataKey] = allowedAuthIDs
+	}
+	if pinnedAuthID = strings.TrimSpace(pinnedAuthID); pinnedAuthID != "" {
+		metadata[coreauth.PinnedAuthIDMetadataKey] = pinnedAuthID
 	}
 	if allowedModelIDs != nil {
 		metadata[coreauth.AllowedModelIDsMetadataKey] = allowedModelIDs
