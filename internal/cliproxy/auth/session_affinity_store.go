@@ -28,6 +28,7 @@ type SessionAffinityCommit struct {
 	TTL       time.Duration
 	// SessionKey and Provider record a successful selection for cross-model
 	// Guardian inheritance. SessionKey hashes the session without its model or provider.
+	// Empty metadata keeps ordinary affinity without recording Guardian history.
 	SessionKey string
 	Provider   string
 }

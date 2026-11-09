@@ -576,7 +576,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
 		}
 		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
-		if realProvider := sessionSelectionProvider(selected, provider); realProvider != "" && realProvider != "mixed" {
+		if realProvider := sessionSelectionProvider(selected, provider); s.subagentAffinity && realProvider != "" && realProvider != "mixed" {
 			commit.SessionKey = sessionBindingKey("", primaryID, "")
 			commit.Provider = realProvider
 		}

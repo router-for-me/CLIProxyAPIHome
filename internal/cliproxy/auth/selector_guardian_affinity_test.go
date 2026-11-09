@@ -161,6 +161,36 @@ func TestSessionAffinityGuardianStoreFailure(t *testing.T) {
 	}
 }
 
+func TestSessionAffinityGuardianHistoryFollowsSubagentSetting(t *testing.T) {
+	store := NewSessionCache(time.Hour)
+	t.Cleanup(store.Stop)
+	auths := []*Auth{{ID: "parent", Provider: "codex", Status: StatusActive}}
+	opts := Options{Headers: http.Header{"Session_id": {"parent"}}, SessionAffinity: &SessionAffinitySelection{}}
+	for _, enabled := range []bool{false, true, false, true} {
+		selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Store: store, SubagentAffinity: &enabled})
+		picked, errPick := selector.Pick(t.Context(), "codex", "model", opts, auths)
+		if errPick != nil || picked == nil || picked.ID != "parent" || opts.SessionAffinity.Commit == nil {
+			t.Fatalf("enabled=%t pick=%v err=%v", enabled, picked, errPick)
+		}
+		commit := *opts.SessionAffinity.Commit
+		if enabled && (commit.SessionKey == "" || commit.Provider == "") || !enabled && (commit.SessionKey != "" || commit.Provider != "") {
+			t.Fatalf("enabled=%t selection metadata=%+v", enabled, commit)
+		}
+		before := store.selectionSequence
+		if swapped, errSwap := store.CompareAndSwapSessionBinding(t.Context(), commit); errSwap != nil || !swapped {
+			t.Fatalf("enabled=%t commit=%t err=%v", enabled, swapped, errSwap)
+		}
+		if !enabled && store.selectionSequence != before {
+			t.Fatal("disabled subagent inheritance still advanced selection history")
+		}
+		latest, errLatest := store.LoadLatestSessionBinding(t.Context(), sessionBindingKey("", "codex:parent", ""), []string{"codex"})
+		if errLatest != nil || (latest.AuthID != "") != enabled {
+			t.Fatalf("enabled=%t latest=%+v err=%v", enabled, latest, errLatest)
+		}
+		opts.SessionAffinity.Reset()
+	}
+}
+
 func TestSessionAffinityGuardianDeferredSelectionOrder(t *testing.T) {
 	store := NewSessionCache(time.Hour)
 	t.Cleanup(store.Stop)

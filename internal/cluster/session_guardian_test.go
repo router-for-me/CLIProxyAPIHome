@@ -36,7 +36,7 @@ func TestPostgresGuardianSessionSchemaUpgrade(t *testing.T) {
 
 func testGuardianSessionSchemaUpgrade(t *testing.T, repo *Repository) {
 	t.Helper()
-	if errDrop := repo.db.Migrator().DropTable(&SessionAffinityRecord{}, &SessionAffinitySequenceRecord{}); errDrop != nil {
+	if errDrop := repo.db.Migrator().DropTable(&SessionAffinityRecord{}); errDrop != nil {
 		t.Fatal(errDrop)
 	}
 	if errCreate := repo.db.AutoMigrate(&guardianLegacyBindingRecord{}); errCreate != nil {
@@ -51,6 +51,17 @@ func testGuardianSessionSchemaUpgrade(t *testing.T, repo *Repository) {
 	}
 	if errMigrate := AutoMigrate(repo.db); errMigrate != nil {
 		t.Fatal(errMigrate)
+	}
+	if repo.db.Dialector.Name() == "postgres" {
+		assertPostgresSchemaMigrationVersion(t, repo.db, currentDatabaseVersion)
+	}
+	if repo.db.Migrator().HasTable("session_affinity_sequence") {
+		t.Fatal("migration created an independent sequence table")
+	}
+	for _, index := range []string{"idx_session_affinity_counter_expires", "idx_session_affinity_binding_expires"} {
+		if !repo.db.Migrator().HasIndex(&SessionAffinityRecord{}, index) {
+			t.Fatalf("migration did not create cleanup index %s", index)
+		}
 	}
 	binding, errLoad := repo.LoadSessionBinding(t.Context(), legacy.Key)
 	if errLoad != nil || binding.AuthID != legacy.CredentialID || binding.Revision != legacy.Revision {
@@ -67,8 +78,10 @@ func testGuardianSessionSchemaUpgrade(t *testing.T, repo *Repository) {
 	if errLatest != nil || latest.AuthID != legacy.CredentialID || latest.Revision != legacy.Revision {
 		t.Fatalf("legacy binding not discoverable: %+v err=%v", latest, errLatest)
 	}
-	if models, ok := databaseSnapshotModels(18); !ok || len(models) != len(homeDatabaseModels) {
-		t.Fatal("v18 snapshot compatibility was lost")
+	for _, version := range []int{18, 19} {
+		if models, ok := databaseSnapshotModels(version); !ok || len(models) != len(homeDatabaseModels) {
+			t.Fatalf("v%d snapshot compatibility was lost", version)
+		}
 	}
 }
 
@@ -154,13 +167,13 @@ func testGuardianSessionDatabaseSelectionOrder(t *testing.T, repo *Repository) {
 		t.Fatal(errPurge)
 	}
 	var sequences int64
-	if errCount := repo.db.Model(&SessionAffinitySequenceRecord{}).Where("key = ?", sessionKey).Count(&sequences).Error; errCount != nil || sequences != 1 {
+	if errCount := repo.db.Model(&SessionAffinityRecord{}).Where("key = ?", sessionAffinitySequenceKey(sessionKey)).Count(&sequences).Error; errCount != nil || sequences != 1 {
 		t.Fatalf("live sequence count=%d err=%v", sequences, errCount)
 	}
 	if _, errPurge := repo.PurgeExpiredSessionBindings(t.Context(), time.Now().Add(2*time.Hour), 100); errPurge != nil {
 		t.Fatal(errPurge)
 	}
-	if errCount := repo.db.Model(&SessionAffinitySequenceRecord{}).Where("key = ?", sessionKey).Count(&sequences).Error; errCount != nil || sequences != 0 {
+	if errCount := repo.db.Model(&SessionAffinityRecord{}).Where("key = ?", sessionAffinitySequenceKey(sessionKey)).Count(&sequences).Error; errCount != nil || sequences != 0 {
 		t.Fatalf("expired sequence count=%d err=%v", sequences, errCount)
 	}
 }
@@ -209,8 +222,8 @@ func testGuardianSessionAdmissionAtomicOrder(t *testing.T, repo *Repository) {
 	if errLatest != nil || latest.AuthID != "cred-a" || latest.Revision != before.Revision {
 		t.Fatalf("rejected model published: %+v err=%v", latest, errLatest)
 	}
-	var counter SessionAffinitySequenceRecord
-	if errFind := repo.db.Where("key = ?", sessionKey).Take(&counter).Error; errFind != nil || counter.Sequence != 1 {
+	var counter SessionAffinityRecord
+	if errFind := repo.db.Where("key = ?", sessionAffinitySequenceKey(sessionKey)).Take(&counter).Error; errFind != nil || counter.SelectionSequence != 1 {
 		t.Fatalf("rejected admission consumed order: %+v err=%v", counter, errFind)
 	}
 }

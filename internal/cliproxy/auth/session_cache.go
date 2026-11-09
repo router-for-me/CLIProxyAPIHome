@@ -187,10 +187,14 @@ func (c *SessionCache) CompareAndSwapSessionBinding(ctx context.Context, commit 
 		revision = uuid.NewString()
 	}
 	c.pruneLocked()
-	c.selectionSequence++
+	var selection uint64
+	if commit.SessionKey != "" {
+		c.selectionSequence++
+		selection = c.selectionSequence
+	}
 	c.entries[commit.Key] = sessionEntry{
 		authID: commit.AuthID, revision: revision, expiresAt: now.Add(commit.TTL),
-		sessionKey: commit.SessionKey, provider: commit.Provider, selection: c.selectionSequence,
+		sessionKey: commit.SessionKey, provider: commit.Provider, selection: selection,
 	}
 	return true, nil
 }

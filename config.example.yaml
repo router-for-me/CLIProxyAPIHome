@@ -178,6 +178,7 @@ routing:
   # Allow unbound child sessions to inherit an eligible parent's credential for the same model.
   # Guardian requests (X-Openai-Subagent: guardian) may inherit the parent's latest live
   # selection across models; this history is shared through the Home database.
+  # False also stops recording Guardian history; re-enabling records subsequent selections.
   # Default: true; ignored when session-affinity is false. False uses normal selection,
   # but preserves existing child bindings, forks, compaction, and content-hash fallbacks.
   # Upgrade every Home node before relying on this switch across the cluster.

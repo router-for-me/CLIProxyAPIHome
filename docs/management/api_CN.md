@@ -4224,7 +4224,7 @@ Query 参数：
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
 
-Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 新增会过期的选择元数据（不纳入可移植快照）；升级前的绑定在下一次成功派发时补充该信息。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
+Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有在开启 `session-affinity-subagents` 时成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。关闭后仍保留普通粘性绑定，但不再维护 Guardian 历史，并将本次使用的绑定从该历史中移除。重新开启后从后续成功选择继续记录，不回补关闭期间的选择。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 通过正常启动迁移新增 Guardian 字段及查询索引，并继续支持 v18 可移植快照。会过期的选择元数据及内部会话计数器记录存于现有 `session_affinity` 表内，不新增独立表（均不纳入可移植快照）；升级前的绑定在下一次成功派发时补充选择元数据。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
 
 ### v8 补充字段
 
