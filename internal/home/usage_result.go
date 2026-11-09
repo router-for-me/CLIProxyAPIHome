@@ -20,9 +20,9 @@ func (r *Runtime) RecordUsagePayload(ctx context.Context, payload string) error 
 	return r.recordUsagePayload(ctx, payload, false)
 }
 
-// ApplyUsagePayloadFeedback applies scheduler feedback for a redelivered usage
-// event without counting it as a new request. The result state machine fences
-// replays by event time, so applying an already-processed event is a no-op.
+// ApplyUsagePayloadFeedback retries scheduler feedback for persisted usage.
+// Execution identity lets MarkResult apply any missing request statistics once;
+// legacy replays without an execution ID continue to suppress request statistics.
 func (r *Runtime) ApplyUsagePayloadFeedback(ctx context.Context, payload string) error {
 	return r.recordUsagePayload(ctx, payload, true)
 }
@@ -65,9 +65,17 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 		// than poisoning the fence or turning timing errors into ingestion retries.
 		return nil
 	}
+	// Charge before this result changes availability. Replayed persistence rows
+	// must also reach accounting: an earlier delivery may have failed after the
+	// row committed but before feedback ran. The weighted selector deduplicates
+	// by execution identity rather than the database's inserted flag.
+	if errAccount := r.accountReusedUsage(ctx, payload); errAccount != nil {
+		return errAccount
+	}
 	result := coreauth.NewUsageResultWithCode(authIndex, provider, model, statusCode, body, failCode)
 	result.AccessTokenSHA256 = strings.TrimSpace(gjson.Get(payload, "access_token_sha256").String())
 	result.ObservedAt = observedAt
+	result.RequestStatsEventID = strings.TrimSpace(gjson.Get(payload, "execution_id").String())
 	result.SkipRequestStats = skipRequestStats
 	errMark := r.coreManager.MarkResult(ctx, result)
 	if errors.Is(errMark, coreauth.ErrAuthNotFound) || errors.Is(errMark, coreauth.ErrFullAuthNotFound) {
@@ -90,6 +98,9 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 		return errLoad
 	}
 	r.applyCoreAuthAddOrUpdate(coreauth.WithSkipPersist(ctx), auth)
+	if errAccount := r.accountReusedUsage(ctx, payload); errAccount != nil {
+		return errAccount
+	}
 	errRetry := r.coreManager.MarkResult(ctx, result)
 	if errors.Is(errRetry, coreauth.ErrAuthNotFound) || errors.Is(errRetry, coreauth.ErrFullAuthNotFound) {
 		return nil

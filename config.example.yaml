@@ -162,13 +162,20 @@ routing:
   # Sticky requests (including inherited bindings) consume credits without moving bindings.
   # Each eligible credential set keeps separate credits; returning to a set resumes them.
   # Sticky accounting uses available peers in the bound credential's priority tier,
-  # and pinned requests use the eligible pool before pinning within that priority tier,
+  # and pinned requests use the eligible pool before pinning within that priority tier, even without affinity,
   # so lower-priority bindings never change ratios among higher-priority credentials.
   # Settled credits are capped at +/-32 times the pool total; ratios are approximate.
   # In-flight offsets stay intact until the pool settles, including a final rollback.
   # Sticky requests keep their bindings but skip accounting if their full delta cannot
   # fit the cap; new sessions keep earning credit to avoid starving smaller-weight peers.
   # Credits are process-local and reset on restart, selector replacement, or pool-cache eviction.
+  # Compatible CPA nodes report reused WS responses through usage (including Codex duplex successors).
+  # Home charges these after completion, without another dispatch or concurrency admission.
+  # First-turn primary usage is not charged again. Split additional-model billing records
+  # (such as image usage) never add scheduling charges; only primary reuse usage does.
+  # Current eligible pools and API-key restrictions apply.
+  # The last 65,536 usage-accounted execution IDs are replay-protected per selector; older replays and
+  # missing usage can skew ratios. Old CPA nodes without the optional marker keep dispatch-only accounting.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
   # Enable universal session-sticky routing for all clients.
   # Home nodes using the same database share bindings across reloads and restarts.
