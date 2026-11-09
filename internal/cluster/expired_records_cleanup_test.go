@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -191,21 +192,45 @@ func TestPostgresSessionCleanupConcurrentRenewal(t *testing.T) {
 
 func testSessionCleanupConcurrentRenewal(t *testing.T, reader, writer *Repository) {
 	t.Helper()
+	for _, counter := range []bool{false, true} {
+		t.Run(fmt.Sprintf("counter=%t", counter), func(t *testing.T) {
+			testSessionCleanupRecordConcurrentRenewal(t, reader, writer, counter)
+		})
+	}
+}
+
+func testSessionCleanupRecordConcurrentRenewal(t *testing.T, reader, writer *Repository, counter bool) {
+	t.Helper()
 	ctx, cancelCtx := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancelCtx()
 	now := time.Now().UTC()
 	record := SessionAffinityRecord{Key: fmt.Sprintf("%064x", 1), CredentialID: "a", Revision: "r", ExpiresAt: now.Add(-time.Hour)}
+	if counter {
+		record.Key = sessionAffinitySequenceKey(fmt.Sprintf("%064x", 1))
+		record.CredentialID, record.Revision, record.SelectionSequence = "", "", 1
+	}
 	if errCreate := reader.db.Create(&record).Error; errCreate != nil {
 		t.Fatal(errCreate)
 	}
 	started, release := make(chan struct{}), make(chan struct{})
+	var barrier sync.Once
+	var deletes int
 	if errRegister := reader.db.Callback().Delete().Before("gorm:delete").Register("test_cleanup_renewal", func(tx *gorm.DB) {
-		close(started)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			tx.AddError(ctx.Err())
+		if tx.Statement.Table != (SessionAffinityRecord{}).TableName() {
+			return
 		}
+		deletes++
+		if counter && deletes == 1 {
+			return // The second delete handles internal counters.
+		}
+		barrier.Do(func() {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				tx.AddError(ctx.Err())
+			}
+		})
 	}); errRegister != nil {
 		t.Fatal(errRegister)
 	}
@@ -240,6 +265,10 @@ func testSessionCleanupConcurrentRenewal(t *testing.T, reader, writer *Repositor
 		}
 	case <-ctx.Done():
 		t.Fatal("cleanup did not finish")
+	}
+	var retained SessionAffinityRecord
+	if errFind := reader.db.Where("key = ?", record.Key).Take(&retained).Error; errFind != nil || !retained.ExpiresAt.After(now) {
+		t.Fatalf("renewed record removed: %+v err=%v", retained, errFind)
 	}
 }
 

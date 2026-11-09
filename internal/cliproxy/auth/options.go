@@ -12,6 +12,12 @@ const RequestedModelMetadataKey = "requested_model"
 // AllowedAuthIDsMetadataKey stores the dispatch allowlist in Options.Metadata.
 const AllowedAuthIDsMetadataKey = "allowed_auth_ids"
 
+// PinnedAuthIDMetadataKey stores an explicit pinned credential ID in Options.Metadata.
+const PinnedAuthIDMetadataKey = "pinned_auth_id"
+
+// PinnedAuthMetadataKey aliases PinnedAuthIDMetadataKey for CPA metadata parity.
+const PinnedAuthMetadataKey = PinnedAuthIDMetadataKey
+
 // AllowedModelIDsMetadataKey stores the model allowlist in Options.Metadata.
 const AllowedModelIDsMetadataKey = "allowed_model_ids"
 

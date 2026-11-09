@@ -258,6 +258,11 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	if parentSessionID != "" && strings.TrimSpace(headers.Get("X-Parent-Session-ID")) == "" {
 		headers.Set("X-Parent-Session-ID", parentSessionID)
 	}
+	// CPA already sends node_kind separately from headers. Preserve it for
+	// distinguishing conversational forks from subagent inheritance.
+	if nodeKind := strings.TrimSpace(gjson.Get(jsonArg, "node_kind").String()); nodeKind != "" && strings.TrimSpace(headers.Get("X-Node-Kind")) == "" {
+		headers.Set("X-Node-Kind", nodeKind)
+	}
 	ctx = cluster.WithAPIKeyRequestCache(ctx)
 	authRes, authErr := env.Runtime.Authenticate(ctx, headers)
 	if authErr != nil {

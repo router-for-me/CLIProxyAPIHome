@@ -326,7 +326,10 @@ type RoutingConfig struct {
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 
-	// Settings shared with CPA V8.
+	// SessionAffinitySubagents controls initial parent-credential inheritance for child sessions.
+	// Guardian children may inherit the parent's latest eligible selection across models.
+	// Defaults to true; ignored when SessionAffinity is false. Existing child bindings,
+	// conversational forks, compaction, and content-hash fallbacks are unaffected.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
 }
 

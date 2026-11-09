@@ -7,6 +7,25 @@ import (
 )
 
 func allowedAuthIDsFromOptions(opts Options) map[string]struct{} {
+	allowed := unpinnedAllowedAuthIDsFromOptions(opts)
+	pinnedID := pinnedAuthIDFromOptions(opts)
+	if pinnedID == "" {
+		return allowed
+	}
+	if !authAllowedByID(pinnedID, allowed) {
+		return map[string]struct{}{}
+	}
+	return map[string]struct{}{pinnedID: {}}
+}
+
+func pinnedAuthIDFromOptions(opts Options) string {
+	if opts.Metadata == nil {
+		return ""
+	}
+	return strings.TrimSpace(toString(opts.Metadata[PinnedAuthIDMetadataKey]))
+}
+
+func unpinnedAllowedAuthIDsFromOptions(opts Options) map[string]struct{} {
 	if opts.Metadata == nil {
 		return nil
 	}
@@ -250,6 +269,8 @@ func toString(value any) string {
 	switch typed := value.(type) {
 	case string:
 		return typed
+	case []byte:
+		return string(typed)
 	default:
 		return ""
 	}

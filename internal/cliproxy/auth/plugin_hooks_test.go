@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -11,6 +13,61 @@ type unhandledSchedulerPlugin struct{}
 
 func (s *unhandledSchedulerPlugin) PickAuth(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
 	return pluginapi.SchedulerPickResponse{}, false, nil
+}
+
+type statefulSchedulerPlugin struct {
+	unhandledSchedulerPlugin
+	active bool
+}
+
+func (s *statefulSchedulerPlugin) HasScheduler() bool {
+	return s.active
+}
+
+func TestDispatchWeightedPinnedAccountingUsesPluginState(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprintf("active=%t", active), func(t *testing.T) {
+			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &WeightedRoundRobinSelector{}})
+			t.Cleanup(selector.Stop)
+			manager := NewManager(nil, selector, nil)
+			manager.SetPluginScheduler(&statefulSchedulerPlugin{active: active})
+			const provider, model = "gemini", "plugin-pinned-model"
+			aID, bID := t.Name()+"-a", t.Name()+"-b"
+			registerDispatchTestAuth(t, manager, &Auth{
+				ID: aID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"weight": "3"},
+			}, model)
+			registerDispatchTestAuth(t, manager, &Auth{
+				ID: bID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"weight": "1"},
+			}, model)
+			for i := range 4 {
+				decision, errDispatch := manager.Dispatch(t.Context(), []string{provider}, model, Options{
+					Headers:  http.Header{"Session_id": {"pinned"}},
+					Metadata: map[string]any{PinnedAuthIDMetadataKey: bID},
+				})
+				if errDispatch != nil || decision == nil || decision.Auth == nil || decision.Auth.ID != bID {
+					t.Fatalf("pinned dispatch %d: decision=%v err=%v", i, decision, errDispatch)
+				}
+			}
+			counts := map[string]int{}
+			for i := range 12 {
+				decision, errDispatch := manager.Dispatch(t.Context(), []string{provider}, model, Options{
+					Headers: http.Header{"Session_id": {fmt.Sprintf("fresh-%d", i)}},
+				})
+				if errDispatch != nil || decision == nil || decision.Auth == nil {
+					t.Fatalf("fresh dispatch %d: decision=%v err=%v", i, decision, errDispatch)
+				}
+				counts[decision.Auth.ID]++
+			}
+			wantA, wantB := 12, 0
+			if active {
+				// An active plugin declining a pick must not enable shared-pool accounting.
+				wantA, wantB = 9, 3
+			}
+			if counts[aID] != wantA || counts[bID] != wantB {
+				t.Fatalf("fresh distribution=%v, want a=%d b=%d", counts, wantA, wantB)
+			}
+		})
+	}
 }
 
 type delegatingSchedulerPlugin struct{}

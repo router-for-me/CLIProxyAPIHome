@@ -398,17 +398,19 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
-	store    SessionAffinityStore
-	ttl      time.Duration
+	fallback         Selector
+	cache            *SessionCache
+	store            SessionAffinityStore
+	ttl              time.Duration
+	subagentAffinity bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
-	Store    SessionAffinityStore
+	Fallback         Selector
+	TTL              time.Duration
+	Store            SessionAffinityStore
+	SubagentAffinity *bool
 }
 
 // NewSessionAffinitySelectorWithConfig creates a selector with custom configuration.
@@ -419,7 +421,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
-	selector := &SessionAffinitySelector{fallback: cfg.Fallback, store: cfg.Store, ttl: cfg.TTL}
+	selector := &SessionAffinitySelector{
+		fallback: cfg.Fallback, store: cfg.Store, ttl: cfg.TTL,
+		subagentAffinity: cfg.SubagentAffinity == nil || *cfg.SubagentAffinity,
+	}
 	if selector.store == nil {
 		selector.cache = NewSessionCache(cfg.TTL)
 		selector.store = selector.cache
@@ -447,9 +452,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	opts.SessionAffinity.Finish(false)
+	var reservation *weightedReservation
+	defer func() { reservation.finish(false) }()
 	entry := selectorLogEntry(ctx)
+	weighted, _ := s.fallback.(*WeightedRoundRobinSelector)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
+	if primaryID == "" && weighted == nil {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
@@ -464,7 +473,46 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
+	var weightedKey string
+	if weighted != nil {
+		weightedKey = weightedStateKey(provider, model, opts)
+	}
+	if primaryID == "" {
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		selected, pending, errReserve := s.reserveWeighted(ctx, weighted, weightedKey, model, opts, available, nil, nil, now)
+		if errReserve != nil {
+			return nil, errReserve
+		}
+		if opts.SessionAffinity != nil {
+			opts.SessionAffinity.reservation = pending
+			return selected, nil
+		}
+		pending.finish(true)
+		return selected, nil
+	}
 	cacheKey := sessionBindingKey(provider, primaryID, model)
+	isSubagent := sessionFallbackIsSubagent(primaryID, fallbackID, opts)
+	inheritFallback := s.subagentAffinity || !isSubagent
+	guardian := s.subagentAffinity && isSubagent && strings.EqualFold(sessionHeaderValue(opts.Headers, "X-Openai-Subagent"), "guardian")
+	// Sticky bindings outrank priority, including on later Guardian turns that
+	// omit their parent header. Only cold/failover selection uses the highest tier.
+	var bindingCandidates []*Auth
+	var parentProviders []string
+	providers := make(map[string]bool)
+	requestProvider := sessionSelectionProvider(nil, provider)
+	for _, auth := range auths {
+		if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
+			continue
+		}
+		bindingCandidates = append(bindingCandidates, auth)
+		if guardian {
+			realProvider := sessionSelectionProvider(auth, provider)
+			if realProvider != "" && realProvider != "mixed" && (requestProvider == "mixed" || realProvider == requestProvider) && !providers[realProvider] {
+				providers[realProvider] = true
+				parentProviders = append(parentProviders, realProvider)
+			}
+		}
+	}
 	for {
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
@@ -476,20 +524,32 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		var selected *Auth
 		active := time.Now().Before(binding.ExpiresAt)
 		if active {
-			for _, auth := range available {
+			for _, auth := range bindingCandidates {
 				if auth.ID == binding.AuthID {
 					selected = auth
 					break
 				}
 			}
 		}
-		if selected == nil && !active && fallbackID != "" && fallbackID != primaryID {
+		if selected == nil && !active && guardian {
+			parent, errParent := s.store.LoadLatestSessionBinding(ctx, sessionBindingKey("", fallbackID, ""), parentProviders)
+			if errParent != nil {
+				return nil, fmt.Errorf("load Guardian parent session binding: %w", errParent)
+			}
+			for _, auth := range bindingCandidates {
+				if auth.ID == parent.AuthID {
+					selected = auth
+					break
+				}
+			}
+		}
+		if selected == nil && !active && inheritFallback && fallbackID != "" && fallbackID != primaryID {
 			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
 			if errParent != nil {
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
 			}
 			if time.Now().Before(parent.ExpiresAt) {
-				for _, auth := range available {
+				for _, auth := range bindingCandidates {
 					if auth.ID == parent.AuthID {
 						selected = auth
 						break
@@ -497,23 +557,36 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 		}
-		if selected == nil {
+		if weighted != nil {
+			var errReserve error
+			selected, reservation, errReserve = s.reserveWeighted(ctx, weighted, weightedKey, model, opts, available, bindingCandidates, selected, now)
+			if errReserve != nil {
+				return nil, errReserve
+			}
+		} else if selected == nil {
 			var errPick error
 			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)
 			if errPick != nil {
 				return nil, errPick
 			}
-			if selected == nil {
-				return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
-			}
+		}
+		if selected == nil {
+			return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
 		}
 		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
+		if realProvider := sessionSelectionProvider(selected, provider); s.subagentAffinity && realProvider != "" && realProvider != "mixed" {
+			commit.SessionKey = sessionBindingKey("", primaryID, "")
+			commit.Provider = realProvider
+		}
 		if !active && binding.Revision != "" {
 			commit.ExpiredAt = binding.ExpiresAt
 		}
 		if opts.SessionAffinity != nil {
 			opts.SessionAffinity.Store = s.store
 			opts.SessionAffinity.Commit = &commit
+			// Dispatch now owns confirmation or rollback of the reservation.
+			opts.SessionAffinity.reservation = reservation
+			reservation = nil
 			entry.Debugf("session-affinity: candidate selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), selected.ID, provider, model)
 			return selected, nil
 		}
@@ -522,11 +595,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, fmt.Errorf("commit session affinity binding: %w", errSwap)
 		}
 		if swapped {
+			reservation.finish(true)
 			entry.Infof("session-affinity: binding selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), selected.ID, provider, model)
 			return selected, nil
 		}
-		// Another request won the binding. Re-read it instead of returning a
-		// credential selected from a stale snapshot.
+		// Another request won the binding. Release speculative credit before
+		// re-reading it instead of returning a stale credential.
+		reservation.finish(false)
+		reservation = nil
 	}
 }
 

@@ -2040,6 +2040,12 @@ Set `routing.strategy` to `weighted-round-robin` to enable weighted credential s
 
 Each key can specify integer `weight`; omission defaults to `1`, the maximum is `1000000`, and non-positive values exclude the credential only while weighted routing is active. Weight belongs to each key, not to the group. Explicit `null`, strings, and fractional values are invalid in config key lists. OAuth/file credentials can carry a top-level numeric `weight` in their uploaded auth JSON.
 
+With `routing.session-affinity` enabled, sticky requests (including parent-session inheritance) also consume weighted credits without moving existing bindings; new or reselected sessions favor under-served credentials. Each eligible credential set keeps separate credits across priority tiers, allowlists, retry exclusions, and cooldown subsets; returning to a set resumes its retained credits. Sticky accounting uses available peers in the bound credential's priority tier, and pinned requests account against the eligible pool before pinning within the pinned credential's priority tier, so a lower-priority binding never changes the ratio among higher-priority credentials.
+
+Settled credits are capped at ±32 times the pool's total weight, so request ratios are approximate rather than guaranteed. Sticky requests retain their binding but skip reservation/accounting when their full credit delta cannot fit the cap; new sessions continue earning credit and repaying debt so excessive sticky traffic does not starve smaller-weight peers. Concurrent selections see pending allocations. Committed balances may temporarily exceed the cap while reservations remain in flight; offsets stay intact until the pool settles, including a final rollback. Successful binding/admission confirms the reservation; failure or retry releases it without consuming committed credits.
+
+Credits remain local to each Home process and reset on restart, selector replacement, or bounded pool-cache eviction; changing weights resets that pool's credits and invalidates its pending reservations. Shared database bindings are unchanged.
+
 ### Provider-specific Key Options
 
 | Field | Provider | Meaning |
@@ -4207,6 +4213,7 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `routing.strategy` | string | `round-robin`, `weighted-round-robin`, or `fill-first`. |
 | `routing.session-affinity` | boolean | Database-backed session-sticky credential routing, shared across Home nodes using the same database. Bindings survive config reloads and restarts; unavailable credentials may be reselected. Upgrade all Home nodes to enable cluster-wide consistency. |
 | `routing.session-affinity-ttl` | string | Session-to-auth idle timeout, renewed by successful dispatches. Default: `1h`. |
+| `routing.session-affinity-subagents` | optional boolean | Controls Home parent-credential inheritance for unbound child sessions. Ordinary children inherit within the same provider/model; Guardian requests (`X-Openai-Subagent: guardian`, case-insensitive) can inherit the parent session's latest live selection across models on eligible real providers. Existing child bindings take precedence. Default: `true`; ignored when `session-affinity` is disabled. `false` uses normal credential selection without clearing existing child bindings or disabling fork, compaction, and content-hash fallbacks; it does not force a different credential from the parent. Applies on config reload. Upgrade all Home nodes before relying on this switch cluster-wide. CPA must forward fork/compaction markers (`node_kind` / `X-Node-Kind`) when they are not present in the original headers. |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
 | `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate with zero-width characters in system instructions. |
@@ -4237,6 +4244,8 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `requests.payload.override-raw` | array of `PayloadRule` | Overrides raw JSON payload params. |
 | `requests.payload.filter` | array of `PayloadFilterRule` | Removes JSON payload paths. |
 
+Guardian selection history is database-backed and shared across Home nodes, config reloads, and restarts. Only successful dispatch/admission while `session-affinity-subagents` is enabled advances selection order; completion/usage reports and parent lookups do not. When disabled, dispatch keeps ordinary sticky bindings but stops maintaining Guardian history and removes the touched binding from that history. Re-enabling resumes recording subsequent selections; selections made while disabled are not reconstructed. Inherited credentials must still belong to the current request's eligible candidate set. Guardian bindings may reuse a lower-priority eligible credential; cold selection still uses normal priority rules. Fork/compaction requests do not use Guardian cross-model inheritance. Schema version 19 adds the Guardian columns and lookup index through the normal startup migration. Version 18 portable snapshots remain supported. Expiring selection metadata and internal per-session counters use the existing `session_affinity` table, without a separate table (all excluded from portable snapshots); pre-upgrade bindings acquire selection metadata on their next successful dispatch. Upgrade all Home nodes before relying on cross-node Guardian inheritance.
+
 ### Additional v8 Fields
 
 These fields supplement the reference above. Settings under `oauth.providers` apply to OAuth credentials; API-key options are documented in the upstream group schema.
@@ -4254,7 +4263,6 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `server.discovery.advertise-management` | boolean | Advertises management endpoints; defaults to `false`. |
 | `credentials.concurrency` | object | Home-owned limiter lifecycle and release tuning. Revision fields are read-only; see the configuration section. |
 | `credentials.in-flight` | object | Observation snapshot, staleness, size, and staging limits. |
-| `routing.session-affinity-subagents` | optional boolean | CPA compatibility option for parent-session credential inheritance; Home continues to manage its own session hierarchy. |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA compatibility setting; Home runtime cooldown state is DB-backed. |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | CPA transient-error cooldown setting carried with configuration. |
 | `oauth.providers.aistudio.ws-auth` | boolean | Home normalizes this to `false`. |

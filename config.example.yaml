@@ -159,6 +159,16 @@ routing:
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
+  # Sticky requests (including inherited bindings) consume credits without moving bindings.
+  # Each eligible credential set keeps separate credits; returning to a set resumes them.
+  # Sticky accounting uses available peers in the bound credential's priority tier,
+  # and pinned requests use the eligible pool before pinning within that priority tier,
+  # so lower-priority bindings never change ratios among higher-priority credentials.
+  # Settled credits are capped at +/-32 times the pool total; ratios are approximate.
+  # In-flight offsets stay intact until the pool settles, including a final rollback.
+  # Sticky requests keep their bindings but skip accounting if their full delta cannot
+  # fit the cap; new sessions keep earning credit to avoid starving smaller-weight peers.
+  # Credits are process-local and reset on restart, selector replacement, or pool-cache eviction.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
   # Enable universal session-sticky routing for all clients.
   # Home nodes using the same database share bindings across reloads and restarts.
@@ -173,8 +183,13 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
-  # CPA compatibility option for inheriting a parent session's upstream credential.
-  # Home retains its existing session scheduling policy.
+  # Allow unbound child sessions to inherit an eligible parent's credential for the same model.
+  # Guardian requests (X-Openai-Subagent: guardian) may inherit the parent's latest live
+  # selection across models; this history is shared through the Home database.
+  # False also stops recording Guardian history; re-enabling records subsequent selections.
+  # Default: true; ignored when session-affinity is false. False uses normal selection,
+  # but preserves existing child bindings, forks, compaction, and content-hash fallbacks.
+  # Upgrade every Home node before relying on this switch across the cluster.
   # session-affinity-subagents: true
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).

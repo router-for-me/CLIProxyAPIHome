@@ -2031,6 +2031,12 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 
 每个 key 可设置整数 `weight`，缺省为 `1`，最大 `1000000`；非正数仅在启用加权调度时排除该凭证。权重属于 key，不能放在分组上。配置 key 列表中的显式 `null`、字符串和小数均不合法。OAuth/文件凭证可在上传的 auth JSON 顶层携带数值 `weight`。
 
+开启 `routing.session-affinity` 后，粘性命中（包括继承父会话绑定）的请求也会消耗权重额度，但不会为了均衡迁移已有绑定；新建或重新选择的会话优先分配给低于目标份额的凭证。不同优先级层、allowlist、重试排除和冷却子集按实际候选凭证集合隔离额度，回到原候选池时继续使用保留额度。粘性请求只与绑定凭证同优先级层的可用凭证记账，固定凭证（pinned）请求在固定凭证所属优先级层内按固定前的合格候选池记账，低优先级绑定不会改变高优先级凭证之间的比例。
+
+结算后的额度限制在候选池总权重的 ±32 倍，因此请求比例是近似目标而非严格保证。粘性请求的完整额度增量无法放入上限时，保留绑定但不预留、不记账；新会话继续赚取额度和偿还欠额，避免超额粘性流量饿死小权重凭证。并发选择能看到未提交的预留；存在未结算预留时，已提交余额可暂时超出上限，抵消额度保留至整个池结算完毕，最后一个预留回滚也会触发裁剪。绑定提交及并发准入成功后确认预留，失败或重试时释放，不消耗已提交额度。
+
+额度保存在各 Home 进程内，进程重启、选择器替换或有界候选池缓存淘汰后重置；权重变化会重置对应池额度并使该池的旧预留失效。数据库共享绑定不变。
+
 ### Provider 专属 Key 选项
 
 | 字段 | Provider | 含义 |
@@ -4191,6 +4197,7 @@ Query 参数：
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
 | `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
 | `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
+| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承父凭证。普通子会话仅在同 provider、同模型内继承；Guardian 请求（`X-Openai-Subagent: guardian`，大小写不敏感）可跨模型继承父会话在合格真实 provider 上最近的有效选择，已有子绑定优先。默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
 | `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
@@ -4221,6 +4228,8 @@ Query 参数：
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
 
+Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有在开启 `session-affinity-subagents` 时成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。关闭后仍保留普通粘性绑定，但不再维护 Guardian 历史，并将本次使用的绑定从该历史中移除。重新开启后从后续成功选择继续记录，不回补关闭期间的选择。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 通过正常启动迁移新增 Guardian 字段及查询索引，并继续支持 v18 可移植快照。会过期的选择元数据及内部会话计数器记录存于现有 `session_affinity` 表内，不新增独立表（均不纳入可移植快照）；升级前的绑定在下一次成功派发时补充选择元数据。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
+
 ### v8 补充字段
 
 下列字段补充前表。`oauth.providers` 下的设置作用于 OAuth 凭证；API Key 选项见上游分组结构。
@@ -4238,7 +4247,6 @@ Query 参数：
 | `server.discovery.advertise-management` | boolean | 是否广播管理接口，默认 `false`。 |
 | `credentials.concurrency` | object | Home 并发限制生命周期和释放调优；revision 只读，见配置章节。 |
 | `credentials.in-flight` | object | 观测快照、过期、大小及暂存限制。 |
-| `routing.session-affinity-subagents` | optional boolean | CPA 的父会话凭证继承兼容选项；Home 继续管理自己的会话层级。 |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA 兼容设置；Home 运行时冷却状态由数据库持久化。 |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | 随配置携带的 CPA 临时错误冷却设置。 |
 | `oauth.providers.aistudio.ws-auth` | boolean | Home 规范化为 `false`。 |
