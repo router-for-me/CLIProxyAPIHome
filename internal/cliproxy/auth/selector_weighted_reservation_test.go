@@ -18,16 +18,16 @@ func TestWeightedReservationRollbackPreservesConcurrentCharges(t *testing.T) {
 		_, reservation := weighted.reserve(key, auths, "b")
 		reservation.finish(true)
 	}
-	state := weighted.states[key]
+	state := weightedStateForTest(t, weighted, key, "a", "b")
 	_, rejected := weighted.reserve(key, auths, "b")
 	_, accepted := weighted.reserve(key, auths, "a")
 	accepted.finish(true)
 	rejected.finish(false)
 	rejected.finish(true)
 	accepted.finish(false)
-	limit := maxSmoothWeightedCreditRounds * 4
-	if state.current["a"] != limit-1 || state.current["b"] != -limit+1 || len(state.pending) != 0 {
-		t.Fatalf("rollback lost another charge: committed=%v pending=%v", state.current, state.pending)
+	limit := maxSmoothWeightedCreditRounds * 4 / 3 * 3
+	if state.currentForTest()["a"] != limit-1 || state.currentForTest()["b"] != -limit+1 || len(state.pendingForTest()) != 0 {
+		t.Fatalf("rollback lost another charge: committed=%v pending=%v", state.currentForTest(), state.pendingForTest())
 	}
 }
 
@@ -66,20 +66,20 @@ func TestWeightedSessionAffinitySelectionReset(t *testing.T) {
 			if selection.Store != nil || selection.Commit != nil || selection.reservation != nil {
 				t.Fatalf("reset retained selection metadata: %#v", selection)
 			}
-			state := weighted.states[key]
+			state := weightedStateForTest(t, weighted, key, "a", "b")
 			wantA, wantB := int64(0), int64(0)
 			if committed {
 				wantA, wantB = -1, 1
 			}
-			if !reservation.finished || state.current["a"] != wantA || state.current["b"] != wantB {
-				t.Fatalf("reset changed committed credits or lost reservation: finished=%t credits=%v", reservation.finished, state.current)
+			if !reservation.finished || state.currentForTest()["a"] != wantA || state.currentForTest()["b"] != wantB {
+				t.Fatalf("reset changed committed credits or lost reservation: finished=%t credits=%v", reservation.finished, state.currentForTest())
 			}
-			if len(state.pending) != 2 || state.pending["a"] != 3 || state.pending["b"] != -3 {
-				t.Fatalf("reset leaked credit or released another reservation: %v", state.pending)
+			if len(state.pendingForTest()) != 2 || state.pendingForTest()["a"] != 3 || state.pendingForTest()["b"] != -3 {
+				t.Fatalf("reset leaked credit or released another reservation: %v", state.pendingForTest())
 			}
 			other.finish(false)
-			if len(state.pending) != 0 {
-				t.Fatalf("pending credits remain after releasing all reservations: %v", state.pending)
+			if len(state.pendingForTest()) != 0 {
+				t.Fatalf("pending credits remain after releasing all reservations: %v", state.pendingForTest())
 			}
 		})
 	}
@@ -93,13 +93,13 @@ func TestWeightedReservationResetInvalidatesOldGeneration(t *testing.T) {
 	auths[0].Attributes["weight"] = "1"
 	_, latest := weighted.reserve(key, auths, "")
 	old.finish(true)
-	state := weighted.states[key]
-	if state.current["a"] != 0 || state.current["b"] != 0 || state.pending["a"] != -1 || state.pending["b"] != 1 {
-		t.Fatalf("stale reservation changed new generation: committed=%v pending=%v", state.current, state.pending)
+	state := weightedStateForTest(t, weighted, key, "a", "b")
+	if state.currentForTest()["a"] != 0 || state.currentForTest()["b"] != 0 || state.pendingForTest()["a"] != -1 || state.pendingForTest()["b"] != 1 {
+		t.Fatalf("stale reservation changed new generation: committed=%v pending=%v", state.currentForTest(), state.pendingForTest())
 	}
 	latest.finish(true)
-	if state.current["a"] != -1 || state.current["b"] != 1 || len(state.pending) != 0 {
-		t.Fatalf("new generation accounting: committed=%v pending=%v", state.current, state.pending)
+	if state.currentForTest()["a"] != -1 || state.currentForTest()["b"] != 1 || len(state.pendingForTest()) != 0 {
+		t.Fatalf("new generation accounting: committed=%v pending=%v", state.currentForTest(), state.pendingForTest())
 	}
 }
 
@@ -138,21 +138,21 @@ func TestWeightedReservationManagerReleasesRejectedCandidates(t *testing.T) {
 			decision, errDispatch := manager.Dispatch(t.Context(), []string{"codex"}, "model", Options{
 				Headers: http.Header{"X-Session-ID": {"manager"}}, SessionAffinity: selection,
 			})
-			state := weighted.states["codex:model"]
+			state := weightedStateForTest(t, weighted, "codex:model", a.ID, b.ID)
 			if mode == "resolver-failure" {
-				if !errors.Is(errDispatch, failure) || decision != nil || len(state.pending) != 0 {
-					t.Fatalf("failed resolution: decision=%v err=%v pending=%v", decision, errDispatch, state.pending)
+				if !errors.Is(errDispatch, failure) || decision != nil || len(state.pendingForTest()) != 0 {
+					t.Fatalf("failed resolution: decision=%v err=%v pending=%v", decision, errDispatch, state.pendingForTest())
 				}
 			} else {
-				if errDispatch != nil || decision == nil || decision.Auth.ID != b.ID || len(state.pending) != 0 {
+				if errDispatch != nil || decision == nil || decision.Auth.ID != b.ID || len(state.pendingForTest()) != 0 {
 					// The surviving singleton's net reservation is zero. A leaked
 					// reservation for a would still be visible in this map.
-					t.Fatalf("reselection: decision=%v err=%v pending=%v", decision, errDispatch, state.pending)
+					t.Fatalf("reselection: decision=%v err=%v pending=%v", decision, errDispatch, state.pendingForTest())
 				}
 			}
 			selection.Finish(false)
-			if state.current[a.ID] != 0 || state.current[b.ID] != 0 || len(state.pending) != 0 {
-				t.Fatalf("rejected candidate consumed credits: committed=%v pending=%v", state.current, state.pending)
+			if state.currentForTest()[a.ID] != 0 || state.currentForTest()[b.ID] != 0 || len(state.pendingForTest()) != 0 {
+				t.Fatalf("rejected candidate consumed credits: committed=%v pending=%v", state.currentForTest(), state.pendingForTest())
 			}
 		})
 	}

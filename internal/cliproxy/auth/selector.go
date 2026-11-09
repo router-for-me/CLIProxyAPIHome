@@ -551,17 +551,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 			pool := available
 			if selected != nil {
-				inPool := false
-				for _, auth := range pool {
-					if auth.ID == selected.ID {
-						inPool = true
-						break
+				// Sticky traffic only charges available peers in its own priority
+				// tier, never credentials competing in a higher-priority pool.
+				pool = nil
+				priority := authPriority(selected)
+				for _, auth := range bindingCandidates {
+					if authPriority(auth) == priority {
+						pool = append(pool, auth)
 					}
-				}
-				if !inPool {
-					// Charge a lower-priority sticky credential without adding
-					// unrelated lower tiers to the normal weighted credit pool.
-					pool = append(append([]*Auth(nil), pool...), selected)
 				}
 			}
 			selected, reservation = weighted.reserve(weightedKey, pool, authID)

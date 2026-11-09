@@ -35,9 +35,9 @@ func TestWeightedSessionAffinityCompensatesStickyRequests(t *testing.T) {
 					t.Fatalf("sticky request %d: pick=%v err=%v", i, picked, errPick)
 				}
 			}
-			state := weighted.states["codex:model"]
-			if state.current["a"] != 12 || state.current["b"] != -12 {
-				t.Fatalf("sticky credits = %v, want a=12 b=-12", state.current)
+			state := weightedStateForTest(t, weighted, "codex:model", "a", "b")
+			if state.currentForTest()["a"] != 12 || state.currentForTest()["b"] != -12 {
+				t.Fatalf("sticky credits = %v, want a=12 b=-12", state.currentForTest())
 			}
 			for i := range 12 {
 				// New sessions and requests without an identity share the same credits.
@@ -50,8 +50,8 @@ func TestWeightedSessionAffinityCompensatesStickyRequests(t *testing.T) {
 					t.Fatalf("compensating request %d: pick=%v err=%v", i, picked, errPick)
 				}
 			}
-			if state.current["a"] != 0 || state.current["b"] != 0 {
-				t.Fatalf("compensated credits = %v", state.current)
+			if state.currentForTest()["a"] != 0 || state.currentForTest()["b"] != 0 {
+				t.Fatalf("compensated credits = %v", state.currentForTest())
 			}
 			binding, errLoad := selector.store.LoadSessionBinding(t.Context(), key)
 			if errLoad != nil || binding.AuthID != "b" {
@@ -74,8 +74,9 @@ func TestWeightedSessionAffinityColdSelectionsCountOnce(t *testing.T) {
 		if errPick != nil || picked == nil {
 			t.Fatalf("pick=%v err=%v", picked, errPick)
 		}
-		if i == 0 && (weighted.states["codex:model"].current["a"] != -1 || weighted.states["codex:model"].current["b"] != 1) {
-			t.Fatalf("first selection charged more than once: %v", weighted.states["codex:model"].current)
+		state := weightedStateForTest(t, weighted, "codex:model", "a", "b")
+		if i == 0 && (state.currentForTest()["a"] != -1 || state.currentForTest()["b"] != 1) {
+			t.Fatalf("first selection charged more than once: %v", state.currentForTest())
 		}
 		counts[picked.ID]++
 	}
@@ -98,18 +99,20 @@ func TestWeightedSessionAffinityBoundsCompensation(t *testing.T) {
 			t.Fatalf("long session: pick=%v err=%v", picked, errPick)
 		}
 	}
-	state := weighted.states["codex:model"]
+	state := weightedStateForTest(t, weighted, "codex:model", "a", "b")
 	limit := maxSmoothWeightedCreditRounds * 4
-	if state.current["a"] != limit || state.current["b"] != -limit {
-		t.Fatalf("unbounded credits = %v, want +/- %d", state.current, limit)
+	// Admit a whole sticky delta or none, stopping within one delta of the cap.
+	wantCredit := limit / 3 * 3
+	if state.currentForTest()["a"] != wantCredit || state.currentForTest()["b"] != -wantCredit {
+		t.Fatalf("bounded credits = %v, want +/- %d", state.currentForTest(), wantCredit)
 	}
-	for range limit {
+	for range wantCredit {
 		if _, errPick := weighted.Pick(t.Context(), "codex", "model", Options{}, auths); errPick != nil {
 			t.Fatal(errPick)
 		}
 	}
-	if state.current["a"] != 0 || state.current["b"] != 0 {
-		t.Fatalf("compensation did not finish within bounded window: %v", state.current)
+	if state.currentForTest()["a"] != 0 || state.currentForTest()["b"] != 0 {
+		t.Fatalf("compensation did not finish within bounded window: %v", state.currentForTest())
 	}
 }
 
@@ -167,12 +170,12 @@ func TestWeightedSessionAffinityCASAccounting(t *testing.T) {
 			} else if errPick != nil || picked == nil || picked.ID != tc.wantAuth {
 				t.Fatalf("pick=%v err=%v, want %s", picked, errPick, tc.wantAuth)
 			}
-			state := weighted.states["codex:model"]
-			if len(state.pending) != 0 {
-				t.Fatalf("CAS attempt leaked pending credits: %v", state.pending)
+			state := weightedStateForTest(t, weighted, "codex:model", "a", "b")
+			if len(state.pendingForTest()) != 0 {
+				t.Fatalf("CAS attempt leaked pending credits: %v", state.pendingForTest())
 			}
-			if state.current["a"] != tc.wantA || state.current["b"] != tc.wantB {
-				t.Fatalf("credits = %v, want a=%d b=%d", state.current, tc.wantA, tc.wantB)
+			if state.currentForTest()["a"] != tc.wantA || state.currentForTest()["b"] != tc.wantB {
+				t.Fatalf("credits = %v, want a=%d b=%d", state.currentForTest(), tc.wantA, tc.wantB)
 			}
 		})
 	}
@@ -204,16 +207,16 @@ func TestWeightedSessionAffinityDefersAccounting(t *testing.T) {
 					t.Fatalf("pick=%v err=%v, missing deferred accounting", picked, errPick)
 				}
 				for _, state := range weighted.states {
-					if state.current["a"] != 0 || state.current["b"] != 0 {
-						t.Fatalf("uncommitted selection consumed credits: %v", state.current)
+					if state.currentForTest()["a"] != 0 || state.currentForTest()["b"] != 0 {
+						t.Fatalf("uncommitted selection consumed credits: %v", state.currentForTest())
 					}
-					if state.pending["a"] != wantA || state.pending["b"] != wantB {
-						t.Fatalf("missing reservation: %v", state.pending)
+					if state.pendingForTest()["a"] != wantA || state.pendingForTest()["b"] != wantB {
+						t.Fatalf("missing reservation: %v", state.pendingForTest())
 					}
 				}
 				if attempt == 0 {
 					opts.SessionAffinity.Finish(false)
-					if len(weighted.states["codex:model"].pending) != 0 {
+					if len(weightedStateForTest(t, weighted, "codex:model", "a", "b").pendingForTest()) != 0 {
 						t.Fatal("failed attempt leaked pending credits")
 					}
 				}
@@ -224,12 +227,12 @@ func TestWeightedSessionAffinityDefersAccounting(t *testing.T) {
 			opts.SessionAffinity.Finish(true)
 			opts.SessionAffinity.Finish(true)
 			opts.SessionAffinity.Finish(false)
-			state := weighted.states["codex:model"]
-			if len(state.pending) != 0 {
-				t.Fatalf("confirmed selection leaked pending credits: %v", state.pending)
+			state := weightedStateForTest(t, weighted, "codex:model", "a", "b")
+			if len(state.pendingForTest()) != 0 {
+				t.Fatalf("confirmed selection leaked pending credits: %v", state.pendingForTest())
 			}
-			if state.current["a"] != wantA || state.current["b"] != wantB {
-				t.Fatalf("committed credits = %v, want a=%d b=%d", state.current, wantA, wantB)
+			if state.currentForTest()["a"] != wantA || state.currentForTest()["b"] != wantB {
+				t.Fatalf("committed credits = %v, want a=%d b=%d", state.currentForTest(), wantA, wantB)
 			}
 		})
 	}
@@ -255,18 +258,18 @@ func TestWeightedSessionAffinitySharesEligibleModelCredits(t *testing.T) {
 	if errPick != nil || picked == nil || picked.ID != "b" {
 		t.Fatalf("sticky pick=%v err=%v", picked, errPick)
 	}
-	state := weighted.states["codex:requested"]
-	if len(weighted.states) != 1 || len(state.current) != 2 || state.current["a"] != 3 || state.current["b"] != -3 {
+	state := weightedStateForTest(t, weighted, "codex:requested", "a", "b")
+	if len(weighted.states) != 1 || len(state.currentForTest()) != 2 || state.currentForTest()["a"] != 3 || state.currentForTest()["b"] != -3 {
 		t.Fatalf("wrong state key or eligible credits: %v", weighted.states)
 	}
 	picked, errPick = weighted.Pick(t.Context(), "codex", "", opts, auths[:2])
-	if errPick != nil || picked == nil || picked.ID != "a" || state.current["a"] != 2 || state.current["b"] != -2 {
-		t.Fatalf("fallback did not share credits: pick=%v err=%v credits=%v", picked, errPick, state.current)
+	if errPick != nil || picked == nil || picked.ID != "a" || state.currentForTest()["a"] != 2 || state.currentForTest()["b"] != -2 {
+		t.Fatalf("fallback did not share credits: pick=%v err=%v credits=%v", picked, errPick, state.currentForTest())
 	}
 	if _, errOther := weighted.Pick(t.Context(), "other", "", opts, auths[:2]); errOther != nil {
 		t.Fatal(errOther)
 	}
-	if state.current["a"] != 2 || state.current["b"] != -2 {
+	if state.currentForTest()["a"] != 2 || state.currentForTest()["b"] != -2 {
 		t.Fatal("another provider changed credits")
 	}
 }

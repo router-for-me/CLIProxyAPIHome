@@ -159,8 +159,15 @@ routing:
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
-  # Sticky requests also consume weighted credits without moving existing bindings.
-  # New sessions compensate toward the configured request ratio, with bounded credits.
+  # Sticky requests (including inherited bindings) consume credits without moving bindings.
+  # Each eligible credential set keeps separate credits; returning to a set resumes them.
+  # Sticky accounting uses available peers in the bound credential's priority tier,
+  # so lower-priority bindings never change ratios among higher-priority credentials.
+  # Settled credits are capped at +/-32 times the pool total; ratios are approximate.
+  # In-flight offsets stay intact until the pool settles, including a final rollback.
+  # Sticky requests keep their bindings but skip accounting if their full delta cannot
+  # fit the cap; new sessions keep earning credit to avoid starving smaller-weight peers.
+  # Credits are process-local and reset on restart, selector replacement, or pool-cache eviction.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
   # Enable universal session-sticky routing for all clients.
   # Home nodes using the same database share bindings across reloads and restarts.
