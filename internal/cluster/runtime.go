@@ -287,6 +287,14 @@ func (a *RuntimeAdapter) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, a
 	return a.repo.AllowedDispatchIDsForAPIKeyModel(ctx, apiKey, modelID)
 }
 
+// AllowedUsageIDsForAPIKeyModel resolves completed-usage permissions without billing admission.
+func (a *RuntimeAdapter) AllowedUsageIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error) {
+	if !a.Enabled() {
+		return nil, nil, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.AllowedUsageIDsForAPIKeyModel(ctx, apiKey, modelID)
+}
+
 // ModelAccessForAPIKey loads the credential/model policy used by model listings.
 func (a *RuntimeAdapter) ModelAccessForAPIKey(ctx context.Context, apiKey string) (*coreauth.ModelAccess, error) {
 	if !a.Enabled() {

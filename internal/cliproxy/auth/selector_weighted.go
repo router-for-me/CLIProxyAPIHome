@@ -23,6 +23,11 @@ type WeightedRoundRobinSelector struct {
 	states     map[[32]byte]*weightedPoolState
 	stateCount int
 	maxKeys    int
+
+	usageMu    sync.Mutex
+	usageSeen  map[[32]byte]struct{}
+	usageOrder [][32]byte
+	usageNext  int
 }
 
 // weightedReservation separates speculative credit from committed, clamped credit.
@@ -74,11 +79,15 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
-	picked, reservation := s.reserve(weightedStateKey(provider, model, opts), available, "")
-	if picked == nil {
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
+	picked, reservation, errReserve := s.reserveForRequest(ctx, weightedStateKey(provider, model, opts), model, opts, available, auths, nil, time.Now())
+	if errReserve != nil {
+		return nil, errReserve
 	}
-	reservation.finish(true)
+	if opts.SessionAffinity != nil {
+		opts.SessionAffinity.reservation = reservation
+	} else {
+		reservation.finish(true)
+	}
 	return picked, nil
 }
 
@@ -89,7 +98,10 @@ func weightedStateKey(provider, model string, opts Options) string {
 	return provider + ":" + canonicalModelKey(model)
 }
 
-func (s *SessionAffinitySelector) reserveWeighted(ctx context.Context, weighted *WeightedRoundRobinSelector, weightedKey, model string, opts Options, available, bindingCandidates []*Auth, selected *Auth, now time.Time) (*Auth, *weightedReservation, error) {
+func (weighted *WeightedRoundRobinSelector) reserveForRequest(ctx context.Context, weightedKey, model string, opts Options, available, bindingCandidates []*Auth, selected *Auth, now time.Time) (*Auth, *weightedReservation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	authID := ""
 	pool := available
 	if accountingAuths, ok := ctx.Value(weightedAccountingPoolKey{}).([]*Auth); ok {

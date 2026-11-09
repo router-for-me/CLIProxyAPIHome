@@ -112,6 +112,7 @@ type Manager struct {
 	indexAuth       map[string]*Auth
 	scheduler       *authScheduler
 	modelAliasHints modelAliasHintIndex
+	usageStats      usageRequestStatsCache
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -1431,10 +1432,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		m.mu.RLock()
 		selector := m.selector
 		pluginScheduler := m.pluginScheduler
-		trackPinnedAccounting := false
-		if affinitySelector, ok := selector.(*SessionAffinitySelector); ok && affinitySelector != nil && pinnedAuthID != "" && filterWeights {
-			_, trackPinnedAccounting = affinitySelector.fallback.(*WeightedRoundRobinSelector)
-		}
+		trackPinnedAccounting := pinnedAuthID != "" && filterWeights && isWeightedSelector(selector)
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
 		var accountingAuths []*Auth

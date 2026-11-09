@@ -36,7 +36,10 @@ type Result struct {
 	// ObservedAt is the event time of the usage result. Non-zero values fence
 	// replayed or out-of-order deliveries against the model state.
 	ObservedAt time.Time
-	// SkipRequestStats retries feedback without counting the delivery as a new request.
+	// RequestStatsEventID identifies a completed execution independently of usage
+	// persistence. Identified replays count only if this manager has not counted it.
+	RequestStatsEventID string
+	// SkipRequestStats suppresses statistics for legacy replays without an event ID.
 	SkipRequestStats bool
 }
 
@@ -92,14 +95,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	var mutator StateMutator
 	stateMutatorAvailable := false
 	disableCooling = m.quotaCooldownDisabledForAuth(auth)
-	if !result.SkipRequestStats {
-		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
-			auth.Success++
-		} else {
-			auth.Failed++
-		}
-	}
+	m.recordResultRequestStatsLocked(auth, result, now)
 	if result.RequestScoped() || resultObservationStale(auth, result, resultModel) {
 		// Count the request failure without publishing a stale credential snapshot
 		// or adopting shared availability state through the status-based paths.

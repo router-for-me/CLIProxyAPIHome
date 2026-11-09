@@ -479,7 +479,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		selected, pending, errReserve := s.reserveWeighted(ctx, weighted, weightedKey, model, opts, available, nil, nil, now)
+		selected, pending, errReserve := weighted.reserveForRequest(ctx, weightedKey, model, opts, available, nil, nil, now)
 		if errReserve != nil {
 			return nil, errReserve
 		}
@@ -559,7 +559,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		if weighted != nil {
 			var errReserve error
-			selected, reservation, errReserve = s.reserveWeighted(ctx, weighted, weightedKey, model, opts, available, bindingCandidates, selected, now)
+			selected, reservation, errReserve = weighted.reserveForRequest(ctx, weightedKey, model, opts, available, bindingCandidates, selected, now)
 			if errReserve != nil {
 				return nil, errReserve
 			}

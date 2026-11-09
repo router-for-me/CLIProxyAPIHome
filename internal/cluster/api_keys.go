@@ -13,6 +13,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"gorm.io/gorm"
 )
 
@@ -859,11 +860,36 @@ func (r *Repository) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, apiKe
 		return nil, nil, errBilling
 	}
 
+	return allowedModelDispatchIDsForAPIKeyRecord(ctx, db, &record, modelID)
+}
+
+// AllowedUsageIDsForAPIKeyModel resolves permissions for completed usage without
+// applying the balance and period limits that admit new requests.
+func (r *Repository) AllowedUsageIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, nil, errDB
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, nil, nil
+	}
+	record, errFirst := r.findAPIKeyForAccess(ctx, db, apiKey)
+	if errors.Is(errFirst, gorm.ErrRecordNotFound) {
+		return nil, nil, fmt.Errorf("%w: %w", homeerrors.ErrUsageAPIKeyNotFound, errFirst)
+	}
+	if errFirst != nil {
+		return nil, nil, errFirst
+	}
+	return allowedModelDispatchIDsForAPIKeyRecord(ctx, db, &record, strings.TrimSpace(modelID))
+}
+
+func allowedModelDispatchIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord, modelID string) ([]string, []string, error) {
 	baseChannelIDs, errBaseChannels := apiKeyChannelsFromJSON(record.Channels)
 	if errBaseChannels != nil {
 		return nil, nil, errBaseChannels
 	}
-	modelDetails, modelGroupsRestricted, errModelDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, &record)
+	modelDetails, modelGroupsRestricted, errModelDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, record)
 	if errModelDetails != nil {
 		return nil, nil, errModelDetails
 	}
