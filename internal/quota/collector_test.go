@@ -204,8 +204,14 @@ func TestCollectorSupportsClaudeAntigravityKimiAndXAI(t *testing.T) {
 			}
 		}},
 		{id: "antigravity-probe", provider: "antigravity", status: "healthy", windows: 4, assert: func(t *testing.T, item *cluster.QuotaCredentialSnapshot) {
-			if len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ScopeID == nil || item.PrimaryWindows[1].ScopeID == nil || *item.PrimaryWindows[0].ScopeID != "gemini" || *item.PrimaryWindows[1].ScopeID != "third-party" {
+			want := []string{"antigravity-gemini-5h", "antigravity-3p-5h", "antigravity-gemini-weekly", "antigravity-3p-weekly"}
+			if item.WindowCount != len(want) || len(item.PrimaryWindows) != len(want) {
 				t.Fatalf("unexpected antigravity primary windows: %+v", item.PrimaryWindows)
+			}
+			for index, id := range want {
+				if item.PrimaryWindows[index].ID != id {
+					t.Fatalf("unexpected antigravity primary windows: %+v", item.PrimaryWindows)
+				}
 			}
 		}},
 		{id: "kimi-probe", provider: "kimi", status: "healthy", windows: 2, assert: func(t *testing.T, item *cluster.QuotaCredentialSnapshot) {
