@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"encoding/json"
+	"regexp"
+
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -94,7 +97,24 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	}
 	var mutator StateMutator
 	stateMutatorAvailable := false
+	cfg, _ := m.runtimeConfig.Load().(*config.Config)
+	evaluateResultErrorCode := func(target *Auth) {
+		if !result.Success && result.Error != nil && strings.TrimSpace(result.Error.Code) == "" {
+			if action, matched := matchRequestScopedErrorActionForResult(target, result.Error, cfg); matched {
+				switch action {
+				case "stop", "continue":
+					result.Error.Code = ErrorCodeRequestScoped
+				case "stop-and-cooldown", "continue-and-cooldown":
+					result.Error.Code = ErrorCodeForceCooldown
+				}
+			}
+		}
+	}
+	evaluateResultErrorCode(auth)
 	disableCooling = m.quotaCooldownDisabledForAuth(auth)
+	if isForceCooldownResultError(result.Error) {
+		disableCooling = false
+	}
 	m.recordResultRequestStatsLocked(auth, result, now)
 	if result.RequestScoped() || resultObservationStale(auth, result, resultModel) {
 		// Count the request failure without publishing a stale credential snapshot
@@ -139,9 +159,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 		// Apply the transition against the persisted auth so concurrent quota
 		// results reported to other Home nodes cannot clobber the shared state.
 		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) StateMutation {
+			evaluateResultErrorCode(persisted)
+			effectiveDisableCooling := disableCooling
+			if isForceCooldownResultError(result.Error) {
+				effectiveDisableCooling = false
+			}
 			before := availabilityFingerprint(persisted, resultModel)
 			baseVersion := persisted.StateVersion
-			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
+			transition = m.applyResultTransition(persisted, result, resultModel, now, effectiveDisableCooling)
 			after := availabilityFingerprint(persisted, resultModel)
 			changed := after != before
 			if baseVersion > 0 {
@@ -187,7 +212,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 		m.queueRefreshReschedule(authSnapshot.ID)
 	}
 	resultStatus := statusCodeFromResult(result.Error)
-	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
+	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) || isForceCooldownResultError(result.Error) {
 		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
 		return nil
 	}
@@ -332,6 +357,14 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 			state.NextRetryAfter = time.Time{}
 		}
 	}
+	if isForceCooldownResultError(result.Error) && state.NextRetryAfter.IsZero() {
+		state.NextRetryAfter = now.Add(time.Minute)
+		state.Unavailable = true
+		transition.shouldSuspendModel = true
+		if transition.suspendReason == "" {
+			transition.suspendReason = "force_cooldown"
+		}
+	}
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
@@ -348,7 +381,10 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 
 // RequestScoped reports failures which must not participate in credential feedback.
 func (r Result) RequestScoped() bool {
-	return !r.Success && ((r.Error != nil && r.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(r.Error))
+	if r.Success || isForceCooldownResultError(r.Error) {
+		return false
+	}
+	return (r.Error != nil && r.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(r.Error)
 }
 
 // resultObservationStale reports whether a timestamped result is older than, or
@@ -388,6 +424,9 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	}
 	statusCode := statusCodeFromResult(result.Error)
 	if statusCode == http.StatusUnauthorized {
+		return true
+	}
+	if isForceCooldownResultError(result.Error) && statusCode != http.StatusTooManyRequests {
 		return true
 	}
 	if statusCode != http.StatusTooManyRequests {
@@ -1136,6 +1175,93 @@ func newUsageResultWithCode(authIndex, provider, model string, statusCode int, b
 // failures that must not mark the credential/model unavailable.
 func isStreamTruncatedResultError(err *Error) bool {
 	return err != nil && err.Code == ErrorCodeStreamTruncated
+}
+
+func isForceCooldownResultError(err *Error) bool {
+	return err != nil && err.Code == ErrorCodeForceCooldown
+}
+
+func extractRequestScopedErrorRulesForAuth(auth *Auth, cfg *config.Config) []config.RequestScopedErrorRule {
+	if auth != nil && auth.Metadata != nil {
+		raw, ok := auth.Metadata["request_scoped_errors"]
+		if !ok {
+			raw, ok = auth.Metadata["request-scoped-errors"]
+		}
+		if ok && raw != nil {
+			switch typed := raw.(type) {
+			case []config.RequestScopedErrorRule:
+				if len(typed) > 0 {
+					return typed
+				}
+			case []any:
+				var rules []config.RequestScopedErrorRule
+				if data, errMarshal := json.Marshal(typed); errMarshal == nil {
+					if errUnmarshal := json.Unmarshal(data, &rules); errUnmarshal == nil && len(rules) > 0 {
+						return rules
+					}
+				}
+			}
+		}
+	}
+	if cfg == nil || auth == nil {
+		return nil
+	}
+	if auth.AuthKind() == AuthKindOAuth {
+		if len(cfg.OAuthRequestScopedErrors) > 0 {
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if rules, ok := cfg.OAuthRequestScopedErrors[provider]; ok && len(rules) > 0 {
+				return rules
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func matchRequestScopedErrorActionForResult(auth *Auth, err *Error, cfg *config.Config) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	rules := extractRequestScopedErrorRulesForAuth(auth, cfg)
+	if len(rules) == 0 {
+		return "", false
+	}
+	statusCode := statusCodeFromResult(err)
+	body := err.Message
+	for _, rule := range rules {
+		if rule.Status <= 0 || rule.Status != statusCode {
+			continue
+		}
+		if len(rule.Match) == 0 && len(rule.MatchRegexr) == 0 {
+			continue
+		}
+		matched := false
+		for _, substr := range rule.Match {
+			if substr != "" && strings.Contains(body, substr) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			for _, pattern := range rule.MatchRegexr {
+				if pattern != "" {
+					if re, errCompile := regexp.Compile(pattern); errCompile == nil && re.MatchString(body) {
+						matched = true
+						break
+					}
+				}
+			}
+		}
+		if !matched {
+			continue
+		}
+		action := strings.ToLower(strings.TrimSpace(rule.Action))
+		switch action {
+		case "stop", "stop-and-cooldown", "continue", "continue-and-cooldown":
+			return action, true
+		}
+	}
+	return "", false
 }
 
 func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {
