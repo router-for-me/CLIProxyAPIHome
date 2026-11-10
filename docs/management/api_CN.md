@@ -259,6 +259,8 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 返回持久化 Home 配置和数据库中上游 API Key 凭证的规范化 v8 视图，包含 `config-version: 8`。这是持久化配置视图，不保证列出所有运行时默认值；未配置的可选字段可以省略。读取响应设置 `Cache-Control: no-store`。
 
+v8 配置 GET（包括子树和 YAML）读取已提交数据，不初始化生命周期配置，也不对其加行锁。初始化和生命周期校验在启动阶段完成；生命周期记录缺失时返回 `500 config_load_failed`，不会在读取时创建默认值。
+
 响应节选：
 
 ```json
@@ -411,6 +413,8 @@ Home 在数据库和下发配置中保留兼容的
 | `cleanup-interval` | `5s` | lifecycle cleanup interval。 |
 
 所有 duration 必须为正数。Home 还要求 `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`，duration 求和溢出也会被视为无效。存在状态为 `active` 或 `canceling` 的 CPA membership 时，仅对 `cpa-heartbeat-timeout`、`cpa-cancel-bound`、`reclaim-grace` 或 `cleanup-interval` 的变更返回 `lifecycle configuration is in use`；完全相同的配置会按未变更接受，非安全时序调优字段仍可更新。
+
+订阅仅在 Home 成功持久化存活状态后续期心跳期限。临时数据库超时会跳过 PONG，不立即隔离订阅；但如果在该 membership 的 `cpa-heartbeat-timeout` 内始终未能成功持久化，Home 会独立计时并隔离该精确 lifetime。期限由 lifetime 持有：订阅断线或退订不能取消期限，且期限在客户端数量同步或初始消息发送之前注册。即使数据库不可用，到期也会取消关联命令连接和本地任务。配置/集群消息和 RTT 回显均不能延长期限；明确的 membership 失效或 Home fencing 仍立即触发隔离。此 Home 侧保护兼容现有 CPA 客户端；更新后的 CPA 客户端同样仅允许有效心跳 PONG 续期接收期限。
 
 ## 节点、版本和证书
 

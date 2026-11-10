@@ -29,6 +29,8 @@ type ConnectionLifetime struct {
 	Home         HomeIncarnationID
 	Controlled   bool
 	Subscription bool
+	// HeartbeatTimeout is server-only subscription metadata, not part of lifetime identity.
+	HeartbeatTimeout time.Duration `json:"-"`
 }
 
 // SubscribeMembershipRequest contains the subscription identity supplied by a CPA node.
@@ -58,6 +60,8 @@ func (r *Repository) ClassifyConnection(ctx context.Context, fingerprint string,
 	if errDB != nil {
 		return ConnectionLifetime{}, errDB
 	}
+	ctx, cancel := context.WithTimeout(contextOrBackground(ctx), lifecycleTransactionBudget)
+	defer cancel()
 	member := CPANodeMembershipRecord{}
 	errFirst := db.WithContext(contextOrBackground(ctx)).Where("certificate_fingerprint = ?", fingerprint).First(&member).Error
 	if errors.Is(errFirst, gorm.ErrRecordNotFound) {
@@ -71,6 +75,7 @@ func (r *Repository) ClassifyConnection(ctx context.Context, fingerprint string,
 	}
 
 	lifetime.ConnectedAt = member.ConnectedAt
+	lifetime.HeartbeatTimeout = member.CPAHeartbeatTimeout
 	lifetime.Controlled = true
 	if errParticipation := r.RecordParticipation(ctx, lifetime); errParticipation != nil {
 		return ConnectionLifetime{}, errParticipation
@@ -100,8 +105,13 @@ func (r *Repository) SubscribeMembership(ctx context.Context, request SubscribeM
 		return CPANodeMembershipRecord{}, fmt.Errorf("unsupported membership protocol version %d", request.ProtocolVersion)
 	}
 
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
 	accepted := CPANodeMembershipRecord{}
-	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		gate := ConcurrencyActivationGateRecord{ID: 1}
 		if errCreate := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&gate).Error; errCreate != nil {
 			return errCreate
@@ -203,7 +213,12 @@ func (r *Repository) RecordParticipation(ctx context.Context, lifetime Connectio
 	if fingerprint == "" || lifetime.ConnectedAt.IsZero() || strings.TrimSpace(lifetime.Home.IP) == "" || lifetime.Home.Port <= 0 || lifetime.Home.StartedAt.IsZero() {
 		return fmt.Errorf("membership participation lifetime is invalid")
 	}
-	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		member := CPANodeMembershipRecord{}
 		errMember := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).
 			Where("certificate_fingerprint = ?", fingerprint).

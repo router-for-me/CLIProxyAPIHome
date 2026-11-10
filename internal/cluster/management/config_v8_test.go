@@ -222,6 +222,9 @@ func TestConfigV8CleansUnknownLegacySectionsOnWrite(t *testing.T) {
 	defer cleanup()
 	repo := cluster.NewRepository(db)
 	ctx := context.Background()
+	if _, errEnsure := repo.EnsureLifecycleConfig(ctx, cluster.DefaultHeartbeatTimeout()); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
 	seed := map[string]any{
 		"home":           map[string]any{"enabled": true, "host": "ignored.example"},
 		"former-feature": map[string]any{"items": []any{"first", "second"}, "token": "fixture-secret"},

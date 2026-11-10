@@ -114,11 +114,12 @@ func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint strin
 		return ConnectionLifetime{}, errSubscribe
 	}
 	return ConnectionLifetime{
-		Fingerprint:  member.CertificateFingerprint,
-		ConnectedAt:  member.ConnectedAt,
-		InstanceID:   strings.TrimSpace(instanceID),
-		Home:         home,
-		Subscription: true,
+		Fingerprint:      member.CertificateFingerprint,
+		ConnectedAt:      member.ConnectedAt,
+		InstanceID:       strings.TrimSpace(instanceID),
+		Home:             home,
+		Subscription:     true,
+		HeartbeatTimeout: member.CPAHeartbeatTimeout,
 	}, nil
 }
 

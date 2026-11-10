@@ -73,14 +73,23 @@ func recoverCPAFences(ctx context.Context, repo *cluster.Repository, home cluste
 	if repo == nil || server == nil {
 		return fmt.Errorf("CPA fence recovery is unavailable")
 	}
-	if errRecover := repo.RecoverStaleQuiescence(ctx); errRecover != nil {
-		return errRecover
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// A membership that cannot be recovered now must not starve this Home's pending fences.
+	errRecover := repo.RecoverStaleQuiescence(ctx)
+	if errContext := ctx.Err(); errContext != nil {
+		return errors.Join(errRecover, errContext)
 	}
 	rows, errRows := repo.ListPendingQuiescence(ctx, home)
 	if errRows != nil {
-		return errRows
+		return errors.Join(errRecover, errRows)
 	}
+	recoveryErrors := []error{errRecover}
 	for _, row := range rows {
+		if errContext := ctx.Err(); errContext != nil {
+			return errors.Join(append(recoveryErrors, errContext)...)
+		}
 		event := cluster.ClusterEventRecord{
 			Scope:      "cpa-fence",
 			Op:         row.MembershipConnectedAt.UTC().Format(time.RFC3339Nano),
@@ -88,8 +97,8 @@ func recoverCPAFences(ctx context.Context, repo *cluster.Repository, home cluste
 			Version:    row.CancelRevision,
 		}
 		if errFence := handleCPAFence(ctx, event, repo, home, server); errFence != nil {
-			return errFence
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("recover CPA fence %s: %w", row.CertificateFingerprint, errFence))
 		}
 	}
-	return nil
+	return errors.Join(recoveryErrors...)
 }

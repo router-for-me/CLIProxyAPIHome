@@ -27,6 +27,8 @@ type fingerprintEntry struct {
 	lifetime      cluster.ConnectionLifetime
 	fenced        bool
 	fenceRevision int64
+	fencedSignal  chan struct{}
+	liveness      *subscriptionLiveness
 	connections   map[*TrackedConnection]struct{}
 	handlers      int
 	changed       chan struct{}
@@ -239,7 +241,10 @@ func (r *FingerprintRegistry) fence(ctx context.Context, lifetime cluster.Connec
 	r.mu.Lock()
 	entry := r.entryLocked(lifetimeKey(lifetime))
 	entry.mu.Lock()
-	entry.fenced = true
+	if !entry.fenced {
+		entry.fenced = true
+		close(entry.fencedSignal)
+	}
 	if revision > entry.fenceRevision {
 		entry.fenceRevision = revision
 	}
@@ -297,9 +302,10 @@ func (r *FingerprintRegistry) entryLocked(key fingerprintLifetimeKey) *fingerpri
 	entry := r.entries[key]
 	if entry == nil {
 		entry = &fingerprintEntry{
-			lifetime:    cluster.ConnectionLifetime{Fingerprint: key.fingerprint, ConnectedAt: key.connectedAt},
-			connections: make(map[*TrackedConnection]struct{}),
-			changed:     make(chan struct{}),
+			lifetime:     cluster.ConnectionLifetime{Fingerprint: key.fingerprint, ConnectedAt: key.connectedAt},
+			fencedSignal: make(chan struct{}),
+			connections:  make(map[*TrackedConnection]struct{}),
+			changed:      make(chan struct{}),
 		}
 		r.entries[key] = entry
 	}

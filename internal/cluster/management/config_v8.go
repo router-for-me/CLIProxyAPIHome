@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -25,7 +27,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	}
 	yamlRequest := strings.HasSuffix(c.FullPath(), "/config.yaml")
 	if c.Request.Method == http.MethodGet {
-		stored, err := h.configRoot(ctx)
+		stored, err := h.configV8Root(ctx)
 		if err != nil {
 			respondError(c, http.StatusInternalServerError, "config_load_failed", err)
 			return
@@ -122,6 +124,27 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": 8})
+}
+
+// configV8Root reads committed configuration without initializing or locking lifecycle state.
+func (h *Handler) configV8Root(ctx context.Context) (map[string]any, error) {
+	if h == nil || h.repo == nil {
+		return nil, errors.New("cluster management repository is nil")
+	}
+	snapshot, errSnapshot := h.repo.LoadConfigSnapshot(ctx)
+	if errSnapshot != nil {
+		return nil, errSnapshot
+	}
+	root, errRoot := cluster.ConfigRootFromSnapshot(snapshot)
+	if errRoot != nil {
+		return nil, errRoot
+	}
+	lifecycleConfig, errLifecycle := h.repo.LifecycleConfig(ctx)
+	if errLifecycle != nil {
+		return nil, errLifecycle
+	}
+	root["credential-concurrency"] = lifecycleConfig
+	return root, nil
 }
 
 // configV8Document produces the same normalized view for reads and transactional edits.
