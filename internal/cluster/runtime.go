@@ -768,6 +768,14 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 		item.Quota = auth.Quota
 		item.ModelStates = auth.ModelStates
 		item.Attributes = cloneStringMap(auth.Attributes)
+		if kind := auth.AuthKind(); kind != "" {
+			if item.Attributes == nil {
+				item.Attributes = make(map[string]string, 1)
+			}
+			if strings.TrimSpace(item.Attributes["auth_kind"]) == "" {
+				item.Attributes["auth_kind"] = kind
+			}
+		}
 		item.ModelMetadata = modelMetadataFromAuth(auth)
 		item.DisableCooling = disableCooling
 		if item.Version == 0 {
@@ -843,6 +851,11 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		metadata["request_retry"] = requestRetry
+	}
+	if rules, exists := auth.Metadata["request_scoped_errors"]; exists && rules != nil {
+		metadata["request_scoped_errors"] = cloneMetadataValue(rules)
+	} else if rules, exists := auth.Metadata["request-scoped-errors"]; exists && rules != nil {
+		metadata["request_scoped_errors"] = cloneMetadataValue(rules)
 	}
 	if weight, exists := auth.Metadata["weight"]; exists {
 		metadata["weight"] = weight

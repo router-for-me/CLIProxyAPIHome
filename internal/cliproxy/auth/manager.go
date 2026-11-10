@@ -1123,7 +1123,7 @@ func shouldSuspendRegistryModel(auth *Auth, model string, reason blockReason) bo
 	if state == nil {
 		return false
 	}
-	if isModelSupportResultError(state.LastError) {
+	if isModelSupportResultError(state.LastError) || isForceCooldownResultError(state.LastError) {
 		return true
 	}
 	switch statusCodeFromResult(state.LastError) {

@@ -15,6 +15,10 @@ const ErrorCodeStreamTruncated = "stream_truncated"
 // They must not change credential or model availability.
 const ErrorCodeRequestScoped = "request_scoped"
 
+// ErrorCodeForceCooldown marks failures that must enforce credential cooldown
+// even when cooling is disabled or the HTTP status is not normally cooled.
+const ErrorCodeForceCooldown = "force_cooldown"
+
 // ErrorCodeRefreshOutcomeUnknown identifies legacy refresh diagnostics.
 // New failures use the normal transient refresh error and bounded backoff.
 const ErrorCodeRefreshOutcomeUnknown = "refresh_outcome_unknown"
