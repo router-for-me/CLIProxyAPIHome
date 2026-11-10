@@ -19,9 +19,12 @@ const (
 	postgresQueryCanceled    = "57014"
 )
 
-var lifecycleTimeoutSQL = fmt.Sprintf(`SELECT set_config(name, LEAST(NULLIF(setting::bigint, 0),
-	CASE name WHEN 'lock_timeout' THEN %d ELSE %d END)::text, true)
-	FROM pg_settings WHERE name IN ('lock_timeout', 'statement_timeout')`,
+// current_setting includes units (for example, 100ms or 1min). Convert to
+// milliseconds directly instead of enumerating PostgreSQL's configuration catalog.
+// Zero disables a timeout, so treat it as unbounded before applying our limit.
+var lifecycleTimeoutSQL = fmt.Sprintf(`SELECT set_config(name,
+	LEAST(NULLIF(EXTRACT(EPOCH FROM current_setting(name)::interval) * 1000, 0), budget)::bigint::text, true)
+	FROM (VALUES ('lock_timeout', %d), ('statement_timeout', %d)) AS limits(name, budget)`,
 	lifecycleLockTimeout.Milliseconds(), lifecycleTransactionBudget.Milliseconds())
 
 type lifecycleTransactionKey struct{}

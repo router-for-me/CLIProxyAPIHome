@@ -87,7 +87,13 @@ func assertQuiescenceLockOrder(t *testing.T, order []string) {
 	}
 }
 
+// Keep the *testing.T signature for table-driven repository factory callbacks.
 func newPostgresQuiescenceRepository(t *testing.T) *Repository {
+	t.Helper()
+	return newPostgresQuiescenceTestRepository(t)
+}
+
+func newPostgresQuiescenceTestRepository(t testing.TB) *Repository {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("HOME_TEST_POSTGRES_DSN"))
 	if dsn == "" {
