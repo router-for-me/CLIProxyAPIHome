@@ -229,7 +229,7 @@ func TestClusterBroadcastDeliversToConnectionsAndPreservesRebalance(t *testing.T
 				t.Error(errClose)
 			}
 		})
-		cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connections[i]))
+		cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connections[i]), newSubscriptionLiveness(0))
 		cancels = append(cancels, cancel)
 		t.Cleanup(cancel)
 	}

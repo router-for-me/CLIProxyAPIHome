@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,7 +65,7 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 			return nil
 		}))
 	}
-	sqlDB := stdlib.OpenDB(*pgConfig, options...)
+	sqlDB := sql.OpenDB(lifecyclePostgresConnector{Connector: stdlib.GetConnector(*pgConfig, options...)})
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	if cfg.MaxIdleConns != nil {
 		sqlDB.SetMaxIdleConns(*cfg.MaxIdleConns)

@@ -20,11 +20,11 @@ func TestPostgresTransactionTracerOnlyMeasuresStartupBegin(t *testing.T) {
 	}}
 	ctx := context.WithValue(t.Context(), postgresTransactionStartupKey{}, &startup)
 	tracer := postgresTransactionTracer{}
-	for _, statement := range []string{"SELECT 1", "commit", "rollback", "begin", "begin isolation level serializable"} {
+	for _, statement := range []string{"SELECT 1", "commit", "rollback", "begin", "begin isolation level serializable", "begin; " + lifecycleTimeoutSQL} {
 		queryCtx := tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{SQL: statement})
 		tracer.TraceQueryEnd(queryCtx, nil, pgx.TraceQueryEndData{Err: errors.New("begin failure")})
 	}
-	if !startup.observed || startup.beginDuration != 2*time.Millisecond {
+	if !startup.observed || startup.beginDuration != 3*time.Millisecond {
 		t.Fatalf("unexpected BEGIN measurement: %+v", startup)
 	}
 	if ctx.Value(postgresTransactionBeginKey{}) != nil {

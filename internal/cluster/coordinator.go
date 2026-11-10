@@ -158,17 +158,22 @@ func (c *Coordinator) runStartupRecovery(ctx context.Context, incarnation HomeIn
 }
 
 func (c *Coordinator) runLifecycleCleanup(ctx context.Context) error {
-	if errCleanup := c.repo.CleanupStaleMemberships(ctx); errCleanup != nil {
-		return errCleanup
+	ctx = contextOrBackground(ctx)
+	errCleanup := c.repo.CleanupStaleMemberships(ctx)
+	if errContext := ctx.Err(); errContext != nil {
+		return errors.Join(errCleanup, errContext)
 	}
 	home, initialized := c.HomeIncarnation()
 	if !initialized {
-		return fmt.Errorf("cluster coordinator is not initialized")
+		return errors.Join(errCleanup, fmt.Errorf("cluster coordinator is not initialized"))
 	}
-	if errRecovery := c.runStartupRecovery(ctx, home); errRecovery != nil {
-		return errRecovery
+	// One blocked membership must not starve recovery of unrelated lifetimes.
+	errRecovery := c.runStartupRecovery(ctx, home)
+	if errContext := ctx.Err(); errContext != nil {
+		return errors.Join(errCleanup, errRecovery, errContext)
 	}
-	return c.repo.DeleteExpiredCPANodeSnapshots(ctx, cpaNodeSnapshotRetention(c.heartbeatTimeout))
+	errSnapshots := c.repo.DeleteExpiredCPANodeSnapshots(ctx, cpaNodeSnapshotRetention(c.heartbeatTimeout))
+	return errors.Join(errCleanup, errRecovery, errSnapshots)
 }
 
 func (c *Coordinator) retireFailedInitialization(ctx context.Context, incarnation HomeIncarnationID, initializationErr error) error {

@@ -259,6 +259,8 @@ The following v8 routes are derived from `internal/managementhttp/routes_v8.go` 
 
 Returns the normalized v8 view of persisted Home configuration and DB-backed upstream API-key credentials, with `config-version: 8`. This is a persisted configuration view, not a dump of every effective runtime default. Optional absent fields can be omitted. Reads set `Cache-Control: no-store`.
 
+V8 configuration GETs (including subtrees and YAML) read committed data without initializing or taking row locks on lifecycle configuration. Initialization and lifecycle validation happen at startup; a missing lifecycle row returns `500 config_load_failed` rather than creating defaults during a read.
+
 Example response excerpt:
 
 ```json
@@ -412,6 +414,8 @@ The `credentials.concurrency` object is included in both config responses. Home 
 | `cleanup-interval` | `5s` | Lifecycle cleanup interval. |
 
 All durations must be positive. Home also requires `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`, rejecting duration-sum overflow as invalid. While any CPA membership is `active` or `canceling`, changes to `cpa-heartbeat-timeout`, `cpa-cancel-bound`, `reclaim-grace`, or `cleanup-interval` are rejected with `lifecycle configuration is in use`. An identical configuration is accepted as unchanged, and non-safety tuning fields may still be updated.
+
+A subscription renews its heartbeat deadline only after Home successfully persists its liveness. A transient database timeout withholds PONG without immediately fencing the subscription, but Home independently fences the exact lifetime once its membership `cpa-heartbeat-timeout` elapses without successful persistence. The deadline belongs to the lifetime: subscription disconnect or unsubscribe cannot cancel it, and it is registered before client-count synchronization or initial delivery. Expiry also cancels associated command connections and local tasks, even while the database is unavailable. Configuration/cluster messages and RTT echoes do not extend this deadline. Explicit membership invalidation or Home fencing still causes immediate fencing. This Home-side protection also applies to existing CPA clients; updated CPA clients likewise renew their receive deadline only on valid heartbeat PONGs.
 
 ## Nodes, Version, and Certificates
 
