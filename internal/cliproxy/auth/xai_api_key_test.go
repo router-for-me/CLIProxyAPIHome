@@ -59,3 +59,46 @@ func TestDispatchResolvesXAIAPIKeyModelAlias(t *testing.T) {
 		t.Fatalf("Dispatch() force mapping = %t/%q, want true/grok-latest", decision.ForceMapping, decision.OriginalAlias)
 	}
 }
+
+func TestDispatchResolvesOpenAICompatibilityMetadataAliasWithEmptyConfig(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{})
+	auth := &Auth{
+		ID:       "zai-api-key-auth",
+		Provider: "zai-coding",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"api_key":     "zai-key",
+			"base_url":    "https://api.example.test/v1",
+			"compat_name": "zai-coding",
+		},
+		Metadata: map[string]any{
+			homeConfigModelsMetadataKey: []map[string]any{{
+				"id":           "fractalops-coding",
+				"name":         "glm-5.3",
+				"user_defined": true,
+			}},
+		},
+	}
+	registerDispatchTestAuth(t, manager, auth, "fractalops-coding")
+
+	decision, errDispatch := manager.Dispatch(
+		context.Background(),
+		[]string{"zai-coding"},
+		"fractalops-coding",
+		Options{},
+	)
+	if errDispatch != nil {
+		t.Fatalf("Dispatch() error = %v", errDispatch)
+	}
+	if decision == nil || decision.Auth == nil || decision.Auth.ID != auth.ID {
+		t.Fatalf("Dispatch() decision = %#v", decision)
+	}
+	if decision.Provider != "zai-coding" || decision.UpstreamModel != "glm-5.3" {
+		t.Fatalf(
+			"Dispatch() provider/model = %q/%q, want zai-coding/glm-5.3",
+			decision.Provider,
+			decision.UpstreamModel,
+		)
+	}
+}
