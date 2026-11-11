@@ -381,7 +381,13 @@ Example `PUT /config/requests/payload/filter` body:
 Example `PATCH /config/oauth/providers/antigravity` body:
 
 ```json
-{ "sensitive-words": ["API", "proxy"], "connection-pool": { "enabled": true } }
+{
+  "sensitive-words": ["API", "proxy"],
+  "sensitive-words-replace": {
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+  },
+  "connection-pool": { "enabled": true }
+}
 ```
 
 Settings under `oauth.providers` are OAuth-scoped. API-key credentials use their own group/key options; the v8 OAuth provider settings do not implicitly configure API-key credentials.
@@ -2057,7 +2063,7 @@ Credits remain local to each Home process and reset on restart, selector replace
 | `disable-codex-cloaking` | Codex | Optional boolean controlling Codex identity headers for this API-key credential. |
 | `websockets` | Codex, xAI | Enables Responses WebSocket transport. |
 | `alpha-search` | Codex | Allows `/v1/alpha/search` through the configured upstream `/alpha/search`. |
-| `cloak` | Claude | Object with `mode`, `strict-mode`, `sensitive-words`, and `cache-user-id`. |
+| `cloak` | Claude | Object with `mode`, `strict-mode`, `sensitive-words`, `sensitive-words-replace`, and `cache-user-id`. |
 | `experimental-cch-signing` | Claude | Retained for compatibility; signing is automatic on supported direct upstreams. |
 | `rebuild-mid-system-message` | Claude | Rebuilds system messages found in the conversation body. |
 | `native-tool-search` | Claude | Trusts a custom base URL with Anthropic native tool search (`defer_loading` + `tool_reference`) for Codex `tool_search`; official `api.anthropic.com` keys use it automatically. Requires `upstream.claude.tool-search: true`. |
@@ -4220,7 +4226,8 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `routing.session-affinity-subagents` | optional boolean | Controls Home parent-credential inheritance for unbound child sessions. Ordinary children inherit within the same provider/model; Guardian requests (`X-Openai-Subagent: guardian`, case-insensitive) can inherit the parent session's latest live selection across models on eligible real providers. Existing child bindings take precedence. Default: `true`; ignored when `session-affinity` is disabled. `false` uses normal credential selection without clearing existing child bindings or disabling fork, compaction, and content-hash fallbacks; it does not force a different credential from the parent. Applies on config reload. Upgrade all Home nodes before relying on this switch cluster-wide. CPA must forward fork/compaction markers (`node_kind` / `X-Node-Kind`) when they are not present in the original headers. |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | Enables Antigravity thinking signature cache validation. |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
-| `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate with zero-width characters in system instructions. |
+| `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate in system instructions. |
+| `oauth.providers.antigravity.sensitive-words-replace` | object string to string | Target-to-replacement string map applied to system instructions (empty string deletes the matched phrase). |
 | `api-keys.gemini` | array of groups | Upstream gemini groups with `keys`; see the provider configuration section. |
 | `api-keys.interactions` | array of groups | Upstream interactions groups with `keys`; see the provider configuration section. |
 | `api-keys.codex` | array of groups | Upstream codex groups with `keys`; see the provider configuration section. |
@@ -4293,7 +4300,8 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `oauth.providers.antigravity.connection-pool.idle-conn-timeout` | duration string | Idle timeout, default `30s`, capped at `210s`. |
 | `oauth.providers.antigravity.connection-pool.max-idle-conns-per-host` | optional integer | Idle connections per host per credential; default `2`. |
 | `upstream.xai.inject-x-search` | boolean | Injects native `x_search` when absent from the request. |
-| `oauth.providers.devin.sensitive-words` | string array | Words obfuscated in system prompts/messages. |
+| `oauth.providers.devin.sensitive-words` | string array | Words used to strip matching lines in system prompts. |
+| `oauth.providers.devin.sensitive-words-replace` | object string to string | Target-to-replacement string map applied to system prompts (empty string deletes the matched phrase). |
 | `oauth.model-alias.*[].display-name` | string | Optional catalog display-name override. |
 | `multimedia.gpt-image-2-base-model` | string | Base model used for GPT Image 2 requests. |
 | `multimedia.video-result-auth-cache-ttl` | duration string | Video-result credential association lifetime. |

@@ -203,6 +203,7 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg.SanitizeOAuthModelAlias()
 	cfg.SanitizePayloadRules()
 	cfg.SanitizeAntigravity()
+	cfg.SanitizeDevin()
 	if cfg.Pprof.Addr == "" {
 		cfg.Pprof.Addr = appconfig.DefaultPprofAddr
 	}

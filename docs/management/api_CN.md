@@ -381,7 +381,13 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 `PATCH /config/oauth/providers/antigravity` 请求体示例：
 
 ```json
-{ "sensitive-words": ["API", "proxy"], "connection-pool": { "enabled": true } }
+{
+  "sensitive-words": ["API", "proxy"],
+  "sensitive-words-replace": {
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+  },
+  "connection-pool": { "enabled": true }
+}
 ```
 
 `oauth.providers` 下的设置仅作用于 OAuth。API Key 凭证使用自己的分组/key 选项，不会隐式继承 v8 OAuth provider 配置。
@@ -2048,7 +2054,7 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 | `disable-codex-cloaking` | Codex | 可选布尔值，控制该 API Key 凭证的 Codex 身份请求头。 |
 | `websockets` | Codex、xAI | 启用 Responses WebSocket 传输。 |
 | `alpha-search` | Codex | 允许 `/v1/alpha/search` 通过配置的上游 `/alpha/search` 执行。 |
-| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`cache-user-id` 的对象。 |
+| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`sensitive-words-replace`、`cache-user-id` 的对象。 |
 | `experimental-cch-signing` | Claude | 兼容保留；支持的直连上游已自动签名。 |
 | `rebuild-mid-system-message` | Claude | 重建会话正文中间的 system 消息。 |
 | `native-tool-search` | Claude | 信任自定义 base URL 支持 Anthropic 原生 tool search（`defer_loading` + `tool_reference`），用于 Codex `tool_search`；官方 `api.anthropic.com` 凭证自动启用。需要开启 `upstream.claude.tool-search`。 |
@@ -4204,7 +4210,8 @@ Query 参数：
 | `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承父凭证。普通子会话仅在同 provider、同模型内继承；Guardian 请求（`X-Openai-Subagent: guardian`，大小写不敏感）可跨模型继承父会话在合格真实 provider 上最近的有效选择，已有子绑定优先。默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
-| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中进行混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words-replace` | object string to string | 在 system instructions 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
 | `api-keys.gemini` | 分组数组 | 上游 gemini 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.interactions` | 分组数组 | 上游 interactions 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.codex` | 分组数组 | 上游 codex 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
@@ -4277,7 +4284,8 @@ Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启�
 | `oauth.providers.antigravity.connection-pool.idle-conn-timeout` | duration string | 空闲超时，默认 `30s`，最大 `210s`。 |
 | `oauth.providers.antigravity.connection-pool.max-idle-conns-per-host` | optional integer | 每凭证每 host 的空闲连接数，默认 `2`。 |
 | `upstream.xai.inject-x-search` | boolean | 请求未提供时注入原生 `x_search`。 |
-| `oauth.providers.devin.sensitive-words` | string array | system prompt/消息中需要混淆的词。 |
+| `oauth.providers.devin.sensitive-words` | string array | system prompt 中匹配后整行剔除的敏感词列表。 |
+| `oauth.providers.devin.sensitive-words-replace` | object string to string | system prompt 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
 | `oauth.model-alias.*[].display-name` | string | 可选目录显示名覆盖。 |
 | `multimedia.gpt-image-2-base-model` | string | GPT Image 2 请求使用的基础模型。 |
 | `multimedia.video-result-auth-cache-ttl` | duration string | 视频结果与凭证关联缓存的有效期。 |

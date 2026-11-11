@@ -177,3 +177,41 @@ func TestSanitizeConfigYAMLForDownstreamForwardsClaudeToolSearch(t *testing.T) {
 		t.Fatalf("downstream config kept a v8 upstream block: %q", out)
 	}
 }
+
+func TestSanitizeConfigYAMLForDownstreamForwardsSensitiveWordsReplace(t *testing.T) {
+	input := `config-version: 8
+oauth:
+  providers:
+    antigravity:
+      sensitive-words-replace:
+        "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+        "RemoveOnly": ""
+    devin:
+      sensitive-words-replace:
+        "Claude Code": "Devin"
+`
+	out, errSanitize := sanitizeConfigYAMLForDownstream([]byte(input))
+	if errSanitize != nil {
+		t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+	}
+	var decoded struct {
+		Antigravity struct {
+			SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace"`
+		} `yaml:"antigravity"`
+		Devin struct {
+			SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace"`
+		} `yaml:"devin"`
+	}
+	if errUnmarshal := yaml.Unmarshal(out, &decoded); errUnmarshal != nil {
+		t.Fatalf("yaml.Unmarshal(out) error = %v", errUnmarshal)
+	}
+	if decoded.Antigravity.SensitiveWordsReplace["You are Codex, an agent based on GPT-5."] != "You are a helpful coding assistant." {
+		t.Fatalf("downstream antigravity replacements = %#v", decoded.Antigravity.SensitiveWordsReplace)
+	}
+	if val, ok := decoded.Antigravity.SensitiveWordsReplace["RemoveOnly"]; !ok || val != "" {
+		t.Fatalf("downstream empty deletion lost: %#v", decoded.Antigravity.SensitiveWordsReplace)
+	}
+	if decoded.Devin.SensitiveWordsReplace["Claude Code"] != "Devin" {
+		t.Fatalf("downstream devin replacements = %#v", decoded.Devin.SensitiveWordsReplace)
+	}
+}

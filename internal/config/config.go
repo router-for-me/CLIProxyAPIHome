@@ -224,8 +224,11 @@ type CodexHeaderDefaults struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
-	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
+	// SensitiveWords is a list of words to obfuscate in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+
+	// SensitiveWordsReplace maps target substrings to literal replacement text in system instructions.
+	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
 
 	// Settings shared with CPA V8.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
@@ -415,6 +418,9 @@ type CloakConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters.
 	// This can help bypass certain content filters.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+
+	// SensitiveWordsReplace maps target substrings to literal replacement text when cloaking.
+	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
 
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.
@@ -982,8 +988,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
-	// Sanitize Antigravity configuration.
+	// Sanitize Antigravity and Devin configurations.
 	cfg.SanitizeAntigravity()
+	cfg.SanitizeDevin()
 
 	ForceHomeRuntimeConfig(&cfg)
 
@@ -1080,19 +1087,40 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 }
 
-// SanitizeAntigravity trims surrounding whitespace and drops empty words from Antigravity sensitive words.
+// SanitizeAntigravity trims surrounding whitespace and drops empty entries from Antigravity sensitive-word settings.
 func (cfg *Config) SanitizeAntigravity() {
-	if cfg == nil || len(cfg.Antigravity.SensitiveWords) == 0 {
+	if cfg == nil {
 		return
 	}
-	cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
-	for _, word := range cfg.Antigravity.SensitiveWords {
-		word = strings.TrimSpace(word)
-		if word != "" {
-			cleaned = append(cleaned, word)
+	if len(cfg.Antigravity.SensitiveWords) > 0 {
+		cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
+		for _, word := range cfg.Antigravity.SensitiveWords {
+			word = strings.TrimSpace(word)
+			if word != "" {
+				cleaned = append(cleaned, word)
+			}
 		}
+		cfg.Antigravity.SensitiveWords = cleaned
 	}
-	cfg.Antigravity.SensitiveWords = cleaned
+	cfg.Antigravity.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Antigravity.SensitiveWordsReplace)
+}
+
+// SanitizeDevin trims surrounding whitespace and drops empty entries from Devin sensitive-word settings.
+func (cfg *Config) SanitizeDevin() {
+	if cfg == nil {
+		return
+	}
+	if len(cfg.Devin.SensitiveWords) > 0 {
+		cleaned := make([]string, 0, len(cfg.Devin.SensitiveWords))
+		for _, word := range cfg.Devin.SensitiveWords {
+			word = strings.TrimSpace(word)
+			if word != "" {
+				cleaned = append(cleaned, word)
+			}
+		}
+		cfg.Devin.SensitiveWords = cleaned
+	}
+	cfg.Devin.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Devin.SensitiveWordsReplace)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1334,7 +1362,32 @@ func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
 	return out
 }
 
-// SanitizeClaudeKeys normalizes headers for Claude credentials.
+// NormalizeCloakConfig trims strings and removes blank sensitive words.
+func NormalizeCloakConfig(cloak *CloakConfig) *CloakConfig {
+	if cloak == nil {
+		return nil
+	}
+	cloak.Mode = strings.TrimSpace(cloak.Mode)
+	if len(cloak.SensitiveWords) > 0 {
+		normalizedWords := make([]string, 0, len(cloak.SensitiveWords))
+		for _, w := range cloak.SensitiveWords {
+			if trimmed := strings.TrimSpace(w); trimmed != "" {
+				normalizedWords = append(normalizedWords, trimmed)
+			}
+		}
+		if len(normalizedWords) > 0 {
+			cloak.SensitiveWords = normalizedWords
+		} else {
+			cloak.SensitiveWords = nil
+		}
+	} else {
+		cloak.SensitiveWords = nil
+	}
+	cloak.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cloak.SensitiveWordsReplace)
+	return cloak
+}
+
+// SanitizeClaudeKeys normalizes headers and cloak settings for Claude credentials.
 func (cfg *Config) SanitizeClaudeKeys() {
 	if cfg == nil || len(cfg.ClaudeKey) == 0 {
 		return
@@ -1344,6 +1397,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.Cloak = NormalizeCloakConfig(entry.Cloak)
 	}
 }
 
@@ -1451,6 +1505,34 @@ func NormalizeRemoteManagementSecret(secret string) (string, bool, error) {
 		return "", false, errHash
 	}
 	return hashed, true, nil
+}
+
+// NormalizeSensitiveWordsReplace trims replacement target keys, drops blank keys,
+// and preserves replacement values (including empty strings for phrase deletion).
+func NormalizeSensitiveWordsReplace(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(in))
+	for _, rawKey := range keys {
+		trimmedKey := strings.TrimSpace(rawKey)
+		if trimmedKey == "" {
+			continue
+		}
+		if _, exists := out[trimmedKey]; exists && rawKey != trimmedKey {
+			continue
+		}
+		out[trimmedKey] = in[rawKey]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // NormalizeHeaders trims header keys and values and removes empty pairs.

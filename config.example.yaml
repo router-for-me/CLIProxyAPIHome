@@ -719,14 +719,13 @@ upstream:
 #           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
 #           rebuild-mid-system-message: false # optional: default is false; when true, move messages with role "system" into the top-level Claude system field
 #           native-tool-search: false # optional: default is false; when true, trust this key's custom base-url with Anthropic native tool search (defer_loading + tool_reference) for Codex tool_search; requires upstream.claude.tool-search: true
-#           # CPA file-mode reference: Home currently does not retain per-key cloak blocks.
 #           # cloak:                         # optional: explicitly enable request cloaking for non-Claude-Code clients
-#           #   mode: "auto"                 # "auto" (default inside this block): cloak only when client is not Claude Code
+#           #   mode: "auto"                 # omitted inherits shared default; explicit "auto": cloak only when client is not Claude Code
 #           #                                # "always": cloak every unconfirmed client; confirmed native Claude Code still passes through
 #           #                                # "never": never apply cloaking
 #           #   # This "cloak" block applies to this api-keys.claude key entry only. For Claude OAuth
 #           #   # credentials, set the same options in the auth/token JSON file via "cloak_mode" /
-#           #   # "cloak_strict_mode" / "cloak_sensitive_words" / "cloak_cache_user_id".
+#           #   # "cloak_strict_mode" / "cloak_sensitive_words" / "cloak_sensitive_words_replace" / "cloak_cache_user_id".
 #           #   # upstream.claude.disable-claude-cloak-mode is the shared default; this key can override it.
 #           #   strict-mode: false           # false (default): legacy-model whitelist uses a user system-reminder;
 #           #                                # all other and future models use messages[].role=system
@@ -734,6 +733,8 @@ upstream:
 #           #   sensitive-words:             # optional: words to obfuscate with zero-width characters
 #           #     - "API"
 #           #     - "proxy"
+#           #   sensitive-words-replace:     # optional: target-to-replacement string map
+#           #     "Claude Code": "Claude"
 #           #   cache-user-id: true          # optional: default is false; set true to reuse cached user_id per API key instead of generating a random one each request
 #           #   # Every custom tool on a cloaked OAuth request automatically uses a caller-stable opaque mcp__<server>__<tool> alias.
 #
@@ -1091,9 +1092,11 @@ oauth:
 
     # Antigravity provider behavior.
     antigravity:
-      # sensitive-words:              # optional: words to obfuscate with zero-width characters in system instructions
+      # sensitive-words:              # optional: words to obfuscate in system instructions
       #   - "API"
       #   - "proxy"
+      # sensitive-words-replace:      # optional: target-to-replacement string map in system instructions
+      #   "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
       # connection-pool:              # optional: upstream HTTP connection pool settings
       #   enabled: false             # whether to enable connection pooling (default: false)
       #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)
@@ -1113,9 +1116,11 @@ oauth:
 
     # Devin provider behavior.
     # devin:
-    #   sensitive-words:             # optional: words to obfuscate with zero-width characters in system instructions and prompts
+    #   sensitive-words:             # optional: words to remove matching lines in system prompts
     #     - "API"
     #     - "proxy"
+    #   sensitive-words-replace:     # optional: target-to-replacement string map in system prompts
+    #     "Claude Code": "Devin"
 
 # Image and video behavior.
 multimedia:
