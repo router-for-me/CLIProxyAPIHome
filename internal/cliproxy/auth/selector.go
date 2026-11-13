@@ -348,6 +348,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if credentialExpiryBlocksDispatch(auth, now) {
+		return true, blockReasonOther, time.Time{}
+	}
 	if RefreshBlocksDispatch(auth) {
 		return true, blockReasonOther, auth.NextRetryAfter
 	}
