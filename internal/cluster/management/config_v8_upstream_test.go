@@ -194,3 +194,94 @@ func TestConfigV8SensitiveWordsReplaceDatabaseRoundTrip(t *testing.T) {
 		t.Fatalf("cleared cloak persisted in GET api-keys/claude: %s", claudeReadAfter)
 	}
 }
+
+func TestConfigV8SensitivePatternsReplaceDatabaseRoundTrip(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	defer cleanup()
+	repo := cluster.NewRepository(db)
+	h := NewHandler(repo, nil, "127.0.0.1", 0)
+	router := gin.New()
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		router.Handle(method, "/v8/management/config/*path", h.ConfigV8)
+	}
+	request := func(method, path, body string, want int) string {
+		t.Helper()
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(method, "/v8/management/config/"+path, strings.NewReader(body)))
+		if response.Code != want {
+			t.Fatalf("%s %s: status %d, want %d: %s", method, path, response.Code, want, response.Body.String())
+		}
+		return response.Body.String()
+	}
+
+	request(http.MethodPut, "oauth/providers/antigravity/sensitive-patterns-replace", `[{"pattern":"(?m)^RFC 2119[^\\n]*\\n?","replacement":""}]`, http.StatusOK)
+	request(http.MethodPut, "oauth/providers/devin/sensitive-patterns-replace", `[{"pattern":"(?m)^You are omp[^\\n]*\\n?","replacement":""}]`, http.StatusOK)
+
+	if got := request(http.MethodGet, "oauth/providers/antigravity/sensitive-patterns-replace", "", http.StatusOK); !strings.Contains(got, "RFC 2119") || !strings.Contains(got, `"replacement":""`) {
+		t.Fatalf("GET antigravity sensitive-patterns-replace = %s", got)
+	}
+
+	cfg, _, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if len(cfg.Antigravity.SensitivePatternsReplace) != 1 || cfg.Antigravity.SensitivePatternsReplace[0].Replacement != "" {
+		t.Fatalf("Antigravity.SensitivePatternsReplace = %#v", cfg.Antigravity.SensitivePatternsReplace)
+	}
+	if len(cfg.Devin.SensitivePatternsReplace) != 1 {
+		t.Fatalf("Devin.SensitivePatternsReplace = %#v", cfg.Devin.SensitivePatternsReplace)
+	}
+	if !cfg.OAuthOnlyFields["antigravity.sensitive-patterns-replace"] || !cfg.OAuthOnlyFields["devin.sensitive-patterns-replace"] {
+		t.Fatalf("OAuthOnlyFields missing sensitive-patterns-replace: %#v", cfg.OAuthOnlyFields)
+	}
+
+	request(http.MethodDelete, "oauth/providers/antigravity/sensitive-patterns-replace", "", http.StatusOK)
+	request(http.MethodGet, "oauth/providers/antigravity/sensitive-patterns-replace", "", http.StatusNotFound)
+
+	request(
+		http.MethodPut,
+		"api-keys/claude",
+		`[{"name":"claude-team","keys":[{"api-key":"sk-ant-cloak-pat-1","cloak":{"mode":"always","sensitive-patterns-replace":[{"pattern":"(?m)^You are omp[^\\n]*\\n?","replacement":""},{"pattern":"Claude\\s+Code","replacement":"Claude"}]}}]}]`,
+		http.StatusOK,
+	)
+	claudeRead := request(http.MethodGet, "api-keys/claude", "", http.StatusOK)
+	if !strings.Contains(claudeRead, "sensitive-patterns-replace") || !strings.Contains(claudeRead, `"replacement":""`) {
+		t.Fatalf("GET api-keys/claude missing sensitive-patterns-replace: %s", claudeRead)
+	}
+
+	auths, errList := repo.ListAuths(context.Background())
+	if errList != nil || len(auths) != 1 {
+		t.Fatalf("ListAuths() = %d, err = %v", len(auths), errList)
+	}
+	dispatched := home.SanitizeAuthForDownstream(auths[0])
+	var attrPatterns []map[string]string
+	if errUnmarshal := json.Unmarshal([]byte(dispatched.Attributes["cloak_sensitive_patterns_replace"]), &attrPatterns); errUnmarshal != nil {
+		t.Fatalf("unmarshal cloak_sensitive_patterns_replace attr: %v (raw=%q)", errUnmarshal, dispatched.Attributes["cloak_sensitive_patterns_replace"])
+	}
+	if len(attrPatterns) != 2 || attrPatterns[0]["replacement"] != "" || attrPatterns[1]["replacement"] != "Claude" {
+		t.Fatalf("dispatched cloak_sensitive_patterns_replace = %#v", attrPatterns)
+	}
+	if metaPatterns, okMeta := dispatched.Metadata["cloak_sensitive_patterns_replace"].([]any); !okMeta || len(metaPatterns) != 2 {
+		t.Fatalf("dispatched metadata cloak_sensitive_patterns_replace = %#v", dispatched.Metadata["cloak_sensitive_patterns_replace"])
+	}
+	credOpts, okOpts := dispatched.Metadata["credential_options"].(map[string]any)
+	if !okOpts {
+		t.Fatalf("missing credential_options in metadata: %#v", dispatched.Metadata)
+	}
+	cloakOpt, okCloakOpt := credOpts["cloak"].(map[string]any)
+	if !okCloakOpt {
+		t.Fatalf("missing credential_options.cloak: %#v", credOpts)
+	}
+	if rawPatterns, okRaw := cloakOpt["sensitive-patterns-replace"].([]any); !okRaw || len(rawPatterns) != 2 {
+		t.Fatalf("credential_options.cloak.sensitive-patterns-replace = %#v", cloakOpt["sensitive-patterns-replace"])
+	}
+
+	request(http.MethodPut, "api-keys/claude", `[{"name":"claude-team","keys":[{"api-key":"sk-ant-cloak-pat-1"}]}]`, http.StatusOK)
+	authsAfter, errListAfter := repo.ListAuths(context.Background())
+	if errListAfter != nil || len(authsAfter) != 1 {
+		t.Fatalf("ListAuths() after clear = %d, err = %v", len(authsAfter), errListAfter)
+	}
+	if _, hasAttr := authsAfter[0].Attributes["cloak_sensitive_patterns_replace"]; hasAttr {
+		t.Fatalf("cleared cloak left cloak_sensitive_patterns_replace attribute: %#v", authsAfter[0].Attributes)
+	}
+}

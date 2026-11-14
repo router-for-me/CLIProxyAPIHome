@@ -96,6 +96,19 @@ func projectClaudeCloakOptions(raw any, attrs map[string]string, metadata map[st
 		}
 		metadata["cloak_sensitive_words_replace"] = copied
 	}
+	if len(cloakCfg.SensitivePatternsReplace) > 0 {
+		if patBytes, errMarshalPat := json.Marshal(cloakCfg.SensitivePatternsReplace); errMarshalPat == nil {
+			attrs["cloak_sensitive_patterns_replace"] = string(patBytes)
+		}
+		copied := make([]map[string]string, 0, len(cloakCfg.SensitivePatternsReplace))
+		for _, rule := range cloakCfg.SensitivePatternsReplace {
+			copied = append(copied, map[string]string{
+				"pattern":     rule.Pattern,
+				"replacement": rule.Replacement,
+			})
+		}
+		metadata["cloak_sensitive_patterns_replace"] = copied
+	}
 	if cloakCfg.CacheUserID != nil {
 		attrs["cloak_cache_user_id"] = strconv.FormatBool(*cloakCfg.CacheUserID)
 	}

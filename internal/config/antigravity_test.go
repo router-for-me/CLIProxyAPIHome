@@ -138,3 +138,53 @@ api-keys:
 		t.Fatalf("ClaudeKey[0].Cloak = %#v", cfg.ClaudeKey)
 	}
 }
+
+func TestParseAndValidateV8_SensitivePatternsReplace(t *testing.T) {
+	v8Content := []byte(`config-version: 8
+oauth:
+  providers:
+    antigravity:
+      sensitive-patterns-replace:
+        - pattern: '(?m)^RFC 2119[^\n]*\n?'
+          replacement: ""
+        - pattern: '[invalid'
+          replacement: "ignored"
+    devin:
+      sensitive-patterns-replace:
+        - pattern: '(?m)^You are omp[^\n]*\n?'
+          replacement: ""
+api-keys:
+  claude:
+    - name: claude-1
+      keys:
+        - api-key: sk-ant-test
+          cloak:
+            mode: always
+            sensitive-patterns-replace:
+              - pattern: 'Claude\s+Code'
+                replacement: "Claude"
+`)
+	if errValidate := ValidateV8Config(v8Content); errValidate != nil {
+		t.Fatalf("ValidateV8Config() error = %v", errValidate)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, v8Content, 0o600); errWrite != nil {
+		t.Fatalf("write config file: %v", errWrite)
+	}
+	cfg, errLoad := LoadConfigOptional(configPath, false)
+	if errLoad != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", errLoad)
+	}
+	if len(cfg.Antigravity.SensitivePatternsReplace) != 1 || cfg.Antigravity.SensitivePatternsReplace[0].Pattern != `(?m)^RFC 2119[^\n]*\n?` || cfg.Antigravity.SensitivePatternsReplace[0].Replacement != "" {
+		t.Fatalf("Antigravity.SensitivePatternsReplace = %#v", cfg.Antigravity.SensitivePatternsReplace)
+	}
+	if len(cfg.Devin.SensitivePatternsReplace) != 1 || cfg.Devin.SensitivePatternsReplace[0].Pattern != `(?m)^You are omp[^\n]*\n?` {
+		t.Fatalf("Devin.SensitivePatternsReplace = %#v", cfg.Devin.SensitivePatternsReplace)
+	}
+	if !cfg.OAuthOnlyFields["antigravity.sensitive-patterns-replace"] || !cfg.OAuthOnlyFields["devin.sensitive-patterns-replace"] {
+		t.Fatalf("OAuthOnlyFields missing sensitive-patterns-replace scope: %#v", cfg.OAuthOnlyFields)
+	}
+	if len(cfg.ClaudeKey) != 1 || cfg.ClaudeKey[0].Cloak == nil || len(cfg.ClaudeKey[0].Cloak.SensitivePatternsReplace) != 1 || cfg.ClaudeKey[0].Cloak.SensitivePatternsReplace[0].Replacement != "Claude" {
+		t.Fatalf("ClaudeKey[0].Cloak.SensitivePatternsReplace = %#v", cfg.ClaudeKey)
+	}
+}

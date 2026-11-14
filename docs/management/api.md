@@ -2063,7 +2063,7 @@ Credits remain local to each Home process and reset on restart, selector replace
 | `disable-codex-cloaking` | Codex | Optional boolean controlling Codex identity headers for this API-key credential. |
 | `websockets` | Codex, xAI | Enables Responses WebSocket transport. |
 | `alpha-search` | Codex | Allows `/v1/alpha/search` through the configured upstream `/alpha/search`. |
-| `cloak` | Claude | Object with `mode`, `strict-mode`, `sensitive-words`, `sensitive-words-replace`, and `cache-user-id`. |
+| `cloak` | Claude | Object with `mode`, `strict-mode`, `sensitive-words`, `sensitive-words-replace`, `sensitive-patterns-replace`, and `cache-user-id`. |
 | `experimental-cch-signing` | Claude | Retained for compatibility; signing is automatic on supported direct upstreams. |
 | `rebuild-mid-system-message` | Claude | Rebuilds system messages found in the conversation body. |
 | `native-tool-search` | Claude | Trusts a custom base URL with Anthropic native tool search (`defer_loading` + `tool_reference`) for Codex `tool_search`; official `api.anthropic.com` keys use it automatically. Requires `upstream.claude.tool-search: true`. |
@@ -4228,6 +4228,7 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | Controls strictness of Antigravity signature bypass. |
 | `oauth.providers.antigravity.sensitive-words` | array of string | Words to obfuscate in system instructions. |
 | `oauth.providers.antigravity.sensitive-words-replace` | object string to string | Target-to-replacement string map applied to system instructions (empty string deletes the matched phrase). |
+| `oauth.providers.antigravity.sensitive-patterns-replace` | array of `{pattern, replacement}` | Ordered Go RE2 regex replacements applied to system instructions (empty `replacement` deletes matches). |
 | `api-keys.gemini` | array of groups | Upstream gemini groups with `keys`; see the provider configuration section. |
 | `api-keys.interactions` | array of groups | Upstream interactions groups with `keys`; see the provider configuration section. |
 | `api-keys.codex` | array of groups | Upstream codex groups with `keys`; see the provider configuration section. |
@@ -4302,6 +4303,7 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `upstream.xai.inject-x-search` | boolean | Injects native `x_search` when absent from the request. |
 | `oauth.providers.devin.sensitive-words` | string array | Words used to strip matching lines in system prompts. |
 | `oauth.providers.devin.sensitive-words-replace` | object string to string | Target-to-replacement string map applied to system prompts (empty string deletes the matched phrase). |
+| `oauth.providers.devin.sensitive-patterns-replace` | array of `{pattern, replacement}` | Ordered Go RE2 regex replacements applied to system prompts (empty `replacement` deletes matches). |
 | `oauth.model-alias.*[].display-name` | string | Optional catalog display-name override. |
 | `multimedia.gpt-image-2-base-model` | string | Base model used for GPT Image 2 requests. |
 | `multimedia.video-result-auth-cache-ttl` | duration string | Video-result credential association lifetime. |

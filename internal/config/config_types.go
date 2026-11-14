@@ -25,12 +25,24 @@ type XAIConfig struct {
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
 }
 
+// SensitivePatternRule defines a Go RE2 regular expression replacement rule.
+type SensitivePatternRule struct {
+	// Pattern is the Go RE2 regular expression to match.
+	Pattern string `yaml:"pattern" json:"pattern"`
+
+	// Replacement is the substitution string (empty string deletes matches).
+	Replacement string `yaml:"replacement" json:"replacement"`
+}
+
 type DevinConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system prompts and messages.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 
 	// SensitiveWordsReplace maps target substrings to literal replacement text in system prompts.
 	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
+
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system prompts.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 }
 
 type AntigravityConnectionPoolConfig struct {

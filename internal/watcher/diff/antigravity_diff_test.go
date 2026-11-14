@@ -95,3 +95,48 @@ func TestConfigDiff_SensitiveWordsReplace(t *testing.T) {
 		t.Fatalf("expected claude[0].cloak.sensitive-words: 1 -> 1, got %q", gotWords)
 	}
 }
+
+func TestConfigDiff_SensitivePatternsReplace(t *testing.T) {
+	oldCfg := &config.Config{
+		Antigravity: config.AntigravityConfig{
+			SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "a", Replacement: ""}},
+		},
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey: "sk-ant-1",
+			Cloak:  &config.CloakConfig{SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "c", Replacement: ""}}},
+		}},
+	}
+	newCfg := &config.Config{
+		Antigravity: config.AntigravityConfig{
+			SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "a", Replacement: ""}, {Pattern: "b", Replacement: "x"}},
+		},
+		Devin: config.DevinConfig{
+			SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "d", Replacement: ""}},
+		},
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey: "sk-ant-1",
+			Cloak:  &config.CloakConfig{SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "c", Replacement: "y"}}},
+		}},
+	}
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	joined := strings.Join(changes, "; ")
+	for _, want := range []string{
+		"antigravity.sensitive-patterns-replace: 1 -> 2",
+		"devin.sensitive-patterns-replace: 0 -> 1",
+		"claude[0].cloak.sensitive-patterns-replace: 1 -> 1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("BuildConfigChangeDetails() = %q, missing %q", joined, want)
+		}
+	}
+
+	emptyA := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "sk-ant-1", Cloak: &config.CloakConfig{}}}}
+	emptyB := &config.Config{
+		Antigravity: config.AntigravityConfig{SensitivePatternsReplace: []config.SensitivePatternRule{}},
+		Devin:       config.DevinConfig{SensitivePatternsReplace: []config.SensitivePatternRule{}},
+		ClaudeKey:   []config.ClaudeKey{{APIKey: "sk-ant-1", Cloak: &config.CloakConfig{SensitivePatternsReplace: []config.SensitivePatternRule{}}}},
+	}
+	if noDiff := BuildConfigChangeDetails(emptyA, emptyB); len(noDiff) != 0 {
+		t.Fatalf("expected no diff between nil and empty SensitivePatternsReplace slices, got %v", noDiff)
+	}
+}

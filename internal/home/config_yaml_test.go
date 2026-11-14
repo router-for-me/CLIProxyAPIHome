@@ -215,3 +215,45 @@ oauth:
 		t.Fatalf("downstream devin replacements = %#v", decoded.Devin.SensitiveWordsReplace)
 	}
 }
+
+func TestSanitizeConfigYAMLForDownstreamForwardsSensitivePatternsReplace(t *testing.T) {
+	input := `config-version: 8
+oauth:
+  providers:
+    antigravity:
+      sensitive-patterns-replace:
+        - pattern: '(?m)^RFC 2119[^\n]*\n?'
+          replacement: ""
+    devin:
+      sensitive-patterns-replace:
+        - pattern: '(?m)^You are omp[^\n]*\n?'
+          replacement: ""
+`
+	out, errSanitize := sanitizeConfigYAMLForDownstream([]byte(input))
+	if errSanitize != nil {
+		t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+	}
+	var decoded struct {
+		Antigravity struct {
+			SensitivePatternsReplace []struct {
+				Pattern     string `yaml:"pattern"`
+				Replacement string `yaml:"replacement"`
+			} `yaml:"sensitive-patterns-replace"`
+		} `yaml:"antigravity"`
+		Devin struct {
+			SensitivePatternsReplace []struct {
+				Pattern     string `yaml:"pattern"`
+				Replacement string `yaml:"replacement"`
+			} `yaml:"sensitive-patterns-replace"`
+		} `yaml:"devin"`
+	}
+	if errUnmarshal := yaml.Unmarshal(out, &decoded); errUnmarshal != nil {
+		t.Fatalf("yaml.Unmarshal(out) error = %v", errUnmarshal)
+	}
+	if len(decoded.Antigravity.SensitivePatternsReplace) != 1 || decoded.Antigravity.SensitivePatternsReplace[0].Pattern != `(?m)^RFC 2119[^\n]*\n?` || decoded.Antigravity.SensitivePatternsReplace[0].Replacement != "" {
+		t.Fatalf("downstream antigravity pattern replacements = %#v", decoded.Antigravity.SensitivePatternsReplace)
+	}
+	if len(decoded.Devin.SensitivePatternsReplace) != 1 || decoded.Devin.SensitivePatternsReplace[0].Pattern != `(?m)^You are omp[^\n]*\n?` {
+		t.Fatalf("downstream devin pattern replacements = %#v", decoded.Devin.SensitivePatternsReplace)
+	}
+}

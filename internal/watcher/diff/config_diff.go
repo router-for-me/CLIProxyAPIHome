@@ -92,11 +92,17 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !equalStringMap(oldCfg.Antigravity.SensitiveWordsReplace, newCfg.Antigravity.SensitiveWordsReplace) {
 		changes = append(changes, fmt.Sprintf("antigravity.sensitive-words-replace: %d -> %d", len(oldCfg.Antigravity.SensitiveWordsReplace), len(newCfg.Antigravity.SensitiveWordsReplace)))
 	}
+	if !equalSensitivePatternRules(oldCfg.Antigravity.SensitivePatternsReplace, newCfg.Antigravity.SensitivePatternsReplace) {
+		changes = append(changes, fmt.Sprintf("antigravity.sensitive-patterns-replace: %d -> %d", len(oldCfg.Antigravity.SensitivePatternsReplace), len(newCfg.Antigravity.SensitivePatternsReplace)))
+	}
 	if !reflect.DeepEqual(oldCfg.Devin.SensitiveWords, newCfg.Devin.SensitiveWords) {
 		changes = append(changes, fmt.Sprintf("devin.sensitive-words: %d -> %d", len(oldCfg.Devin.SensitiveWords), len(newCfg.Devin.SensitiveWords)))
 	}
 	if !equalStringMap(oldCfg.Devin.SensitiveWordsReplace, newCfg.Devin.SensitiveWordsReplace) {
 		changes = append(changes, fmt.Sprintf("devin.sensitive-words-replace: %d -> %d", len(oldCfg.Devin.SensitiveWordsReplace), len(newCfg.Devin.SensitiveWordsReplace)))
+	}
+	if !equalSensitivePatternRules(oldCfg.Devin.SensitivePatternsReplace, newCfg.Devin.SensitivePatternsReplace) {
+		changes = append(changes, fmt.Sprintf("devin.sensitive-patterns-replace: %d -> %d", len(oldCfg.Devin.SensitivePatternsReplace), len(newCfg.Devin.SensitivePatternsReplace)))
 	}
 
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
@@ -246,6 +252,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 				}
 				if !equalStringMap(o.Cloak.SensitiveWordsReplace, n.Cloak.SensitiveWordsReplace) {
 					changes = append(changes, fmt.Sprintf("claude[%d].cloak.sensitive-words-replace: %d -> %d", i, len(o.Cloak.SensitiveWordsReplace), len(n.Cloak.SensitiveWordsReplace)))
+				}
+				if !equalSensitivePatternRules(o.Cloak.SensitivePatternsReplace, n.Cloak.SensitivePatternsReplace) {
+					changes = append(changes, fmt.Sprintf("claude[%d].cloak.sensitive-patterns-replace: %d -> %d", i, len(o.Cloak.SensitivePatternsReplace), len(n.Cloak.SensitivePatternsReplace)))
 				}
 				if !reflect.DeepEqual(o.Cloak.CacheUserID, n.Cloak.CacheUserID) {
 					changes = append(changes, fmt.Sprintf("claude[%d].cloak.cache-user-id: %s -> %s", i, formatOptionalBool(o.Cloak.CacheUserID), formatOptionalBool(n.Cloak.CacheUserID)))
@@ -586,6 +595,18 @@ func equalStringSet(a, b []string) bool {
 	}
 	for k := range aSet {
 		if _, ok := bSet[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func equalSensitivePatternRules(a, b []config.SensitivePatternRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -230,6 +231,9 @@ type AntigravityConfig struct {
 	// SensitiveWordsReplace maps target substrings to literal replacement text in system instructions.
 	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
 
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system instructions.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
+
 	// Settings shared with CPA V8.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
 }
@@ -421,6 +425,9 @@ type CloakConfig struct {
 
 	// SensitiveWordsReplace maps target substrings to literal replacement text when cloaking.
 	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
+
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules when cloaking.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.
@@ -1103,6 +1110,7 @@ func (cfg *Config) SanitizeAntigravity() {
 		cfg.Antigravity.SensitiveWords = cleaned
 	}
 	cfg.Antigravity.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Antigravity.SensitiveWordsReplace)
+	cfg.Antigravity.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Antigravity.SensitivePatternsReplace)
 }
 
 // SanitizeDevin trims surrounding whitespace and drops empty entries from Devin sensitive-word settings.
@@ -1121,6 +1129,7 @@ func (cfg *Config) SanitizeDevin() {
 		cfg.Devin.SensitiveWords = cleaned
 	}
 	cfg.Devin.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Devin.SensitiveWordsReplace)
+	cfg.Devin.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Devin.SensitivePatternsReplace)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1384,6 +1393,7 @@ func NormalizeCloakConfig(cloak *CloakConfig) *CloakConfig {
 		cloak.SensitiveWords = nil
 	}
 	cloak.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cloak.SensitiveWordsReplace)
+	cloak.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cloak.SensitivePatternsReplace)
 	return cloak
 }
 
@@ -1528,6 +1538,36 @@ func NormalizeSensitiveWordsReplace(in map[string]string) map[string]string {
 			continue
 		}
 		out[trimmedKey] = in[rawKey]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeSensitivePatternsReplace validates Go RE2 regex rules, logs and drops
+// invalid or blank patterns, and preserves replacement values (including empty strings).
+func NormalizeSensitivePatternsReplace(in []SensitivePatternRule) []SensitivePatternRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]SensitivePatternRule, 0, len(in))
+	for i, rule := range in {
+		if strings.TrimSpace(rule.Pattern) == "" {
+			continue
+		}
+		if _, errCompile := regexp.Compile(rule.Pattern); errCompile != nil {
+			log.WithFields(log.Fields{
+				"rule_index": i + 1,
+				"pattern":    rule.Pattern,
+				"error":      errCompile,
+			}).Warn("sensitive-patterns-replace rule dropped: invalid regex")
+			continue
+		}
+		out = append(out, SensitivePatternRule{
+			Pattern:     rule.Pattern,
+			Replacement: rule.Replacement,
+		})
 	}
 	if len(out) == 0 {
 		return nil
