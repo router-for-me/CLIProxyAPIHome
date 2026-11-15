@@ -18,7 +18,6 @@ func TestSDKExecutionOptionsWithoutHomeFields(t *testing.T) {
 		{reflect.TypeOf(ClaudeConfig{}), "SessionDatePinDays"},
 		{reflect.TypeOf(ClaudeHeaderDefaults{}), "NativeEntrypoints"},
 		{reflect.TypeOf(CodexKey{}), "ConnectionPool"},
-		{reflect.TypeOf(CloakConfig{}), "SensitivePatternsReplace"},
 		{reflect.TypeOf(VertexCompatModel{}), "OpenAPI"},
 	} {
 		if _, exists := check.owner.FieldByName(check.field); exists {
@@ -118,6 +117,34 @@ upstream:
 		if value, exists := restoredHeaders["native-entrypoints"]; !exists || len(value.([]any)) != 0 {
 			t.Fatal("empty SDK option was lost")
 		}
+	}
+}
+
+func TestClaudeCloakPatternsTypedSDKProjection(t *testing.T) {
+	entry := ClaudeKey{Cloak: &CloakConfig{SensitivePatternsReplace: []SensitivePatternRule{
+		{Pattern: "^private", Replacement: ""},
+		{Pattern: "[invalid", Replacement: "ignored"},
+		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
+	}}}
+	entry.Cloak = NormalizeCloakConfig(entry.Cloak)
+	want := []SensitivePatternRule{
+		{Pattern: "^private", Replacement: ""},
+		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
+	}
+	if !reflect.DeepEqual(entry.Cloak.SensitivePatternsReplace, want) {
+		t.Fatalf("normalized cloak patterns = %#v, want %#v", entry.Cloak.SensitivePatternsReplace, want)
+	}
+	options, errProject := CredentialExecutionOptions(entry)
+	if errProject != nil {
+		t.Fatal(errProject)
+	}
+	wantWire := []any{
+		map[string]any{"pattern": "^private", "replacement": ""},
+		map[string]any{"pattern": "Claude[ ]+Code", "replacement": "Claude"},
+	}
+	cloak, ok := options["cloak"].(map[string]any)
+	if !ok || !reflect.DeepEqual(cloak["sensitive-patterns-replace"], wantWire) {
+		t.Fatalf("SDK cloak projection = %#v, want patterns %#v", options["cloak"], wantWire)
 	}
 }
 

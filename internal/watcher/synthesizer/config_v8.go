@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -108,11 +109,15 @@ func projectClaudeCloakOptions(raw any, attrs map[string]string, metadata map[st
 	if errMarshal != nil {
 		return fmt.Errorf("encode Claude cloak options: %w", errMarshal)
 	}
-	var cloakCfg appconfig.CloakConfig
-	if errUnmarshal := json.Unmarshal(data, &cloakCfg); errUnmarshal != nil {
+	sdkCfg := cpaconfig.Config{ClaudeKey: make([]cpaconfig.ClaudeKey, 1)}
+	if errUnmarshal := json.Unmarshal(data, &sdkCfg.ClaudeKey[0].Cloak); errUnmarshal != nil {
 		return fmt.Errorf("decode Claude cloak options: %w", errUnmarshal)
 	}
-	appconfig.NormalizeCloakConfig(&cloakCfg)
+	sdkCfg.SanitizeClaudeKeys()
+	cloakCfg := sdkCfg.ClaudeKey[0].Cloak
+	if cloakCfg == nil {
+		return nil
+	}
 
 	if cloakCfg.Mode != "" {
 		attrs["cloak_mode"] = cloakCfg.Mode

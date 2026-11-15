@@ -40,7 +40,7 @@ func TestAntigravityTOSPausePersistenceFailuresAndConcurrentReplay(t *testing.T)
 	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 		t.Fatal(errRegister)
 	}
-	runtime := &Runtime{cfg: &config.Config{}, coreManager: manager, clusterAdapter: adapter}
+	runtime := &Runtime{cfg: &config.Config{Antigravity: config.AntigravityConfig{TOSPauseWindow: "6h"}}, coreManager: manager, clusterAdapter: adapter}
 	result := coreauth.NewUsageResult(auth.ID, auth.Provider, "model", 403, `{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}`)
 	result.ObservedAt = time.Now().Add(-time.Minute)
 	failure := errors.New("injected KV failure")

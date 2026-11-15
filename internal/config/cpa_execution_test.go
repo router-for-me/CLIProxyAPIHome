@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -155,6 +156,26 @@ func TestCPAExecutionExampleConfig(t *testing.T) {
 	}
 	if errValidate := ValidateV8Config(data); errValidate != nil {
 		t.Fatal(errValidate)
+	}
+	cpa, errParse := cpaconfig.ParseConfigBytes(data)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if cpa.Antigravity.TOSPauseWindow != "0" {
+		t.Fatal("example must disable the TOS pool pause by default")
+	}
+	if cpa.Claude.SessionDatePinDays == nil || *cpa.Claude.SessionDatePinDays != 7 {
+		t.Fatal("example must document the session date pin default")
+	}
+	if strings.Count(string(data), "      # sensitive-patterns-replace:") != 1 {
+		t.Fatal("Antigravity must have a single regex replacement example")
+	}
+	var root yaml.Node
+	if errDecode := yaml.Unmarshal(data, &root); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if wsAuth := yamlPath(root.Content[0], "oauth.providers.aistudio.ws-auth"); wsAuth == nil || wsAuth.Tag != "!!bool" || wsAuth.Value != "false" {
+		t.Fatal("example must retain ws-auth: false for compatibility")
 	}
 }
 

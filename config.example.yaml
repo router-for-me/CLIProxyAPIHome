@@ -529,6 +529,11 @@ upstream:
     # for Responses).
     server-side-fallback: false
 
+    # Days to retain the cloaked currentDate pin per session in CPA in-memory mode.
+    # Default 7; explicit 0 uses the continuity-scoped pin (1h lifetime).
+    # With local bbolt or Home KV, date pins persist permanently and this setting is ignored.
+    session-date-pin-days: 7
+
     # When true, disable Claude request cloaking on OAuth and API-key CLI profiles (the Claude Code CLI disguise and
     # system prompt replacement), so the original system prompt is passed through to Claude as-is.
     # Credential attributes and explicit per-key cloak modes override this shared default.
@@ -1197,7 +1202,7 @@ oauth:
   # API-key credentials use their own group/key options.
   providers:
     aistudio:
-      # Home owns client authentication and forces this setting to false on CPA nodes.
+      # Compatibility only; not distributed because CPA does not expose /v1/ws in Home mode.
       ws-auth: false
 
     # Codex provider behavior.
@@ -1245,14 +1250,11 @@ oauth:
     antigravity:
       # Pool-wide protective pause after Google RPC HTTP 403 PERMISSION_DENIED with
       # ErrorInfo.reason=TOS_VIOLATION; ordinary quota errors do not trigger it.
-      # Default: "6h". Set "0"/"off"/"false"/"none"/"disabled" to disable the pause.
+      # Default: "0" (disabled). Set a positive duration such as "6h" to enable the pause.
+      # "0"/"off"/"false"/"none"/"disabled" explicitly disables it.
       # Home mode shares the deadline in Home KV: Home stops dispatching Antigravity,
       # and compatible CPA nodes also honor it. Standalone CPA pauses its local pool.
-      tos-pause-window: "6h"
-      # Deleting flagged text with an empty replacement is recommended over obfuscation for Antigravity.
-      # sensitive-patterns-replace:   # optional: ordered Go RE2 regex replacements in system instructions ("replacement": "" deletes matches); executed by CPA
-      #   - pattern: '(?m)^Internal instruction:.*$'
-      #     replacement: ""
+      tos-pause-window: "0"
       # sensitive-words:              # optional: words to obfuscate with combining grapheme joiners (U+034F) in system instructions
       #   - "API"
       #   - "proxy"

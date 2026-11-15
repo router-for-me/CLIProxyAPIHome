@@ -3,14 +3,14 @@ module github.com/router-for-me/CLIProxyAPIHome
 go 1.26.10
 
 require (
-	github.com/MoeForge/moego v0.1.0-alpha.1
+	github.com/MoeForge/moego v0.1.0-alpha.3
 	github.com/gin-gonic/gin v1.12.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/go-webauthn/webauthn v0.17.4
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/refraction-networking/utls v1.8.2
-	github.com/router-for-me/CLIProxyAPI/v8 v8.0.70
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.72
 	github.com/sirupsen/logrus v1.9.3
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5

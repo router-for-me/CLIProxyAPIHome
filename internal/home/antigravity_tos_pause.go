@@ -22,14 +22,12 @@ func (r *Runtime) antigravityTOSPauseWindow() time.Duration {
 		raw = strings.TrimSpace(cfg.Antigravity.TOSPauseWindow)
 	}
 	switch strings.ToLower(raw) {
-	case "0", "off", "false", "none", "disabled":
+	case "", "0", "off", "false", "none", "disabled":
 		return 0
-	case "":
-		return 6 * time.Hour
 	}
 	window, errParse := time.ParseDuration(raw)
 	if errParse != nil || window <= 0 {
-		return 6 * time.Hour
+		return 0
 	}
 	return window
 }

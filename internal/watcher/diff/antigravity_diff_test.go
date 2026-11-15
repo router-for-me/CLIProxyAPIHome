@@ -102,8 +102,8 @@ func TestConfigDiff_SensitivePatternsReplace(t *testing.T) {
 			SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "a", Replacement: ""}},
 		},
 		ClaudeKey: []config.ClaudeKey{{
-			APIKey: "sk-ant-1",
-			Cloak:  &config.CloakConfig{SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "c", Replacement: ""}}},
+			APIKey:           "sk-ant-1",
+			CredentialConfig: config.CredentialConfig{RawConfig: map[string]any{"cloak": map[string]any{"sensitive-patterns-replace": []any{map[string]any{"pattern": "c", "replacement": ""}}}}},
 		}},
 	}
 	newCfg := &config.Config{
@@ -114,8 +114,8 @@ func TestConfigDiff_SensitivePatternsReplace(t *testing.T) {
 			SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "d", Replacement: ""}},
 		},
 		ClaudeKey: []config.ClaudeKey{{
-			APIKey: "sk-ant-1",
-			Cloak:  &config.CloakConfig{SensitivePatternsReplace: []config.SensitivePatternRule{{Pattern: "c", Replacement: "y"}}},
+			APIKey:           "sk-ant-1",
+			CredentialConfig: config.CredentialConfig{RawConfig: map[string]any{"cloak": map[string]any{"sensitive-patterns-replace": []any{map[string]any{"pattern": "c", "replacement": "y"}}}}},
 		}},
 	}
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
@@ -134,7 +134,7 @@ func TestConfigDiff_SensitivePatternsReplace(t *testing.T) {
 	emptyB := &config.Config{
 		Antigravity: config.AntigravityConfig{SensitivePatternsReplace: []config.SensitivePatternRule{}},
 		Devin:       config.DevinConfig{SensitivePatternsReplace: []config.SensitivePatternRule{}},
-		ClaudeKey:   []config.ClaudeKey{{APIKey: "sk-ant-1", Cloak: &config.CloakConfig{SensitivePatternsReplace: []config.SensitivePatternRule{}}}},
+		ClaudeKey:   []config.ClaudeKey{{APIKey: "sk-ant-1", Cloak: &config.CloakConfig{}}},
 	}
 	if noDiff := BuildConfigChangeDetails(emptyA, emptyB); len(noDiff) != 0 {
 		t.Fatalf("expected no diff between nil and empty SensitivePatternsReplace slices, got %v", noDiff)

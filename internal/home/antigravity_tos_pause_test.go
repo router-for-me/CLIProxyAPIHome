@@ -42,7 +42,7 @@ func TestAntigravityTOSPauseSharedDispatchAndReplay(t *testing.T) {
 	ctx := t.Context()
 	adapter := &tosPauseTestAdapter{runtimeKVTestAdapter: runtimeKVTestAdapter{enabled: true}}
 	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
-	cfg := &config.Config{}
+	cfg := &config.Config{Antigravity: config.AntigravityConfig{TOSPauseWindow: "6h"}}
 	manager.SetConfig(cfg)
 	auth := &coreauth.Auth{ID: "tos-test-auth", Index: "tos-test-auth", Provider: "antigravity", Status: coreauth.StatusActive}
 	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
@@ -104,7 +104,7 @@ func TestAntigravityTOSPausePreservesSessionBindings(t *testing.T) {
 	for _, strategy := range []string{"fill-first", "weighted-round-robin"} {
 		for _, mode := range []string{"any", "quota", "never"} {
 			t.Run(strategy+"/"+mode, func(t *testing.T) {
-				cfg := &config.Config{Routing: config.RoutingConfig{Strategy: strategy, SessionAffinity: true, SessionAffinityRebindOn: mode}}
+				cfg := &config.Config{Routing: config.RoutingConfig{Strategy: strategy, SessionAffinity: true, SessionAffinityRebindOn: mode}, Antigravity: config.AntigravityConfig{TOSPauseWindow: "6h"}}
 				store := coreauth.NewSessionCache(time.Hour)
 				t.Cleanup(store.Stop)
 				selector := selectorFromConfig(cfg, store)
@@ -174,7 +174,7 @@ func TestAntigravityTOSPauseBoundCredentialRecovery(t *testing.T) {
 	for _, strategy := range []string{"fill-first", "weighted-round-robin"} {
 		for _, mode := range []string{"any", "quota", "never"} {
 			t.Run(strategy+"/"+mode, func(t *testing.T) {
-				cfg := &config.Config{Routing: config.RoutingConfig{Strategy: strategy, SessionAffinity: true, SessionAffinityRebindOn: mode}}
+				cfg := &config.Config{Routing: config.RoutingConfig{Strategy: strategy, SessionAffinity: true, SessionAffinityRebindOn: mode}, Antigravity: config.AntigravityConfig{TOSPauseWindow: "6h"}}
 				store := coreauth.NewSessionCache(time.Hour)
 				t.Cleanup(store.Stop)
 				manager := coreauth.NewManager(nil, selectorFromConfig(cfg, store), nil)
@@ -227,7 +227,7 @@ func TestAntigravityTOSPauseBoundCredentialRecovery(t *testing.T) {
 func TestAntigravityTOSPauseExcludesSchedulerCandidates(t *testing.T) {
 	for _, strategy := range []string{"round-robin", "fill-first", "weighted-round-robin"} {
 		t.Run(strategy, func(t *testing.T) {
-			cfg := &config.Config{Routing: config.RoutingConfig{Strategy: strategy}}
+			cfg := &config.Config{Routing: config.RoutingConfig{Strategy: strategy}, Antigravity: config.AntigravityConfig{TOSPauseWindow: "6h"}}
 			manager := coreauth.NewManager(nil, selectorFromConfig(cfg, nil), nil)
 			manager.SetConfig(cfg)
 			model := "pause-scheduler-model"
@@ -274,7 +274,7 @@ func TestAntigravityTOSPauseUsageClassification(t *testing.T) {
 			if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
 				t.Fatal(errRegister)
 			}
-			runtime := &Runtime{cfg: &config.Config{}, coreManager: manager, clusterAdapter: adapter}
+			runtime := &Runtime{cfg: &config.Config{Antigravity: config.AntigravityConfig{TOSPauseWindow: "6h"}}, coreManager: manager, clusterAdapter: adapter}
 			payload, errMarshal := json.Marshal(map[string]any{"auth_index": auth.ID, "provider": tc.provider, "model": "tos-model", "timestamp": time.Now().Add(-time.Minute).Format(time.RFC3339Nano), "failed": true, "fail": map[string]any{"status_code": tc.status, "body": tc.body}})
 			if errMarshal != nil {
 				t.Fatal(errMarshal)

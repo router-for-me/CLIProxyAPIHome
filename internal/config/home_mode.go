@@ -30,9 +30,14 @@ func ApplyHomeRuntimeScalars(root map[string]any) {
 // remote-management, auth-dir, tls, or credential roots. Callers that build
 // downstream CPA YAML must filter those roots separately first.
 func ApplyDownstreamHomeModeScalars(root map[string]any) {
-	ApplyHomeRuntimeScalars(root)
 	if root == nil {
 		return
 	}
+	root["usage-statistics-enabled"] = true
 	root["disable-cooling"] = true
+	// CPA does not expose /v1/ws in Home mode, so its auth switch is not distributed.
+	delete(root, "ws-auth")
+	if oauth, changed, errScope := UpdateOAuthScope(root["oauth"], "ws-auth", nil); errScope == nil && changed {
+		root["oauth"] = oauth
+	}
 }

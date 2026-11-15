@@ -353,7 +353,7 @@ JSON writes preserve omitted TURN `username`/`credential` values only when the n
 
 The read-only paths are `credentials/concurrency/lifecycle-config-revision`, `credentials/concurrency/observation-barrier-revision`, and `plugins/auth-revision`. Preserve their current presence and value when replacing a containing object. Setting or removing them directly is rejected.
 
-Home normalizes `observability.usage.usage-statistics-enabled` to `true` and `oauth.providers.aistudio.ws-auth` to `false`. `routing.cooldown.disable-cooling` remains Home's local scheduling policy; downstream CPA configuration independently forces local CPA cooling off. `server.port` configures CPA, and running CPA processes need a restart to rebind; Home's listener still uses `-addr` or `cluster.yaml` / `node.port`. `oauth.auth-dir` remains an import/export path, not a runtime file-write destination.
+Home normalizes `observability.usage.usage-statistics-enabled` to `true`. The legacy `oauth.providers.aistudio.ws-auth` switch is normalized to `false` for compatibility but is not distributed: CPA does not expose `/v1/ws` in Home mode. `routing.cooldown.disable-cooling` remains Home's local scheduling policy; downstream CPA configuration independently forces local CPA cooling off. `server.port` configures CPA, and running CPA processes need a restart to rebind; Home's listener still uses `-addr` or `cluster.yaml` / `node.port`. `oauth.auth-dir` remains an import/export path, not a runtime file-write destination.
 
 ### Model Catalog Sources
 
@@ -417,13 +417,13 @@ The config endpoints also accept the fields below. All values are database-backe
 | CPA server | `server.max-request-body-bytes`, `server.response-compression.enabled/min-bytes`, `server.shutdown-timeout`, `server.github-token` |
 | CPA client compatibility | `client.codex.enable-apply-patch`, `client.codex.web-search-result-cache.enabled/ttl/limit`, `client.claude.show-codex-commentary` |
 | CPA Codex execution | `upstream.codex.upstream-request-compression`, `upstream.codex.upstream-request-compression-min-bytes`, `upstream.codex.websocket-compression`; `oauth.providers.codex.signin-with-chatgpt-identifier` |
-| CPA Claude execution | `upstream.claude.server-side-fallback`; `upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA Claude execution | `upstream.claude.server-side-fallback`, `upstream.claude.session-date-pin-days` (in-memory mode only; ignored with Home KV); `upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
 | CPA prompt policies | `oauth.providers.antigravity.sensitive-patterns-replace`, `oauth.providers.devin.sensitive-patterns-replace`, `api-keys.claude[].keys[].cloak.sensitive-patterns-replace`; ordered `{pattern, replacement}` Go RE2 rules |
 | Credential execution options | `api-keys.<provider>[].connection-pool` (group and per-key); `api-keys.vertex[].interactions`; `api-keys.vertex[].models[].openapi`; `oauth.model-alias.vertex[].openapi` |
 
 `routing.session-affinity-rebind-on` controls failover when a bound credential is unavailable: `any` (default) rebinds on any failover; `quota` keeps the binding through transient failures and rebinds only for quota, authentication, or model-support failures; `never` refuses to fail over from a live binding. Expired bindings are always eligible for reselection. Only current failures for the requested model, or a credential-wide fence, count; temporary concurrency or retry exclusions do not trigger a rebind under `quota`.
 
-`tos-pause-window` defaults to `6h`; `0`, `off`, `false`, `none`, or `disabled` turns it off. A Google RPC 403 `PERMISSION_DENIED` with `ErrorInfo.reason=TOS_VIOLATION` pauses the whole Antigravity pool for the window. During the pause Home excludes only Antigravity candidates; bindings to other providers stay valid, including under `never`.
+`tos-pause-window` defaults to `0` (disabled) in Home. Omitted or blank values are explicitly distributed as `"0"` so CPA nodes do not fall back to their own default; explicit non-blank values are preserved. Set a positive duration such as `6h` to enable it; `0`, `off`, `false`, `none`, or `disabled` turns it off. A Google RPC 403 `PERMISSION_DENIED` with `ErrorInfo.reason=TOS_VIOLATION` pauses the whole Antigravity pool for the window. During the pause Home excludes only Antigravity candidates; bindings to other providers stay valid, including under `never`.
 
 `oauth.settings.<provider>[]` overrides `max-context-length` for OAuth models and is applied after exclusions and aliases, before prefixes. An entry matching an `alias` takes precedence over one matching the original `name`. API-key models are not affected.
 
@@ -4304,7 +4304,7 @@ These fields supplement the reference above. Settings under `oauth.providers` ap
 | `credentials.in-flight` | object | Observation snapshot, staleness, size, and staging limits. |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA compatibility setting; Home runtime cooldown state is DB-backed. |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | CPA transient-error cooldown setting carried with configuration. |
-| `oauth.providers.aistudio.ws-auth` | boolean | Home normalizes this to `false`. |
+| `oauth.providers.aistudio.ws-auth` | boolean | Compatibility only; normalized to `false`, never distributed to CPA. `/v1/ws` is unavailable in Home mode. |
 | `oauth.request-scoped-errors` | provider-to-rule-array object | OAuth request-scoped error overrides. |
 | `upstream.codex.disable-codex-cloaking` | boolean | Disables forcing official identity headers for Codex OAuth and API-key requests. |
 | `upstream.codex.stream-bootstrap-buffering` | boolean | Buffers pre-generation frames to allow failover before committing a stream; default `false`. |
