@@ -61,7 +61,7 @@ func TestManagerSessionAffinityQuotaAliasState(t *testing.T) {
 					opts.Metadata = map[string]any{ExcludedAuthIDsMetadataKey: []string{a.ID}}
 				}
 				primary, _ := extractSessionIDs(opts.Headers, nil, nil)
-				key := sessionBindingKey("codex", primary, "public")
+				key := sessionBindingKey("mixed", primary, "public")
 				store.Set(key, a.ID)
 				before, errBefore := store.LoadSessionBinding(ctx, key)
 				if errBefore != nil {

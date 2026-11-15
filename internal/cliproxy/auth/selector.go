@@ -448,9 +448,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 //  9. Body conversation_id
 //  10. Hash-based fallback from message content
 //
-// Note: The cache key includes provider, session ID, and model to handle cases where
-// a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
-// that may be supported by different auth credentials, and to avoid cross-provider conflicts.
+// Note: The cache key includes provider scope, session ID, and model. Home dispatch
+// supplies a stable cross-provider scope regardless of provider availability; direct
+// selector calls default to the supplied provider. Models retain separate bindings.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -493,7 +493,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		pending.finish(true)
 		return selected, nil
 	}
-	cacheKey := sessionBindingKey(provider, primaryID, model)
+	bindingScope := opts.SessionAffinityScope
+	if bindingScope == "" {
+		bindingScope = provider
+	}
+	cacheKey := sessionBindingKey(bindingScope, primaryID, model)
 	isSubagent := sessionFallbackIsSubagent(primaryID, fallbackID, opts)
 	inheritFallback := s.subagentAffinity || !isSubagent
 	guardian := s.subagentAffinity && isSubagent && strings.EqualFold(sessionHeaderValue(opts.Headers, "X-Openai-Subagent"), "guardian")
@@ -554,7 +558,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if selected == nil && !active && inheritFallback && fallbackID != "" && fallbackID != primaryID {
-			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
+			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(bindingScope, fallbackID, model))
 			if errParent != nil {
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
 			}

@@ -420,7 +420,7 @@ Home 在数据库和下发配置中保留兼容的
 | CPA 提示词策略 | `oauth.providers.antigravity.sensitive-patterns-replace`、`oauth.providers.devin.sensitive-patterns-replace`、`api-keys.claude[].keys[].cloak.sensitive-patterns-replace`；按顺序执行的 `{pattern, replacement}` Go RE2 规则 |
 | 凭证执行选项 | `api-keys.<provider>[].connection-pool`（组级和单 Key）；`api-keys.vertex[].interactions`；`api-keys.vertex[].models[].openapi`；`oauth.model-alias.vertex[].openapi` |
 
-`routing.session-affinity-rebind-on` 控制已绑定凭证不可用时的切换行为：`any`（默认）在任何切换时重新绑定；`quota` 在临时故障时保留原绑定，仅在配额、认证或模型支持错误时重绑；`never` 拒绝从仍有效的绑定切换。过期绑定始终可以重新选择。重绑定只依据请求模型的当前故障或凭证级阻断；`quota` 下临时的并发避让或重试排除不会触发重绑。
+`routing.session-affinity-rebind-on` 控制已绑定凭证不可用时的切换行为：`any`（默认）在任何切换时重新绑定；`quota` 在临时故障时保留原绑定，仅在配额、认证或模型支持错误时重绑；`never` 拒绝从仍有效的绑定切换。可用提供商变化不会改变会话绑定作用域：禁用已绑定提供商的最后一个凭证时，`never` 会拒绝调度；启用其他提供商也不会替换健康绑定。过期绑定始终可以重新选择。重绑定只依据请求模型的当前故障或凭证级阻断；`quota` 下临时的并发避让或重试排除不会触发重绑。
 
 `tos-pause-window` 在 Home 中默认 `0`（关闭）。省略或留空时显式下发 `"0"`，避免 CPA 节点回退到自身默认值；显式非空值保持不变。设置 `6h` 等正时长可启用；设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
 

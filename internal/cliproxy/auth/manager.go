@@ -1338,7 +1338,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if len(normalizedProviders) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
-	// Binding keys describe the requested provider scope, not temporary availability.
+	// Home session bindings have a stable cross-provider scope. Keep it
+	// separate from the current provider set used for selection and accounting.
+	opts.SessionAffinityScope = "mixed"
 	providerForSelector := "mixed"
 	if len(normalizedProviders) == 1 {
 		providerForSelector = normalizedProviders[0]

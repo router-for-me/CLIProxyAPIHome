@@ -87,7 +87,7 @@ func TestManagerSessionAffinityTemporaryFailoverRecovery(t *testing.T) {
 				}
 				opts := Options{Headers: http.Header{"X-Session-Id": {"recovery-session"}}, SessionAffinity: &SessionAffinitySelection{}}
 				primary, _ := extractSessionIDs(opts.Headers, nil, nil)
-				key := sessionBindingKey("codex", primary, "recovery-model")
+				key := sessionBindingKey("mixed", primary, "recovery-model")
 				store.Set(key, a.ID)
 				initial, errInitial := manager.Dispatch(ctx, []string{"codex"}, "recovery-model", opts)
 				if errInitial != nil || initial == nil || initial.Auth.ID != a.ID {
@@ -179,7 +179,7 @@ func TestManagerSessionAffinityPreservesTransientBinding(t *testing.T) {
 	}
 	opts := Options{Headers: http.Header{"X-Session-Id": {"manager-policy"}}, SessionAffinity: &SessionAffinitySelection{}}
 	primary, _ := extractSessionIDs(opts.Headers, nil, nil)
-	key := sessionBindingKey("codex", primary, "policy-model")
+	key := sessionBindingKey("mixed", primary, "policy-model")
 	store.Set(key, "policy-a")
 	decision, errDispatch := manager.Dispatch(ctx, []string{"codex"}, "policy-model", opts)
 	if errDispatch != nil || decision == nil || decision.Auth.ID != "policy-b" {

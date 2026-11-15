@@ -160,7 +160,7 @@ func TestManagerSessionAffinityStateTransitions(t *testing.T) {
 					}
 					opts := Options{Headers: http.Header{"X-Session-Id": {"transition-session"}}, SessionAffinity: &SessionAffinitySelection{}}
 					primary, _ := extractSessionIDs(opts.Headers, nil, nil)
-					key := sessionBindingKey("codex", primary, "transition-model")
+					key := sessionBindingKey("mixed", primary, "transition-model")
 					store.Set(key, a.ID)
 					before, errBefore := store.LoadSessionBinding(ctx, key)
 					if errBefore != nil {
