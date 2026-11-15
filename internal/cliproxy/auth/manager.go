@@ -1104,9 +1104,6 @@ func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
 				suspendReason = strings.TrimSpace(state.StatusMessage)
 			}
 		}
-		// Recreate the suspension so a transition from quota to another error
-		// also updates the registry reason.
-		modelRegistry.ResumeClientModel(auth.ID, registryModel)
 		modelRegistry.SuspendClientModel(auth.ID, registryModel, suspendReason)
 	}
 }
