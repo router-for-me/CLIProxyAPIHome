@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
@@ -11,8 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config remains the effective runtime/wire representation. Layout translation is
-// confined to YAML boundaries so older SDK and Home consumers keep their contract.
+// Config fields are runtime read projections. Complete documents remain in
+// RawConfig; layout translation stays at YAML boundaries for compatibility.
 type legacyConfig Config
 
 type configPath struct{ old, current string }
@@ -49,7 +48,26 @@ var v8SharedPaths = []configPath{
 	{"oauth.providers.xai.inject-x-search", "upstream.xai.inject-x-search"},
 }
 
-var v8Aliases = append(append([]configPath(nil), v8ClientPaths...), v8SharedPaths...)
+var v8Aliases = buildV8Aliases()
+
+func buildV8Aliases() []configPath {
+	aliases := append(append([]configPath(nil), v8ClientPaths...), v8SharedPaths...)
+	seen := make(map[string]bool)
+	for _, alias := range aliases {
+		seen[alias.old] = true
+	}
+	for _, path := range v8Paths {
+		if !strings.HasPrefix(path.current, "upstream.") {
+			continue
+		}
+		old := "oauth.providers." + strings.TrimPrefix(path.current, "upstream.")
+		if !seen[old] {
+			aliases = append(aliases, configPath{old, path.current})
+			seen[old] = true
+		}
+	}
+	return aliases
+}
 
 var v8SharedStructPaths = []configPath{
 	{"oauth.providers.claude.header-defaults", "upstream.claude.header-defaults"},
@@ -68,6 +86,8 @@ var v8KeyFamilies = []configPath{
 func buildV8Paths() []configPath {
 	prefixes := []configPath{
 		{"allow-host", "server.allow-host"}, {"host", "server.host"}, {"port", "server.port"}, {"trusted-proxies", "server.trusted-proxies"},
+		{"max-request-body-bytes", "server.max-request-body-bytes"}, {"response-compression", "server.response-compression"},
+		{"github-token", "server.github-token"}, {"shutdown-timeout", "server.shutdown-timeout"}, {"kv-store", "server.kv-store"},
 		{"tls", "server.tls"}, {"commercial-mode", "server.commercial-mode"}, {"discovery", "server.discovery"},
 		{"remote-management", "management"}, {"api-keys", "access.api-keys"},
 		{"credential-concurrency", "credentials.concurrency"}, {"credential-in-flight", "credentials.in-flight"},
@@ -79,7 +99,7 @@ func buildV8Paths() []configPath {
 		{"proxy-url", "requests.proxy-url"}, {"tls-handshake-timeout-seconds", "requests.tls-handshake-timeout-seconds"}, {"passthrough-headers", "requests.passthrough-headers"},
 		{"nonstream-keepalive-interval", "requests.nonstream-keepalive-interval"}, {"streaming", "requests.streaming"}, {"payload", "requests.payload"},
 		{"auth-dir", "oauth.auth-dir"}, {"auth-auto-refresh-workers", "oauth.auth-auto-refresh-workers"},
-		{"oauth-model-alias", "oauth.model-alias"}, {"oauth-excluded-models", "oauth.excluded-models"},
+		{"oauth-model-alias", "oauth.model-alias"}, {"oauth-excluded-models", "oauth.excluded-models"}, {"oauth-settings", "oauth.settings"},
 		{"oauth-request-scoped-errors", "oauth.request-scoped-errors"}, {"ws-auth", "oauth.providers.aistudio.ws-auth"},
 		{"codex.disable-codex-cloaking", "upstream.codex.disable-codex-cloaking"},
 		{"codex.stream-bootstrap-buffering", "upstream.codex.stream-bootstrap-buffering"},
@@ -88,6 +108,9 @@ func buildV8Paths() []configPath {
 		{"codex.orphan-delegation-compatibility", "upstream.codex.orphan-delegation-compatibility"},
 		{"codex.model-level-cooling", "upstream.codex.model-level-cooling"},
 		{"codex.response-steering", "upstream.codex.response-steering"},
+		{"codex.upstream-request-compression", "upstream.codex.upstream-request-compression"},
+		{"codex.upstream-request-compression-min-bytes", "upstream.codex.upstream-request-compression-min-bytes"},
+		{"codex.websocket-compression", "upstream.codex.websocket-compression"},
 		{"codex", "oauth.providers.codex"}, {"codex-header-defaults", "oauth.providers.codex.header-defaults"},
 		{"claude", "upstream.claude"}, {"claude-code", "upstream.claude"},
 		{"disable-claude-cloak-mode", "upstream.claude.disable-claude-cloak-mode"},
@@ -106,8 +129,9 @@ func buildV8Paths() []configPath {
 		{"redis-usage-queue-retention-seconds", "observability.usage.redis-usage-queue-retention-seconds"}, {"pprof", "observability.pprof"},
 	}
 	var out []configPath
-	var walk func(reflect.Type, string, []int)
-	walk = func(t reflect.Type, path string, indexes []int) {
+	seen := make(map[string]bool)
+	var walk func(reflect.Type, string, []int, bool)
+	walk = func(t reflect.Type, path string, indexes []int, home bool) {
 		if t.Kind() == reflect.Struct {
 			for _, prefix := range prefixes {
 				if path == prefix.old || strings.HasPrefix(path, prefix.old+".") {
@@ -117,32 +141,39 @@ func buildV8Paths() []configPath {
 			}
 			for i := 0; i < t.NumField(); i++ {
 				field := t.Field(i)
-				tag := strings.Split(field.Tag.Get("yaml"), ",")[0]
-				if tag == "-" || field.PkgPath != "" {
+				tag, flags, _ := strings.Cut(field.Tag.Get("yaml"), ",")
+				if tag == "-" || field.PkgPath != "" || (strings.Contains(flags, "inline") && field.Type.Kind() == reflect.Map) {
 					continue
 				}
 				fieldIndexes := append(append([]int(nil), indexes...), i)
 				if field.Anonymous {
-					walk(field.Type, path, fieldIndexes)
+					walk(field.Type, path, fieldIndexes, home)
 					continue
 				}
 				child := tag
 				if path != "" {
 					child = path + "." + tag
 				}
-				walk(field.Type, child, fieldIndexes)
+				walk(field.Type, child, fieldIndexes, home)
 			}
 			return
 		}
 		for _, prefix := range prefixes {
 			if path == prefix.old || strings.HasPrefix(path, prefix.old+".") {
-				out = append(out, configPath{path, prefix.current + strings.TrimPrefix(path, prefix.old)})
-				v8FieldIndexes[path] = indexes
+				if !seen[path] {
+					out = append(out, configPath{path, prefix.current + strings.TrimPrefix(path, prefix.old)})
+					seen[path] = true
+				}
+				if home {
+					v8FieldIndexes[path] = indexes
+				}
 				return
 			}
 		}
 	}
-	walk(reflect.TypeOf(Config{}), "", nil)
+	// CPA owns execution fields. An SDK update extends this schema automatically.
+	walk(reflect.TypeOf(Config{}), "", nil, true)
+	walk(reflect.TypeOf(cpaconfig.Config{}), "", nil, false)
 	return out
 }
 
@@ -218,6 +249,15 @@ func (cfg *Config) UnmarshalYAML(node *yaml.Node) error {
 		return errValidate
 	}
 	*cfg = Config(decoded)
+	if errCapture := cfg.captureConfigTree(node, root); errCapture != nil {
+		return errCapture
+	}
+	if errValidate := cfg.ValidateHomePolicies(); errValidate != nil {
+		return errValidate
+	}
+	if errValidate := validateCPAExecution(root); errValidate != nil {
+		return errValidate
+	}
 	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
 		return errValidate
 	}
@@ -314,13 +354,42 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 			setYAMLPath(root, family.old, keys)
 		}
 	}
+	pruneEmptyV8Containers(root)
 	return root, nil
 }
 
-var sharedKeyFields = map[string]bool{
-	"priority": true, "prefix": true, "proxy-url": true, "headers": true,
-	"models": true, "excluded-models": true, "disable-cooling": true,
-	"request-retry": true, "request-scoped-errors": true,
+func pruneEmptyV8Containers(root *yaml.Node) {
+	for _, path := range v8Paths {
+		parts := strings.Split(path.current, ".")
+		for end := len(parts) - 1; end > 0; end-- {
+			container := strings.Join(parts[:end], ".")
+			if value := yamlPath(root, container); value != nil && value.Kind == yaml.MappingNode && len(value.Content) == 0 {
+				deleteYAMLPath(root, container)
+			}
+		}
+	}
+}
+
+var sharedKeyFields = buildSharedKeyFields()
+
+func buildSharedKeyFields() map[string]bool {
+	shared := map[string]bool{
+		"priority": true, "prefix": true, "proxy-url": true, "headers": true,
+		"models": true, "excluded-models": true, "disable-cooling": true,
+		"request-retry": true, "request-scoped-errors": true,
+	}
+	home := configFields(reflect.TypeOf(Config{}))
+	sdk := configFields(reflect.TypeOf(cpaconfig.Config{}))
+	for _, family := range v8KeyFamilies {
+		homeFields := configFields(home[family.old].Elem())
+		sdkFields := configFields(sdk[family.old].Elem())
+		for name := range sdkFields {
+			if _, owned := homeFields[name]; !owned && name != "api-key" && name != "id" && name != "uuid" && name != "name" && name != "base-url" && name != "weight" {
+				shared[name] = true
+			}
+		}
+	}
+	return shared
 }
 
 func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
@@ -368,13 +437,32 @@ func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
 			}
 			for i := 0; i < len(key.Content); i += 2 {
 				if key.Content[i+1].Tag != "!!null" {
-					setYAMLPath(item, key.Content[i].Value, key.Content[i+1])
+					field := key.Content[i].Value
+					if field == "connection-pool" {
+						setYAMLPath(item, field, mergeConnectionPoolNode(yamlPath(group, field), key.Content[i+1]))
+					} else {
+						setYAMLPath(item, field, key.Content[i+1])
+					}
 				}
 			}
 			out.Content = append(out.Content, item)
 		}
 	}
 	return out, nil
+}
+
+// mergeConnectionPoolNode preserves group defaults for omitted or null per-key fields.
+func mergeConnectionPoolNode(base, override *yaml.Node) *yaml.Node {
+	merged := deepCopyYAMLNode(base)
+	if merged == nil || merged.Kind != yaml.MappingNode || override == nil || override.Kind != yaml.MappingNode {
+		return deepCopyYAMLNode(override)
+	}
+	for i := 0; i < len(override.Content); i += 2 {
+		if override.Content[i+1].Tag != "!!null" {
+			setYAMLPath(merged, override.Content[i].Value, override.Content[i+1])
+		}
+	}
+	return merged
 }
 
 // groupLegacyKeys deliberately keeps one group per legacy entry: equal endpoints
@@ -492,7 +580,7 @@ func NormalizeConfigLayout(data []byte, migrate bool) ([]byte, bool, error) {
 }
 
 func v8AllowedRoots() map[string]bool {
-	allowed := map[string]bool{"models": true, "config-version": true, "api-keys": true, "plugins": true, "quota-exceeded": true, "user-email": true, "credential-concurrency-policies": true}
+	allowed := map[string]bool{"models": true, "client": true, "config-version": true, "api-keys": true, "plugins": true, "quota-exceeded": true, "user-email": true, "credential-concurrency-policies": true}
 	for _, path := range v8Paths {
 		section, _, _ := strings.Cut(path.current, ".")
 		allowed[section] = true
@@ -658,24 +746,20 @@ func ValidateV8Config(data []byte) error {
 	deleteYAMLPath(flat, "config-version")
 	// Empty struct containers are valid replacements. Only strip known structural
 	// paths; empty user maps (headers, aliases, plugin options) carry real values.
-	for _, path := range v8Paths {
-		parts := strings.Split(path.current, ".")
-		for end := len(parts) - 1; end > 0; end-- {
-			container := strings.Join(parts[:end], ".")
-			if value := yamlPath(flat, container); value != nil && value.Kind == yaml.MappingNode && len(value.Content) == 0 {
-				deleteYAMLPath(flat, container)
-			}
-		}
-	}
+	pruneEmptyV8Containers(flat)
 	encoded, err := yaml.Marshal(flat)
 	if err != nil {
 		return err
 	}
-	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
-	decoder.KnownFields(true)
+	if errValidate := validateExecutionSchema(flat, []reflect.Type{reflect.TypeOf(legacyConfig{}), reflect.TypeOf(cpaconfig.Config{})}, ""); errValidate != nil {
+		return errValidate
+	}
 	var cfg legacyConfig
-	if errDecode := decoder.Decode(&cfg); errDecode != nil {
+	if errDecode := flat.Decode(&cfg); errDecode != nil {
 		return errDecode
+	}
+	if errValidate := (*Config)(&cfg).ValidateHomePolicies(); errValidate != nil {
+		return errValidate
 	}
 	// Validate the compatible runtime projection with the bundled CPA SDK.
 	_, errParse := cpaconfig.ParseConfigBytes(encoded)

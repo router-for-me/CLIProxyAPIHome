@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestParseConfig_AntigravitySensitiveWords(t *testing.T) {
@@ -184,7 +187,15 @@ api-keys:
 	if !cfg.OAuthOnlyFields["antigravity.sensitive-patterns-replace"] || !cfg.OAuthOnlyFields["devin.sensitive-patterns-replace"] {
 		t.Fatalf("OAuthOnlyFields missing sensitive-patterns-replace scope: %#v", cfg.OAuthOnlyFields)
 	}
-	if len(cfg.ClaudeKey) != 1 || cfg.ClaudeKey[0].Cloak == nil || len(cfg.ClaudeKey[0].Cloak.SensitivePatternsReplace) != 1 || cfg.ClaudeKey[0].Cloak.SensitivePatternsReplace[0].Replacement != "Claude" {
-		t.Fatalf("ClaudeKey[0].Cloak.SensitivePatternsReplace = %#v", cfg.ClaudeKey)
+	wire, errMarshal := yaml.Marshal(cfg)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	cpa, errParse := cpaconfig.ParseConfigBytes(wire)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if len(cpa.ClaudeKey) != 1 || cpa.ClaudeKey[0].Cloak == nil || len(cpa.ClaudeKey[0].Cloak.SensitivePatternsReplace) != 1 || cpa.ClaudeKey[0].Cloak.SensitivePatternsReplace[0].Replacement != "Claude" {
+		t.Fatalf("SDK Claude cloak patterns were lost: %#v", cpa.ClaudeKey)
 	}
 }

@@ -507,7 +507,7 @@ func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex, observ
 	if errRefresh != nil {
 		return nil, errRefresh
 	}
-	return BuildRefreshPayload(updated)
+	return BuildRefreshPayload(updated, r.Config())
 }
 
 // UpdateAuthInMemory updates an auth in memory.
@@ -714,12 +714,15 @@ func (r *Runtime) ListPendingPluginTasks(ctx context.Context, nodeType string, n
 }
 
 // BuildRefreshPayload builds a build refresh payload.
-func BuildRefreshPayload(updated *coreauth.Auth) ([]byte, error) {
+func BuildRefreshPayload(updated *coreauth.Auth, cfg *config.Config) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if updated == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	auth := SanitizeAuthForDownstream(updated)
+	auth, errSanitize := SanitizeAuthForDownstream(updated, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	if auth == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
@@ -950,6 +953,23 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	providers := r.availableProviderKeys()
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("home runtime: no providers available")
+	}
+	for _, provider := range providers {
+		if provider != "antigravity" {
+			continue
+		}
+		until, errPause := r.antigravityTOSPauseDeadline(ctx)
+		if errPause != nil {
+			return nil, fmt.Errorf("read Antigravity pool pause: %w", errPause)
+		}
+		if until.After(time.Now()) {
+			// Keep the provider scope stable for session affinity; only fence candidates.
+			opts.ExcludedProviders = append(append([]string(nil), opts.ExcludedProviders...), "antigravity")
+			if len(providers) == 1 {
+				return nil, &coreauth.Error{Code: "antigravity_tos_pause", Message: "Antigravity credential pool is paused", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
+			}
+		}
+		break
 	}
 
 	if !r.supportsRequestedModel(reqModel) {

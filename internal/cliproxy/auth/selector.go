@@ -403,6 +403,7 @@ type SessionAffinitySelector struct {
 	store            SessionAffinityStore
 	ttl              time.Duration
 	subagentAffinity bool
+	rebindOn         string
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -411,6 +412,7 @@ type SessionAffinityConfig struct {
 	TTL              time.Duration
 	Store            SessionAffinityStore
 	SubagentAffinity *bool
+	RebindOn         string
 }
 
 // NewSessionAffinitySelectorWithConfig creates a selector with custom configuration.
@@ -424,6 +426,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	selector := &SessionAffinitySelector{
 		fallback: cfg.Fallback, store: cfg.Store, ttl: cfg.TTL,
 		subagentAffinity: cfg.SubagentAffinity == nil || *cfg.SubagentAffinity,
+		rebindOn:         strings.ToLower(strings.TrimSpace(cfg.RebindOn)),
 	}
 	if selector.store == nil {
 		selector.cache = NewSessionCache(cfg.TTL)
@@ -445,9 +448,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 //  9. Body conversation_id
 //  10. Hash-based fallback from message content
 //
-// Note: The cache key includes provider, session ID, and model to handle cases where
-// a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
-// that may be supported by different auth credentials, and to avoid cross-provider conflicts.
+// Note: The cache key includes provider scope, session ID, and model. Home dispatch
+// supplies a stable cross-provider scope regardless of provider availability; direct
+// selector calls default to the supplied provider. Models retain separate bindings.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -469,7 +472,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		auths = positiveWeightAuths(auths)
 	}
 	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
+	if err != nil && s.rebindOn != "never" {
 		return nil, err
 	}
 
@@ -490,7 +493,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		pending.finish(true)
 		return selected, nil
 	}
-	cacheKey := sessionBindingKey(provider, primaryID, model)
+	bindingScope := opts.SessionAffinityScope
+	if bindingScope == "" {
+		bindingScope = provider
+	}
+	cacheKey := sessionBindingKey(bindingScope, primaryID, model)
 	isSubagent := sessionFallbackIsSubagent(primaryID, fallbackID, opts)
 	inheritFallback := s.subagentAffinity || !isSubagent
 	guardian := s.subagentAffinity && isSubagent && strings.EqualFold(sessionHeaderValue(opts.Headers, "X-Openai-Subagent"), "guardian")
@@ -531,6 +538,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 		}
+		preserveBinding := active && selected == nil && s.rebindOn == "quota" && preserveSessionBinding(ctx, auths, binding.AuthID, model, now)
+		if active && selected == nil && s.rebindOn == "never" {
+			return nil, &Error{Code: "session_auth_unavailable", Message: "bound session credential is unavailable; failover is disabled", Retryable: true, HTTPStatus: 503}
+		}
+		if err != nil {
+			return nil, err
+		}
 		if selected == nil && !active && guardian {
 			parent, errParent := s.store.LoadLatestSessionBinding(ctx, sessionBindingKey("", fallbackID, ""), parentProviders)
 			if errParent != nil {
@@ -544,7 +558,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if selected == nil && !active && inheritFallback && fallbackID != "" && fallbackID != primaryID {
-			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(provider, fallbackID, model))
+			parent, errParent := s.store.LoadSessionBinding(ctx, sessionBindingKey(bindingScope, fallbackID, model))
 			if errParent != nil {
 				return nil, fmt.Errorf("load parent session affinity binding: %w", errParent)
 			}
@@ -572,6 +586,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		if selected == nil {
 			return nil, &Error{Code: "auth_unavailable", Message: "selector returned no auth"}
+		}
+		if preserveBinding {
+			// A transient failover consumes credit but never overwrites the live
+			// binding, including when admission is committed by another Home.
+			if opts.SessionAffinity != nil {
+				opts.SessionAffinity.reservation = reservation
+				reservation = nil
+			} else {
+				reservation.finish(true)
+			}
+			return selected, nil
 		}
 		commit := SessionAffinityCommit{Key: cacheKey, ExpectedRevision: binding.Revision, AuthID: selected.ID, TTL: s.ttl}
 		if realProvider := sessionSelectionProvider(selected, provider); s.subagentAffinity && realProvider != "" && realProvider != "mixed" {

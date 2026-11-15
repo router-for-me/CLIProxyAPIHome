@@ -42,5 +42,6 @@ func selectorFromConfig(cfg *config.Config, store coreauth.SessionAffinityStore)
 		TTL:              ttl,
 		Store:            store,
 		SubagentAffinity: cfg.Routing.SessionAffinitySubagents,
+		RebindOn:         cfg.Routing.SessionAffinityRebindOn,
 	})
 }

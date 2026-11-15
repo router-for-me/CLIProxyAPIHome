@@ -121,8 +121,8 @@ func TestApplyDownstreamHomeModeScalarsPreservesRemoteManagement(t *testing.T) {
 	if root["disable-cooling"] != true {
 		t.Fatalf("disable-cooling = %v, want true", root["disable-cooling"])
 	}
-	if root["ws-auth"] != false {
-		t.Fatalf("ws-auth = %v, want false", root["ws-auth"])
+	if _, exists := root["ws-auth"]; exists {
+		t.Fatalf("ws-auth must not be distributed: %#v", root)
 	}
 	remoteManagement, ok := root["remote-management"].(map[string]any)
 	if !ok {
@@ -149,6 +149,31 @@ func TestApplyDownstreamHomeModeScalarsDoesNotInjectRemoteManagement(t *testing.
 	}
 }
 
+func TestApplyDownstreamHomeModeScalarsRemovesWebsocketAuth(t *testing.T) {
+	for _, value := range []bool{false, true} {
+		root := map[string]any{
+			"ws-auth": value,
+			"oauth": map[string]any{"providers": map[string]any{
+				"aistudio": map[string]any{"ws-auth": value},
+				"codex":    map[string]any{"signin-with-chatgpt-identifier": "preserved"},
+			}},
+		}
+		ApplyDownstreamHomeModeScalars(root)
+		if _, exists := root["ws-auth"]; exists {
+			t.Fatalf("legacy ws-auth was distributed: %#v", root)
+		}
+		providers := root["oauth"].(map[string]any)["providers"].(map[string]any)
+		if studio, ok := providers["aistudio"].(map[string]any); ok {
+			if _, exists := studio["ws-auth"]; exists {
+				t.Fatalf("scoped ws-auth was distributed: %#v", studio)
+			}
+		}
+		if providers["codex"].(map[string]any)["signin-with-chatgpt-identifier"] != "preserved" {
+			t.Fatal("removing ws-auth changed another provider setting")
+		}
+	}
+}
+
 func TestApplyDownstreamHomeModeScalarsAlwaysDisablesCPACooling(t *testing.T) {
 	for _, homeDisableCooling := range []bool{false, true} {
 		root := map[string]any{"disable-cooling": homeDisableCooling}
@@ -162,7 +187,10 @@ func TestApplyDownstreamHomeModeScalarsAlwaysDisablesCPACooling(t *testing.T) {
 
 	emptyRoot := map[string]any{}
 	ApplyDownstreamHomeModeScalars(emptyRoot)
-	if emptyRoot["usage-statistics-enabled"] != true || emptyRoot["disable-cooling"] != true || emptyRoot["ws-auth"] != false {
-		t.Fatalf("empty downstream root invariants = %#v, want usage=true disable-cooling=true ws-auth=false", emptyRoot)
+	if emptyRoot["usage-statistics-enabled"] != true || emptyRoot["disable-cooling"] != true {
+		t.Fatalf("empty downstream root invariants = %#v, want usage=true disable-cooling=true", emptyRoot)
+	}
+	if _, exists := emptyRoot["ws-auth"]; exists {
+		t.Fatalf("ws-auth must not be injected: %#v", emptyRoot)
 	}
 }

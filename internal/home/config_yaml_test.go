@@ -118,7 +118,7 @@ plugins:
 	assertContains("port: 8317")
 	assertContains("usage-statistics-enabled: true")
 	assertContains("disable-cooling: true")
-	assertContains("ws-auth: false")
+	assertNotContains("ws-auth:")
 	assertContains("plugins:")
 	assertContains("sample:")
 	assertContains("mode: fast")
@@ -154,7 +154,6 @@ func TestSanitizeConfigYAMLForDownstreamNullDocumentAppliesHomeModeScalars(t *te
 	for _, expected := range []string{
 		"usage-statistics-enabled: true",
 		"disable-cooling: true",
-		"ws-auth: false",
 	} {
 		if !strings.Contains(string(out), expected) {
 			t.Fatalf("downstream config = %q, want %q", out, expected)

@@ -226,8 +226,21 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 				}
 				if !existing.DeletedAt.Valid {
 					currentConfig, nextConfig := make(map[string]any), make(map[string]any)
-					ApplyCredentialConfigToRoot(currentConfig, []*coreauth.Auth{current})
-					ApplyCredentialConfigToRoot(nextConfig, []*coreauth.Auth{auth})
+					if _, errApplyCurrent := ApplyCredentialConfigToRoot(currentConfig, []*coreauth.Auth{current}); errApplyCurrent != nil {
+						return errApplyCurrent
+					}
+					if _, errApplyNext := ApplyCredentialConfigToRoot(nextConfig, []*coreauth.Auth{auth}); errApplyNext != nil {
+						return errApplyNext
+					}
+					// Compare the actual configuration trees, not lossy Go/JSON projections.
+					currentConfig, errCurrentTree := appconfig.NormalizeConfigRoot(currentConfig)
+					if errCurrentTree != nil {
+						return errCurrentTree
+					}
+					nextConfig, errNextTree := appconfig.NormalizeConfigRoot(nextConfig)
+					if errNextTree != nil {
+						return errNextTree
+					}
 					currentJSON, errCurrentJSON := json.Marshal(currentConfig)
 					if errCurrentJSON != nil {
 						return errCurrentJSON

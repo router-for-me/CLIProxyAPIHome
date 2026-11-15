@@ -139,7 +139,10 @@ func TestConfigV8SensitiveWordsReplaceDatabaseRoundTrip(t *testing.T) {
 	if errList != nil || len(auths) != 1 {
 		t.Fatalf("ListAuths() = %d, err = %v", len(auths), errList)
 	}
-	dispatched := home.SanitizeAuthForDownstream(auths[0])
+	dispatched, errSanitize := home.SanitizeAuthForDownstream(auths[0], nil)
+	if errSanitize != nil {
+		t.Fatal(errSanitize)
+	}
 	if dispatched.Attributes["cloak_mode"] != "always" ||
 		dispatched.Attributes["cloak_strict_mode"] != "true" ||
 		dispatched.Attributes["cloak_sensitive_words"] != "API,proxy" ||
@@ -168,7 +171,10 @@ func TestConfigV8SensitiveWordsReplaceDatabaseRoundTrip(t *testing.T) {
 	if errListOmitted != nil || len(authsOmittedMode) != 1 {
 		t.Fatalf("ListAuths() omitted mode = %d, err = %v", len(authsOmittedMode), errListOmitted)
 	}
-	dispatchedOmitted := home.SanitizeAuthForDownstream(authsOmittedMode[0])
+	dispatchedOmitted, errSanitize := home.SanitizeAuthForDownstream(authsOmittedMode[0], nil)
+	if errSanitize != nil {
+		t.Fatal(errSanitize)
+	}
 	if gotMode, hasMode := dispatchedOmitted.Attributes["cloak_mode"]; hasMode {
 		t.Fatalf("omitted cloak.mode unexpectedly set cloak_mode=%q", gotMode)
 	}
@@ -253,7 +259,10 @@ func TestConfigV8SensitivePatternsReplaceDatabaseRoundTrip(t *testing.T) {
 	if errList != nil || len(auths) != 1 {
 		t.Fatalf("ListAuths() = %d, err = %v", len(auths), errList)
 	}
-	dispatched := home.SanitizeAuthForDownstream(auths[0])
+	dispatched, errSanitize := home.SanitizeAuthForDownstream(auths[0], nil)
+	if errSanitize != nil {
+		t.Fatal(errSanitize)
+	}
 	var attrPatterns []map[string]string
 	if errUnmarshal := json.Unmarshal([]byte(dispatched.Attributes["cloak_sensitive_patterns_replace"]), &attrPatterns); errUnmarshal != nil {
 		t.Fatalf("unmarshal cloak_sensitive_patterns_replace attr: %v (raw=%q)", errUnmarshal, dispatched.Attributes["cloak_sensitive_patterns_replace"])

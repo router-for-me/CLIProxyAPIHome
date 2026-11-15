@@ -7,10 +7,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// MarshalYAML preserves OAuth scope across watcher/server YAML snapshots. A
-// legacy-only Config still produces its original layout. Database field updates
-// use LegacyConfigRoot and reconcile any existing OAuth scope separately.
+// MarshalYAML returns the complete source tree without rebuilding it from runtime
+// fields. Programmatically constructed configs retain the legacy fallback below.
+// Legacy field updates explicitly use LegacyConfigRoot instead.
 func (cfg Config) MarshalYAML() (any, error) {
+	if cfg.RawConfig != nil {
+		return cfg.RawConfig, nil
+	}
 	var root yaml.Node
 	if err := root.Encode(legacyConfig(cfg)); err != nil {
 		return nil, err
@@ -23,7 +26,11 @@ func (cfg Config) MarshalYAML() (any, error) {
 		field := yamlPath(&root, path.old)
 		if field == nil {
 			field = new(yaml.Node)
-			if err := field.Encode(value.FieldByIndex(v8FieldIndexes[path.old]).Interface()); err != nil {
+			indexes, owned := v8FieldIndexes[path.old]
+			if !owned {
+				continue
+			}
+			if err := field.Encode(value.FieldByIndex(indexes).Interface()); err != nil {
 				return nil, err
 			}
 		}

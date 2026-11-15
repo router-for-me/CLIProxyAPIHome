@@ -139,7 +139,19 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 	}
 	seen := make(map[string]struct{}, len(candidates))
 	var selected *ModelInfo
+	// OAuth aliases can override capabilities independently of their upstream.
+	// API-key pools retain the upstream-first lookup below.
+	for _, route := range []string{strings.TrimSpace(routeModel), coreauth.CanonicalModelID(routeModel)} {
+		info := modelRegistry.GetModelInfoForClient(authID, route)
+		if info != nil && info.MetadataModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.MetadataModelID), coreauth.CanonicalModelID(upstreamModel)) {
+			selected = info
+			break
+		}
+	}
 	for _, candidate := range candidates {
+		if selected != nil {
+			break
+		}
 		key := strings.ToLower(strings.TrimSpace(candidate))
 		if key == "" {
 			continue
@@ -472,9 +484,7 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		key = strings.ToLower(strings.TrimSpace(a.Provider))
 	}
 	models = r.appendPluginModels(key, models)
-	candidates := append([]*ModelInfo{}, models...)
-	models = applyExcludedModels(models, excluded)
-	models = applyOAuthModelAlias(cfg, provider, authKind, models)
+	models, candidates := applyOAuthModelConfig(cfg, provider, authKind, models, excluded)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix), candidates)
 	if provider == "antigravity" {
@@ -1058,6 +1068,9 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			seen[aliasKey] = struct{}{}
 			clone := *model
 			clone.ID = mappedID
+			if clone.MetadataModelID == "" {
+				clone.MetadataModelID = id
+			}
 			if entry.displayName != "" {
 				clone.DisplayName = entry.displayName
 			}

@@ -32,6 +32,9 @@ var ErrInvalidProviderCredentialID = errors.New("provider credential id must be 
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
+	// RawConfig is the complete submitted configuration, not an execution-field remainder.
+	// Runtime fields below are a read projection; configuration writes update the tree.
+	RawConfig map[string]any `yaml:"-" json:"-"`
 	// Models selects optional catalog sources independently for each catalog.
 	Models ModelCatalogs `yaml:"models" json:"models"`
 
@@ -41,6 +44,9 @@ type Config struct {
 	Host string `yaml:"host" json:"-"`
 	// Port is the CPA server port distributed by Home.
 	Port int `yaml:"port" json:"-"`
+
+	// OAuth model capabilities are owned and published by Home.
+	OAuthSettings map[string][]OAuthModelSetting `yaml:"oauth-settings,omitempty" json:"oauth-settings,omitempty"`
 
 	// AllowHost limits RESP client connections to the listed IP addresses.
 	// Empty means all client hosts are allowed.
@@ -225,6 +231,7 @@ type CodexHeaderDefaults struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
+	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
 	// SensitiveWords is a list of words to obfuscate in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 
@@ -318,6 +325,8 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	// SessionAffinityRebindOn controls failover binding changes: any, quota, or never.
+	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
@@ -352,6 +361,8 @@ type OAuthModelAlias struct {
 
 	// Settings shared with CPA V8.
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
+	// OpenAPI selects the Vertex execution endpoint without changing Home alias resolution.
+	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
@@ -437,6 +448,7 @@ type CloakConfig struct {
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -541,6 +553,7 @@ func (m ClaudeModel) GetMaxContextLength() int { return m.MaxContextLength }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -659,6 +672,7 @@ type MetaModel = CodexModel
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -754,6 +768,7 @@ func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable identity of the fallback credential when no API key entries exist.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -798,6 +813,7 @@ type OpenAICompatibility struct {
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
 type OpenAICompatibilityAPIKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -913,6 +929,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if secretChanged {
 		cfg.RemoteManagement.SecretKey = normalizedSecret
+		// Secret normalization is an explicit Home-owned tree update, not a
+		// serialization of the runtime projection back into the full document.
+		for _, section := range []string{"management", "remote-management"} {
+			if management, ok := cfg.RawConfig[section].(map[string]any); ok {
+				management["secret-key"] = normalizedSecret
+				break
+			}
+		}
 		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
 		// Preserve YAML comments and ordering; update only the nested key.
 		secretPath := []string{"remote-management", "secret-key"}
@@ -1162,12 +1186,18 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 				continue
 			}
 			seenAlias[aliasKey] = struct{}{}
+			var openAPI *bool
+			if channel == "vertex" && entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
 			clean = append(clean, OAuthModelAlias{
 				Name:         name,
 				Alias:        alias,
 				Fork:         entry.Fork,
 				DisplayName:  strings.TrimSpace(entry.DisplayName),
 				ForceMapping: entry.ForceMapping,
+				OpenAPI:      openAPI,
 			})
 		}
 		if len(clean) > 0 {
@@ -1412,7 +1442,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
-// It uses API key, base URL, proxy URL, prefix, and custom headers as the uniqueness key.
+// Distinct scheduling, model, and CPA execution options remain separate credentials.
 func (cfg *Config) SanitizeGeminiKeys() {
 	// Keep validation before state changes so failures leave existing data intact.
 	if cfg == nil {
@@ -1464,6 +1494,14 @@ func formatGeminiKeyDedupID(entry GeminiKey) string {
 	b.WriteString(entry.Prefix)
 	b.WriteByte(0)
 	b.WriteString(FormatSortedHeaders(entry.Headers))
+	b.WriteByte(0)
+	raw, _ := yaml.Marshal(entry)
+	var options map[string]any
+	_ = yaml.Unmarshal(raw, &options)
+	delete(options, "id")
+	delete(options, "uuid")
+	encoded, _ := json.Marshal(options)
+	b.Write(encoded)
 	return b.String()
 }
 

@@ -133,6 +133,28 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	if errNormalize != nil {
 		return nil, fmt.Errorf("home runtime: normalize config: %w", errNormalize)
 	}
+	// Older CPA executors default an omitted or blank TOS pause window to 6h.
+	// Project Home's disabled default explicitly without changing stored config.
+	antigravity, ok := normalized["antigravity"].(map[string]any)
+	if !ok {
+		if normalized["antigravity"] != nil {
+			return nil, fmt.Errorf("home runtime: antigravity must be a mapping")
+		}
+		antigravity = make(map[string]any)
+		normalized["antigravity"] = antigravity
+	}
+	window := antigravity["tos-pause-window"]
+	if raw, isString := window.(string); window == nil || (isString && strings.TrimSpace(raw) == "") {
+		antigravity["tos-pause-window"] = "0"
+		// NormalizeConfigRoot has already validated these optional containers.
+		if oauth, okOAuth := normalized["oauth"].(map[string]any); okOAuth {
+			if providers, okProviders := oauth["providers"].(map[string]any); okProviders {
+				if scoped, okScoped := providers["antigravity"].(map[string]any); okScoped {
+					scoped["tos-pause-window"] = "0"
+				}
+			}
+		}
+	}
 	var errMarshal error
 	payload, errMarshal = yaml.Marshal(normalized)
 	if errMarshal != nil {

@@ -78,12 +78,8 @@ func TestManagerNonWeightedPinnedSelection(t *testing.T) {
 						}
 					}
 					if sticky, ok := selector.(*SessionAffinitySelector); ok {
-						namespace := provider
-						if mixed {
-							namespace = "mixed"
-						}
 						id, _ := extractSessionIDs(http.Header{"Session_id": {"non-weighted-pinned"}}, nil, nil)
-						if binding, found := sticky.cache.Get(sessionBindingKey(namespace, id, model)); !found || binding != pinnedID {
+						if binding, found := sticky.cache.Get(sessionBindingKey("mixed", id, model)); !found || binding != pinnedID {
 							t.Fatalf("pinning checks changed the sticky binding: %q, found=%t", binding, found)
 						}
 					}
@@ -149,7 +145,7 @@ func TestManagerWeightedPinnedSessionCompensation(t *testing.T) {
 				}
 				stickyHeaders := http.Header{"Session_id": {"pinned-session"}}
 				id, _ := extractSessionIDs(stickyHeaders, nil, nil)
-				bindingKey := sessionBindingKey(namespace, id, model)
+				bindingKey := sessionBindingKey("mixed", id, model)
 				if mode == "sticky" {
 					selector.cache.Set(bindingKey, bID)
 				}

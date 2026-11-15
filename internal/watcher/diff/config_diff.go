@@ -235,31 +235,7 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if oldExcluded.hash != newExcluded.hash {
 				changes = append(changes, fmt.Sprintf("claude[%d].excluded-models: updated (%d -> %d entries)", i, oldExcluded.count, newExcluded.count))
 			}
-			switch {
-			case o.Cloak == nil && n.Cloak != nil:
-				changes = append(changes, fmt.Sprintf("claude[%d].cloak: added", i))
-			case o.Cloak != nil && n.Cloak == nil:
-				changes = append(changes, fmt.Sprintf("claude[%d].cloak: removed", i))
-			case o.Cloak != nil && n.Cloak != nil:
-				if strings.TrimSpace(o.Cloak.Mode) != strings.TrimSpace(n.Cloak.Mode) {
-					changes = append(changes, fmt.Sprintf("claude[%d].cloak.mode: %s -> %s", i, o.Cloak.Mode, n.Cloak.Mode))
-				}
-				if o.Cloak.StrictMode != n.Cloak.StrictMode {
-					changes = append(changes, fmt.Sprintf("claude[%d].cloak.strict-mode: %t -> %t", i, o.Cloak.StrictMode, n.Cloak.StrictMode))
-				}
-				if !reflect.DeepEqual(o.Cloak.SensitiveWords, n.Cloak.SensitiveWords) {
-					changes = append(changes, fmt.Sprintf("claude[%d].cloak.sensitive-words: %d -> %d", i, len(o.Cloak.SensitiveWords), len(n.Cloak.SensitiveWords)))
-				}
-				if !equalStringMap(o.Cloak.SensitiveWordsReplace, n.Cloak.SensitiveWordsReplace) {
-					changes = append(changes, fmt.Sprintf("claude[%d].cloak.sensitive-words-replace: %d -> %d", i, len(o.Cloak.SensitiveWordsReplace), len(n.Cloak.SensitiveWordsReplace)))
-				}
-				if !equalSensitivePatternRules(o.Cloak.SensitivePatternsReplace, n.Cloak.SensitivePatternsReplace) {
-					changes = append(changes, fmt.Sprintf("claude[%d].cloak.sensitive-patterns-replace: %d -> %d", i, len(o.Cloak.SensitivePatternsReplace), len(n.Cloak.SensitivePatternsReplace)))
-				}
-				if !reflect.DeepEqual(o.Cloak.CacheUserID, n.Cloak.CacheUserID) {
-					changes = append(changes, fmt.Sprintf("claude[%d].cloak.cache-user-id: %s -> %s", i, formatOptionalBool(o.Cloak.CacheUserID), formatOptionalBool(n.Cloak.CacheUserID)))
-				}
-			}
+			changes = appendClaudeCloakChanges(changes, i, o, n)
 		}
 	}
 

@@ -423,20 +423,20 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 	}
 	if refreshErr != nil {
 		if coreauth.AuthIsNewerThanObserved(updated, observedAccessTokenSHA256) {
-			return home.BuildRefreshPayload(updated)
+			return home.BuildRefreshPayload(updated, c.runtime.Config())
 		}
 		if coreauth.CanUseObservedTokenAfterRefreshFailure(updated, observedAccessTokenSHA256, refreshErr, time.Now().UTC()) {
-			return home.BuildRefreshPayload(updated)
+			return home.BuildRefreshPayload(updated, c.runtime.Config())
 		}
 		return nil, refreshErr
 	}
 	if targetIndex != requestedIndex {
 		if requested, ok := core.GetByIndex(requestedIndex); ok && requested != nil {
-			return home.BuildRefreshPayload(requested)
+			return home.BuildRefreshPayload(requested, c.runtime.Config())
 		}
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	return home.BuildRefreshPayload(updated)
+	return home.BuildRefreshPayload(updated, c.runtime.Config())
 }
 
 func (c *RefreshController) retryRefreshFinalize(ctx context.Context, targetUUID, leaseID string, leased, beforeClaim, refreshed *coreauth.Auth, errRefresh error) (*coreauth.Auth, bool, bool, bool, error) {

@@ -51,6 +51,11 @@ type Options struct {
 	OriginalRequest []byte
 	Metadata        map[string]any
 	SessionAffinity *SessionAffinitySelection
+	// SessionAffinityScope overrides the binding namespace, not candidate filtering
+	// or weighted accounting. Empty uses the provider passed to the selector.
+	SessionAffinityScope string
+	// ExcludedProviders fences unavailable pools without changing session-binding namespaces.
+	ExcludedProviders []string
 }
 
 func requestRetryRoundFromOptions(opts Options) int {

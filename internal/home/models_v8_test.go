@@ -61,7 +61,11 @@ func TestV8ModelCapabilitiesSurviveCredentialAndDispatch(t *testing.T) {
 			if _, exists := wire["is_compat"]; exists {
 				t.Fatalf("unexpected dispatch is_compat: %s", encoded)
 			}
-			downstream, errMarshalDownstream := json.Marshal(SanitizeAuthForDownstream(&restored))
+			sanitized, errSanitize := SanitizeAuthForDownstream(&restored, nil)
+			if errSanitize != nil {
+				t.Fatal(errSanitize)
+			}
+			downstream, errMarshalDownstream := json.Marshal(sanitized)
 			if errMarshalDownstream != nil {
 				t.Fatal(errMarshalDownstream)
 			}
@@ -107,7 +111,10 @@ func TestV8ClaudeNativeToolSearchOption(t *testing.T) {
 		return auths[0]
 	}
 
-	enabled := SanitizeAuthForDownstream(synthesize(true))
+	enabled, errSanitize := SanitizeAuthForDownstream(synthesize(true), nil)
+	if errSanitize != nil {
+		t.Fatal(errSanitize)
+	}
 	if got := enabled.Attributes["native_tool_search"]; got != "true" {
 		t.Fatalf("native_tool_search = %q, want true", got)
 	}
@@ -130,7 +137,10 @@ func TestV8CredentialOptionsPreserveEmptyModels(t *testing.T) {
 		if errSynthesize != nil || len(auths) != 1 {
 			t.Fatalf("synthesis count=%d err=%v", len(auths), errSynthesize)
 		}
-		downstream := SanitizeAuthForDownstream(auths[0])
+		downstream, errSanitize := SanitizeAuthForDownstream(auths[0], nil)
+		if errSanitize != nil {
+			t.Fatal(errSanitize)
+		}
 		options, ok := downstream.Metadata["credential_options"].(map[string]any)
 		if !ok {
 			t.Fatal("missing credential options")

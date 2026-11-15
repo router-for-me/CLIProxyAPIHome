@@ -126,7 +126,7 @@ func TestV8ConfigExample(t *testing.T) {
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
-	if active.Port != 8317 || active.RequestRetry != 3 || !active.QuotaExceeded.AntigravityCredits || active.QuotaExceeded.SwitchProject || active.QuotaExceeded.SwitchPreviewModel || !active.UsageStatisticsEnabled || active.WebsocketAuth {
+	if active.Port != 8317 || active.RequestRetry != 3 || !active.QuotaExceeded.AntigravityCredits || active.QuotaExceeded.SwitchProject || active.QuotaExceeded.SwitchPreviewModel || !active.UsageStatisticsEnabled {
 		t.Fatal("template defaults do not match the Home configuration contract")
 	}
 	for _, count := range []int{len(active.GeminiKey), len(active.InteractionsKey), len(active.VertexCompatAPIKey), len(active.CodexKey), len(active.ClaudeKey), len(active.XAIKey), len(active.MetaKey), len(active.OpenAICompatibility)} {

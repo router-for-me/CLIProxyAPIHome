@@ -27,13 +27,15 @@ type CredentialConfigCounts struct {
 }
 
 // ApplyCredentialConfigToRoot restores auth-backed config keys into a config root.
-func ApplyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth) CredentialConfigCounts {
+func ApplyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth) (CredentialConfigCounts, error) {
 	if root == nil {
-		return CredentialConfigCounts{}
+		return CredentialConfigCounts{}, nil
 	}
 	result := &CredentialConfigCounts{}
-	applyCredentialConfigToRoot(root, auths, result)
-	return *result
+	if errApply := applyCredentialConfigToRoot(root, auths, result); errApply != nil {
+		return CredentialConfigCounts{}, errApply
+	}
+	return *result, nil
 }
 
 type credentialModelPair struct {
@@ -53,7 +55,7 @@ type credentialOpenAICompatGroup struct {
 }
 
 // applyCredentialConfigToRoot restores auth-backed credential config values.
-func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, result *CredentialConfigCounts) {
+func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, result *CredentialConfigCounts) error {
 	// Normalize source data before building the derived payload.
 	geminiKeys := make([]appconfig.GeminiKey, 0)
 	interactionsKeys := make([]appconfig.GeminiKey, 0)
@@ -66,22 +68,50 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 
 	for _, auth := range auths {
 		switch credentialConfigAuthKind(auth) {
-		case "gemini-api-key":
-			geminiKeys = append(geminiKeys, credentialGeminiKey(auth))
-		case "interactions-api-key":
-			interactionsKeys = append(interactionsKeys, credentialGeminiKey(auth))
+		case "gemini-api-key", "interactions-api-key":
+			entry, errGemini := credentialGeminiKey(auth)
+			if errGemini != nil {
+				return errGemini
+			}
+			if auth.Provider == "gemini-interactions" {
+				interactionsKeys = append(interactionsKeys, entry)
+			} else {
+				geminiKeys = append(geminiKeys, entry)
+			}
 		case "vertex-api-key":
-			vertexKeys = append(vertexKeys, credentialVertexKey(auth))
+			entry, errVertex := credentialVertexKey(auth)
+			if errVertex != nil {
+				return errVertex
+			}
+			vertexKeys = append(vertexKeys, entry)
 		case "codex-api-key":
-			codexKeys = append(codexKeys, credentialCodexKey(auth))
+			entry, errCodex := credentialCodexKey(auth)
+			if errCodex != nil {
+				return errCodex
+			}
+			codexKeys = append(codexKeys, entry)
 		case "xai-api-key":
-			xaiKeys = append(xaiKeys, credentialXAIKey(auth))
+			entry, errXAI := credentialXAIKey(auth)
+			if errXAI != nil {
+				return errXAI
+			}
+			xaiKeys = append(xaiKeys, entry)
 		case "meta-api-key":
-			metaKeys = append(metaKeys, credentialMetaKey(auth))
+			entry, errMeta := credentialMetaKey(auth)
+			if errMeta != nil {
+				return errMeta
+			}
+			metaKeys = append(metaKeys, entry)
 		case "claude-api-key":
-			claudeKeys = append(claudeKeys, credentialClaudeKey(auth))
+			entry, errClaude := credentialClaudeKey(auth)
+			if errClaude != nil {
+				return errClaude
+			}
+			claudeKeys = append(claudeKeys, entry)
 		case "openai-compatibility":
-			addOpenAICompatCredential(openAICompat, auth)
+			if errAdd := addOpenAICompatCredential(openAICompat, auth); errAdd != nil {
+				return errAdd
+			}
 		}
 	}
 
@@ -131,6 +161,7 @@ func applyCredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth, re
 		root["openai-compatibility"] = items
 		result.OpenAICompatibility = len(items)
 	}
+	return nil
 }
 
 // credentialConfigAuthKind returns the config key represented by an auth record.
@@ -174,7 +205,7 @@ func isOpenAICompatConfigAuth(auth *coreauth.Auth) bool {
 }
 
 // credentialGeminiKey builds a Gemini key config from an auth record.
-func credentialGeminiKey(auth *coreauth.Auth) appconfig.GeminiKey {
+func credentialGeminiKey(auth *coreauth.Auth) (appconfig.GeminiKey, error) {
 	return applyCredentialConfigOptions(auth, appconfig.GeminiKey{
 		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
@@ -191,7 +222,7 @@ func credentialGeminiKey(auth *coreauth.Auth) appconfig.GeminiKey {
 }
 
 // credentialVertexKey builds a Vertex key config from an auth record.
-func credentialVertexKey(auth *coreauth.Auth) appconfig.VertexCompatKey {
+func credentialVertexKey(auth *coreauth.Auth) (appconfig.VertexCompatKey, error) {
 	return applyCredentialConfigOptions(auth, appconfig.VertexCompatKey{
 		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
@@ -208,7 +239,7 @@ func credentialVertexKey(auth *coreauth.Auth) appconfig.VertexCompatKey {
 }
 
 // credentialCodexKey builds a Codex key config from an auth record.
-func credentialCodexKey(auth *coreauth.Auth) appconfig.CodexKey {
+func credentialCodexKey(auth *coreauth.Auth) (appconfig.CodexKey, error) {
 	return applyCredentialConfigOptions(auth, appconfig.CodexKey{
 		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
@@ -227,7 +258,7 @@ func credentialCodexKey(auth *coreauth.Auth) appconfig.CodexKey {
 }
 
 // credentialXAIKey builds an xAI key config from an auth record.
-func credentialXAIKey(auth *coreauth.Auth) appconfig.XAIKey {
+func credentialXAIKey(auth *coreauth.Auth) (appconfig.XAIKey, error) {
 	return applyCredentialConfigOptions(auth, appconfig.XAIKey{
 		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
@@ -245,7 +276,7 @@ func credentialXAIKey(auth *coreauth.Auth) appconfig.XAIKey {
 }
 
 // credentialMetaKey builds a Meta key config from an auth record.
-func credentialMetaKey(auth *coreauth.Auth) appconfig.MetaKey {
+func credentialMetaKey(auth *coreauth.Auth) (appconfig.MetaKey, error) {
 	return applyCredentialConfigOptions(auth, appconfig.MetaKey{
 		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
@@ -263,7 +294,7 @@ func credentialMetaKey(auth *coreauth.Auth) appconfig.MetaKey {
 }
 
 // credentialClaudeKey builds a Claude key config from an auth record.
-func credentialClaudeKey(auth *coreauth.Auth) appconfig.ClaudeKey {
+func credentialClaudeKey(auth *coreauth.Auth) (appconfig.ClaudeKey, error) {
 	return applyCredentialConfigOptions(auth, appconfig.ClaudeKey{
 		ID:             strings.TrimSpace(auth.ID),
 		APIKey:         authAttribute(auth, "api_key"),
@@ -280,10 +311,10 @@ func credentialClaudeKey(auth *coreauth.Auth) appconfig.ClaudeKey {
 }
 
 // addOpenAICompatCredential adds an OpenAI-compatible auth record to grouped config.
-func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, auth *coreauth.Auth) {
+func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, auth *coreauth.Auth) error {
 	// Keep validation before state changes so failures leave existing data intact.
 	if auth == nil {
-		return
+		return nil
 	}
 	name := authAttribute(auth, "compat_name")
 	if name == "" {
@@ -304,7 +335,37 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 	if apiKey == "" && proxyURL == "" {
 		representation = "fallback:" + strings.TrimSpace(auth.ID)
 	}
-	options, _ := json.Marshal(auth.Metadata["credential_options"])
+	groupConfig, errGroup := applyCredentialConfigOptions(auth, appconfig.OpenAICompatibility{
+		ID:             openAICompatFallbackID(auth),
+		Name:           name,
+		Priority:       priority,
+		Prefix:         prefix,
+		BaseURL:        baseURL,
+		Models:         credentialOpenAIModels(auth),
+		Headers:        headers,
+		DisableCooling: disableCooling,
+		RequestRetry:   requestRetry,
+	})
+	if errGroup != nil {
+		return errGroup
+	}
+	// Equal effective options can come from different group defaults and key
+	// overrides. Only merge groups whose original defaults also match, or a
+	// key with an omitted override can change behavior on the next import.
+	groupSource := make(map[string]any, len(groupConfig.RawConfig))
+	for key, value := range groupConfig.RawConfig {
+		if key != "api-key-entries" {
+			groupSource[key] = value
+		}
+	}
+	source, errSource := json.Marshal(groupSource)
+	if errSource != nil {
+		return fmt.Errorf("encode compatibility source for credential %q: %w", auth.ID, errSource)
+	}
+	options, errMarshal := json.Marshal(auth.Metadata["credential_options"])
+	if errMarshal != nil {
+		return fmt.Errorf("encode compatibility options for credential %q: %w", auth.ID, errMarshal)
+	}
 	groupKey := strings.Join([]string{
 		strings.ToLower(name),
 		baseURL,
@@ -315,43 +376,38 @@ func addOpenAICompatCredential(groups map[string]*credentialOpenAICompatGroup, a
 		optionalIntKey(requestRetry),
 		representation,
 		string(options),
+		string(source),
 	}, "\x00")
 
 	group := groups[groupKey]
 	if group == nil {
 		group = &credentialOpenAICompatGroup{
-			Config: appconfig.OpenAICompatibility{
-				ID:             openAICompatFallbackID(auth),
-				Name:           name,
-				Priority:       priority,
-				Prefix:         prefix,
-				BaseURL:        baseURL,
-				Models:         credentialOpenAIModels(auth),
-				Headers:        headers,
-				DisableCooling: disableCooling,
-				RequestRetry:   requestRetry,
-			},
+			Config:      groupConfig,
 			SeenEntry:   make(map[string]struct{}),
 			SortKey:     groupKey,
 			FirstAuthID: strings.TrimSpace(auth.ID),
 		}
-		group.Config = applyCredentialConfigOptions(auth, group.Config)
 		groups[groupKey] = group
 	}
 
 	if apiKey == "" && proxyURL == "" {
-		return
+		return nil
 	}
 	entryKey := strings.TrimSpace(auth.ID) + "\x00" + apiKey + "\x00" + proxyURL
 	if _, ok := group.SeenEntry[entryKey]; ok {
-		return
+		return nil
 	}
-	group.SeenEntry[entryKey] = struct{}{}
-	group.Config.APIKeyEntries = append(group.Config.APIKeyEntries, applyCredentialConfigOptions(auth, appconfig.OpenAICompatibilityAPIKey{
+	entry, errApply := applyCredentialConfigOptions(auth, appconfig.OpenAICompatibilityAPIKey{
 		ID:       strings.TrimSpace(auth.ID),
 		APIKey:   apiKey,
 		ProxyURL: proxyURL,
-	}))
+	})
+	if errApply != nil {
+		return errApply
+	}
+	group.SeenEntry[entryKey] = struct{}{}
+	group.Config.APIKeyEntries = append(group.Config.APIKeyEntries, entry)
+	return nil
 }
 
 func openAICompatFallbackID(auth *coreauth.Auth) string {
@@ -831,13 +887,67 @@ func boolFromAny(value any) (bool, bool) {
 
 // applyCredentialConfigOptions restores options retained with the authoritative
 // credential rather than reconstructing them from lossy scheduling projections.
-func applyCredentialConfigOptions[T any](auth *coreauth.Auth, value T) T {
+func applyCredentialConfigOptions[T any](auth *coreauth.Auth, value T) (T, error) {
 	if auth == nil || auth.Metadata == nil {
-		return value
+		return value, nil
 	}
-	data, errMarshal := json.Marshal(auth.Metadata["credential_options"])
-	if errMarshal == nil {
-		_ = json.Unmarshal(data, &value)
+	options := auth.Metadata["credential_options"]
+	data, errMarshal := json.Marshal(options)
+	if errMarshal != nil {
+		return value, fmt.Errorf("encode options for credential %q: %w", auth.ID, errMarshal)
 	}
-	return value
+	if errDecode := json.Unmarshal(data, &value); errDecode != nil {
+		return value, fmt.Errorf("decode options for credential %q: %w", auth.ID, errDecode)
+	}
+	var source map[string]any
+	if raw := auth.Metadata[appconfig.HomeCredentialConfigMetadataKey]; raw != nil {
+		sourceData, errSource := json.Marshal(raw)
+		if errSource != nil {
+			return value, fmt.Errorf("encode source for credential %q: %w", auth.ID, errSource)
+		}
+		if errDecode := json.Unmarshal(sourceData, &source); errDecode != nil {
+			return value, fmt.Errorf("decode source for credential %q: %w", auth.ID, errDecode)
+		}
+		if _, keyEntry := any(&value).(*appconfig.OpenAICompatibilityAPIKey); keyEntry {
+			keys, ok := source["api-key-entries"].([]any)
+			if !ok || len(keys) != 1 {
+				return value, fmt.Errorf("source for credential %q must contain exactly one compatibility key entry", auth.ID)
+			}
+			source, ok = keys[0].(map[string]any)
+			if !ok || source == nil {
+				return value, fmt.Errorf("source key entry for credential %q must be an object", auth.ID)
+			}
+		}
+	} else if options != nil {
+		// Compatibility for records written before raw credential trees existed.
+		var errRestore error
+		source, errRestore = appconfig.CredentialConfigFromOptions(value, options)
+		if errRestore != nil {
+			return value, fmt.Errorf("restore legacy options for credential %q: %w", auth.ID, errRestore)
+		}
+	}
+	if source == nil {
+		return value, nil
+	}
+	// Identity, secrets and scheduling remain authoritative on the auth record.
+	// Execution fields (including nested models/cloak) stay in the original tree.
+	data, errMarshal = json.Marshal(value)
+	if errMarshal != nil {
+		return value, fmt.Errorf("encode fields for credential %q: %w", auth.ID, errMarshal)
+	}
+	var owned map[string]any
+	if errDecode := json.Unmarshal(data, &owned); errDecode != nil {
+		return value, fmt.Errorf("decode fields for credential %q: %w", auth.ID, errDecode)
+	}
+	for _, key := range appconfig.HomeCredentialFields {
+		if field, exists := owned[key]; exists {
+			source[key] = field
+		} else {
+			delete(source, key)
+		}
+	}
+	if holder, ok := any(&value).(interface{ SetConfigTree(map[string]any) }); ok {
+		holder.SetConfigTree(source)
+	}
+	return value, nil
 }
