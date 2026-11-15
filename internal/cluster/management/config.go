@@ -305,8 +305,8 @@ func (h *Handler) applyCredentialConfig(ctx context.Context, root map[string]any
 	if errAuths != nil {
 		return errAuths
 	}
-	cluster.ApplyCredentialConfigToRoot(root, auths)
-	return nil
+	_, errApply := cluster.ApplyCredentialConfigToRoot(root, auths)
+	return errApply
 }
 
 // rawConfigRootFromYAML derives config root from yaml without dropping credential roots.

@@ -282,7 +282,9 @@ func ExportLocalState(ctx context.Context, opts ExportOptions) (ExportStats, err
 		})
 		root["auth-dir"] = authDirName
 		root["credential-concurrency"] = lifecycleConfig
-		ApplyCredentialConfigToRoot(root, auths)
+		if _, errApply := ApplyCredentialConfigToRoot(root, auths); errApply != nil {
+			return errApply
+		}
 		return exportCredentialConcurrencyPoliciesForAuthsTx(ctx, tx, root, auths)
 	}()
 	if errSnapshot != nil {

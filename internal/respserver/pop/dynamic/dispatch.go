@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
@@ -125,11 +126,14 @@ func handleAuth(ctx context.Context, env dispatch.Env, args []string) dispatch.R
 	return reply
 }
 
-func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]byte, []byte, error) {
+func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string, cfg *config.Config) ([]byte, []byte, error) {
 	if result == nil || result.Auth == nil {
 		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
 	}
-	auth := home.SanitizeAuthForDownstream(result.Auth)
+	auth, errSanitize := home.SanitizeAuthForDownstream(result.Auth, cfg)
+	if errSanitize != nil {
+		return nil, nil, errSanitize
+	}
 	if auth == nil {
 		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
 	}
@@ -291,7 +295,7 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		RetryRound:        retryRound,
 		RetryRoundPresent: retryRoundPresent,
 		PrepareResponse: func(result *home.DispatchResult) ([]byte, []byte, error) {
-			unaccounted, accounted, errPrepare := prepareDispatchResponse(result, userAPIKey)
+			unaccounted, accounted, errPrepare := prepareDispatchResponse(result, userAPIKey, env.Runtime.Config())
 			if errPrepare != nil {
 				return nil, nil, errPrepare
 			}

@@ -51,6 +51,8 @@ type Options struct {
 	OriginalRequest []byte
 	Metadata        map[string]any
 	SessionAffinity *SessionAffinitySelection
+	// ExcludedProviders fences unavailable pools without changing session-binding namespaces.
+	ExcludedProviders []string
 }
 
 func requestRetryRoundFromOptions(opts Options) int {

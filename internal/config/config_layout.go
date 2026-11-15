@@ -103,9 +103,38 @@ func LegacyConfigRoot(cfg *Config) (map[string]any, error) {
 	if errEncode := node.Encode((*legacyConfig)(cfg)); errEncode != nil {
 		return nil, errEncode
 	}
+	// Only the legacy field-update adapter serializes runtime fields. Normal
+	// snapshots use RawConfig directly; unknown CPA fields remain in this tree.
+	if cfg.RawConfig != nil {
+		stored, errNormalize := NormalizeConfigRoot(cfg.RawConfig)
+		if errNormalize != nil {
+			return nil, errNormalize
+		}
+		var source yaml.Node
+		if errEncode := source.Encode(stored); errEncode != nil {
+			return nil, errEncode
+		}
+		mergeLegacyRuntimeFields(&source, &node)
+		node = source
+	}
 	var root map[string]any
 	if errDecode := node.Decode(&root); errDecode != nil {
 		return nil, errDecode
 	}
 	return root, nil
+}
+
+func mergeLegacyRuntimeFields(dst, src *yaml.Node) {
+	if dst.Kind != yaml.MappingNode || src.Kind != yaml.MappingNode {
+		*dst = *deepCopyYAMLNode(src)
+		return
+	}
+	for i := 0; i < len(src.Content); i += 2 {
+		key, value := src.Content[i], src.Content[i+1]
+		if index := findMapKeyIndex(dst, key.Value); index >= 0 {
+			mergeLegacyRuntimeFields(dst.Content[index+1], value)
+		} else {
+			dst.Content = append(dst.Content, deepCopyYAMLNode(key), deepCopyYAMLNode(value))
+		}
+	}
 }

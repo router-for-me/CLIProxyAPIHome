@@ -406,6 +406,33 @@ OAuth fields otherwise precede flat fields. v8 reads and successful mutations
 use canonical names. Home persists and publishes a compatible legacy runtime
 projection so the bundled CPA SDK can consume the shared values.
 
+#### Home policies and CPA execution settings
+
+The config endpoints also accept the fields below. All values are database-backed and round-trip through config reads and import/export. Explicit `false`, `0`, empty collections, and `null` are preserved; SDK defaults are not written back. CPA execution fields are validated against the CPA SDK version pinned in Home, so an SDK update normally exposes new options without Home changes; unknown fields are still rejected. CPA-only settings are stored and distributed by Home but never applied to Home's own HTTP server or upstream connections, and older CPA nodes may ignore options they do not support.
+
+| Scope | Fields |
+| --- | --- |
+| Home scheduling | `routing.session-affinity-rebind-on`; `oauth.providers.antigravity.tos-pause-window` |
+| Home model catalog | `oauth.settings.<provider>[]` (`name`, optional `alias`, `max-context-length`) |
+| CPA server | `server.max-request-body-bytes`, `server.response-compression.enabled/min-bytes`, `server.shutdown-timeout`, `server.github-token` |
+| CPA client compatibility | `client.codex.enable-apply-patch`, `client.codex.web-search-result-cache.enabled/ttl/limit`, `client.claude.show-codex-commentary` |
+| CPA Codex execution | `upstream.codex.upstream-request-compression`, `upstream.codex.upstream-request-compression-min-bytes`, `upstream.codex.websocket-compression`; `oauth.providers.codex.signin-with-chatgpt-identifier` |
+| CPA Claude execution | `upstream.claude.server-side-fallback`; `upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA prompt policies | `oauth.providers.antigravity.sensitive-patterns-replace`, `oauth.providers.devin.sensitive-patterns-replace`, `api-keys.claude[].keys[].cloak.sensitive-patterns-replace`; ordered `{pattern, replacement}` Go RE2 rules |
+| Credential execution options | `api-keys.<provider>[].connection-pool` (group and per-key); `api-keys.vertex[].interactions`; `api-keys.vertex[].models[].openapi`; `oauth.model-alias.vertex[].openapi` |
+
+`routing.session-affinity-rebind-on` controls failover when a bound credential is unavailable: `any` (default) rebinds on any failover; `quota` keeps the binding through transient failures and rebinds only for quota, authentication, or model-support failures; `never` refuses to fail over from a live binding. Expired bindings are always eligible for reselection. Only current failures for the requested model, or a credential-wide fence, count; temporary concurrency or retry exclusions do not trigger a rebind under `quota`.
+
+`tos-pause-window` defaults to `6h`; `0`, `off`, `false`, `none`, or `disabled` turns it off. A Google RPC 403 `PERMISSION_DENIED` with `ErrorInfo.reason=TOS_VIOLATION` pauses the whole Antigravity pool for the window. During the pause Home excludes only Antigravity candidates; bindings to other providers stay valid, including under `never`.
+
+`oauth.settings.<provider>[]` overrides `max-context-length` for OAuth models and is applied after exclusions and aliases, before prefixes. An entry matching an `alias` takes precedence over one matching the original `name`. API-key models are not affected.
+
+`connection-pool` is opt-in: an empty `connection-pool: {}` enables CPA defaults (`idle-conn-timeout: 300s`, `max-idle-conns-per-host: 2`). Fields are `enabled`, `idle-conn-timeout`, and `max-idle-conns-per-host`. Per-key values override the group; omitted or `null` fields inherit, and `enabled: false` opts a key out. The effective options travel with each dispatched credential; Home itself never opens these pools.
+
+Explicit `true`/`false` values of `api-keys.vertex[].models[].openapi` and `oauth.model-alias.vertex[].openapi` are projected into the dispatched credential's `vertex_model_openapi` attribute; omitted or `null` keeps CPA's automatic routing. Credential-level rules take precedence over OAuth alias rules, and alias rules do not affect API-key credentials. Removing a setting drops the projection on the next dispatch or refresh without rewriting stored credentials. Malformed credential execution options fail synthesis, dispatch, or refresh instead of being silently dropped.
+
+`server.github-token` is a secret distributed to trusted CPA nodes, not a Home management key. Credential identity, secrets, and scheduling stay on auth records; private original credential configuration is retained for export but excluded from CPA payloads.
+
 #### Credential concurrency lifecycle fields
 
 The `credentials.concurrency` object is included in both config responses. Home owns `lifecycle-config-revision` and `observation-barrier-revision`: clients must preserve their current values when replacing this subtree or the full config; Home derives both values from singleton records. The observation barrier starts at `0`, increases monotonically when policies change, and Home publishes its current value. Neither revision can be changed through YAML import or Management API updates.

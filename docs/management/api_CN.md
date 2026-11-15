@@ -405,6 +405,33 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 Home 在数据库和下发配置中保留兼容的
 运行时字段投影，让当前依赖的 CPA SDK 也能消费共享值。
 
+#### Home 策略与 CPA 执行配置
+
+现有配置接口也支持下列字段。所有值均持久化到数据库，并在配置读取和导入导出中保留。显式的 `false`、`0`、空集合和 `null` 会原样保留，SDK 默认值不会回写。CPA 执行字段依据 Home 当前依赖的 CPA SDK 版本校验，因此升级 SDK 通常即可支持新选项，无需改动 Home；未知字段仍被拒绝。标为 CPA 的配置仅由 Home 保存和下发，不会作用于 Home 自身的 HTTP 服务或上游连接；旧 CPA 节点可能忽略尚未支持的选项。
+
+| 范围 | 字段 |
+| --- | --- |
+| Home 调度 | `routing.session-affinity-rebind-on`；`oauth.providers.antigravity.tos-pause-window` |
+| Home 模型目录 | `oauth.settings.<provider>[]`（`name`、可选 `alias`、`max-context-length`） |
+| CPA 服务 | `server.max-request-body-bytes`、`server.response-compression.enabled/min-bytes`、`server.shutdown-timeout`、`server.github-token` |
+| CPA 客户端兼容 | `client.codex.enable-apply-patch`、`client.codex.web-search-result-cache.enabled/ttl/limit`、`client.claude.show-codex-commentary` |
+| CPA Codex 执行 | `upstream.codex.upstream-request-compression`、`upstream.codex.upstream-request-compression-min-bytes`、`upstream.codex.websocket-compression`；`oauth.providers.codex.signin-with-chatgpt-identifier` |
+| CPA Claude 执行 | `upstream.claude.server-side-fallback`；`upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA 提示词策略 | `oauth.providers.antigravity.sensitive-patterns-replace`、`oauth.providers.devin.sensitive-patterns-replace`、`api-keys.claude[].keys[].cloak.sensitive-patterns-replace`；按顺序执行的 `{pattern, replacement}` Go RE2 规则 |
+| 凭证执行选项 | `api-keys.<provider>[].connection-pool`（组级和单 Key）；`api-keys.vertex[].interactions`；`api-keys.vertex[].models[].openapi`；`oauth.model-alias.vertex[].openapi` |
+
+`routing.session-affinity-rebind-on` 控制已绑定凭证不可用时的切换行为：`any`（默认）在任何切换时重新绑定；`quota` 在临时故障时保留原绑定，仅在配额、认证或模型支持错误时重绑；`never` 拒绝从仍有效的绑定切换。过期绑定始终可以重新选择。重绑定只依据请求模型的当前故障或凭证级阻断；`quota` 下临时的并发避让或重试排除不会触发重绑。
+
+`tos-pause-window` 默认 `6h`，设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
+
+`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。匹配 `alias` 的条目优先于匹配原名 `name` 的条目。不影响 API Key 模型。
+
+`connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
+
+`api-keys.vertex[].models[].openapi` 和 `oauth.model-alias.vertex[].openapi` 的显式 `true`/`false` 会在凭证下发时投影到 `vertex_model_openapi` 属性；未设置或 `null` 时保留 CPA 的自动路由。凭证级规则优先于 OAuth 别名规则，别名规则不影响 API Key 凭证。删除设置后，下次派发或刷新即不再携带该投影，无需重写数据库凭证。凭证执行选项格式损坏时，合成、派发或刷新会明确失败，不会静默丢弃。
+
+`server.github-token` 是下发给可信 CPA 节点的秘密，不是 Home 管理密钥。凭证身份、秘密和调度信息仍保存在 Auth 记录中；凭证的原始私有配置仅保留供导出，不随凭证下发给 CPA。
+
 #### Credential concurrency lifecycle 字段
 
 两个配置响应都包含 `credentials.concurrency` 对象。`lifecycle-config-revision` 和 `observation-barrier-revision` 由 Home 管理：替换整个配置或该子树时，客户端必须保留这两个字段的当前值；Home 从单例记录派生它们。observation barrier 初始为 `0`，在 policy 变更时单调递增，Home 始终下发当前值。不能通过 YAML import 或 Management API 修改这两个 revision。

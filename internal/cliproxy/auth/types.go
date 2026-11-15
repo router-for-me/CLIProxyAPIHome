@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	cpaauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	baseauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth"
 )
 
@@ -45,6 +46,8 @@ type Auth struct {
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// ProxyConnectionPool is carried to CPA; Home does not create upstream pools.
+	ProxyConnectionPool *cpaauth.ProxyConnectionPoolOverride `json:"proxy_connection_pool,omitempty"`
 	// Attributes stores provider specific metadata needed by executors (immutable configuration).
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
@@ -226,6 +229,7 @@ func (a *Auth) Clone() *Auth {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.ProxyConnectionPool = a.ProxyConnectionPool.Clone()
 	copyAuth.LastError = cloneError(a.LastError)
 	copyAuth.LastRefreshError = cloneError(a.LastRefreshError)
 	if a.RuntimeDisableCooling != nil {

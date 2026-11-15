@@ -32,28 +32,23 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 		return out, nil
 	}
 
-	// Gemini API Keys
-	out = append(out, s.synthesizeGeminiKeys(ctx)...)
-	// Native Interactions API Keys
-	out = append(out, s.synthesizeInteractionsKeys(ctx)...)
-	// Claude API Keys
-	out = append(out, s.synthesizeClaudeKeys(ctx)...)
-	// Codex API Keys
-	out = append(out, s.synthesizeCodexKeys(ctx)...)
-	// xAI API Keys
-	out = append(out, s.synthesizeXAIKeys(ctx)...)
-	// Meta API Keys
-	out = append(out, s.synthesizeMetaKeys(ctx)...)
-	// OpenAI-compat
-	out = append(out, s.synthesizeOpenAICompat(ctx)...)
-	// Vertex-compat
-	out = append(out, s.synthesizeVertexCompat(ctx)...)
+	for _, synthesize := range []func(*SynthesisContext) ([]*coreauth.Auth, error){
+		s.synthesizeGeminiKeys, s.synthesizeInteractionsKeys, s.synthesizeClaudeKeys,
+		s.synthesizeCodexKeys, s.synthesizeXAIKeys, s.synthesizeMetaKeys,
+		s.synthesizeOpenAICompat, s.synthesizeVertexCompat,
+	} {
+		auths, errSynthesize := synthesize(ctx)
+		if errSynthesize != nil {
+			return nil, errSynthesize
+		}
+		out = append(out, auths...)
+	}
 
 	return out, nil
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.
-func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	return s.synthesizeGeminiKeyEntries(ctx, ctx.Config.GeminiKey, "gemini:apikey", "gemini", "gemini-apikey", "gemini")
 }
 
@@ -101,11 +96,11 @@ func GeminiConfigSource(auth *coreauth.Auth) string {
 }
 
 // synthesizeInteractionsKeys creates Auth entries for native Interactions API keys.
-func (s *ConfigSynthesizer) synthesizeInteractionsKeys(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeInteractionsKeys(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	return s.synthesizeGeminiKeyEntries(ctx, ctx.Config.InteractionsKey, "gemini-interactions:apikey", "interactions", "interactions-apikey", "gemini-interactions")
 }
 
-func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, entries []appconfig.GeminiKey, idKind, sourceName, label, provider string) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, entries []appconfig.GeminiKey, idKind, sourceName, label, provider string) ([]*coreauth.Auth, error) {
 	// Normalize source data before building the derived payload.
 	now := ctx.Now
 	idGen := ctx.IDGenerator
@@ -129,7 +124,9 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 			attrs["api_key"] = key
 		}
 		metadata := map[string]any{}
-		addV8CredentialOptions(entry, attrs, metadata)
+		if errOptions := addV8CredentialOptions(entry, attrs, metadata); errOptions != nil {
+			return nil, errOptions
+		}
 		if entry.DisableCooling != nil {
 			metadata["disable_cooling"] = *entry.DisableCooling
 		}
@@ -164,11 +161,11 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 		applyProviderCredentialID(ctx, a, entry.ID)
 		out = append(out, a)
 	}
-	return out
+	return out, nil
 }
 
 // synthesizeClaudeKeys creates Auth entries for Claude API keys.
-func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	// Normalize source data before building the derived payload.
 	cfg := ctx.Config
 	now := ctx.Now
@@ -189,7 +186,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			"api_key": key,
 		}
 		metadata := map[string]any{}
-		addV8CredentialOptions(ck, attrs, metadata)
+		if errOptions := addV8CredentialOptions(ck, attrs, metadata); errOptions != nil {
+			return nil, errOptions
+		}
 		if ck.DisableCooling != nil {
 			metadata["disable_cooling"] = *ck.DisableCooling
 		}
@@ -225,25 +224,25 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		applyProviderCredentialID(ctx, a, ck.ID)
 		out = append(out, a)
 	}
-	return out
+	return out, nil
 }
 
 // synthesizeCodexKeys creates Auth entries for Codex API keys.
-func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.CodexKey, "codex")
 }
 
 // synthesizeXAIKeys creates Auth entries for xAI API keys.
-func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.XAIKey, "xai")
 }
 
 // synthesizeMetaKeys creates Auth entries for Meta API keys.
-func (s *ConfigSynthesizer) synthesizeMetaKeys(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeMetaKeys(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.MetaKey, "meta")
 }
 
-func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entries []appconfig.CodexKey, provider string) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entries []appconfig.CodexKey, provider string) ([]*coreauth.Auth, error) {
 	now := ctx.Now
 	idGen := ctx.IDGenerator
 
@@ -262,7 +261,9 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 			"api_key": key,
 		}
 		metadata := map[string]any{}
-		addV8CredentialOptions(entry, attrs, metadata)
+		if errOptions := addV8CredentialOptions(entry, attrs, metadata); errOptions != nil {
+			return nil, errOptions
+		}
 		if entry.DisableCooling != nil {
 			metadata["disable_cooling"] = *entry.DisableCooling
 		}
@@ -325,11 +326,11 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		applyProviderCredentialID(ctx, a, entry.ID)
 		out = append(out, a)
 	}
-	return out
+	return out, nil
 }
 
 // synthesizeOpenAICompat creates Auth entries for OpenAI-compatible providers.
-func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	cfg := ctx.Config
 	now := ctx.Now
 	idGen := ctx.IDGenerator
@@ -364,8 +365,12 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
-			addV8CredentialOptions(compat, attrs, metadata)
-			addV8CredentialOptions(entry, attrs, metadata)
+			if errOptions := addV8CredentialOptions(compat, attrs, metadata); errOptions != nil {
+				return nil, errOptions
+			}
+			if errOptions := addV8CredentialOptions(entry, attrs, metadata); errOptions != nil {
+				return nil, errOptions
+			}
 			if disableCooling != nil {
 				metadata["disable_cooling"] = *disableCooling
 			}
@@ -411,7 +416,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": providerName,
 			}
 			metadata := map[string]any{}
-			addV8CredentialOptions(compat, attrs, metadata)
+			if errOptions := addV8CredentialOptions(compat, attrs, metadata); errOptions != nil {
+				return nil, errOptions
+			}
 			if disableCooling != nil {
 				metadata["disable_cooling"] = *disableCooling
 			}
@@ -442,11 +449,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			out = append(out, a)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // synthesizeVertexCompat creates Auth entries for Vertex-compatible providers.
-func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*coreauth.Auth {
+func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	// Normalize source data before building the derived payload.
 	cfg := ctx.Config
 	now := ctx.Now
@@ -469,7 +476,9 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			"provider_key": providerName,
 		}
 		metadata := map[string]any{}
-		addV8CredentialOptions(compat, attrs, metadata)
+		if errOptions := addV8CredentialOptions(compat, attrs, metadata); errOptions != nil {
+			return nil, errOptions
+		}
 		if compat.DisableCooling != nil {
 			metadata["disable_cooling"] = *compat.DisableCooling
 		}
@@ -504,7 +513,7 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		applyProviderCredentialID(ctx, a, compat.ID)
 		out = append(out, a)
 	}
-	return out
+	return out, nil
 }
 
 type modelEntry interface {

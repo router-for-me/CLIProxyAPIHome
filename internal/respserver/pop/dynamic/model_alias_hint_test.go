@@ -106,7 +106,7 @@ func TestRESPDispatchModelAliasHintsPreserveErrorCodes(t *testing.T) {
 	}
 }
 
-func TestRESPDispatchModelAliasHintBeforeBillingRejection(t *testing.T) {
+func TestRESPDispatchModelAliasHintWithUnpricedModels(t *testing.T) {
 	repo, runtime := newAliasHintRESPRuntime(t)
 	publishAliasHintRESPAuth(t, repo, runtime, "upstream-priced-218", "friendly-priced-218")
 	username, unlimited := "alias-hint-user", true
@@ -118,19 +118,25 @@ func TestRESPDispatchModelAliasHintBeforeBillingRejection(t *testing.T) {
 	if _, errKey := repo.CreateAPIKeyForUser(t.Context(), user.ID, cluster.APIKeyUserUpdate{APIKey: &key}); errKey != nil {
 		t.Fatal(errKey)
 	}
-	if _, errPrice := repo.CreateBillingModelPrice(t.Context(), cluster.BillingModelPriceUpdate{Provider: "openai", Model: "friendly-priced-218", Enabled: true}); errPrice != nil {
-		t.Fatal(errPrice)
-	}
-	_, reply := requestAliasHintRESP(t, runtime, key, "upstream-priced-218")
-	if reply == nil || gjson.GetBytes(reply.BulkString, "error.type").String() != "model_not_found" {
-		t.Fatalf("expected model_not_found: %+v", reply)
-	}
-	message := gjson.GetBytes(reply.BulkString, "error.message").String()
-	if !strings.Contains(message, "has no configured price") || !strings.Contains(message, `under the alias "friendly-priced-218"`) {
-		t.Fatalf("billing error must retain its reason and include the alias: %s", reply.BulkString)
-	}
-	if result, replyAlias := requestAliasHintRESP(t, runtime, key, "friendly-priced-218"); result == nil || replyAlias != nil {
-		t.Fatalf("priced alias should route: result=%+v reply=%+v", result, replyAlias)
+	for _, priced := range []bool{false, true} {
+		if priced {
+			if _, errPrice := repo.CreateBillingModelPrice(t.Context(), cluster.BillingModelPriceUpdate{Provider: "openai", Model: "friendly-priced-218", Enabled: true}); errPrice != nil {
+				t.Fatal(errPrice)
+			}
+		}
+		_, reply := requestAliasHintRESP(t, runtime, key, "upstream-priced-218")
+		if reply == nil || gjson.GetBytes(reply.BulkString, "error.type").String() != "model_not_found" {
+			t.Fatalf("expected model_not_found: %+v", reply)
+		}
+		// Unpriced models are allowed. A missing route, not missing pricing,
+		// must remain the reason for rejecting the upstream spelling.
+		message := gjson.GetBytes(reply.BulkString, "error.message").String()
+		if !strings.Contains(message, "does not exist") || strings.Contains(message, "has no configured price") || !strings.Contains(message, `under the alias "friendly-priced-218"`) {
+			t.Fatalf("lookup error must retain its reason and alias: %s", reply.BulkString)
+		}
+		if result, replyAlias := requestAliasHintRESP(t, runtime, key, "friendly-priced-218"); result == nil || replyAlias != nil || result.Model != "upstream-priced-218" {
+			t.Fatalf("alias must route regardless of pricing: priced=%t result=%+v reply=%+v", priced, result, replyAlias)
+		}
 	}
 }
 

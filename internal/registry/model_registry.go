@@ -26,6 +26,8 @@ type NativeCapabilities struct {
 type ModelInfo struct {
 	// ID is the unique identifier for the model
 	ID string `json:"id"`
+	// MetadataModelID preserves the original upstream identity for OAuth settings.
+	MetadataModelID string `json:"-" yaml:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
 	// Created timestamp when the model was created

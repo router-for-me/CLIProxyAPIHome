@@ -124,7 +124,7 @@ func TestConcurrencyDispatchFixture(t *testing.T) {
 			Status:   coreauth.StatusActive,
 		},
 		Concurrency: home.ConcurrencyAdmissionResult{Accounted: true, CredentialID: "cred-1", Model: "gpt"},
-	}, "user-key")
+	}, "user-key", nil)
 	if errPrepare != nil {
 		t.Fatalf("prepareDispatchResponse() error = %v", errPrepare)
 	}
@@ -173,7 +173,7 @@ func TestPrepareDispatchResponseIncludesForceMapping(t *testing.T) {
 		},
 	}
 
-	unaccounted, accounted, errPrepare := prepareDispatchResponse(result, "user-key")
+	unaccounted, accounted, errPrepare := prepareDispatchResponse(result, "user-key", nil)
 	if errPrepare != nil {
 		t.Fatalf("prepareDispatchResponse() error = %v", errPrepare)
 	}
@@ -208,7 +208,7 @@ func TestPrepareDispatchResponseIncludesModelInfo(t *testing.T) {
 		},
 	}
 
-	unaccounted, accounted, errPrepare := prepareDispatchResponse(result, "user-key")
+	unaccounted, accounted, errPrepare := prepareDispatchResponse(result, "user-key", nil)
 	if errPrepare != nil {
 		t.Fatalf("prepareDispatchResponse() error = %v", errPrepare)
 	}

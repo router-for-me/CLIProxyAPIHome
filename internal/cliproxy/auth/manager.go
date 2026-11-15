@@ -1337,9 +1337,30 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if len(providers) == 0 {
+	normalizedProviders := normalizeProviderKeys(providers)
+	if len(normalizedProviders) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	// Binding keys describe the requested provider scope, not temporary availability.
+	providerForSelector := "mixed"
+	if len(normalizedProviders) == 1 {
+		providerForSelector = normalizedProviders[0]
+	}
+	requestedProviders := normalizedProviders
+	if len(opts.ExcludedProviders) > 0 {
+		excluded := normalizeProviderKeys(opts.ExcludedProviders)
+		eligible := make([]string, 0, len(normalizedProviders))
+		for _, provider := range normalizedProviders {
+			if !containsProvider(excluded, provider) {
+				eligible = append(eligible, provider)
+			}
+		}
+		normalizedProviders = eligible
+	}
+	if len(normalizedProviders) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no provider available"}
+	}
+	providers = normalizedProviders
 
 	routeModel := strings.TrimSpace(requestedModel)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
@@ -1415,14 +1436,6 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	unpinnedAllowedAuthIDs := unpinnedAllowedAuthIDsFromOptions(opts)
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	pinnedAuthID := pinnedAuthIDFromOptions(opts)
-	normalizedProviders := normalizeProviderKeys(providers)
-	if len(normalizedProviders) == 0 {
-		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-	providerForSelector := "mixed"
-	if len(normalizedProviders) == 1 {
-		providerForSelector = normalizedProviders[0]
-	}
 	registryRef := registry.GetGlobalRegistry()
 
 	tried := cloneAuthIDSet(excludedAuthIDs)
@@ -1435,6 +1448,10 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		trackPinnedAccounting := pinnedAuthID != "" && filterWeights && isWeightedSelector(selector)
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
+		var transientAuthIDs map[string]struct{}
+		if affinity, ok := selector.(*SessionAffinitySelector); ok && affinity.rebindOn == "quota" {
+			transientAuthIDs = make(map[string]struct{})
+		}
 		var accountingAuths []*Auth
 		if trackPinnedAccounting {
 			accountingAuths = make([]*Auth, 0, len(m.auths))
@@ -1449,12 +1466,6 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if filterWeights && isWeightedSelector(selector) && authWeight(candidate) <= 0 {
 				continue
 			}
-			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
-				continue
-			}
-			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
-				continue
-			}
 			if !authAllowedByID(candidate.ID, unpinnedAllowedAuthIDs) {
 				continue
 			}
@@ -1465,13 +1476,34 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if providerKey == "" {
 				continue
 			}
-			if !containsProvider(normalizedProviders, providerKey) {
+			if !containsProvider(requestedProviders, providerKey) {
 				continue
 			}
 			if routeKey != "" && (registryRef == nil || !registryRef.ClientSupportsModel(candidate.ID, routeKey)) {
 				continue
 			}
 			pinnedAllowed := authAllowedByID(candidate.ID, allowedAuthIDs)
+			if transientAuthIDs != nil && pinnedAllowed && credentialPolicyAllows(credentialPolicy, candidate) {
+				resolved := m.resolveDispatchModel(candidate, routeModel)
+				if resolved.Model != "" {
+					availabilityAuth := m.effectiveAvailabilityAuth(candidate, now)
+					blockedModel, _, _, _ := dispatchModelBlockStatus(availabilityAuth, resolved.Key, routeModel, now)
+					if !sessionAffinityQuotaBlocked(availabilityAuth, blockedModel, now) {
+						transientAuthIDs[candidate.ID] = struct{}{}
+					}
+				}
+			}
+			// Pool pauses constrain selection, not protection of a healthy binding.
+			if !containsProvider(normalizedProviders, providerKey) {
+				continue
+			}
+			// Retry limits constrain this attempt, not the session binding lifetime.
+			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
+				continue
+			}
+			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
+				continue
+			}
 			if pinnedAllowed {
 				totalCandidates++
 			}
@@ -1528,6 +1560,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			}
 			if auth == nil {
 				selectorCtx := ctx
+				if transientAuthIDs != nil {
+					selectorCtx = context.WithValue(selectorCtx, sessionAffinityTransientAuthIDsKey{}, transientAuthIDs)
+				}
 				if len(accountingAuths) > 0 {
 					selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
 				}

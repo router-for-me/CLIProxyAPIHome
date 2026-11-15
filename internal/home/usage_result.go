@@ -82,7 +82,10 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 		return nil
 	}
 	if !errors.Is(errMark, coreauth.ErrAuthNotLoaded) {
-		return errMark
+		if errMark != nil {
+			return errMark
+		}
+		return r.recordAntigravityTOSPause(ctx, result, skipRequestStats)
 	}
 	// The credential can exist in the database before this Home has applied
 	// the cluster event that introduces it. Load the authoritative record once;
@@ -105,7 +108,10 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 	if errors.Is(errRetry, coreauth.ErrAuthNotFound) || errors.Is(errRetry, coreauth.ErrFullAuthNotFound) {
 		return nil
 	}
-	return errRetry
+	if errRetry != nil {
+		return errRetry
+	}
+	return r.recordAntigravityTOSPause(ctx, result, skipRequestStats)
 }
 
 // usagePayloadObservedAt validates the execution completion time. Accepted times
