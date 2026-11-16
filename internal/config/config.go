@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -891,13 +890,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
-	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
-	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
-	cfg.DisableImageGeneration = DisableImageGenerationOff
-	cfg.Pprof.Enable = false
-	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialConcurrency = DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
@@ -952,28 +946,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
 
-	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
-	if cfg.Pprof.Addr == "" {
-		cfg.Pprof.Addr = DefaultPprofAddr
-	}
-
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
-	}
-
-	if cfg.ErrorLogsMaxFiles < 0 {
-		cfg.ErrorLogsMaxFiles = 10
-	}
-
-	if cfg.RedisUsageQueueRetentionSeconds <= 0 {
-		cfg.RedisUsageQueueRetentionSeconds = 60
-	} else if cfg.RedisUsageQueueRetentionSeconds > 3600 {
-		log.WithField("value", cfg.RedisUsageQueueRetentionSeconds).Warn("redis-usage-queue-retention-seconds too large; clamping to 3600")
-		cfg.RedisUsageQueueRetentionSeconds = 3600
-	}
-
-	if cfg.MaxRetryCredentials < 0 {
-		cfg.MaxRetryCredentials = 0
 	}
 
 	if errNormalizeIDs := cfg.NormalizeProviderCredentialIDs(); errNormalizeIDs != nil {
@@ -998,12 +972,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Meta keys: require an API key and default the official base URL.
 	cfg.SanitizeMetaKeys()
 
-	// Sanitize Codex header defaults.
-	cfg.SanitizeCodexHeaderDefaults()
-
-	// Sanitize Claude header defaults.
-	cfg.SanitizeClaudeHeaderDefaults()
-
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
@@ -1016,13 +984,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
-	// Validate raw payload rules and drop invalid entries.
-	cfg.SanitizePayloadRules()
-
-	// Sanitize Antigravity and Devin configurations.
-	cfg.SanitizeAntigravity()
-	cfg.SanitizeDevin()
-
 	ForceHomeRuntimeConfig(&cfg)
 
 	// Return the populated configuration struct.
@@ -1034,126 +995,6 @@ func optionalConfigFallback() *Config {
 		CredentialConcurrency: DefaultCredentialConcurrencyConfig(),
 		CredentialInFlight:    DefaultCredentialInFlightConfig(),
 	}
-}
-
-// SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
-func (cfg *Config) SanitizePayloadRules() {
-	if cfg == nil {
-		return
-	}
-	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
-	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
-}
-
-// sanitizePayloadRawRules sanitizes a payload raw rules.
-func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {
-	// Validate input data before converting it into runtime state.
-	if len(rules) == 0 {
-		return rules
-	}
-	out := make([]PayloadRule, 0, len(rules))
-	for i := range rules {
-		rule := rules[i]
-		if len(rule.Params) == 0 {
-			continue
-		}
-		invalid := false
-		for path, value := range rule.Params {
-			raw, ok := payloadRawString(value)
-			if !ok {
-				continue
-			}
-			trimmed := bytes.TrimSpace(raw)
-			if len(trimmed) == 0 || !json.Valid(trimmed) {
-				log.WithFields(log.Fields{
-					"section":    section,
-					"rule_index": i + 1,
-					"param":      path,
-				}).Warn("payload rule dropped: invalid raw JSON")
-				invalid = true
-				break
-			}
-		}
-		if invalid {
-			continue
-		}
-		out = append(out, rule)
-	}
-	return out
-}
-
-// payloadRawString handles a payload raw string.
-func payloadRawString(value any) ([]byte, bool) {
-	switch typed := value.(type) {
-	case string:
-		return []byte(typed), true
-	case []byte:
-		return typed, true
-	default:
-		return nil, false
-	}
-}
-
-// SanitizeCodexHeaderDefaults trims surrounding whitespace from the
-// configured Codex header fallback values.
-func (cfg *Config) SanitizeCodexHeaderDefaults() {
-	if cfg == nil {
-		return
-	}
-	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
-	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
-}
-
-// SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
-// configured Claude fingerprint baseline values.
-func (cfg *Config) SanitizeClaudeHeaderDefaults() {
-	if cfg == nil {
-		return
-	}
-	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
-	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
-	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
-	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
-	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
-	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
-}
-
-// SanitizeAntigravity trims surrounding whitespace and drops empty entries from Antigravity sensitive-word settings.
-func (cfg *Config) SanitizeAntigravity() {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.Antigravity.SensitiveWords) > 0 {
-		cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
-		for _, word := range cfg.Antigravity.SensitiveWords {
-			word = strings.TrimSpace(word)
-			if word != "" {
-				cleaned = append(cleaned, word)
-			}
-		}
-		cfg.Antigravity.SensitiveWords = cleaned
-	}
-	cfg.Antigravity.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Antigravity.SensitiveWordsReplace)
-	cfg.Antigravity.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Antigravity.SensitivePatternsReplace)
-}
-
-// SanitizeDevin trims surrounding whitespace and drops empty entries from Devin sensitive-word settings.
-func (cfg *Config) SanitizeDevin() {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.Devin.SensitiveWords) > 0 {
-		cleaned := make([]string, 0, len(cfg.Devin.SensitiveWords))
-		for _, word := range cfg.Devin.SensitiveWords {
-			word = strings.TrimSpace(word)
-			if word != "" {
-				cleaned = append(cleaned, word)
-			}
-		}
-		cfg.Devin.SensitiveWords = cleaned
-	}
-	cfg.Devin.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Devin.SensitiveWordsReplace)
-	cfg.Devin.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Devin.SensitivePatternsReplace)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1401,33 +1242,7 @@ func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
 	return out
 }
 
-// NormalizeCloakConfig trims strings and removes blank sensitive words.
-func NormalizeCloakConfig(cloak *CloakConfig) *CloakConfig {
-	if cloak == nil {
-		return nil
-	}
-	cloak.Mode = strings.TrimSpace(cloak.Mode)
-	if len(cloak.SensitiveWords) > 0 {
-		normalizedWords := make([]string, 0, len(cloak.SensitiveWords))
-		for _, w := range cloak.SensitiveWords {
-			if trimmed := strings.TrimSpace(w); trimmed != "" {
-				normalizedWords = append(normalizedWords, trimmed)
-			}
-		}
-		if len(normalizedWords) > 0 {
-			cloak.SensitiveWords = normalizedWords
-		} else {
-			cloak.SensitiveWords = nil
-		}
-	} else {
-		cloak.SensitiveWords = nil
-	}
-	cloak.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cloak.SensitiveWordsReplace)
-	cloak.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cloak.SensitivePatternsReplace)
-	return cloak
-}
-
-// SanitizeClaudeKeys normalizes headers and cloak settings for Claude credentials.
+// SanitizeClaudeKeys normalizes headers and excluded models for Claude credentials.
 func (cfg *Config) SanitizeClaudeKeys() {
 	if cfg == nil || len(cfg.ClaudeKey) == 0 {
 		return
@@ -1437,7 +1252,6 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		entry.Cloak = NormalizeCloakConfig(entry.Cloak)
 	}
 }
 
@@ -1553,64 +1367,6 @@ func NormalizeRemoteManagementSecret(secret string) (string, bool, error) {
 		return "", false, errHash
 	}
 	return hashed, true, nil
-}
-
-// NormalizeSensitiveWordsReplace trims replacement target keys, drops blank keys,
-// and preserves replacement values (including empty strings for phrase deletion).
-func NormalizeSensitiveWordsReplace(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(in))
-	for k := range in {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make(map[string]string, len(in))
-	for _, rawKey := range keys {
-		trimmedKey := strings.TrimSpace(rawKey)
-		if trimmedKey == "" {
-			continue
-		}
-		if _, exists := out[trimmedKey]; exists && rawKey != trimmedKey {
-			continue
-		}
-		out[trimmedKey] = in[rawKey]
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// NormalizeSensitivePatternsReplace validates Go RE2 regex rules, logs and drops
-// invalid or blank patterns, and preserves replacement values (including empty strings).
-func NormalizeSensitivePatternsReplace(in []SensitivePatternRule) []SensitivePatternRule {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]SensitivePatternRule, 0, len(in))
-	for i, rule := range in {
-		if strings.TrimSpace(rule.Pattern) == "" {
-			continue
-		}
-		if _, errCompile := regexp.Compile(rule.Pattern); errCompile != nil {
-			log.WithFields(log.Fields{
-				"rule_index": i + 1,
-				"pattern":    rule.Pattern,
-				"error":      errCompile,
-			}).Warn("sensitive-patterns-replace rule dropped: invalid regex")
-			continue
-		}
-		out = append(out, SensitivePatternRule{
-			Pattern:     rule.Pattern,
-			Replacement: rule.Replacement,
-		})
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // NormalizeHeaders trims header keys and values and removes empty pairs.

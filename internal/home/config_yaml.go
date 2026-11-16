@@ -118,6 +118,25 @@ func (r *Runtime) PublishConfigYAML(payload []byte) {
 	}
 }
 
+var downstreamExcludedConfigKeys = []string{
+	"remote-management",
+	"user-email",
+	"api-keys",
+	"auth-dir",
+	"allow-host",
+	"tls",
+	"gemini-api-key",
+	"interactions-api-key",
+	"codex-api-key",
+	"xai-api-key",
+	"meta-api-key",
+	"claude-api-key",
+	"openai-compatibility",
+	"vertex-api-key",
+	"oauth-model-alias",
+	"oauth-excluded-models",
+}
+
 // sanitizeConfigYAMLForDownstream sanitizes a config yaml for downstream.
 func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	// Normalize source data before building the derived payload.
@@ -155,67 +174,13 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 			}
 		}
 	}
-	var errMarshal error
-	payload, errMarshal = yaml.Marshal(normalized)
+	for _, key := range downstreamExcludedConfigKeys {
+		delete(normalized, key)
+	}
+	appconfig.ApplyDownstreamHomeModeScalars(normalized)
+	forced, errMarshal := yaml.Marshal(normalized)
 	if errMarshal != nil {
-		return nil, fmt.Errorf("home runtime: marshal config: %w", errMarshal)
-	}
-
-	var yamlRoot yaml.Node
-	if errUnmarshal := yaml.Unmarshal(payload, &yamlRoot); errUnmarshal != nil {
-		return nil, fmt.Errorf("home runtime: unmarshal config: %w", errUnmarshal)
-	}
-	if yamlRoot.Kind != yaml.DocumentNode || len(yamlRoot.Content) == 0 || yamlRoot.Content[0] == nil {
-		return nil, fmt.Errorf("home runtime: invalid config yaml document")
-	}
-
-	doc := yamlRoot.Content[0]
-	removeConfigKeysForDownstream(doc, []string{
-		"remote-management",
-		"user-email",
-		"api-keys",
-		"auth-dir",
-		"tls",
-		"gemini-api-key",
-		"interactions-api-key",
-		"codex-api-key",
-		"xai-api-key",
-		"meta-api-key",
-		"claude-api-key",
-		"openai-compatibility",
-		"vertex-api-key",
-		"oauth-model-alias",
-		"oauth-excluded-models",
-	})
-	stripYAMLComments(&yamlRoot)
-
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if errEncode := enc.Encode(&yamlRoot); errEncode != nil {
-		_ = enc.Close()
-		return nil, fmt.Errorf("home runtime: marshal config: %w", errEncode)
-	}
-	if errClose := enc.Close(); errClose != nil {
-		return nil, fmt.Errorf("home runtime: marshal config: %w", errClose)
-	}
-	out := bytes.TrimSpace(buf.Bytes())
-	if len(out) == 0 {
-		return nil, fmt.Errorf("home runtime: config is empty")
-	}
-	out = append(out, '\n')
-
-	var root map[string]any
-	if errUnmarshalRoot := yaml.Unmarshal(out, &root); errUnmarshalRoot != nil {
-		return nil, fmt.Errorf("home runtime: unmarshal downstream config root: %w", errUnmarshalRoot)
-	}
-	if root == nil {
-		root = make(map[string]any)
-	}
-	appconfig.ApplyDownstreamHomeModeScalars(root)
-	forced, errMarshalRoot := yaml.Marshal(root)
-	if errMarshalRoot != nil {
-		return nil, fmt.Errorf("home runtime: marshal downstream config root: %w", errMarshalRoot)
+		return nil, fmt.Errorf("home runtime: marshal downstream config root: %w", errMarshal)
 	}
 	forced = bytes.TrimSpace(forced)
 	if len(forced) == 0 {
@@ -223,56 +188,4 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	}
 	forced = append(forced, '\n')
 	return forced, nil
-}
-
-// removeConfigKeysForDownstream removes a config keys for downstream.
-func removeConfigKeysForDownstream(node *yaml.Node, keys []string) {
-	// Normalize source data before building the derived payload.
-	if node == nil || node.Kind != yaml.MappingNode || len(keys) == 0 {
-		return
-	}
-
-	keySet := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		k := strings.TrimSpace(key)
-		if k == "" {
-			continue
-		}
-		keySet[k] = struct{}{}
-	}
-	if len(keySet) == 0 {
-		return
-	}
-
-	next := make([]*yaml.Node, 0, len(node.Content))
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		k := node.Content[i]
-		v := node.Content[i+1]
-		if k == nil || strings.TrimSpace(k.Value) == "" {
-			next = append(next, k, v)
-			continue
-		}
-		if _, ok := keySet[k.Value]; ok {
-			continue
-		}
-		next = append(next, k, v)
-	}
-	node.Content = next
-}
-
-// stripYAMLComments handles a strip yaml comments.
-func stripYAMLComments(node *yaml.Node) {
-	if node == nil {
-		return
-	}
-	node.HeadComment = ""
-	node.LineComment = ""
-	node.FootComment = ""
-
-	for _, child := range node.Content {
-		stripYAMLComments(child)
-	}
-	if node.Alias != nil {
-		stripYAMLComments(node.Alias)
-	}
 }

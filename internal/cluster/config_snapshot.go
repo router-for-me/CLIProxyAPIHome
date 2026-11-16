@@ -167,10 +167,7 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg := &appconfig.Config{Port: appconfig.DefaultCPAPort}
 	cfg.CredentialConcurrency = appconfig.DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = appconfig.DefaultCredentialInFlightConfig()
-	cfg.Pprof.Addr = appconfig.DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = appconfig.DefaultPanelGitHubRepository
-	cfg.ErrorLogsMaxFiles = 10
-	cfg.RedisUsageQueueRetentionSeconds = 60
 	if errUnmarshal := yaml.Unmarshal(data, cfg); errUnmarshal != nil {
 		return nil, nil, errUnmarshal
 	}
@@ -198,17 +195,9 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
 	cfg.SanitizeMetaKeys()
-	cfg.SanitizeCodexHeaderDefaults()
-	cfg.SanitizeClaudeHeaderDefaults()
 	cfg.SanitizeClaudeKeys()
 	cfg.SanitizeOpenAICompatibility()
 	cfg.SanitizeOAuthModelAlias()
-	cfg.SanitizePayloadRules()
-	cfg.SanitizeAntigravity()
-	cfg.SanitizeDevin()
-	if cfg.Pprof.Addr == "" {
-		cfg.Pprof.Addr = appconfig.DefaultPprofAddr
-	}
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = appconfig.DefaultPanelGitHubRepository
 	}

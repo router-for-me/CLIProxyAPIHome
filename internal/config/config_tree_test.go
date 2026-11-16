@@ -123,17 +123,8 @@ upstream:
 func TestClaudeCloakPatternsTypedSDKProjection(t *testing.T) {
 	entry := ClaudeKey{Cloak: &CloakConfig{SensitivePatternsReplace: []SensitivePatternRule{
 		{Pattern: "^private", Replacement: ""},
-		{Pattern: "[invalid", Replacement: "ignored"},
 		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
 	}}}
-	entry.Cloak = NormalizeCloakConfig(entry.Cloak)
-	want := []SensitivePatternRule{
-		{Pattern: "^private", Replacement: ""},
-		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
-	}
-	if !reflect.DeepEqual(entry.Cloak.SensitivePatternsReplace, want) {
-		t.Fatalf("normalized cloak patterns = %#v, want %#v", entry.Cloak.SensitivePatternsReplace, want)
-	}
 	options, errProject := CredentialExecutionOptions(entry)
 	if errProject != nil {
 		t.Fatal(errProject)
