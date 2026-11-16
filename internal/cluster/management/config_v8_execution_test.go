@@ -57,7 +57,7 @@ func TestConfigV8CPAExecutionDatabaseMutations(t *testing.T) {
 	if errCPA != nil {
 		t.Fatal(errCPA)
 	}
-	if cfg.Routing.SessionAffinityRebindOn != "quota" || !cpa.Client.Codex.EnableApplyPatch || !cfg.Codex.OptimizeMultiAgentV2 || cfg.Antigravity.TOSPauseWindow != "3h" || cfg.OAuthSettings["codex"][0].MaxContextLength != 524288 {
+	if cfg.Routing.SessionAffinityRebindOn != "quota" || !cpa.Client.Codex.EnableApplyPatch || !cpa.Client.Codex.OptimizeMultiAgentV2 || cfg.Antigravity.TOSPauseWindow != "3h" || cfg.OAuthSettings["codex"][0].MaxContextLength != 524288 {
 		t.Fatal("database runtime projection lost Home or CPA configuration")
 	}
 	response := httptest.NewRecorder()
@@ -73,7 +73,7 @@ func TestConfigV8CPAExecutionDatabaseMutations(t *testing.T) {
 	if errCPA != nil {
 		t.Fatal(errCPA)
 	}
-	if cpa.Client.Codex.WebSearchResultCache.Enabled || !cfg.Codex.OptimizeMultiAgentV2 {
+	if cpa.Client.Codex.WebSearchResultCache.Enabled || !cpa.Client.Codex.OptimizeMultiAgentV2 {
 		t.Fatalf("deleting cache settings changed other client options: %v", errLoad)
 	}
 }

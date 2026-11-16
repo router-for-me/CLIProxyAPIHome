@@ -267,7 +267,15 @@ func TestV8MigrationRemovesRetiredFieldsAndPreservesSessionAffinity(t *testing.T
 			if errDecode := yaml.Unmarshal(source, &cfg); errDecode != nil {
 				t.Fatal(errDecode)
 			}
-			if cfg.Routing.SessionAffinity != test.want || !cfg.Codex.DisableCodexCloaking {
+			wire, errMarshalSource := yaml.Marshal(cfg)
+			if errMarshalSource != nil {
+				t.Fatal(errMarshalSource)
+			}
+			cpaSource, errParseSource := cpaconfig.ParseConfigBytes(wire)
+			if errParseSource != nil {
+				t.Fatal(errParseSource)
+			}
+			if cfg.Routing.SessionAffinity != test.want || !cpaSource.Codex.DisableCodexCloaking {
 				t.Fatal("legacy config load changed effective settings")
 			}
 			unchanged, changed, errNormalize := NormalizeConfigLayout(source, false)

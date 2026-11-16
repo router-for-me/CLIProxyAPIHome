@@ -24,6 +24,7 @@ var v8Paths = buildV8Paths()
 var v8ClientPaths = []configPath{
 	{"oauth.providers.codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
 	{"providers.codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
+	{"codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
 }
 
 // Canonical upstream fields win by presence; historical OAuth fields precede globals.
@@ -104,7 +105,6 @@ func buildV8Paths() []configPath {
 		{"codex.disable-codex-cloaking", "upstream.codex.disable-codex-cloaking"},
 		{"codex.stream-bootstrap-buffering", "upstream.codex.stream-bootstrap-buffering"},
 		{"codex.stream-bootstrap-timeout", "upstream.codex.stream-bootstrap-timeout"},
-		{"codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
 		{"codex.orphan-delegation-compatibility", "upstream.codex.orphan-delegation-compatibility"},
 		{"codex.model-level-cooling", "upstream.codex.model-level-cooling"},
 		{"codex.response-steering", "upstream.codex.response-steering"},

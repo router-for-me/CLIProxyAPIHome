@@ -15,8 +15,10 @@ func TestSDKExecutionOptionsWithoutHomeFields(t *testing.T) {
 	}{
 		{reflect.TypeOf(Config{}), "Client"},
 		{reflect.TypeOf(Config{}), "ShutdownTimeoutSeconds"},
-		{reflect.TypeOf(ClaudeConfig{}), "SessionDatePinDays"},
-		{reflect.TypeOf(ClaudeHeaderDefaults{}), "NativeEntrypoints"},
+		{reflect.TypeOf(Config{}), "Claude"},
+		{reflect.TypeOf(Config{}), "ClaudeHeaderDefaults"},
+		{reflect.TypeOf(Config{}), "Codex"},
+		{reflect.TypeOf(Config{}), "Payload"},
 		{reflect.TypeOf(CodexKey{}), "ConnectionPool"},
 		{reflect.TypeOf(VertexCompatModel{}), "OpenAPI"},
 	} {

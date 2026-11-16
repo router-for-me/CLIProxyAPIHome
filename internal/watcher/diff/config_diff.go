@@ -30,6 +30,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.DisableCooling != newCfg.DisableCooling {
 		changes = append(changes, fmt.Sprintf("disable-cooling: %t -> %t", oldCfg.DisableCooling, newCfg.DisableCooling))
 	}
+	if oldCfg.AuthAutoRefreshWorkers != newCfg.AuthAutoRefreshWorkers {
+		changes = append(changes, fmt.Sprintf("auth-auto-refresh-workers: %d -> %d", oldCfg.AuthAutoRefreshWorkers, newCfg.AuthAutoRefreshWorkers))
+	}
 	if oldCfg.LogsMaxTotalSizeMB != newCfg.LogsMaxTotalSizeMB {
 		changes = append(changes, fmt.Sprintf("logs-max-total-size-mb: %d -> %d", oldCfg.LogsMaxTotalSizeMB, newCfg.LogsMaxTotalSizeMB))
 	}

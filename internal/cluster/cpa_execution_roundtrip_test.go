@@ -229,7 +229,7 @@ api-keys:
 	if errCPA != nil {
 		t.Fatal(errCPA)
 	}
-	if !cpa.Client.Codex.EnableApplyPatch || !cfg.Codex.OptimizeMultiAgentV2 || cpa.ShutdownTimeoutSeconds != 20 || cpa.ResponseCompression.Enabled == nil || *cpa.ResponseCompression.Enabled {
+	if !cpa.Client.Codex.EnableApplyPatch || !cpa.Client.Codex.OptimizeMultiAgentV2 || cpa.ShutdownTimeoutSeconds != 20 || cpa.ResponseCompression.Enabled == nil || *cpa.ResponseCompression.Enabled {
 		t.Fatalf("export lost execution options:\n%s", data)
 	}
 	if len(cfg.OAuthSettings["codex"]) != 1 || cfg.VertexCompatAPIKey[0].RawConfig["interactions"] != true || len(cfg.ClaudeKey[0].RawConfig["cloak"].(map[string]any)["sensitive-patterns-replace"].([]any)) != 1 {

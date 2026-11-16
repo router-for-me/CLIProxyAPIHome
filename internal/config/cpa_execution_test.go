@@ -91,7 +91,11 @@ oauth:
 	if errRestored != nil {
 		t.Fatal(errRestored)
 	}
-	if !reflect.DeepEqual(restoredRoot, root) || restored.Codex.OptimizeMultiAgentV2 != cfg.Codex.OptimizeMultiAgentV2 || !reflect.DeepEqual(restored.OAuthSettings, cfg.OAuthSettings) {
+	restoredCPA, errRestoredCPA := cpaconfig.ParseConfigBytes(canonical)
+	if errRestoredCPA != nil {
+		t.Fatal(errRestoredCPA)
+	}
+	if !reflect.DeepEqual(restoredRoot, root) || restoredCPA.Client.Codex.OptimizeMultiAgentV2 != cpa.Client.Codex.OptimizeMultiAgentV2 || !reflect.DeepEqual(restored.OAuthSettings, cfg.OAuthSettings) {
 		t.Fatal("configuration changed across legacy/v8 round trip")
 	}
 }

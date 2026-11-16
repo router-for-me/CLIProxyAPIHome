@@ -8,26 +8,18 @@ import (
 
 func TestForceHomeRuntimeConfigPreservesDisableCooling(t *testing.T) {
 	cfg := &Config{}
-	cfg.APIKeys = []string{"local-key"}
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = true
-	cfg.WebsocketAuth = true
 	cfg.RemoteManagement.AllowRemote = true
 	cfg.RemoteManagement.DisableControlPanel = false
 
 	ForceHomeRuntimeConfig(cfg)
 
-	if len(cfg.APIKeys) != 0 {
-		t.Fatalf("APIKeys = %#v, want nil/empty", cfg.APIKeys)
-	}
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("UsageStatisticsEnabled = false, want true")
 	}
 	if !cfg.DisableCooling {
 		t.Fatal("DisableCooling = false, want Home global cooling disabled")
-	}
-	if cfg.WebsocketAuth {
-		t.Fatal("WebsocketAuth = true, want false")
 	}
 	if !cfg.RemoteManagement.AllowRemote {
 		t.Fatal("RemoteManagement.AllowRemote = false, want preserved true")
@@ -52,17 +44,11 @@ ws-auth: true
 	if errLoad != nil {
 		t.Fatalf("LoadConfigOptional() error = %v", errLoad)
 	}
-	if len(cfg.APIKeys) != 0 {
-		t.Fatalf("APIKeys = %#v, want nil/empty", cfg.APIKeys)
-	}
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("UsageStatisticsEnabled = false, want true")
 	}
 	if !cfg.DisableCooling {
 		t.Fatal("DisableCooling = false, want Home global cooling disabled")
-	}
-	if cfg.WebsocketAuth {
-		t.Fatal("WebsocketAuth = true, want false")
 	}
 }
 
