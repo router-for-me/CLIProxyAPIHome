@@ -4279,6 +4279,7 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `requests.payload.default-raw` | array of `PayloadRule` | Sets missing raw JSON payload params. |
 | `requests.payload.override` | array of `PayloadRule` | Overrides JSON payload params. |
 | `requests.payload.override-raw` | array of `PayloadRule` | Overrides raw JSON payload params. |
+| `requests.payload.replace` | array of `PayloadReplaceRule` | Ordered literal replacements in selected user-message text; executed by CPA. |
 | `requests.payload.filter` | array of `PayloadFilterRule` | Removes JSON payload paths. |
 
 Guardian selection history is database-backed and shared across Home nodes, config reloads, and restarts. Only successful dispatch/admission while `session-affinity-subagents` is enabled advances selection order; completion/usage reports and parent lookups do not. When disabled, dispatch keeps ordinary sticky bindings but stops maintaining Guardian history and removes the touched binding from that history. Re-enabling resumes recording subsequent selections; selections made while disabled are not reconstructed. Inherited credentials must still belong to the current request's eligible candidate set. Guardian bindings may reuse a lower-priority eligible credential; cold selection still uses normal priority rules. Fork/compaction requests do not use Guardian cross-model inheritance. Schema version 19 adds the Guardian columns and lookup index through the normal startup migration. Version 18 portable snapshots remain supported. Expiring selection metadata and internal per-session counters use the existing `session_affinity` table, without a separate table (all excluded from portable snapshots); pre-upgrade bindings acquire selection metadata on their next successful dispatch. Upgrade all Home nodes before relying on cross-node Guardian inheritance.
@@ -4350,6 +4351,14 @@ Payload nested structure:
       "reasoning.effort": "high"
     }
   },
+  "PayloadReplaceRule": {
+    "models": [{ "name": "*", "protocol": "claude", "from-protocol": "openai" }],
+    "target": { "role": "user", "positions": [1, 2] },
+    "replacements": [
+      { "you are hero": "you are fool" },
+      { "remove this phrase": "" }
+    ]
+  },
   "PayloadFilterRule": {
     "models": [
       { "name": "gpt-*", "protocol": "responses" }
@@ -4374,6 +4383,10 @@ Payload nested structure:
   }
 }
 ```
+
+Use `PUT /config/requests/payload/replace` with a rule array to replace this section, or `PATCH /config/requests/payload` with `{"replace": [...]}` to preserve sibling sections. Home validates and stores the rules without applying them; downstream CPA nodes must support `payload.replace`. Older nodes may ignore the rules.
+
+`target.role` must be `user`. Select positive, one-based `positions` among user messages in the final upstream body, or use `all: true` without positions. Missing positions and unmatched text are skipped by CPA. Each `replacements` entry must contain exactly one non-empty string key and a string destination; an empty destination deletes matches. Rules and replacements execute in list order after overrides and before filters. Matching is case-sensitive and literal, within individual text blocks; images, tool results, and thinking content are not rewritten. Model conditions use the same fields below as other payload rules. Invalid replacement configuration is rejected before database writes.
 
 `PayloadModelRule` fields:
 

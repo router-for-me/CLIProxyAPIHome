@@ -770,6 +770,9 @@ func ValidateV8Config(data []byte) error {
 	if errValidate := (*Config)(&cfg).ValidateHomePolicies(); errValidate != nil {
 		return errValidate
 	}
+	if errValidate := validatePayloadReplace(flat); errValidate != nil {
+		return errValidate
+	}
 	// Validate the compatible runtime projection with the bundled CPA SDK.
 	_, errParse := cpaconfig.ParseConfigBytes(encoded)
 	return errParse
