@@ -53,9 +53,6 @@ func validateExecutionSchema(node *yaml.Node, types []reflect.Type, path string)
 		}
 		types[i] = t
 	}
-	if path == "payload" {
-		types = append(types, reflect.TypeOf(payloadReplaceSchema{}))
-	}
 	if node.Kind == yaml.MappingNode {
 		for i := 0; i < len(node.Content); i += 2 {
 			key := node.Content[i].Value

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -81,6 +82,22 @@ func TestPayloadReplaceConfigTreeRoundTrip(t *testing.T) {
 		}
 		if !reflect.DeepEqual(root["payload"], original["payload"]) {
 			t.Fatalf("layout round trip changed payload: %s", canonical)
+		}
+		cpa, errParse := cpaconfig.ParseConfigBytes(canonical)
+		if errParse != nil {
+			t.Fatal(errParse)
+		}
+		rules := cpa.Payload.Replace
+		if len(rules) != 2 || !reflect.DeepEqual(rules[0].Target.Positions, []int{1, 2, 2}) || !rules[1].Target.All {
+			t.Fatalf("SDK lost replacement selectors: %+v", rules)
+		}
+		want := []cpaconfig.PayloadReplacement{
+			{"you are hero": "you are fool"},
+			{"you are fool": "you are friend"},
+			{"remove": ""},
+		}
+		if !reflect.DeepEqual(rules[0].Replacements, want) || !reflect.DeepEqual(rules[1].Replacements, []cpaconfig.PayloadReplacement{{"1": "false"}}) {
+			t.Fatalf("SDK changed replacement order or operands: %+v", rules)
 		}
 	}
 }

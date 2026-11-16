@@ -174,8 +174,6 @@ func buildV8Paths() []configPath {
 	// CPA owns execution fields. An SDK update extends this schema automatically.
 	walk(reflect.TypeOf(Config{}), "", nil, true)
 	walk(reflect.TypeOf(cpaconfig.Config{}), "", nil, false)
-	// Bridge new CPA execution fields without adding Home runtime projections.
-	walk(reflect.TypeOf(payloadReplaceSchema{}), "payload", nil, false)
 	return out
 }
 
