@@ -15,7 +15,8 @@ const HomeCredentialConfigMetadataKey = "home_config"
 var HomeCredentialFields = [...]string{"id", "uuid", "api-key", "base-url", "proxy-url", "prefix", "priority", "headers", "excluded-models", "disable-cooling", "request-retry", "name", "disabled"}
 
 // CredentialConfig retains the complete credential subtree, including models and
-// cloak settings. Home's typed credential fields are scheduling projections only.
+// cloak settings. Credential fields project Home scheduling policy, while model
+// definitions retain the complete model configuration shared with CPA.
 type CredentialConfig struct {
 	RawConfig map[string]any `yaml:"-" json:"-"`
 }

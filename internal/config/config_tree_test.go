@@ -20,7 +20,12 @@ func TestSDKExecutionOptionsWithoutHomeFields(t *testing.T) {
 		{reflect.TypeOf(Config{}), "Codex"},
 		{reflect.TypeOf(Config{}), "Payload"},
 		{reflect.TypeOf(CodexKey{}), "ConnectionPool"},
-		{reflect.TypeOf(VertexCompatModel{}), "OpenAPI"},
+		{reflect.TypeOf(CodexKey{}), "DisableCodexCloaking"},
+		{reflect.TypeOf(ClaudeKey{}), "Cloak"},
+		{reflect.TypeOf(ClaudeKey{}), "ExperimentalCCHSigning"},
+		{reflect.TypeOf(ClaudeKey{}), "RebuildMidSystemMessage"},
+		{reflect.TypeOf(ClaudeKey{}), "FingerprintProfile"},
+		{reflect.TypeOf(OpenAICompatibility{}), "SupportPromptCacheKey"},
 	} {
 		if _, exists := check.owner.FieldByName(check.field); exists {
 			t.Fatalf("CPA-only field %s.%s was duplicated in Home", check.owner.Name(), check.field)
@@ -123,9 +128,13 @@ upstream:
 }
 
 func TestClaudeCloakPatternsTypedSDKProjection(t *testing.T) {
-	entry := ClaudeKey{Cloak: &CloakConfig{SensitivePatternsReplace: []SensitivePatternRule{
-		{Pattern: "^private", Replacement: ""},
-		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
+	entry := ClaudeKey{CredentialConfig: CredentialConfig{RawConfig: map[string]any{
+		"cloak": map[string]any{
+			"sensitive-patterns-replace": []any{
+				map[string]any{"pattern": "^private", "replacement": ""},
+				map[string]any{"pattern": "Claude[ ]+Code", "replacement": "Claude"},
+			},
+		},
 	}}}
 	options, errProject := CredentialExecutionOptions(entry)
 	if errProject != nil {

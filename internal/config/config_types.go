@@ -10,12 +10,3 @@ type RequestScopedErrorRule struct {
 	// Action specifies the handling behavior: "stop", "stop-and-cooldown", "continue", "continue-and-cooldown".
 	Action string `yaml:"action,omitempty" json:"action,omitempty"`
 }
-
-// SensitivePatternRule defines a Go RE2 regular expression replacement rule.
-type SensitivePatternRule struct {
-	// Pattern is the Go RE2 regular expression to match.
-	Pattern string `yaml:"pattern" json:"pattern"`
-
-	// Replacement is the substitution string (empty string deletes matches).
-	Replacement string `yaml:"replacement" json:"replacement"`
-}

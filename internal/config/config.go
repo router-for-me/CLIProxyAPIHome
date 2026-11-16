@@ -277,35 +277,6 @@ type OAuthModelAlias struct {
 	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
 }
 
-// CloakConfig configures request cloaking for non-Claude-Code clients.
-// Cloaking disguises API requests to appear as originating from the official Claude Code CLI.
-type CloakConfig struct {
-	// Mode controls cloaking behavior: "auto" (default), "always", or "never".
-	// - "auto": cloak only when client is not Claude Code (based on User-Agent)
-	// - "always": always apply cloaking regardless of client
-	// - "never": never apply cloaking
-	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
-
-	// StrictMode controls how system prompts are handled when cloaking.
-	// - false (default): prepend Claude Code prompt to user system messages
-	// - true: strip all user system messages, keep only Claude Code prompt
-	StrictMode bool `yaml:"strict-mode,omitempty" json:"strict-mode,omitempty"`
-
-	// SensitiveWords is a list of words to obfuscate with zero-width characters.
-	// This can help bypass certain content filters.
-	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
-
-	// SensitiveWordsReplace maps target substrings to literal replacement text when cloaking.
-	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
-
-	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules when cloaking.
-	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
-
-	// CacheUserID controls whether Claude user_id values are cached per API key.
-	// When false, a fresh random user_id is generated for every request.
-	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
-}
-
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
@@ -348,18 +319,9 @@ type ClaudeKey struct {
 	// Nil or a negative value inherits the global setting; zero disables additional rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
-	// Cloak configures request cloaking for non-Claude-Code clients.
-	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
-
-	// ExperimentalCCHSigning is retained for configuration compatibility.
-	// CCH signing is automatic for Claude OAuth and supported direct upstreams.
-	ExperimentalCCHSigning bool `yaml:"experimental-cch-signing,omitempty" json:"experimental-cch-signing,omitempty"`
-
 	// Settings shared with CPA V8.
-	Weight                  *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
-	RebuildMidSystemMessage bool                     `yaml:"rebuild-mid-system-message,omitempty" json:"rebuild-mid-system-message,omitempty"`
-	RequestScopedErrors     []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
-	FingerprintProfile      string                   `yaml:"fingerprint-profile,omitempty" json:"fingerprint-profile,omitempty"`
+	Weight              *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// NativeToolSearch trusts a custom base URL with Anthropic native tool search
 	// (defer_loading tools and tool_reference results) for Codex tool_search.
 	NativeToolSearch bool `yaml:"native-tool-search,omitempty" json:"native-tool-search,omitempty"`
@@ -377,7 +339,7 @@ func (k ClaudeKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k ClaudeKey) GetProxyURL() string { return k.ProxyURL }
 
-// ClaudeModel describes a mapping between an alias and the actual upstream model name.
+// ClaudeModel defines the complete Claude model configuration shared with CPA.
 type ClaudeModel struct {
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
@@ -460,9 +422,8 @@ type CodexKey struct {
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// Settings shared with CPA V8.
-	Weight               *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
-	DisableCodexCloaking *bool                    `yaml:"disable-codex-cloaking,omitempty" json:"disable-codex-cloaking,omitempty"`
-	RequestScopedErrors  []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+	Weight              *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 }
 
 // GetAPIKey returns an api key.
@@ -477,7 +438,7 @@ func (k CodexKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k CodexKey) GetProxyURL() string { return k.ProxyURL }
 
-// CodexModel describes a mapping between an alias and the actual upstream model name.
+// CodexModel defines the complete Codex model configuration shared with CPA.
 type CodexModel struct {
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
@@ -588,7 +549,7 @@ func (k GeminiKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k GeminiKey) GetProxyURL() string { return k.ProxyURL }
 
-// GeminiModel describes a mapping between an alias and the actual upstream model name.
+// GeminiModel defines the complete Gemini model configuration shared with CPA.
 type GeminiModel struct {
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
@@ -668,8 +629,7 @@ type OpenAICompatibility struct {
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// Settings shared with CPA V8.
-	SupportPromptCacheKey bool                     `yaml:"support-prompt-cache-key,omitempty" json:"support-prompt-cache-key,omitempty"`
-	RequestScopedErrors   []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -689,8 +649,8 @@ type OpenAICompatibilityAPIKey struct {
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 }
 
-// OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
-// including the actual model name and its alias for API routing.
+// OpenAICompatibilityModel defines the complete OpenAI-compatible model configuration
+// shared with CPA, including model capabilities and protocol compatibility options.
 type OpenAICompatibilityModel struct {
 	// Name is the actual model name used by the external provider.
 	Name string `yaml:"name" json:"name"`
