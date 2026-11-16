@@ -20,12 +20,12 @@ import (
 func TestCORSMiddlewareMatchesCPAHeaders(t *testing.T) {
 	engine := gin.New()
 	engine.Use(corsMiddleware())
-	engine.GET("/v0/management/ping", func(c *gin.Context) {
+	engine.GET("/v8/management/ping", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 
 	optionsResp := httptest.NewRecorder()
-	optionsReq := httptest.NewRequest(http.MethodOptions, "/v0/management/ping", nil)
+	optionsReq := httptest.NewRequest(http.MethodOptions, "/v8/management/ping", nil)
 	engine.ServeHTTP(optionsResp, optionsReq)
 
 	if optionsResp.Code != http.StatusNoContent {
@@ -34,7 +34,7 @@ func TestCORSMiddlewareMatchesCPAHeaders(t *testing.T) {
 	assertCORSHeaders(t, optionsResp)
 
 	getResp := httptest.NewRecorder()
-	getReq := httptest.NewRequest(http.MethodGet, "/v0/management/ping", nil)
+	getReq := httptest.NewRequest(http.MethodGet, "/v8/management/ping", nil)
 	engine.ServeHTTP(getResp, getReq)
 
 	if getResp.Code != http.StatusOK {
@@ -114,34 +114,8 @@ func TestClusterManagementAPIKeyUsageRouteRegistered(t *testing.T) {
 	registerClusterManagementRoutes(reg, handler)
 
 	for _, route := range []RouteKey{
-		{Method: http.MethodGet, Path: "/api-key-usage"},
-		{Method: http.MethodPost, Path: "/api-keys"},
-		{Method: http.MethodGet, Path: "/xai-api-key"},
-		{Method: http.MethodPut, Path: "/xai-api-key"},
-		{Method: http.MethodPatch, Path: "/xai-api-key"},
-		{Method: http.MethodDelete, Path: "/xai-api-key"},
-		{Method: http.MethodGet, Path: "/meta-api-key"},
-		{Method: http.MethodPut, Path: "/meta-api-key"},
-		{Method: http.MethodPatch, Path: "/meta-api-key"},
-		{Method: http.MethodDelete, Path: "/meta-api-key"},
-		{Method: http.MethodGet, Path: "/devin-auth-url"},
-		{Method: http.MethodGet, Path: "/meta-auth-url"},
-	} {
-		if reg.routes[route] == nil {
-			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
-		}
-	}
-}
-
-func TestClusterManagementPortRoutesRegistered(t *testing.T) {
-	reg := newRouteRegistry()
-	handler := clustermanagement.NewHandler(nil, nil, "", 0)
-	registerClusterManagementRoutes(reg, handler)
-
-	for _, route := range []RouteKey{
-		{Method: http.MethodGet, Path: "/port"},
-		{Method: http.MethodPut, Path: "/port"},
-		{Method: http.MethodPatch, Path: "/port"},
+		{Method: http.MethodGet, Path: "/observability/usage/api-keys"},
+		{Method: http.MethodPost, Path: "/access/api-keys"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
@@ -152,7 +126,7 @@ func TestClusterManagementPortRoutesRegistered(t *testing.T) {
 func TestClusterManagementLogRoutesRegistered(t *testing.T) {
 	reg := newRouteRegistry()
 	legacyDeleteCalled := false
-	reg.Set(http.MethodDelete, "/logs", func(c *gin.Context) {
+	reg.Set(http.MethodDelete, "/observability/logs", func(c *gin.Context) {
 		legacyDeleteCalled = true
 		c.Status(http.StatusTeapot)
 	})
@@ -160,8 +134,8 @@ func TestClusterManagementLogRoutesRegistered(t *testing.T) {
 	registerClusterManagementRoutes(reg, handler)
 
 	for _, route := range []RouteKey{
-		{Method: http.MethodGet, Path: "/logs"},
-		{Method: http.MethodDelete, Path: "/logs"},
+		{Method: http.MethodGet, Path: "/observability/logs"},
+		{Method: http.MethodDelete, Path: "/observability/logs"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
@@ -169,12 +143,12 @@ func TestClusterManagementLogRoutesRegistered(t *testing.T) {
 	}
 
 	engine := gin.New()
-	engine.DELETE("/logs", reg.routes[RouteKey{Method: http.MethodDelete, Path: "/logs"}])
+	engine.DELETE("/observability/logs", reg.routes[RouteKey{Method: http.MethodDelete, Path: "/observability/logs"}])
 	resp := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete, "/logs", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/observability/logs", nil)
 	engine.ServeHTTP(resp, req)
 	if legacyDeleteCalled || resp.Code == http.StatusTeapot {
-		t.Fatal("database DELETE /logs did not replace the legacy file-log handler")
+		t.Fatal("database DELETE /observability/logs did not replace the SDK file-log handler")
 	}
 }
 
@@ -193,7 +167,6 @@ func TestClusterManagementInFlightRoutesRegistered(t *testing.T) {
 		{Method: http.MethodDelete, Path: "/credentials/:credential_id/cooldown"},
 		{Method: http.MethodGet, Path: "/credentials/:credential_id/model-states"},
 		{Method: http.MethodGet, Path: "/credentials/model-states"},
-		{Method: http.MethodGet, Path: "/auth-files/model-states"},
 	} {
 		if reg.routes[route] == nil {
 			t.Fatalf("route %s %s was not registered", route.Method, route.Path)
@@ -376,12 +349,12 @@ func TestManagementControlPanelRoutesDoNotCaptureManagementEndpoints(t *testing.
 	registerManagementControlPanelRoutes(engine, func(assetName string) gin.HandlerFunc {
 		return serveManagementControlPanel(cfg, "", assetName)
 	}, serveManagementControlPanelAsset(cfg, ""))
-	engine.GET("/v0/management/ping", func(c *gin.Context) {
+	engine.GET("/v8/management/ping", func(c *gin.Context) {
 		c.String(http.StatusOK, "pong")
 	})
 
 	resp := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v0/management/ping", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v8/management/ping", nil)
 	engine.ServeHTTP(resp, req)
 
 	if resp.Code != http.StatusOK {
@@ -400,7 +373,7 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 
 	invalidResp := httptest.NewRecorder()
 	invalidCtx, _ := gin.CreateTestContext(invalidResp)
-	invalidReq := httptest.NewRequest(http.MethodGet, "/v0/management/ping", nil)
+	invalidReq := httptest.NewRequest(http.MethodGet, "/v8/management/ping", nil)
 	invalidReq.RemoteAddr = "127.0.0.1:12345"
 	invalidReq.Header.Set("X-Management-Key", "wrong-secret")
 	invalidCtx.Request = invalidReq
@@ -412,12 +385,12 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 	}
 
 	engine := gin.New()
-	engine.GET("/v0/management/ping", middleware, func(c *gin.Context) {
+	engine.GET("/v8/management/ping", middleware, func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 
 	resp := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v0/management/ping", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v8/management/ping", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("X-Management-Key", "test-secret")
 	engine.ServeHTTP(resp, req)

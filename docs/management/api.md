@@ -24,12 +24,12 @@ Home examples usually use port `8327`. An explicit `-addr` takes precedence; oth
 
 ## API Versions
 
-This reference uses the v8 Management API. `/v0/management` remains available for existing clients; it shares Home's database and runtime with v8. The v8 API is not a prefix-only rename: configuration bodies and several resource paths changed. See the v0 migration appendix for the old mutation contracts.
+This reference uses the v8 Management API. `/v0/management` has been removed; retired endpoints return `404` without redirects. Migrate clients to `/v8/management` using the route and configuration mappings below: configuration bodies and several resource paths changed, so changing the prefix alone is insufficient.
 
 | Interface | Base path | Contract |
 | --- | --- | --- |
 | Management API | `/v8/management` | Configuration tree plus Home management resources. |
-| Legacy Management API | `/v0/management` | Existing flat config and provider-specific routes. |
+| Retired Management API | `/v0/management` | Removed; use the v8 routes and request bodies. |
 | User API | `/user` | Unchanged base path and user-token authentication; see [User API](../user/api.md). |
 | Plugin assets | `/v0/resource/plugins/...` | Asset URLs returned by Home keep their existing path. |
 
@@ -43,7 +43,7 @@ The route list below is the database-backed route set registered by `cmd/home` t
 
 ## Authentication
 
-Management routes under `/v8/management/*` and `/v0/management/*` require a management key. The exception is `GET/POST /v8/management/oauth/callback`: it validates a pending OAuth `state` without the management-key middleware. Availability checks still apply, so a disabled Management API also disables the v8 callback.
+Management routes under `/v8/management/*` require a management key. The exception is `GET/POST /v8/management/oauth/callback`: it validates a pending OAuth `state` without the management-key middleware. Availability checks still apply, so a disabled Management API also disables the v8 callback.
 
 Supported request headers:
 
@@ -278,7 +278,7 @@ Example response excerpt:
 }
 ```
 
-Unlike the v0 runtime JSON response, the v8 tree can include `server`, `management`, and upstream key material. Only the `username` and `credential` fields inside `oauth.providers.codex.live-media-relay.ice-servers[]` are explicitly redacted from JSON reads, including subtree reads. This endpoint is not a general secret-redaction API. The YAML endpoint includes those TURN secrets.
+The v8 tree can include `server`, `management`, and upstream key material. Only the `username` and `credential` fields inside `oauth.providers.codex.live-media-relay.ice-servers[]` are explicitly redacted from JSON reads, including subtree reads. This endpoint is not a general secret-redaction API. The YAML endpoint includes those TURN secrets.
 
 ### GET/PUT/PATCH/DELETE `/config/*path`
 
@@ -2219,7 +2219,7 @@ v8 list entries additionally expose the following fields only when an active quo
 | `quota_provider` | string | The credential provider key. |
 | `quota_plugin_id` | string | Plugin ID selected by the host's two-pass precedence; use it directly in `/plugins/:id/quota`. |
 
-These fields are not added to the v0 `/auth-files` response. Matching normalizes provider keys and excludes fused plugins; plugins may explicitly support built-in providers. Declarative `quota_probe` metadata or an available Home collector alone does not advertise plugin quota support.
+Matching normalizes provider keys and excludes fused plugins; plugins may explicitly support built-in providers. Declarative `quota_probe` metadata or an available Home collector alone does not advertise plugin quota support.
 
 ### GET `/credentials/models?name=<name-or-id>`
 
@@ -2251,13 +2251,11 @@ Example response:
 
 `models` contains the credential's currently registered, client-visible IDs after exclusions, OAuth aliases, and prefixes. Use it to inspect effective routing, not to construct exclusion rules.
 
-`exclusion_models` is the current Home node's candidate snapshot before those transformations, including models already excluded. Its entries use the same shape as `models`, and their `id` values are the IDs matched by `excluded_models`. The list remains available when all candidates are excluded. It is `null` when no candidate snapshot is available (for example, a disabled credential or a provider path that does not apply credential exclusions); an empty array means a known empty catalog. Older Home versions omit this field. Clients must keep manual rule editing available and must not substitute `models` when candidates are unavailable. This field is only added to v8; the legacy v0 response is unchanged.
+`exclusion_models` is the current Home node's candidate snapshot before those transformations, including models already excluded. Its entries use the same shape as `models`, and their `id` values are the IDs matched by `excluded_models`. The list remains available when all candidates are excluded. It is `null` when no candidate snapshot is available (for example, a disabled credential or a provider path that does not apply credential exclusions); an empty array means a known empty catalog. Older Home versions omit this field. Clients must keep manual rule editing available and must not substitute `models` when candidates are unavailable.
 
 ### GET `/credentials/model-states` and `/credentials/:credential_id/model-states`
 
 Reads per-model execution history and effective availability from the **current Home node's runtime**. This is a read-only snapshot: it does not select credentials, read full credentials from the database, merge persisted state, or aggregate other Home nodes.
-
-Legacy v0 list path: `GET /auth-files/model-states`.
 
 | Query | Type | Description |
 | --- | --- | --- |
@@ -2589,7 +2587,7 @@ A missing `state` returns `200 {"status":"ok"}` and does not verify a login. A c
 
 ### GET/POST `/oauth/callback`
 
-This v8 endpoint does not require a management key. It validates the pending DB-backed OAuth state and remains subject to Management API availability checks. The v0 `POST /v0/management/oauth-callback` still requires management authentication.
+This v8 endpoint does not require a management key. It validates the pending DB-backed OAuth state and remains subject to Management API availability checks.
 
 `GET` accepts query parameters; `POST` accepts JSON:
 
@@ -4390,9 +4388,9 @@ Payload nested structure:
 | `exist` | array of string | Payload JSON paths that must exist and not be `null`. |
 | `not-exist` | array of string | Payload JSON paths that must be missing or `null`. |
 
-## v0 Compatibility and Migration
+## Migration from the Removed v0 API
 
-The tables in this appendix compare paths relative to `/v0/management` and `/v8/management`. Existing operational resources share their handlers and response shapes unless the v8 sections above say otherwise. Home resources such as `/nodes`, `/topology`, `/users`, `/capabilities`, `/credentials/*` concurrency operations, `/quota/*`, `/usage/*`, `/request-events`, `/request-logs`, `/billing/*`, `/proxy/*`, model/channel groups, `/models`, and `/plugin-store-auth` keep their names under v8. `/user` and plugin asset URLs are not renamed.
+The tables below map removed paths relative to `/v0/management` to supported paths relative to `/v8/management`. The v0 entries are migration references, not available endpoints. Existing operational response shapes are retained unless the v8 sections above say otherwise. Home resources such as `/nodes`, `/topology`, `/users`, `/capabilities`, `/credentials/*` concurrency operations, `/quota/*`, `/usage/*`, `/request-events`, `/request-logs`, `/billing/*`, `/proxy/*`, model/channel groups, `/models`, and `/plugin-store-auth` keep their names under v8. `/user` and plugin asset URLs are not renamed.
 
 ### Operational Route Mapping
 
@@ -4433,7 +4431,7 @@ The tables in this appendix compare paths relative to `/v0/management` and `/v8/
 | `/meta-auth-url` | `/oauth/auth-url?provider=meta` |
 | `/<plugin-provider>-auth-url` | `/oauth/auth-url?provider=<plugin-provider>` |
 
-The v0 callback is an authenticated POST; v8 additionally accepts GET and validates state without the management key. `GET /credentials`, `/credentials/refresh`, `/oauth/session`, `/routing/cooldown/reset`, credential/plugin quota operations, and `DELETE /plugins/:id` are registered explicitly in v8, not by copying all SDK v0 endpoints.
+Update OAuth callback URLs to `/v8/management/oauth/callback`. The v8 callback accepts GET and POST and validates the pending state without a management key; the old callback URL is no longer accepted.
 
 ### Configuration Layout Mapping
 
@@ -4507,372 +4505,6 @@ Each row names a legacy config field/root and its canonical v8 tree location. JS
 
 Startup/import parsing accepts legacy and mixed layouts. When both versions of a field exist, explicit v8 presence wins, including `false`, `0`, and empty collections. Historical v8 provider/client paths and request bodies remain accepted as aliases; writes use the canonical layout and still reject unknown fields. Retain read-only revisions and credential IDs when using subtree PATCH/PUT or a complete replacement.
 
-### Legacy Config Reads and Full YAML Replacement
+### Request Body Migration
 
-`GET /v0/management/config` still returns the legacy runtime JSON shape: top-level `proxy-url`, `request-retry`, provider arrays, and other legacy names. It does not become the v8 tree, and fields hidden by the runtime JSON schema remain hidden. `GET /v0/management/config.yaml` reconstructs the persisted snapshot with DB-backed credentials and can retain legacy roots/OAuth scope; use the v8 YAML route for the canonical migrated layout.
-
-`PUT /v0/management/config.yaml` accepts a full YAML document (including legacy/mixed layouts), replaces non-credential configuration, and reconciles only provider credential families explicitly present. Omitted provider families remain unchanged in v0; empty lists clear them. This differs from v8 full replacement. `auth-dir` remains an import/export path. Success returns `{"ok":true,"changed":["config"]}`, with `"auth"` also in `changed` when credential roots were supplied. Lifecycle restrictions still apply.
-
-The remaining appendix documents v0 leaf/config-root and provider-list mutation bodies for existing clients. These are not v8 request bodies. In particular, legacy root PATCH removes fields on `null`, while v8 config-tree PATCH retains `null`.
-
-### Legacy Provider Route Families
-
-The v0 provider routes `/v0/management/gemini-api-key`, `/v0/management/interactions-api-key`, `/v0/management/vertex-api-key`, `/v0/management/codex-api-key`, `/v0/management/claude-api-key`, `/v0/management/xai-api-key`, `/v0/management/meta-api-key`, and `/v0/management/openai-compatibility` retain GET/PUT/PATCH/DELETE. Their arrays use flat credential entries; compatibility entries use `api-key-entries`, not v8 `keys`. Model and credential options described above remain available where supported by the provider; legacy typed JSON uses `thinking.zero_allowed` / `dynamic_allowed`.
-
-### Simple Config Leaf Routes
-
-These routes write the corresponding config root into the cluster repository and reload the Home runtime.
-
-Port changes require a CPA restart: `PUT/PATCH /v0/management/port` persists and distributes the new value immediately, but an already running CPA does not rebind its listener until that CPA process is restarted.
-
-| Method | Path | Input | Output |
-| --- | --- | --- | --- |
-| `GET` | `/v0/management/port` | none | `{ "port": number }` |
-| `PUT/PATCH` | `/v0/management/port` | `{ "value": number }`; must be an integer from `1` to `65535`. | `{ "status": "ok" }` |
-| `GET` | `/v0/management/debug` | none | `{ "debug": boolean }` |
-| `PUT/PATCH` | `/v0/management/debug` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/logging-to-file` | none | `{ "logging-to-file": boolean }` |
-| `PUT/PATCH` | `/v0/management/logging-to-file` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/logs-max-total-size-mb` | none | `{ "logs-max-total-size-mb": number }` |
-| `PUT/PATCH` | `/v0/management/logs-max-total-size-mb` | `{ "value": number }`; negative values are saved as `0` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/error-logs-max-files` | none | `{ "error-logs-max-files": number }` |
-| `PUT/PATCH` | `/v0/management/error-logs-max-files` | `{ "value": number }`; negative values are saved as `10` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/usage-statistics-enabled` | none | `{ "usage-statistics-enabled": boolean }` |
-| `PUT/PATCH` | `/v0/management/usage-statistics-enabled` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/proxy-url` | none | `{ "proxy-url": string }` |
-| `PUT/PATCH` | `/v0/management/proxy-url` | `{ "value": string }` | `{ "status": "ok" }` |
-| `DELETE` | `/v0/management/proxy-url` | none | `{ "status": "ok" }` |
-| `GET` | `/v0/management/request-log` | none | `{ "request-log": boolean }` |
-| `PUT/PATCH` | `/v0/management/request-log` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/request-retry` | none | `{ "request-retry": number }` |
-| `PUT/PATCH` | `/v0/management/request-retry` | `{ "value": number }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/max-retry-credentials` | none | `{ "max-retry-credentials": number }` |
-| `PUT/PATCH` | `/v0/management/max-retry-credentials` | `{ "value": number }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/max-retry-interval` | none | `{ "max-retry-interval": number }` |
-| `PUT/PATCH` | `/v0/management/max-retry-interval` | `{ "value": number }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/force-model-prefix` | none | `{ "force-model-prefix": boolean }` |
-| `PUT/PATCH` | `/v0/management/force-model-prefix` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/routing/strategy` | none | `{ "strategy": "round-robin" }` or `{ "strategy": "fill-first" }` |
-| `PUT/PATCH` | `/v0/management/routing/strategy` | `{ "value": "round-robin" }`, `roundrobin`, `rr`, `weighted-round-robin`, `weightedroundrobin`, `wrr`, `fill-first`, `fillfirst`, or `ff` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/quota-exceeded/switch-project` | none | `{ "switch-project": boolean }` |
-| `PUT/PATCH` | `/v0/management/quota-exceeded/switch-project` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/quota-exceeded/switch-preview-model` | none | `{ "switch-preview-model": boolean }` |
-| `PUT/PATCH` | `/v0/management/quota-exceeded/switch-preview-model` | `{ "value": boolean }` | `{ "status": "ok" }` |
-
-### `/v0/management/payload` Config Root
-
-`GET /v0/management/payload` returns:
-
-```json
-{
-  "payload": {
-    "default": [
-      {
-        "models": [
-          {
-            "name": "gpt-*",
-            "protocol": "responses",
-            "from-protocol": "openai",
-            "headers": {
-              "X-Client-Tier": "tenant-*"
-            },
-            "match": [{ "metadata.client": "codex" }],
-            "not-match": [{ "metadata.mode": "dev" }],
-            "exist": ["tools.#(type==\"web_search\").type"],
-            "not-exist": ["metadata.disable_payload"]
-          }
-        ],
-        "params": { "reasoning.effort": "high" }
-      }
-    ],
-    "default-raw": [],
-    "override": [],
-    "override-raw": [],
-    "filter": [
-      {
-        "models": [{ "name": "*", "protocol": "responses" }],
-        "params": ["metadata.debug"]
-      }
-    ]
-  }
-}
-```
-
-`GET /v0/management/payload` returns the complete persisted payload root, including advanced model matcher fields that older frontends may not recognize.
-
-`PUT /v0/management/payload` accepts either a raw payload object, `{ "value": <payload> }`, or `{ "payload": <payload> }`. It replaces the complete `payload` root and validates the full schema without dropping advanced matcher fields.
-
-`PATCH /v0/management/payload` accepts the same body shapes and applies object merge-patch semantics to the existing `payload` root: submitted object fields are merged recursively, `null` removes a field, arrays are replaced as whole values, and sibling fields not present in the patch are preserved. This lets clients update one section, such as `filter`, without deleting `default`, `override`, or advanced matcher fields.
-
-`DELETE /v0/management/payload` removes the root from the config snapshot.
-
-Successful writes return:
-
-```json
-{ "status": "ok" }
-```
-
-### `/v0/management/antigravity` Config Root
-
-`GET /v0/management/antigravity` returns:
-
-```json
-{
-  "antigravity": {
-    "sensitive-words": ["API", "proxy"]
-  }
-}
-```
-
-`GET /v0/management/antigravity` returns the persisted `antigravity` provider config root.
-
-`PUT /v0/management/antigravity` accepts a raw antigravity object, `{ "value": <antigravity> }`, or `{ "antigravity": <antigravity> }`. It replaces the complete `antigravity` root and validates its schema.
-
-`PATCH /v0/management/antigravity` accepts the same body shapes and applies object merge-patch semantics to the existing `antigravity` root: submitted object fields are merged recursively, `null` removes a field, and arrays are replaced as whole values.
-
-`DELETE /v0/management/antigravity` removes the root from the config snapshot.
-
-Successful writes return:
-
-```json
-{ "status": "ok" }
-```
-
-### Legacy Provider List Operations
-
-#### GET Provider Key Routes
-
-Input: none.
-
-Example response:
-
-```json
-{
-  "gemini-api-key": [
-    {
-      "auth_index": "auth-db-id",
-      "id": "auth-db-id",
-      "api-key": "AIza...",
-      "base-url": "https://generativelanguage.googleapis.com",
-      "prefix": "team-a",
-      "proxy-url": "",
-      "disabled": false,
-      "priority": 10,
-      "request-retry": 2,
-      "headers": { "X-Test": "1" },
-      "models": [
-        { "name": "gemini-upstream", "alias": "gemini-alias" }
-      ]
-    }
-  ]
-}
-```
-
-#### PUT Provider Key Routes
-
-Replaces the full list for the route provider.
-
-Input can be an array:
-
-```json
-[
-  {
-    "api-key": "provider-key",
-    "base-url": "https://api.example.com",
-    "models": [
-      { "name": "upstream-model", "alias": "alias-model" }
-    ]
-  }
-]
-```
-
-or a wrapper:
-
-```json
-{ "items": [ { "api-key": "provider-key" } ] }
-```
-
-Home also accepts `{ "<route-key>": [...] }`, `{ "list": [...] }`, `{ "data": [...] }`, or a single entry object.
-
-Successful response:
-
-```json
-{ "status": "ok" }
-```
-
-#### PATCH Provider Key Routes
-
-Updates one provider credential.
-
-Example request:
-
-```json
-{
-  "index": 0,
-  "match": "old-api-key",
-  "name": "openai-provider-name",
-  "value": {
-    "api-key": "new-api-key",
-    "base-url": "https://api.example.com",
-    "proxy-url": "",
-    "headers": { "X-Test": "1" },
-    "excluded-models": ["model-a"]
-  }
-}
-```
-
-Selector fields:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `index` | integer | Zero-based index in the filtered provider list. |
-| `match` | string | API-key value to match. |
-| `name` | string | OpenAI-compatible provider name or auth label. |
-| `id` | string | DB auth ID. |
-| `uuid` | string | Alias of `id`. |
-| query `base-url` | string | Optional base URL to narrow API-key matches. |
-
-`PATCH` does not use body `auth_index` as the DB ID selector. Use `id` or `uuid` for ID-based patching.
-
-Selectors that still match multiple credentials are rejected. Use `id`, `uuid`, or `index` to select one credential when routing fields such as `prefix`, `proxy-url`, or `headers` distinguish entries with the same API key and base URL.
-
-Within `value`, `disable-cooling` accepts a boolean override and `request-retry` accepts an integer additional-round override. Set either field to `null`, or set `request-retry` to a negative value, to clear its existing override and inherit the global setting; omitting a field leaves its current override unchanged.
-
-Successful response:
-
-```json
-{ "status": "ok" }
-```
-
-#### DELETE Provider Key Routes
-
-Deletes one provider credential.
-
-Query parameters:
-
-| Query | Type | Description |
-| --- | --- | --- |
-| `id` | string | DB auth ID. |
-| `uuid` | string | Alias of `id`. |
-| `auth_index` | string | DB auth ID or runtime index. |
-| `index` | integer | Zero-based index in the filtered provider list. |
-| `api-key` | string | API-key value. |
-| `api_key` | string | Alias of `api-key`. |
-| `match` | string | Alias of `api-key`. |
-| `base-url` | string | Optional base URL to narrow API-key matches. |
-| `base_url` | string | Alias of `base-url`. |
-| `name` | string | Provider or compatibility name. |
-
-Selectors that still match multiple credentials are rejected. Use `id`, `uuid`, `auth_index`, or `index` to delete exactly one credential.
-
-Successful response:
-
-```json
-{ "status": "ok" }
-```
-
-### OAuth Model Rules
-
-#### `/v0/management/oauth-excluded-models`
-
-GET response:
-
-```json
-{
-  "oauth-excluded-models": {
-    "claude": ["claude-opus-4.5"]
-  }
-}
-```
-
-PUT input:
-
-```json
-{
-  "claude": ["claude-opus-4.5"]
-}
-```
-
-or:
-
-```json
-{
-  "items": {
-    "claude": ["claude-opus-4.5"]
-  }
-}
-```
-
-PATCH input:
-
-```json
-{
-  "provider": "claude",
-  "models": ["claude-opus-4.5"]
-}
-```
-
-DELETE query:
-
-| Query | Type | Required | Description |
-| --- | --- | --- | --- |
-| `provider` | string | yes | Provider key to remove. |
-
-Successful writes return `{ "status": "ok" }`.
-
-#### `/v0/management/oauth-model-alias`
-
-GET response:
-
-```json
-{
-  "oauth-model-alias": {
-    "claude": [
-      { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-    ]
-  }
-}
-```
-
-PUT input:
-
-```json
-{
-  "claude": [
-    { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-  ]
-}
-```
-
-or:
-
-```json
-{
-  "items": {
-    "claude": [
-      { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-    ]
-  }
-}
-```
-
-PATCH input:
-
-```json
-{
-  "channel": "claude",
-  "provider": "claude",
-  "aliases": [
-    { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-  ]
-}
-```
-
-DELETE query:
-
-| Query | Type | Required | Description |
-| --- | --- | --- | --- |
-| `channel` | string | conditionally | Alias channel to remove. |
-| `provider` | string | conditionally | Alias of `channel`. |
-
-Successful writes return `{ "status": "ok" }`.
+Use the V8 configuration tree routes, not the removed flat leaf/provider endpoints. Provider credentials use `api-keys.<provider>` groups with `keys`. V8 `PUT /config` and `PUT /config.yaml` replace the complete configuration, including omitted credential families; use subtree writes for partial updates. V8 config-tree PATCH preserves `null` as a value; use DELETE to remove a subtree. Preserve read-only revisions and credential IDs as described above.

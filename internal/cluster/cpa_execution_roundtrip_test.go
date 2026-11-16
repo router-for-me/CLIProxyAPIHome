@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -133,21 +134,35 @@ api-keys:
   codex:
     - base-url: https://codex.example.test
       connection-pool: {enabled: true, idle-conn-timeout: 300s, max-idle-conns-per-host: 7}
+      models: [{name: codex-model, alias: codex-alias, is-compat: true}]
       keys:
         - api-key: codex-key
+          disable-codex-cloaking: false
           connection-pool: {enabled: false}
+  gemini:
+    - models: [{name: gemini-model, alias: gemini-alias, is-compat: true}]
+      keys: [{api-key: gemini-key}]
   vertex:
     - interactions: true
       models: [{name: gemini-2.5-flash, alias: vertex-model, openapi: false}]
       keys: [{api-key: vertex-key}]
   claude:
-    - keys:
+    - models: [{name: claude-model, alias: claude-alias, is-compat: true}]
+      keys:
         - api-key: claude-key
+          experimental-cch-signing: true
+          rebuild-mid-system-message: true
+          fingerprint-profile: claude-code-cli
           cloak:
+            mode: always
+            strict-mode: true
+            cache-user-id: false
             sensitive-patterns-replace: [{pattern: '^old', replacement: new}]
   openai-compatibility:
     - name: gateway
       base-url: https://gateway.example.test
+      support-prompt-cache-key: true
+      models: [{name: gateway-model, alias: gateway-alias, is-compat: true, use-max-completion-tokens: true}]
       connection-pool: {enabled: true, idle-conn-timeout: 123s, max-idle-conns-per-host: 9}
       keys:
         - api-key: gateway-key
@@ -158,7 +173,7 @@ api-keys:
 		t.Fatal(errImport)
 	}
 	auths, errAuths := repo.ListAuths(ctx)
-	if errAuths != nil || len(auths) != 4 {
+	if errAuths != nil || len(auths) != 5 {
 		t.Fatalf("auths = %d, error = %v", len(auths), errAuths)
 	}
 	for _, auth := range auths {
@@ -177,6 +192,11 @@ api-keys:
 		if _, exists := downstream.Metadata[appconfig.HomeCredentialConfigMetadataKey]; exists {
 			t.Fatal("private credential configuration leaked to CPA")
 		}
+		options := downstream.Metadata["credential_options"].(map[string]any)
+		model := options["models"].([]any)[0].(map[string]any)
+		if auth.Provider != "vertex" && model["is-compat"] != true {
+			t.Fatalf("%s dispatch lost model compatibility", auth.Provider)
+		}
 		switch auth.Provider {
 		case "codex", "gateway":
 			pool := downstream.ProxyConnectionPool
@@ -190,11 +210,16 @@ api-keys:
 			if pool.IdleConnTimeout != wantIdle || *pool.MaxIdleConnsPerHost != wantCount {
 				t.Fatalf("%s lost inherited pool settings: %+v", auth.Provider, pool)
 			}
+			if auth.Provider == "codex" {
+				if options["disable-codex-cloaking"] != false || downstream.Attributes["codex_disable_cloaking"] != "false" {
+					t.Fatal("Codex dispatch lost explicit false cloaking override")
+				}
+			} else if options["support-prompt-cache-key"] != true || model["use-max-completion-tokens"] != true {
+				t.Fatal("compatibility dispatch lost CPA execution options")
+			}
 		case "vertex":
-			options := downstream.Metadata["credential_options"].(map[string]any)
-			model := options["models"].([]any)[0].(map[string]any)
 			if model["openapi"] != false {
-				t.Fatal("nested SDK-only model option was lost")
+				t.Fatal("nested model option was lost")
 			}
 			if downstream.Attributes["interactions"] != "true" {
 				t.Fatal("Vertex dispatch lost Interactions capability")
@@ -202,6 +227,15 @@ api-keys:
 		case "claude":
 			if downstream.Metadata["cloak_sensitive_patterns_replace"] == nil {
 				t.Fatal("Claude dispatch lost regex cloak rules")
+			}
+			for key, want := range map[string]string{
+				"experimental_cch_signing": "true", "rebuild_mid_system_message": "true",
+				"fingerprint_profile": "claude-code-cli", "cloak_mode": "always",
+				"cloak_strict_mode": "true", "cloak_cache_user_id": "false",
+			} {
+				if downstream.Attributes[key] != want {
+					t.Fatalf("Claude dispatch attribute %s = %q, want %q", key, downstream.Attributes[key], want)
+				}
 			}
 		}
 	}
@@ -229,8 +263,21 @@ api-keys:
 	if errCPA != nil {
 		t.Fatal(errCPA)
 	}
-	if !cpa.Client.Codex.EnableApplyPatch || !cfg.Codex.OptimizeMultiAgentV2 || cpa.ShutdownTimeoutSeconds != 20 || cpa.ResponseCompression.Enabled == nil || *cpa.ResponseCompression.Enabled {
+	if !cpa.Client.Codex.EnableApplyPatch || !cpa.Client.Codex.OptimizeMultiAgentV2 || cpa.ShutdownTimeoutSeconds != 20 || cpa.ResponseCompression.Enabled == nil || *cpa.ResponseCompression.Enabled {
 		t.Fatalf("export lost execution options:\n%s", data)
+	}
+	if override := cpa.CodexKey[0].DisableCodexCloaking; override == nil || *override {
+		t.Fatal("export lost explicit false Codex cloaking override")
+	}
+	claude := cpa.ClaudeKey[0]
+	if !claude.ExperimentalCCHSigning || !claude.RebuildMidSystemMessage || claude.FingerprintProfile != "claude-code-cli" ||
+		claude.Cloak == nil || claude.Cloak.Mode != "always" || !claude.Cloak.StrictMode || claude.Cloak.CacheUserID == nil || *claude.Cloak.CacheUserID {
+		t.Fatal("export lost Claude execution options")
+	}
+	compat := cpa.OpenAICompatibility[0]
+	if !cpa.CodexKey[0].Models[0].IsCompat || !cpa.GeminiKey[0].Models[0].IsCompat || !claude.Models[0].IsCompat ||
+		!compat.SupportPromptCacheKey || !compat.Models[0].IsCompat || !compat.Models[0].UseMaxCompletionTokens {
+		t.Fatal("export lost model or compatibility execution options")
 	}
 	if len(cfg.OAuthSettings["codex"]) != 1 || cfg.VertexCompatAPIKey[0].RawConfig["interactions"] != true || len(cfg.ClaudeKey[0].RawConfig["cloak"].(map[string]any)["sensitive-patterns-replace"].([]any)) != 1 {
 		t.Fatal("export lost credential or OAuth options")
@@ -238,11 +285,31 @@ api-keys:
 	if pool := cfg.CodexKey[0].RawConfig["connection-pool"].(map[string]any); pool["enabled"] != false || pool["idle-conn-timeout"] != "300s" {
 		t.Fatalf("export pool = %+v", pool)
 	}
-	if cfg.VertexCompatAPIKey[0].RawConfig["models"].([]any)[0].(map[string]any)["openapi"] != false {
-		t.Fatal("nested SDK-only model option was lost on export")
+	if !cfg.CodexKey[0].Models[0].IsCompat || !cfg.GeminiKey[0].Models[0].IsCompat || !cfg.ClaudeKey[0].Models[0].IsCompat ||
+		!cfg.OpenAICompatibility[0].Models[0].IsCompat || !cfg.OpenAICompatibility[0].Models[0].UseMaxCompletionTokens {
+		t.Fatal("export lost typed model compatibility options")
+	}
+	if openAPI := cfg.VertexCompatAPIKey[0].Models[0].OpenAPI; openAPI == nil || *openAPI {
+		t.Fatal("export lost explicit false model endpoint override")
 	}
 	second := NewRepository(openImportTestSQLite(t))
 	if _, errImport := ImportLocalState(ctx, ImportOptions{ConfigPath: filepath.Join(output, "config.yaml"), Repository: second}); errImport != nil {
 		t.Fatal(errImport)
+	}
+	restored, errRestored := second.ListAuths(ctx)
+	if errRestored != nil || len(restored) != len(auths) {
+		t.Fatalf("reimported auths = %d, error = %v", len(restored), errRestored)
+	}
+	for _, auth := range auths {
+		var match *coreauth.Auth
+		for _, candidate := range restored {
+			if candidate.ID == auth.ID {
+				match = candidate
+				break
+			}
+		}
+		if match == nil || !reflect.DeepEqual(auth.Metadata["credential_options"], match.Metadata["credential_options"]) {
+			t.Fatalf("%s execution options changed after export and reimport", auth.Provider)
+		}
 	}
 }

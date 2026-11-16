@@ -237,7 +237,12 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
+	m.mu.Lock()
 	m.runtimeConfig.Store(cfg)
+	if m.refreshLoop != nil {
+		m.refreshLoop.resizeWorkers(m.refreshWorkers())
+	}
+	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.resetModelShards()
 	}
@@ -2613,19 +2618,13 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		interval = refreshCheckInterval
 	}
 
+	// Publish the replacement atomically with respect to stop and reconfiguration.
 	m.mu.Lock()
-	cancelPrev := m.refreshCancel
-	m.refreshCancel = nil
-	m.refreshLoop = nil
-	m.mu.Unlock()
-	if cancelPrev != nil {
-		cancelPrev()
+	if m.refreshCancel != nil {
+		m.refreshCancel()
 	}
-
 	ctx, cancelCtx := context.WithCancel(parent)
-	loop := newAuthAutoRefreshLoop(m, interval, refreshMaxConcurrency)
-
-	m.mu.Lock()
+	loop := newAuthAutoRefreshLoop(m, interval, m.refreshWorkers())
 	m.refreshCancel = cancelCtx
 	m.refreshLoop = loop
 	m.mu.Unlock()
@@ -2676,6 +2675,16 @@ func (m *Manager) stopResultPersistWorkers() {
 		cancelPersist()
 	}
 	m.resultPersistWG.Wait()
+}
+
+func (m *Manager) refreshWorkers() int {
+	workers := refreshMaxConcurrency
+	if m != nil {
+		if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+			workers = cfg.AuthAutoRefreshWorkers
+		}
+	}
+	return workers
 }
 
 // stopAutoRefresh stops an auto refresh.

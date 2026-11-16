@@ -5,9 +5,7 @@ func ForceHomeRuntimeConfig(cfg *Config) {
 	if cfg == nil {
 		return
 	}
-	cfg.APIKeys = nil
 	cfg.UsageStatisticsEnabled = true
-	cfg.WebsocketAuth = false
 }
 
 // ApplyHomeRuntimeScalars applies scalar invariants owned by Home.

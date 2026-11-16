@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -24,7 +23,6 @@ import (
 
 const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Home-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultCPAPort               = 8317
 )
 
@@ -80,12 +78,6 @@ type Config struct {
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 
-	// Pprof config controls the optional pprof HTTP debug server.
-	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
-
-	// CommercialMode disables high-overhead HTTP middleware features to minimize per-request memory usage.
-	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
-
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
 
@@ -100,16 +92,8 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
-	// RedisUsageQueueRetentionSeconds controls how long usage queue items are retained
-	// in memory before database-backed persistence consumes them.
-	// Default: 60. Max: 3600.
-	RedisUsageQueueRetentionSeconds int `yaml:"redis-usage-queue-retention-seconds" json:"redis-usage-queue-retention-seconds"`
-
 	// DisableCooling disables Home request-error and quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
-
-	// WebsocketAuth enables or disables authentication for the WebSocket API.
-	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
@@ -134,13 +118,6 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
-	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
-	// When true (default), cached signatures are preferred and validated.
-	// When false, client signatures are used directly after normalization (bypass mode).
-	AntigravitySignatureCacheEnabled *bool `yaml:"antigravity-signature-cache-enabled,omitempty" json:"antigravity-signature-cache-enabled,omitempty"`
-
-	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
-
 	// Antigravity configures provider-wide Antigravity request behavior.
 	Antigravity AntigravityConfig `yaml:"antigravity" json:"antigravity"`
 
@@ -159,16 +136,8 @@ type Config struct {
 	// MetaKey defines Meta API key configurations using the same structure as Codex API keys.
 	MetaKey []MetaKey `yaml:"meta-api-key" json:"meta-api-key"`
 
-	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
-	// These are used only when the client does not send its own headers.
-	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
-
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
-
-	// ClaudeHeaderDefaults configures default header values for Claude API requests.
-	// These are used as fallbacks when the client does not send its own headers.
-	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
 
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
@@ -188,61 +157,12 @@ type Config struct {
 	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, meta-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
-	// Payload defines default and override rules for provider payload parameters.
-	Payload PayloadConfig `yaml:"payload" json:"payload"`
-
-	// Settings shared with CPA V8.
-	Discovery                     DiscoveryConfig                     `yaml:"discovery" json:"discovery"`
-	SaveCooldownStatus            bool                                `yaml:"save-cooldown-status" json:"save-cooldown-status"`
-	TransientErrorCooldownSeconds int                                 `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
-	Devin                         DevinConfig                         `yaml:"devin" json:"devin"`
-	XAI                           XAIConfig                           `yaml:"xai" json:"xai"`
-	Codex                         CodexConfig                         `yaml:"codex" json:"codex"`
-	Claude                        ClaudeConfig                        `yaml:"claude" json:"claude"`
-	DisableClaudeCloakMode        bool                                `yaml:"disable-claude-cloak-mode" json:"disable-claude-cloak-mode"`
-	OAuthRequestScopedErrors      map[string][]RequestScopedErrorRule `yaml:"oauth-request-scoped-errors,omitempty" json:"oauth-request-scoped-errors,omitempty"`
-}
-
-// ClaudeHeaderDefaults configures default header values injected into Claude API requests.
-// In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
-// the client omits them, while OS/Arch remain runtime-derived. When stabilized device
-// profiles are enabled, OS/Arch become the pinned platform baseline, while
-// UserAgent/PackageVersion/RuntimeVersion seed the upgradeable software fingerprint.
-type ClaudeHeaderDefaults struct {
-	UserAgent              string `yaml:"user-agent" json:"user-agent"`
-	PackageVersion         string `yaml:"package-version" json:"package-version"`
-	RuntimeVersion         string `yaml:"runtime-version" json:"runtime-version"`
-	OS                     string `yaml:"os" json:"os"`
-	Arch                   string `yaml:"arch" json:"arch"`
-	Timeout                string `yaml:"timeout" json:"timeout"`
-	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
-
-	// Settings shared with CPA V8.
-	Timezone string `yaml:"timezone" json:"timezone"`
-}
-
-// CodexHeaderDefaults configures fallback header values injected into Codex
-// model requests for OAuth/file-backed auth when the client omits them.
-// UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
-type CodexHeaderDefaults struct {
-	UserAgent    string `yaml:"user-agent" json:"user-agent"`
-	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+	OAuthRequestScopedErrors map[string][]RequestScopedErrorRule `yaml:"oauth-request-scoped-errors,omitempty" json:"oauth-request-scoped-errors,omitempty"`
 }
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
 	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
-	// SensitiveWords is a list of words to obfuscate in system instructions.
-	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
-
-	// SensitiveWordsReplace maps target substrings to literal replacement text in system instructions.
-	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
-
-	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system instructions.
-	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
-
-	// Settings shared with CPA V8.
-	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -253,14 +173,6 @@ type TLSConfig struct {
 	Cert string `yaml:"cert" json:"cert"`
 	// Key is the path to the TLS private key file.
 	Key string `yaml:"key" json:"key"`
-}
-
-// PprofConfig holds pprof HTTP server settings.
-type PprofConfig struct {
-	// Enable toggles the pprof HTTP debug server.
-	Enable bool `yaml:"enable" json:"enable"`
-	// Addr is the host:port address for the pprof HTTP server.
-	Addr string `yaml:"addr" json:"addr"`
 }
 
 // UserEmailConfig controls optional verified-email and password-recovery behavior.
@@ -365,86 +277,6 @@ type OAuthModelAlias struct {
 	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
 }
 
-// PayloadConfig defines default and override parameter rules applied to provider payloads.
-type PayloadConfig struct {
-	// Default defines rules that only set parameters when they are missing in the payload.
-	Default []PayloadRule `yaml:"default" json:"default"`
-	// DefaultRaw defines rules that set raw JSON values only when they are missing.
-	DefaultRaw []PayloadRule `yaml:"default-raw" json:"default-raw"`
-	// Override defines rules that always set parameters, overwriting any existing values.
-	Override []PayloadRule `yaml:"override" json:"override"`
-	// OverrideRaw defines rules that always set raw JSON values, overwriting any existing values.
-	OverrideRaw []PayloadRule `yaml:"override-raw" json:"override-raw"`
-	// Filter defines rules that remove parameters from the payload by JSON path.
-	Filter []PayloadFilterRule `yaml:"filter" json:"filter"`
-}
-
-// PayloadFilterRule describes a rule to remove specific JSON paths from matching model payloads.
-type PayloadFilterRule struct {
-	// Models lists model entries with name pattern and protocol constraint.
-	Models []PayloadModelRule `yaml:"models" json:"models"`
-	// Params lists JSON paths (gjson/sjson syntax) to remove from the payload.
-	Params []string `yaml:"params" json:"params"`
-}
-
-// PayloadRule describes a single rule targeting a list of models with parameter updates.
-type PayloadRule struct {
-	// Models lists model entries with name pattern and protocol constraint.
-	Models []PayloadModelRule `yaml:"models" json:"models"`
-	// Params maps JSON paths (gjson/sjson syntax) to values written into the payload.
-	// For *-raw rules, values are treated as raw JSON fragments (strings are used as-is).
-	Params map[string]any `yaml:"params" json:"params"`
-}
-
-// PayloadModelRule ties a model name pattern to a specific translator protocol.
-type PayloadModelRule struct {
-	// Name is the model name or wildcard pattern (e.g., "gpt-*", "*-5", "gemini-*-pro").
-	Name string `yaml:"name" json:"name"`
-	// Protocol restricts the rule to a specific translator format (e.g., "gemini", "responses").
-	Protocol string `yaml:"protocol" json:"protocol"`
-	// Headers restricts the rule to requests whose headers match all configured wildcard patterns.
-	Headers map[string]string `yaml:"headers" json:"headers"`
-	// FromProtocol restricts the rule to a specific source protocol (e.g., "gemini", "responses").
-	FromProtocol string `yaml:"from-protocol" json:"from-protocol"`
-	// Match requires payload JSON paths to equal the configured values.
-	Match []map[string]any `yaml:"match" json:"match"`
-	// NotMatch requires payload JSON paths to not equal the configured values.
-	NotMatch []map[string]any `yaml:"not-match" json:"not-match"`
-	// Exist requires payload JSON paths to exist and not be null.
-	Exist []string `yaml:"exist" json:"exist"`
-	// NotExist requires payload JSON paths to be missing or null.
-	NotExist []string `yaml:"not-exist" json:"not-exist"`
-}
-
-// CloakConfig configures request cloaking for non-Claude-Code clients.
-// Cloaking disguises API requests to appear as originating from the official Claude Code CLI.
-type CloakConfig struct {
-	// Mode controls cloaking behavior: "auto" (default), "always", or "never".
-	// - "auto": cloak only when client is not Claude Code (based on User-Agent)
-	// - "always": always apply cloaking regardless of client
-	// - "never": never apply cloaking
-	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
-
-	// StrictMode controls how system prompts are handled when cloaking.
-	// - false (default): prepend Claude Code prompt to user system messages
-	// - true: strip all user system messages, keep only Claude Code prompt
-	StrictMode bool `yaml:"strict-mode,omitempty" json:"strict-mode,omitempty"`
-
-	// SensitiveWords is a list of words to obfuscate with zero-width characters.
-	// This can help bypass certain content filters.
-	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
-
-	// SensitiveWordsReplace maps target substrings to literal replacement text when cloaking.
-	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
-
-	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules when cloaking.
-	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
-
-	// CacheUserID controls whether Claude user_id values are cached per API key.
-	// When false, a fresh random user_id is generated for every request.
-	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
-}
-
 // ClaudeKey represents the configuration for a Claude API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type ClaudeKey struct {
@@ -487,18 +319,9 @@ type ClaudeKey struct {
 	// Nil or a negative value inherits the global setting; zero disables additional rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
-	// Cloak configures request cloaking for non-Claude-Code clients.
-	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
-
-	// ExperimentalCCHSigning is retained for configuration compatibility.
-	// CCH signing is automatic for Claude OAuth and supported direct upstreams.
-	ExperimentalCCHSigning bool `yaml:"experimental-cch-signing,omitempty" json:"experimental-cch-signing,omitempty"`
-
 	// Settings shared with CPA V8.
-	Weight                  *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
-	RebuildMidSystemMessage bool                     `yaml:"rebuild-mid-system-message,omitempty" json:"rebuild-mid-system-message,omitempty"`
-	RequestScopedErrors     []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
-	FingerprintProfile      string                   `yaml:"fingerprint-profile,omitempty" json:"fingerprint-profile,omitempty"`
+	Weight              *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 	// NativeToolSearch trusts a custom base URL with Anthropic native tool search
 	// (defer_loading tools and tool_reference results) for Codex tool_search.
 	NativeToolSearch bool `yaml:"native-tool-search,omitempty" json:"native-tool-search,omitempty"`
@@ -516,7 +339,7 @@ func (k ClaudeKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k ClaudeKey) GetProxyURL() string { return k.ProxyURL }
 
-// ClaudeModel describes a mapping between an alias and the actual upstream model name.
+// ClaudeModel defines the complete Claude model configuration shared with CPA.
 type ClaudeModel struct {
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
@@ -599,9 +422,8 @@ type CodexKey struct {
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// Settings shared with CPA V8.
-	Weight               *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
-	DisableCodexCloaking *bool                    `yaml:"disable-codex-cloaking,omitempty" json:"disable-codex-cloaking,omitempty"`
-	RequestScopedErrors  []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+	Weight              *int                     `yaml:"weight,omitempty" json:"weight,omitempty"`
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 }
 
 // GetAPIKey returns an api key.
@@ -616,7 +438,7 @@ func (k CodexKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k CodexKey) GetProxyURL() string { return k.ProxyURL }
 
-// CodexModel describes a mapping between an alias and the actual upstream model name.
+// CodexModel defines the complete Codex model configuration shared with CPA.
 type CodexModel struct {
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
@@ -727,7 +549,7 @@ func (k GeminiKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k GeminiKey) GetProxyURL() string { return k.ProxyURL }
 
-// GeminiModel describes a mapping between an alias and the actual upstream model name.
+// GeminiModel defines the complete Gemini model configuration shared with CPA.
 type GeminiModel struct {
 	// Name is the upstream model identifier used when issuing requests.
 	Name string `yaml:"name" json:"name"`
@@ -807,8 +629,7 @@ type OpenAICompatibility struct {
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// Settings shared with CPA V8.
-	SupportPromptCacheKey bool                     `yaml:"support-prompt-cache-key,omitempty" json:"support-prompt-cache-key,omitempty"`
-	RequestScopedErrors   []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
+	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -828,8 +649,8 @@ type OpenAICompatibilityAPIKey struct {
 	Weight *int `yaml:"weight,omitempty" json:"weight,omitempty"`
 }
 
-// OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
-// including the actual model name and its alias for API routing.
+// OpenAICompatibilityModel defines the complete OpenAI-compatible model configuration
+// shared with CPA, including model capabilities and protocol compatibility options.
 type OpenAICompatibilityModel struct {
 	// Name is the actual model name used by the external provider.
 	Name string `yaml:"name" json:"name"`
@@ -891,13 +712,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
-	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
-	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
-	cfg.DisableImageGeneration = DisableImageGenerationOff
-	cfg.Pprof.Enable = false
-	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialConcurrency = DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
@@ -952,28 +768,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
 
-	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
-	if cfg.Pprof.Addr == "" {
-		cfg.Pprof.Addr = DefaultPprofAddr
-	}
-
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
-	}
-
-	if cfg.ErrorLogsMaxFiles < 0 {
-		cfg.ErrorLogsMaxFiles = 10
-	}
-
-	if cfg.RedisUsageQueueRetentionSeconds <= 0 {
-		cfg.RedisUsageQueueRetentionSeconds = 60
-	} else if cfg.RedisUsageQueueRetentionSeconds > 3600 {
-		log.WithField("value", cfg.RedisUsageQueueRetentionSeconds).Warn("redis-usage-queue-retention-seconds too large; clamping to 3600")
-		cfg.RedisUsageQueueRetentionSeconds = 3600
-	}
-
-	if cfg.MaxRetryCredentials < 0 {
-		cfg.MaxRetryCredentials = 0
 	}
 
 	if errNormalizeIDs := cfg.NormalizeProviderCredentialIDs(); errNormalizeIDs != nil {
@@ -998,12 +794,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Meta keys: require an API key and default the official base URL.
 	cfg.SanitizeMetaKeys()
 
-	// Sanitize Codex header defaults.
-	cfg.SanitizeCodexHeaderDefaults()
-
-	// Sanitize Claude header defaults.
-	cfg.SanitizeClaudeHeaderDefaults()
-
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
@@ -1016,13 +806,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
-	// Validate raw payload rules and drop invalid entries.
-	cfg.SanitizePayloadRules()
-
-	// Sanitize Antigravity and Devin configurations.
-	cfg.SanitizeAntigravity()
-	cfg.SanitizeDevin()
-
 	ForceHomeRuntimeConfig(&cfg)
 
 	// Return the populated configuration struct.
@@ -1034,126 +817,6 @@ func optionalConfigFallback() *Config {
 		CredentialConcurrency: DefaultCredentialConcurrencyConfig(),
 		CredentialInFlight:    DefaultCredentialInFlightConfig(),
 	}
-}
-
-// SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
-func (cfg *Config) SanitizePayloadRules() {
-	if cfg == nil {
-		return
-	}
-	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
-	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
-}
-
-// sanitizePayloadRawRules sanitizes a payload raw rules.
-func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {
-	// Validate input data before converting it into runtime state.
-	if len(rules) == 0 {
-		return rules
-	}
-	out := make([]PayloadRule, 0, len(rules))
-	for i := range rules {
-		rule := rules[i]
-		if len(rule.Params) == 0 {
-			continue
-		}
-		invalid := false
-		for path, value := range rule.Params {
-			raw, ok := payloadRawString(value)
-			if !ok {
-				continue
-			}
-			trimmed := bytes.TrimSpace(raw)
-			if len(trimmed) == 0 || !json.Valid(trimmed) {
-				log.WithFields(log.Fields{
-					"section":    section,
-					"rule_index": i + 1,
-					"param":      path,
-				}).Warn("payload rule dropped: invalid raw JSON")
-				invalid = true
-				break
-			}
-		}
-		if invalid {
-			continue
-		}
-		out = append(out, rule)
-	}
-	return out
-}
-
-// payloadRawString handles a payload raw string.
-func payloadRawString(value any) ([]byte, bool) {
-	switch typed := value.(type) {
-	case string:
-		return []byte(typed), true
-	case []byte:
-		return typed, true
-	default:
-		return nil, false
-	}
-}
-
-// SanitizeCodexHeaderDefaults trims surrounding whitespace from the
-// configured Codex header fallback values.
-func (cfg *Config) SanitizeCodexHeaderDefaults() {
-	if cfg == nil {
-		return
-	}
-	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
-	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
-}
-
-// SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
-// configured Claude fingerprint baseline values.
-func (cfg *Config) SanitizeClaudeHeaderDefaults() {
-	if cfg == nil {
-		return
-	}
-	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
-	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
-	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
-	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
-	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
-	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
-}
-
-// SanitizeAntigravity trims surrounding whitespace and drops empty entries from Antigravity sensitive-word settings.
-func (cfg *Config) SanitizeAntigravity() {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.Antigravity.SensitiveWords) > 0 {
-		cleaned := make([]string, 0, len(cfg.Antigravity.SensitiveWords))
-		for _, word := range cfg.Antigravity.SensitiveWords {
-			word = strings.TrimSpace(word)
-			if word != "" {
-				cleaned = append(cleaned, word)
-			}
-		}
-		cfg.Antigravity.SensitiveWords = cleaned
-	}
-	cfg.Antigravity.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Antigravity.SensitiveWordsReplace)
-	cfg.Antigravity.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Antigravity.SensitivePatternsReplace)
-}
-
-// SanitizeDevin trims surrounding whitespace and drops empty entries from Devin sensitive-word settings.
-func (cfg *Config) SanitizeDevin() {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.Devin.SensitiveWords) > 0 {
-		cleaned := make([]string, 0, len(cfg.Devin.SensitiveWords))
-		for _, word := range cfg.Devin.SensitiveWords {
-			word = strings.TrimSpace(word)
-			if word != "" {
-				cleaned = append(cleaned, word)
-			}
-		}
-		cfg.Devin.SensitiveWords = cleaned
-	}
-	cfg.Devin.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cfg.Devin.SensitiveWordsReplace)
-	cfg.Devin.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cfg.Devin.SensitivePatternsReplace)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1401,33 +1064,7 @@ func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
 	return out
 }
 
-// NormalizeCloakConfig trims strings and removes blank sensitive words.
-func NormalizeCloakConfig(cloak *CloakConfig) *CloakConfig {
-	if cloak == nil {
-		return nil
-	}
-	cloak.Mode = strings.TrimSpace(cloak.Mode)
-	if len(cloak.SensitiveWords) > 0 {
-		normalizedWords := make([]string, 0, len(cloak.SensitiveWords))
-		for _, w := range cloak.SensitiveWords {
-			if trimmed := strings.TrimSpace(w); trimmed != "" {
-				normalizedWords = append(normalizedWords, trimmed)
-			}
-		}
-		if len(normalizedWords) > 0 {
-			cloak.SensitiveWords = normalizedWords
-		} else {
-			cloak.SensitiveWords = nil
-		}
-	} else {
-		cloak.SensitiveWords = nil
-	}
-	cloak.SensitiveWordsReplace = NormalizeSensitiveWordsReplace(cloak.SensitiveWordsReplace)
-	cloak.SensitivePatternsReplace = NormalizeSensitivePatternsReplace(cloak.SensitivePatternsReplace)
-	return cloak
-}
-
-// SanitizeClaudeKeys normalizes headers and cloak settings for Claude credentials.
+// SanitizeClaudeKeys normalizes headers and excluded models for Claude credentials.
 func (cfg *Config) SanitizeClaudeKeys() {
 	if cfg == nil || len(cfg.ClaudeKey) == 0 {
 		return
@@ -1437,7 +1074,6 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		entry.Cloak = NormalizeCloakConfig(entry.Cloak)
 	}
 }
 
@@ -1553,64 +1189,6 @@ func NormalizeRemoteManagementSecret(secret string) (string, bool, error) {
 		return "", false, errHash
 	}
 	return hashed, true, nil
-}
-
-// NormalizeSensitiveWordsReplace trims replacement target keys, drops blank keys,
-// and preserves replacement values (including empty strings for phrase deletion).
-func NormalizeSensitiveWordsReplace(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(in))
-	for k := range in {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make(map[string]string, len(in))
-	for _, rawKey := range keys {
-		trimmedKey := strings.TrimSpace(rawKey)
-		if trimmedKey == "" {
-			continue
-		}
-		if _, exists := out[trimmedKey]; exists && rawKey != trimmedKey {
-			continue
-		}
-		out[trimmedKey] = in[rawKey]
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// NormalizeSensitivePatternsReplace validates Go RE2 regex rules, logs and drops
-// invalid or blank patterns, and preserves replacement values (including empty strings).
-func NormalizeSensitivePatternsReplace(in []SensitivePatternRule) []SensitivePatternRule {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]SensitivePatternRule, 0, len(in))
-	for i, rule := range in {
-		if strings.TrimSpace(rule.Pattern) == "" {
-			continue
-		}
-		if _, errCompile := regexp.Compile(rule.Pattern); errCompile != nil {
-			log.WithFields(log.Fields{
-				"rule_index": i + 1,
-				"pattern":    rule.Pattern,
-				"error":      errCompile,
-			}).Warn("sensitive-patterns-replace rule dropped: invalid regex")
-			continue
-		}
-		out = append(out, SensitivePatternRule{
-			Pattern:     rule.Pattern,
-			Replacement: rule.Replacement,
-		})
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // NormalizeHeaders trims header keys and values and removes empty pairs.

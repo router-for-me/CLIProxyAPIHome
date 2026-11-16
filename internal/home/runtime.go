@@ -19,7 +19,6 @@ import (
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
-	configaccess "github.com/router-for-me/CLIProxyAPIHome/internal/access/config_access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/concurrency"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -260,7 +259,6 @@ func NewRuntime(cfg *config.Config) (*Runtime, error) {
 	pluginHost := newPluginHostForRuntime(cfg)
 
 	accessManager := access.NewManager()
-	configaccess.Register(&cfg.SDKConfig)
 
 	runtime := &Runtime{
 		cfg:           cfg,

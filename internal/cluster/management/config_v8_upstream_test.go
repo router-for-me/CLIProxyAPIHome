@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 )
@@ -39,11 +40,15 @@ func TestConfigV8SharedUpstreamDatabaseRoundTrip(t *testing.T) {
 	if got := request(http.MethodGet, "upstream/codex/stream-bootstrap-buffering", "", http.StatusOK); got != "true" {
 		t.Fatalf("shared provider value was not persisted: %s", got)
 	}
-	cfg, _, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
+	cfg, wire, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
 	if errLoad != nil {
 		t.Fatal(errLoad)
 	}
-	if !cfg.Codex.StreamBootstrapBuffering || !cfg.Codex.ResponseSteering || cfg.AuthAutoRefreshWorkers != 3 || cfg.OAuthOnlyFields["codex.response-steering"] || !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"] {
+	cpa, errCPA := cpaconfig.ParseConfigBytes(wire)
+	if errCPA != nil {
+		t.Fatal(errCPA)
+	}
+	if !cpa.Codex.StreamBootstrapBuffering || !cpa.Codex.ResponseSteering || cfg.AuthAutoRefreshWorkers != 3 || cfg.OAuthOnlyFields["codex.response-steering"] || !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"] {
 		t.Fatal("database projection changed shared values or OAuth-only header scope")
 	}
 	request(http.MethodPut, "upstream/codex/response-steering", "false", http.StatusOK)
@@ -60,9 +65,13 @@ func TestConfigV8SharedUpstreamDatabaseRoundTrip(t *testing.T) {
 		t.Fatal("historical request body did not replace the canonical value")
 	}
 	request(http.MethodDelete, "upstream/codex", "", http.StatusOK)
-	cfg, _, errLoad = repo.LoadConfigAsRuntimeConfig(context.Background())
-	if errLoad != nil || cfg.Codex.StreamBootstrapBuffering || cfg.Codex.ResponseSteering || cfg.CodexHeaderDefaults.UserAgent != "oauth-agent" {
-		t.Fatalf("deleting shared settings changed unrelated OAuth headers: %v", errLoad)
+	_, wire, errLoad = repo.LoadConfigAsRuntimeConfig(context.Background())
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	cpa, errCPA = cpaconfig.ParseConfigBytes(wire)
+	if errCPA != nil || cpa.Codex.StreamBootstrapBuffering || cpa.Codex.ResponseSteering || cpa.CodexHeaderDefaults.UserAgent != "oauth-agent" {
+		t.Fatalf("deleting shared settings changed unrelated OAuth headers: %v", errCPA)
 	}
 }
 
@@ -92,30 +101,38 @@ func TestConfigV8SensitiveWordsReplaceDatabaseRoundTrip(t *testing.T) {
 		t.Fatalf("GET antigravity sensitive-words-replace = %s", got)
 	}
 
-	cfg, _, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
+	cfg, wire, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
 	if errLoad != nil {
 		t.Fatal(errLoad)
 	}
-	if cfg.Antigravity.SensitiveWordsReplace["You are Codex, an agent based on GPT-5."] != "You are a helpful coding assistant." {
-		t.Fatalf("Antigravity.SensitiveWordsReplace = %#v", cfg.Antigravity.SensitiveWordsReplace)
+	cpa, errCPA := cpaconfig.ParseConfigBytes(wire)
+	if errCPA != nil {
+		t.Fatal(errCPA)
 	}
-	if val, ok := cfg.Antigravity.SensitiveWordsReplace["DropOnly"]; !ok || val != "" {
-		t.Fatalf("Antigravity empty deletion lost: %#v", cfg.Antigravity.SensitiveWordsReplace)
+	if cpa.Antigravity.SensitiveWordsReplace["You are Codex, an agent based on GPT-5."] != "You are a helpful coding assistant." {
+		t.Fatalf("Antigravity.SensitiveWordsReplace = %#v", cpa.Antigravity.SensitiveWordsReplace)
 	}
-	if cfg.Devin.SensitiveWordsReplace["Claude Code"] != "Devin" {
-		t.Fatalf("Devin.SensitiveWordsReplace = %#v", cfg.Devin.SensitiveWordsReplace)
+	if val, ok := cpa.Antigravity.SensitiveWordsReplace["DropOnly"]; !ok || val != "" {
+		t.Fatalf("Antigravity empty deletion lost: %#v", cpa.Antigravity.SensitiveWordsReplace)
+	}
+	if cpa.Devin.SensitiveWordsReplace["Claude Code"] != "Devin" {
+		t.Fatalf("Devin.SensitiveWordsReplace = %#v", cpa.Devin.SensitiveWordsReplace)
 	}
 	if !cfg.OAuthOnlyFields["antigravity.sensitive-words-replace"] || !cfg.OAuthOnlyFields["devin.sensitive-words-replace"] {
 		t.Fatalf("OAuthOnlyFields missing sensitive-words-replace: %#v", cfg.OAuthOnlyFields)
 	}
 
 	request(http.MethodDelete, "oauth/providers/antigravity/sensitive-words-replace/DropOnly", "", http.StatusOK)
-	cfg2, _, errLoad2 := repo.LoadConfigAsRuntimeConfig(context.Background())
+	_, wire2, errLoad2 := repo.LoadConfigAsRuntimeConfig(context.Background())
 	if errLoad2 != nil {
 		t.Fatal(errLoad2)
 	}
-	if _, exists := cfg2.Antigravity.SensitiveWordsReplace["DropOnly"]; exists {
-		t.Fatalf("deleted key DropOnly persisted: %#v", cfg2.Antigravity.SensitiveWordsReplace)
+	cpa2, errCPA2 := cpaconfig.ParseConfigBytes(wire2)
+	if errCPA2 != nil {
+		t.Fatal(errCPA2)
+	}
+	if _, exists := cpa2.Antigravity.SensitiveWordsReplace["DropOnly"]; exists {
+		t.Fatalf("deleted key DropOnly persisted: %#v", cpa2.Antigravity.SensitiveWordsReplace)
 	}
 
 	request(http.MethodDelete, "oauth/providers/devin/sensitive-words-replace", "", http.StatusOK)
@@ -227,15 +244,19 @@ func TestConfigV8SensitivePatternsReplaceDatabaseRoundTrip(t *testing.T) {
 		t.Fatalf("GET antigravity sensitive-patterns-replace = %s", got)
 	}
 
-	cfg, _, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
+	cfg, wire, errLoad := repo.LoadConfigAsRuntimeConfig(context.Background())
 	if errLoad != nil {
 		t.Fatal(errLoad)
 	}
-	if len(cfg.Antigravity.SensitivePatternsReplace) != 1 || cfg.Antigravity.SensitivePatternsReplace[0].Replacement != "" {
-		t.Fatalf("Antigravity.SensitivePatternsReplace = %#v", cfg.Antigravity.SensitivePatternsReplace)
+	cpa, errCPA := cpaconfig.ParseConfigBytes(wire)
+	if errCPA != nil {
+		t.Fatal(errCPA)
 	}
-	if len(cfg.Devin.SensitivePatternsReplace) != 1 {
-		t.Fatalf("Devin.SensitivePatternsReplace = %#v", cfg.Devin.SensitivePatternsReplace)
+	if len(cpa.Antigravity.SensitivePatternsReplace) != 1 || cpa.Antigravity.SensitivePatternsReplace[0].Replacement != "" {
+		t.Fatalf("Antigravity.SensitivePatternsReplace = %#v", cpa.Antigravity.SensitivePatternsReplace)
+	}
+	if len(cpa.Devin.SensitivePatternsReplace) != 1 {
+		t.Fatalf("Devin.SensitivePatternsReplace = %#v", cpa.Devin.SensitivePatternsReplace)
 	}
 	if !cfg.OAuthOnlyFields["antigravity.sensitive-patterns-replace"] || !cfg.OAuthOnlyFields["devin.sensitive-patterns-replace"] {
 		t.Fatalf("OAuthOnlyFields missing sensitive-patterns-replace: %#v", cfg.OAuthOnlyFields)

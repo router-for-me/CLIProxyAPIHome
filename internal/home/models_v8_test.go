@@ -10,16 +10,58 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/watcher/synthesizer"
+	"gopkg.in/yaml.v3"
 )
 
 func TestV8ModelCapabilitiesSurviveCredentialAndDispatch(t *testing.T) {
-	thinking := &registry.ThinkingSupport{Levels: []string{" HIGH ", "none", "AUTO", "high"}}
-	cfg := &config.Config{
-		CodexKey:            []config.CodexKey{{APIKey: "codex", BaseURL: "https://example.test", Models: []config.CodexModel{{Name: "v8-upstream", Alias: "v8-alias", MaxContextLength: 32768, Thinking: thinking, IsCompat: true}}}},
-		ClaudeKey:           []config.ClaudeKey{{APIKey: "claude", Models: []config.ClaudeModel{{Name: "v8-upstream", Alias: "v8-alias", MaxContextLength: 32768, Thinking: thinking, IsCompat: true}}}},
-		GeminiKey:           []config.GeminiKey{{APIKey: "gemini", Models: []config.GeminiModel{{Name: "v8-upstream", Alias: "v8-alias", MaxContextLength: 32768, Thinking: thinking, IsCompat: true}}}},
-		OpenAICompatibility: []config.OpenAICompatibility{{Name: "v8-compat", BaseURL: "https://example.test", APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "compat-key"}}, Models: []config.OpenAICompatibilityModel{{Name: "v8-upstream", Alias: "v8-alias", MaxContextLength: 32768, Thinking: thinking, IsCompat: true}}}},
+	source := []byte(`config-version: 8
+api-keys:
+  codex:
+    - base-url: https://example.test
+      models:
+        - name: v8-upstream
+          alias: v8-alias
+          max-context-length: 32768
+          is-compat: true
+          thinking: {levels: [" HIGH ", "none", "AUTO", "high"]}
+      keys: [{api-key: codex}]
+  claude:
+    - models:
+        - name: v8-upstream
+          alias: v8-alias
+          max-context-length: 32768
+          is-compat: true
+          thinking: {levels: [" HIGH ", "none", "AUTO", "high"]}
+      keys: [{api-key: claude}]
+  gemini:
+    - models:
+        - name: v8-upstream
+          alias: v8-alias
+          max-context-length: 32768
+          is-compat: true
+          thinking: {levels: [" HIGH ", "none", "AUTO", "high"]}
+      keys: [{api-key: gemini}]
+  openai-compatibility:
+    - name: v8-compat
+      base-url: https://example.test
+      models:
+        - name: v8-upstream
+          alias: v8-alias
+          max-context-length: 32768
+          is-compat: true
+          use-max-completion-tokens: true
+          thinking: {levels: [" HIGH ", "none", "AUTO", "high"]}
+      keys: [{api-key: compat-key}]
+`)
+	cfg := &config.Config{}
+	if errDecode := yaml.Unmarshal(source, cfg); errDecode != nil {
+		t.Fatal(errDecode)
 	}
+	if !cfg.CodexKey[0].Models[0].IsCompat || !cfg.ClaudeKey[0].Models[0].IsCompat || !cfg.GeminiKey[0].Models[0].IsCompat ||
+		!cfg.OpenAICompatibility[0].Models[0].IsCompat || !cfg.OpenAICompatibility[0].Models[0].UseMaxCompletionTokens {
+		t.Fatal("typed model configuration lost compatibility options")
+	}
+	thinking := cfg.CodexKey[0].Models[0].Thinking
 	auths, err := synthesizer.NewConfigSynthesizer().Synthesize(&synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()})
 	if err != nil || len(auths) != 4 {
 		t.Fatalf("synthesis count=%d err=%v", len(auths), err)
@@ -72,7 +114,7 @@ func TestV8ModelCapabilitiesSurviveCredentialAndDispatch(t *testing.T) {
 			var credential struct {
 				Metadata struct {
 					Options struct {
-						Models []config.CodexModel `json:"models"`
+						Models []config.OpenAICompatibilityModel `json:"models"`
 					} `json:"credential_options"`
 				} `json:"metadata"`
 			}
@@ -82,6 +124,9 @@ func TestV8ModelCapabilitiesSurviveCredentialAndDispatch(t *testing.T) {
 			models := credential.Metadata.Options.Models
 			if len(models) != 1 || models[0].Name != "v8-upstream" || models[0].Alias != "v8-alias" || models[0].MaxContextLength != 32768 || !models[0].IsCompat {
 				t.Fatalf("downstream credential model options = %+v", models)
+			}
+			if auth.Provider == "v8-compat" && !models[0].UseMaxCompletionTokens {
+				t.Fatal("downstream model lost max_completion_tokens support")
 			}
 		})
 	}

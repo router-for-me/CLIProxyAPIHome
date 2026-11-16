@@ -27,44 +27,17 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Debug != newCfg.Debug {
 		changes = append(changes, fmt.Sprintf("debug: %t -> %t", oldCfg.Debug, newCfg.Debug))
 	}
-	if oldCfg.Pprof.Enable != newCfg.Pprof.Enable {
-		changes = append(changes, fmt.Sprintf("pprof.enable: %t -> %t", oldCfg.Pprof.Enable, newCfg.Pprof.Enable))
-	}
-	if strings.TrimSpace(oldCfg.Pprof.Addr) != strings.TrimSpace(newCfg.Pprof.Addr) {
-		changes = append(changes, fmt.Sprintf("pprof.addr: %s -> %s", strings.TrimSpace(oldCfg.Pprof.Addr), strings.TrimSpace(newCfg.Pprof.Addr)))
-	}
-	if oldCfg.LoggingToFile != newCfg.LoggingToFile {
-		changes = append(changes, fmt.Sprintf("logging-to-file: %t -> %t", oldCfg.LoggingToFile, newCfg.LoggingToFile))
-	}
-	if oldCfg.UsageStatisticsEnabled != newCfg.UsageStatisticsEnabled {
-		changes = append(changes, fmt.Sprintf("usage-statistics-enabled: %t -> %t", oldCfg.UsageStatisticsEnabled, newCfg.UsageStatisticsEnabled))
-	}
-	if oldCfg.RedisUsageQueueRetentionSeconds != newCfg.RedisUsageQueueRetentionSeconds {
-		changes = append(changes, fmt.Sprintf("redis-usage-queue-retention-seconds: %d -> %d", oldCfg.RedisUsageQueueRetentionSeconds, newCfg.RedisUsageQueueRetentionSeconds))
-	}
 	if oldCfg.DisableCooling != newCfg.DisableCooling {
 		changes = append(changes, fmt.Sprintf("disable-cooling: %t -> %t", oldCfg.DisableCooling, newCfg.DisableCooling))
 	}
-	if oldCfg.DisableImageGeneration != newCfg.DisableImageGeneration {
-		changes = append(changes, fmt.Sprintf("disable-image-generation: %v -> %v", oldCfg.DisableImageGeneration, newCfg.DisableImageGeneration))
-	}
-	if oldCfg.RequestLog != newCfg.RequestLog {
-		changes = append(changes, fmt.Sprintf("request-log: %t -> %t", oldCfg.RequestLog, newCfg.RequestLog))
+	if oldCfg.AuthAutoRefreshWorkers != newCfg.AuthAutoRefreshWorkers {
+		changes = append(changes, fmt.Sprintf("auth-auto-refresh-workers: %d -> %d", oldCfg.AuthAutoRefreshWorkers, newCfg.AuthAutoRefreshWorkers))
 	}
 	if oldCfg.LogsMaxTotalSizeMB != newCfg.LogsMaxTotalSizeMB {
 		changes = append(changes, fmt.Sprintf("logs-max-total-size-mb: %d -> %d", oldCfg.LogsMaxTotalSizeMB, newCfg.LogsMaxTotalSizeMB))
 	}
-	if oldCfg.ErrorLogsMaxFiles != newCfg.ErrorLogsMaxFiles {
-		changes = append(changes, fmt.Sprintf("error-logs-max-files: %d -> %d", oldCfg.ErrorLogsMaxFiles, newCfg.ErrorLogsMaxFiles))
-	}
 	if oldCfg.RequestRetry != newCfg.RequestRetry {
 		changes = append(changes, fmt.Sprintf("request-retry: %d -> %d", oldCfg.RequestRetry, newCfg.RequestRetry))
-	}
-	if oldCfg.MaxRetryCredentials != newCfg.MaxRetryCredentials {
-		changes = append(changes, fmt.Sprintf("max-retry-credentials: %d -> %d", oldCfg.MaxRetryCredentials, newCfg.MaxRetryCredentials))
-	}
-	if oldCfg.MaxRetryInterval != newCfg.MaxRetryInterval {
-		changes = append(changes, fmt.Sprintf("max-retry-interval: %d -> %d", oldCfg.MaxRetryInterval, newCfg.MaxRetryInterval))
 	}
 	if oldCfg.ProxyURL != newCfg.ProxyURL {
 		changes = append(changes, fmt.Sprintf("proxy-url: %s -> %s", formatProxyURL(oldCfg.ProxyURL), formatProxyURL(newCfg.ProxyURL)))
@@ -72,51 +45,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ForceModelPrefix != newCfg.ForceModelPrefix {
 		changes = append(changes, fmt.Sprintf("force-model-prefix: %t -> %t", oldCfg.ForceModelPrefix, newCfg.ForceModelPrefix))
 	}
-	if oldCfg.NonStreamKeepAliveInterval != newCfg.NonStreamKeepAliveInterval {
-		changes = append(changes, fmt.Sprintf("nonstream-keepalive-interval: %d -> %d", oldCfg.NonStreamKeepAliveInterval, newCfg.NonStreamKeepAliveInterval))
-	}
-
-	// Quota-exceeded behavior
-	if oldCfg.QuotaExceeded.SwitchProject != newCfg.QuotaExceeded.SwitchProject {
-		changes = append(changes, fmt.Sprintf("quota-exceeded.switch-project: %t -> %t", oldCfg.QuotaExceeded.SwitchProject, newCfg.QuotaExceeded.SwitchProject))
-	}
-	if oldCfg.QuotaExceeded.SwitchPreviewModel != newCfg.QuotaExceeded.SwitchPreviewModel {
-		changes = append(changes, fmt.Sprintf("quota-exceeded.switch-preview-model: %t -> %t", oldCfg.QuotaExceeded.SwitchPreviewModel, newCfg.QuotaExceeded.SwitchPreviewModel))
-	}
-	if oldCfg.QuotaExceeded.AntigravityCredits != newCfg.QuotaExceeded.AntigravityCredits {
-		changes = append(changes, fmt.Sprintf("quota-exceeded.antigravity-credits: %t -> %t", oldCfg.QuotaExceeded.AntigravityCredits, newCfg.QuotaExceeded.AntigravityCredits))
-	}
-	if !reflect.DeepEqual(oldCfg.Antigravity.SensitiveWords, newCfg.Antigravity.SensitiveWords) {
-		changes = append(changes, fmt.Sprintf("antigravity.sensitive-words: %d -> %d", len(oldCfg.Antigravity.SensitiveWords), len(newCfg.Antigravity.SensitiveWords)))
-	}
-	if !equalStringMap(oldCfg.Antigravity.SensitiveWordsReplace, newCfg.Antigravity.SensitiveWordsReplace) {
-		changes = append(changes, fmt.Sprintf("antigravity.sensitive-words-replace: %d -> %d", len(oldCfg.Antigravity.SensitiveWordsReplace), len(newCfg.Antigravity.SensitiveWordsReplace)))
-	}
-	if !equalSensitivePatternRules(oldCfg.Antigravity.SensitivePatternsReplace, newCfg.Antigravity.SensitivePatternsReplace) {
-		changes = append(changes, fmt.Sprintf("antigravity.sensitive-patterns-replace: %d -> %d", len(oldCfg.Antigravity.SensitivePatternsReplace), len(newCfg.Antigravity.SensitivePatternsReplace)))
-	}
-	if !reflect.DeepEqual(oldCfg.Devin.SensitiveWords, newCfg.Devin.SensitiveWords) {
-		changes = append(changes, fmt.Sprintf("devin.sensitive-words: %d -> %d", len(oldCfg.Devin.SensitiveWords), len(newCfg.Devin.SensitiveWords)))
-	}
-	if !equalStringMap(oldCfg.Devin.SensitiveWordsReplace, newCfg.Devin.SensitiveWordsReplace) {
-		changes = append(changes, fmt.Sprintf("devin.sensitive-words-replace: %d -> %d", len(oldCfg.Devin.SensitiveWordsReplace), len(newCfg.Devin.SensitiveWordsReplace)))
-	}
-	if !equalSensitivePatternRules(oldCfg.Devin.SensitivePatternsReplace, newCfg.Devin.SensitivePatternsReplace) {
-		changes = append(changes, fmt.Sprintf("devin.sensitive-patterns-replace: %d -> %d", len(oldCfg.Devin.SensitivePatternsReplace), len(newCfg.Devin.SensitivePatternsReplace)))
-	}
 
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
-	}
-	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
-		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
-	}
-
-	// API keys (redacted) and counts
-	if len(oldCfg.APIKeys) != len(newCfg.APIKeys) {
-		changes = append(changes, fmt.Sprintf("api-keys count: %d -> %d", len(oldCfg.APIKeys), len(newCfg.APIKeys)))
-	} else if !reflect.DeepEqual(trimStrings(oldCfg.APIKeys), trimStrings(newCfg.APIKeys)) {
-		changes = append(changes, "api-keys: values updated (count unchanged, redacted)")
 	}
 	if len(oldCfg.GeminiKey) != len(newCfg.GeminiKey) {
 		changes = append(changes, fmt.Sprintf("gemini-api-key count: %d -> %d", len(oldCfg.GeminiKey), len(newCfg.GeminiKey)))
@@ -235,7 +166,6 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if oldExcluded.hash != newExcluded.hash {
 				changes = append(changes, fmt.Sprintf("claude[%d].excluded-models: updated (%d -> %d entries)", i, oldExcluded.count, newExcluded.count))
 			}
-			changes = appendClaudeCloakChanges(changes, i, o, n)
 		}
 	}
 
@@ -479,38 +409,6 @@ func formatOptionalInt(value *int) string {
 	return fmt.Sprintf("%d", *value)
 }
 
-// trimStrings handles a trim strings.
-func trimStrings(in []string) []string {
-	out := make([]string, len(in))
-	for i := range in {
-		out[i] = strings.TrimSpace(in[i])
-	}
-	return out
-}
-
-func appendPayloadConfigChanges(changes []string, oldPayload, newPayload config.PayloadConfig) []string {
-	changes = appendPayloadRuleChanges(changes, "default", oldPayload.Default, newPayload.Default)
-	changes = appendPayloadRuleChanges(changes, "default-raw", oldPayload.DefaultRaw, newPayload.DefaultRaw)
-	changes = appendPayloadRuleChanges(changes, "override", oldPayload.Override, newPayload.Override)
-	changes = appendPayloadRuleChanges(changes, "override-raw", oldPayload.OverrideRaw, newPayload.OverrideRaw)
-	changes = appendPayloadFilterRuleChanges(changes, "filter", oldPayload.Filter, newPayload.Filter)
-	return changes
-}
-
-func appendPayloadRuleChanges(changes []string, section string, oldRules, newRules []config.PayloadRule) []string {
-	if reflect.DeepEqual(oldRules, newRules) {
-		return changes
-	}
-	return append(changes, fmt.Sprintf("payload.%s: updated (%d -> %d rules)", section, len(oldRules), len(newRules)))
-}
-
-func appendPayloadFilterRuleChanges(changes []string, section string, oldRules, newRules []config.PayloadFilterRule) []string {
-	if reflect.DeepEqual(oldRules, newRules) {
-		return changes
-	}
-	return append(changes, fmt.Sprintf("payload.%s: updated (%d -> %d rules)", section, len(oldRules), len(newRules)))
-}
-
 // equalStringMap handles an equal string map.
 func equalStringMap(a, b map[string]string) bool {
 	if len(a) != len(b) {
@@ -551,40 +449,4 @@ func formatProxyURL(raw string) string {
 		return host
 	}
 	return scheme + "://" + host
-}
-
-// equalStringSet handles an equal string set.
-func equalStringSet(a, b []string) bool {
-	if len(a) == 0 && len(b) == 0 {
-		return true
-	}
-	aSet := make(map[string]struct{}, len(a))
-	for _, k := range a {
-		aSet[strings.TrimSpace(k)] = struct{}{}
-	}
-	bSet := make(map[string]struct{}, len(b))
-	for _, k := range b {
-		bSet[strings.TrimSpace(k)] = struct{}{}
-	}
-	if len(aSet) != len(bSet) {
-		return false
-	}
-	for k := range aSet {
-		if _, ok := bSet[k]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func equalSensitivePatternRules(a, b []config.SensitivePatternRule) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

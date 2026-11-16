@@ -24,6 +24,7 @@ var v8Paths = buildV8Paths()
 var v8ClientPaths = []configPath{
 	{"oauth.providers.codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
 	{"providers.codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
+	{"codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
 }
 
 // Canonical upstream fields win by presence; historical OAuth fields precede globals.
@@ -104,7 +105,6 @@ func buildV8Paths() []configPath {
 		{"codex.disable-codex-cloaking", "upstream.codex.disable-codex-cloaking"},
 		{"codex.stream-bootstrap-buffering", "upstream.codex.stream-bootstrap-buffering"},
 		{"codex.stream-bootstrap-timeout", "upstream.codex.stream-bootstrap-timeout"},
-		{"codex.optimize-multi-agent-v2", "client.codex.optimize-multi-agent-v2"},
 		{"codex.orphan-delegation-compatibility", "upstream.codex.orphan-delegation-compatibility"},
 		{"codex.model-level-cooling", "upstream.codex.model-level-cooling"},
 		{"codex.response-steering", "upstream.codex.response-steering"},
@@ -378,13 +378,22 @@ func buildSharedKeyFields() map[string]bool {
 		"models": true, "excluded-models": true, "disable-cooling": true,
 		"request-retry": true, "request-scoped-errors": true,
 	}
+	// Per-key options (and openai-compatibility group fields) must not be promoted
+	// to native provider group defaults even when Home does not mirror them.
+	nonShared := map[string]bool{
+		"api-key": true, "id": true, "uuid": true, "name": true, "base-url": true, "weight": true,
+		"api-key-entries": true, "support-prompt-cache-key": true,
+		"cloak": true, "experimental-cch-signing": true, "rebuild-mid-system-message": true,
+		"native-tool-search": true, "fingerprint-profile": true,
+		"disable-codex-cloaking": true, "websockets": true, "alpha-search": true,
+	}
 	home := configFields(reflect.TypeOf(Config{}))
 	sdk := configFields(reflect.TypeOf(cpaconfig.Config{}))
 	for _, family := range v8KeyFamilies {
 		homeFields := configFields(home[family.old].Elem())
 		sdkFields := configFields(sdk[family.old].Elem())
 		for name := range sdkFields {
-			if _, owned := homeFields[name]; !owned && name != "api-key" && name != "id" && name != "uuid" && name != "name" && name != "base-url" && name != "weight" {
+			if _, owned := homeFields[name]; !owned && !nonShared[name] {
 				shared[name] = true
 			}
 		}

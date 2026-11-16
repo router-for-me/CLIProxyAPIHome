@@ -15,10 +15,17 @@ func TestSDKExecutionOptionsWithoutHomeFields(t *testing.T) {
 	}{
 		{reflect.TypeOf(Config{}), "Client"},
 		{reflect.TypeOf(Config{}), "ShutdownTimeoutSeconds"},
-		{reflect.TypeOf(ClaudeConfig{}), "SessionDatePinDays"},
-		{reflect.TypeOf(ClaudeHeaderDefaults{}), "NativeEntrypoints"},
+		{reflect.TypeOf(Config{}), "Claude"},
+		{reflect.TypeOf(Config{}), "ClaudeHeaderDefaults"},
+		{reflect.TypeOf(Config{}), "Codex"},
+		{reflect.TypeOf(Config{}), "Payload"},
 		{reflect.TypeOf(CodexKey{}), "ConnectionPool"},
-		{reflect.TypeOf(VertexCompatModel{}), "OpenAPI"},
+		{reflect.TypeOf(CodexKey{}), "DisableCodexCloaking"},
+		{reflect.TypeOf(ClaudeKey{}), "Cloak"},
+		{reflect.TypeOf(ClaudeKey{}), "ExperimentalCCHSigning"},
+		{reflect.TypeOf(ClaudeKey{}), "RebuildMidSystemMessage"},
+		{reflect.TypeOf(ClaudeKey{}), "FingerprintProfile"},
+		{reflect.TypeOf(OpenAICompatibility{}), "SupportPromptCacheKey"},
 	} {
 		if _, exists := check.owner.FieldByName(check.field); exists {
 			t.Fatalf("CPA-only field %s.%s was duplicated in Home", check.owner.Name(), check.field)
@@ -121,19 +128,14 @@ upstream:
 }
 
 func TestClaudeCloakPatternsTypedSDKProjection(t *testing.T) {
-	entry := ClaudeKey{Cloak: &CloakConfig{SensitivePatternsReplace: []SensitivePatternRule{
-		{Pattern: "^private", Replacement: ""},
-		{Pattern: "[invalid", Replacement: "ignored"},
-		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
+	entry := ClaudeKey{CredentialConfig: CredentialConfig{RawConfig: map[string]any{
+		"cloak": map[string]any{
+			"sensitive-patterns-replace": []any{
+				map[string]any{"pattern": "^private", "replacement": ""},
+				map[string]any{"pattern": "Claude[ ]+Code", "replacement": "Claude"},
+			},
+		},
 	}}}
-	entry.Cloak = NormalizeCloakConfig(entry.Cloak)
-	want := []SensitivePatternRule{
-		{Pattern: "^private", Replacement: ""},
-		{Pattern: "Claude[ ]+Code", Replacement: "Claude"},
-	}
-	if !reflect.DeepEqual(entry.Cloak.SensitivePatternsReplace, want) {
-		t.Fatalf("normalized cloak patterns = %#v, want %#v", entry.Cloak.SensitivePatternsReplace, want)
-	}
 	options, errProject := CredentialExecutionOptions(entry)
 	if errProject != nil {
 		t.Fatal(errProject)
