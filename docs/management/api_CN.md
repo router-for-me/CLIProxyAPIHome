@@ -4263,6 +4263,7 @@ Query 参数：
 | `requests.payload.default-raw` | array of `PayloadRule` | 设置缺失的 raw JSON payload params。 |
 | `requests.payload.override` | array of `PayloadRule` | 覆盖 JSON payload params。 |
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
+| `requests.payload.replace` | array of `PayloadReplaceRule` | 按顺序替换选中 user 消息中的文本，由 CPA 执行。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
 
 Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有在开启 `session-affinity-subagents` 时成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。关闭后仍保留普通粘性绑定，但不再维护 Guardian 历史，并将本次使用的绑定从该历史中移除。重新开启后从后续成功选择继续记录，不回补关闭期间的选择。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 通过正常启动迁移新增 Guardian 字段及查询索引，并继续支持 v18 可移植快照。会过期的选择元数据及内部会话计数器记录存于现有 `session_affinity` 表内，不新增独立表（均不纳入可移植快照）；升级前的绑定在下一次成功派发时补充选择元数据。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
@@ -4334,6 +4335,14 @@ Payload 嵌套结构：
       "reasoning.effort": "high"
     }
   },
+  "PayloadReplaceRule": {
+    "models": [{ "name": "*", "protocol": "claude", "from-protocol": "openai" }],
+    "target": { "role": "user", "positions": [1, 2] },
+    "replacements": [
+      { "you are hero": "you are fool" },
+      { "remove this phrase": "" }
+    ]
+  },
   "PayloadFilterRule": {
     "models": [
       { "name": "gpt-*", "protocol": "responses" }
@@ -4358,6 +4367,10 @@ Payload 嵌套结构：
   }
 }
 ```
+
+可使用 `PUT /config/requests/payload/replace` 提交规则数组，或使用 `PATCH /config/requests/payload` 提交 `{"replace": [...]}` 并保留其他规则段。Home 只校验、保存和下发规则，不执行替换；下游 CPA 节点必须支持 `payload.replace`，旧节点可能忽略这些规则。
+
+`target.role` 必须为 `user`。`positions` 按最终上游请求中的 user 消息从 1 开始计数，必须为正整数；也可不填 positions，改用 `all: true`。消息不足或文本未命中时，CPA 自动跳过。每个 `replacements` 列表项必须且只能包含一组非空字符串键到字符串值的映射，值为 `""` 表示删除命中内容。规则和替换项均按列表顺序执行，位于 override 之后、filter 之前。采用区分大小写的字面量匹配，不跨文本块，不修改图片、工具结果或思考内容。模型匹配条件与其他 payload 规则一致，见下表。非法替换配置在写入数据库前被拒绝。
 
 `PayloadModelRule` 字段：
 

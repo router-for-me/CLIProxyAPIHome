@@ -53,6 +53,9 @@ func validateExecutionSchema(node *yaml.Node, types []reflect.Type, path string)
 		}
 		types[i] = t
 	}
+	if path == "payload" {
+		types = append(types, reflect.TypeOf(payloadReplaceSchema{}))
+	}
 	if node.Kind == yaml.MappingNode {
 		for i := 0; i < len(node.Content); i += 2 {
 			key := node.Content[i].Value
@@ -107,6 +110,9 @@ func validateExecutionSchema(node *yaml.Node, types []reflect.Type, path string)
 // Validate imports/reloads against the SDK without persisting its defaults.
 // Home validates its lifecycle, normalizes trusted proxies, and owns the secret hash.
 func validateCPAExecution(root *yaml.Node) error {
+	if errValidate := validatePayloadReplace(root); errValidate != nil {
+		return errValidate
+	}
 	execution := deepCopyYAMLNode(root)
 	for _, path := range []string{"remote-management.secret-key", "credential-concurrency", "credential-in-flight", "trusted-proxies"} {
 		deleteYAMLPath(execution, path)
