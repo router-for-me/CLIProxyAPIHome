@@ -6,8 +6,9 @@
 # Those execution settings are saved and distributed by Home, not executed by the Home process.
 # Home validates them against its bundled CPA SDK; nodes must support the selected feature.
 # Saving or reading a setting does not by itself establish end-to-end executor support.
-# Both legacy configuration and /v0/management remain supported. V8 values win when
-# both spellings are supplied, including false, 0, and empty collections.
+# Legacy configuration remains supported for import. V8 values win when both
+# spellings are supplied, including false, 0, and empty collections.
+# Management clients must use /v8/management; /v0/management has been removed.
 # Existing unknown top-level sections are ignored by the V8 view and removed on a
 # successful V8 write. New unknown fields are rejected. Database values have no YAML comments.
 # Optional credentials and request rules stay commented until configured.
@@ -119,7 +120,7 @@ management:
   allow-remote: false
   # Management key. If a plaintext value is provided here, it will be hashed on startup.
   # All management requests (even from localhost) require this key.
-  # Leave empty to disable the Management API entirely (404 for /v0/management and /v8/management routes).
+  # The Management API is disabled when both this key and MANAGEMENT_PASSWORD are empty.
   secret-key: ""
   # Disable the embedded Home management control panel HTTP routes when true.
   disable-control-panel: false
@@ -1372,6 +1373,6 @@ plugins:
       config-object:
         mode: "safe"
 
-# Legacy files and /v0/management remain compatible. Use the V8 sections above
-# for new configuration. The Antigravity credits fallback is configured only as
+# Legacy files remain supported for import. Use the V8 sections above for new
+# configuration. The Antigravity credits fallback is configured only as
 # oauth.providers.antigravity.antigravity-credits in this example.
