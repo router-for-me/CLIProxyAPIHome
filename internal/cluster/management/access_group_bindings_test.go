@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 )
 
@@ -69,5 +70,81 @@ func TestAccessGroupDeletionClearsAPIKeyBindings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestListChannelGroupDetailsIncludesAuthMetadata(t *testing.T) {
+	handler, engine, closeRepo := newAPIKeyManagementRuntimeTestServer(t)
+	defer closeRepo()
+	ctx := t.Context()
+
+	activeAuth := &coreauth.Auth{
+		ID:       "auth-active-1",
+		Index:    "auth-active-1",
+		Provider: "antigravity",
+		Label:    "active@example.com",
+		Status:   coreauth.StatusActive,
+	}
+	deletedAuth := &coreauth.Auth{
+		ID:          "auth-deleted-2",
+		Index:       "auth-deleted-2",
+		Provider:    "codex",
+		Status:      coreauth.StatusDisabled,
+		Disabled:    true,
+		Unavailable: true,
+		Metadata:    map[string]any{"email": "deleted@example.com"},
+	}
+	for _, auth := range []*coreauth.Auth{activeAuth, deletedAuth} {
+		if _, errUpsert := handler.repo.UpsertAuth(ctx, auth, "test"); errUpsert != nil {
+			t.Fatalf("UpsertAuth(%s) error = %v", auth.ID, errUpsert)
+		}
+	}
+
+	group, errGroup := handler.repo.CreateChannelGroup(ctx, "default", false)
+	if errGroup != nil {
+		t.Fatalf("CreateChannelGroup() error = %v", errGroup)
+	}
+	if _, errCreate := handler.repo.CreateChannelGroupDetail(ctx, group.ID, activeAuth.ID); errCreate != nil {
+		t.Fatalf("CreateChannelGroupDetail(active) error = %v", errCreate)
+	}
+	if _, errCreate := handler.repo.CreateChannelGroupDetail(ctx, group.ID, deletedAuth.ID); errCreate != nil {
+		t.Fatalf("CreateChannelGroupDetail(deleted) error = %v", errCreate)
+	}
+	if errRetire := handler.repo.RetireProviderAuth(ctx, deletedAuth.ID); errRetire != nil {
+		t.Fatalf("RetireProviderAuth() error = %v", errRetire)
+	}
+
+	engine.GET("/channel-group-details", handler.ListChannelGroupDetails)
+	resp := performAPIKeyManagementRequest(t, engine, http.MethodGet, "/channel-group-details", nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET /channel-group-details status = %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	var payload struct {
+		Details []struct {
+			AuthID          string `json:"auth_id"`
+			AuthLabel       string `json:"auth_label"`
+			AuthProvider    string `json:"auth_provider"`
+			AuthStatus      string `json:"auth_status"`
+			AuthDisabled    bool   `json:"auth_disabled"`
+			AuthUnavailable bool   `json:"auth_unavailable"`
+			AuthDeleted     bool   `json:"auth_deleted"`
+		} `json:"channel_group_details"`
+	}
+	decodeAPIKeyManagementResponse(t, resp, &payload)
+	if len(payload.Details) != 2 {
+		t.Fatalf("details len = %d, want 2 (%+v)", len(payload.Details), payload.Details)
+	}
+	byID := make(map[string]int, len(payload.Details))
+	for i, d := range payload.Details {
+		byID[d.AuthID] = i
+	}
+	activeGot := payload.Details[byID[activeAuth.ID]]
+	if activeGot.AuthLabel != "active@example.com" || activeGot.AuthProvider != "antigravity" || activeGot.AuthStatus != "active" || activeGot.AuthDisabled || activeGot.AuthDeleted {
+		t.Fatalf("unexpected active detail metadata: %+v", activeGot)
+	}
+	deletedGot := payload.Details[byID[deletedAuth.ID]]
+	if deletedGot.AuthLabel != "deleted@example.com" || deletedGot.AuthProvider != "codex" || deletedGot.AuthStatus != "disabled" || !deletedGot.AuthDisabled || !deletedGot.AuthUnavailable || !deletedGot.AuthDeleted {
+		t.Fatalf("unexpected deleted detail metadata: %+v", deletedGot)
 	}
 }
