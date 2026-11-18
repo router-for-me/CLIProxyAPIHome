@@ -1015,8 +1015,33 @@ func TestAntigravitySnapshotUpgradeSuccessReplacesLegacyWindows(t *testing.T) {
 	if errGet != nil {
 		t.Fatalf("GetQuotaCredential() error = %v", errGet)
 	}
-	if item.QuotaStatus != "healthy" || item.Freshness != "fresh" || len(item.PrimaryWindows) != 2 || item.PrimaryWindows[0].ID != "antigravity-gemini-5h" || item.PrimaryWindows[1].ID != "antigravity-3p-weekly" {
+	if item.QuotaStatus != "healthy" || item.Freshness != "fresh" || item.WindowCount != 3 || len(item.PrimaryWindows) != 3 || item.PrimaryWindows[0].ID != "antigravity-gemini-5h" || item.PrimaryWindows[1].ID != "antigravity-gemini-weekly" || item.PrimaryWindows[2].ID != "antigravity-3p-weekly" {
 		t.Fatalf("upgraded Antigravity presentation = %+v", item)
+	}
+}
+
+func TestAntigravityPrimaryWindowsKeepEveryCurrentWindowInPriorityOrder(t *testing.T) {
+	periodFive := float64(5)
+	periodWeek := float64(1)
+	geminiScopeID := "gemini"
+	thirdPartyScopeID := "third-party"
+	legacyScopeID := "chat-20706"
+	windows := []QuotaWindow{
+		{ID: "antigravity-3p-weekly", Priority: 3, Scope: "model", ScopeID: &thirdPartyScopeID, Status: "healthy", PeriodUnit: "week", PeriodValue: &periodWeek},
+		{ID: "antigravity-model-chat-20706", Scope: "model", ScopeID: &legacyScopeID, Status: "exhausted", PeriodUnit: "hour", PeriodValue: &periodFive},
+		{ID: "antigravity-gemini-weekly", Priority: 2, Scope: "model", ScopeID: &geminiScopeID, Status: "low", PeriodUnit: "week", PeriodValue: &periodWeek},
+		{ID: "antigravity-3p-5h", Priority: 1, Scope: "model", ScopeID: &thirdPartyScopeID, Status: "healthy", PeriodUnit: "hour", PeriodValue: &periodFive},
+		{ID: "antigravity-gemini-5h", Priority: 0, Scope: "model", ScopeID: &geminiScopeID, Status: "healthy", PeriodUnit: "hour", PeriodValue: &periodFive},
+	}
+	primary := quotaPrimaryWindows("antigravity", windows)
+	want := []string{"antigravity-gemini-5h", "antigravity-3p-5h", "antigravity-gemini-weekly", "antigravity-3p-weekly"}
+	if len(primary) != len(want) {
+		t.Fatalf("Antigravity primary windows = %+v, want %v", primary, want)
+	}
+	for index, id := range want {
+		if primary[index].ID != id {
+			t.Fatalf("Antigravity primary windows = %+v, want %v", primary, want)
+		}
 	}
 }
 
