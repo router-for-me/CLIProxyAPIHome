@@ -4279,7 +4279,7 @@ The following paths use the v8 config layout. `/config` and `/config.yaml` suppo
 | `requests.payload.default-raw` | array of `PayloadRule` | Sets missing raw JSON payload params. |
 | `requests.payload.override` | array of `PayloadRule` | Overrides JSON payload params. |
 | `requests.payload.override-raw` | array of `PayloadRule` | Overrides raw JSON payload params. |
-| `requests.payload.replace` | array of `PayloadReplaceRule` | Ordered literal replacements in selected user-message text; executed by CPA. |
+| `requests.payload.replace` | array of `PayloadReplaceRule` | Ordered literal or Go RE2 replacements in selected message text or existing string fields; executed by CPA. |
 | `requests.payload.filter` | array of `PayloadFilterRule` | Removes JSON payload paths. |
 
 Guardian selection history is database-backed and shared across Home nodes, config reloads, and restarts. Only successful dispatch/admission while `session-affinity-subagents` is enabled advances selection order; completion/usage reports and parent lookups do not. When disabled, dispatch keeps ordinary sticky bindings but stops maintaining Guardian history and removes the touched binding from that history. Re-enabling resumes recording subsequent selections; selections made while disabled are not reconstructed. Inherited credentials must still belong to the current request's eligible candidate set. Guardian bindings may reuse a lower-priority eligible credential; cold selection still uses normal priority rules. Fork/compaction requests do not use Guardian cross-model inheritance. Schema version 19 adds the Guardian columns and lookup index through the normal startup migration. Version 18 portable snapshots remain supported. Expiring selection metadata and internal per-session counters use the existing `session_affinity` table, without a separate table (all excluded from portable snapshots); pre-upgrade bindings acquire selection metadata on their next successful dispatch. Upgrade all Home nodes before relying on cross-node Guardian inheritance.
@@ -4384,9 +4384,32 @@ Payload nested structure:
 }
 ```
 
-Use `PUT /config/requests/payload/replace` with a rule array to replace this section, or `PATCH /config/requests/payload` with `{"replace": [...]}` to preserve sibling sections. Home validates and stores the rules without applying them; downstream CPA nodes must support `payload.replace`. Older nodes may ignore the rules.
+Use `PUT /config/requests/payload/replace` with a rule array to replace this section, or `PATCH /config/requests/payload` with `{"replace": [...]}` to preserve sibling sections. Home validates and stores the rules without applying them; upgrade downstream CPA nodes to v8.0.77 or later before using regex, `system`/`developer` roles, or path targets.
 
-`target.role` must be `user`. Select positive, one-based `positions` among user messages in the final upstream body, or use `all: true` without positions. Missing positions and unmatched text are skipped by CPA. Each `replacements` entry must contain exactly one non-empty string key and a string destination; an empty destination deletes matches. Rules and replacements execute in list order after overrides and before filters. Matching is case-sensitive and literal, within individual text blocks; images, tool results, and thinking content are not rewritten. Model conditions use the same fields below as other payload rules. Invalid replacement configuration is rejected before database writes.
+- **Role target:** Set `target.role` to `user`, `system`, or `developer` and choose positive, one-based `positions` within that role or `all: true`, not both. Roles refer to the final upstream request: a top-level system instruction counts as one message, and developer text merged into system must be selected as `system`. Each message text block is processed independently; images, tool results, and thinking blocks are not modified by role targets.
+- **Path target:** Set `target.paths` to a non-empty list of gjson-style paths relative to the provider payload root. Do not combine it with `role`, `positions`, or `all`. Only existing string fields are edited, regardless of role. Missing and non-string values are skipped; objects and arrays are not traversed recursively. Each resolved path is processed at most once per rule.
+- **Replacements:** Each entry is either a case-sensitive literal pair such as `{"old label":"new label"}` (non-empty source), or a Go RE2 pair such as `{"pattern":"(item)-([0-9]+)","replacement":"${1}_${2}"}`. An empty destination deletes matches. CPA skips an invalid regex entry with a warning and still runs the other entries. Structurally invalid rules are rejected before database writes.
+
+Rules and their replacements run in list order after overrides and before filters. Model conditions use the same fields as other payload rules.
+
+Example `PUT /config/requests/payload/replace` body: this Codex rule targets every function tool's `description` and the `metadata.description` field. It applies literal replacements and deletions, rewrites `User-42` as `account-42`, and removes `<debug>...</debug>` blocks, including multiline blocks.
+
+```json
+[
+  {
+    "models": [{ "name": "*", "protocol": "codex" }],
+    "target": {
+      "paths": ["tools.#(type==\"function\")#.description", "metadata.description"]
+    },
+    "replacements": [
+      { "old name": "new name" },
+      { "remove this phrase": "" },
+      { "pattern": "(?i)user-(\\d+)", "replacement": "account-${1}" },
+      { "pattern": "(?s)<debug>.*?</debug>", "replacement": "" }
+    ]
+  }
+]
+```
 
 `PayloadModelRule` fields:
 
