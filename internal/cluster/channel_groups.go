@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -24,6 +25,15 @@ type ChannelGroupDetailUpdate struct {
 type ChannelGroupDetailFilter struct {
 	ChannelGroupID *uint
 	AuthID         string
+}
+
+type ChannelGroupDetailAuthMeta struct {
+	Label       string
+	Provider    string
+	Status      string
+	Disabled    bool
+	Unavailable bool
+	Deleted     bool
 }
 
 // ListChannelGroups returns channel groups.
@@ -332,4 +342,110 @@ func ensureAuthExists(ctx context.Context, tx *gorm.DB, authID string) error {
 		return fmt.Errorf("auth not found: %w", errFirst)
 	}
 	return errFirst
+}
+
+// ResolveChannelGroupDetailAuthMetadata loads display metadata for the given
+// credential identifiers, including soft-deleted auth records so historical
+// channel bindings remain identifiable.
+func (r *Repository) ResolveChannelGroupDetailAuthMetadata(ctx context.Context, authIDs []string) (map[string]ChannelGroupDetailAuthMeta, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	uniqueIDs := make([]string, 0, len(authIDs))
+	seen := make(map[string]struct{}, len(authIDs))
+	for _, rawID := range authIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniqueIDs = append(uniqueIDs, id)
+	}
+	if len(uniqueIDs) == 0 {
+		return nil, nil
+	}
+
+	values := make([]any, len(uniqueIDs))
+	for i, id := range uniqueIDs {
+		values[i] = id
+	}
+
+	var records []AuthRecord
+	if errFind := db.WithContext(contextOrBackground(ctx)).
+		Unscoped().
+		Model(&AuthRecord{}).
+		Where(clause.Or(
+			clause.IN{Column: clause.Column{Name: "uuid"}, Values: values},
+			clause.IN{Column: clause.Column{Name: "id"}, Values: values},
+			clause.IN{Column: clause.Column{Name: "index"}, Values: values},
+		)).
+		Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+
+	result := make(map[string]ChannelGroupDetailAuthMeta, len(records))
+	setMeta := func(key string, meta ChannelGroupDetailAuthMeta) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		if existing, exists := result[key]; exists && !existing.Deleted && meta.Deleted {
+			return
+		}
+		result[key] = meta
+	}
+
+	for i := range records {
+		rec := &records[i]
+		meta := ChannelGroupDetailAuthMeta{
+			Label:       extractAuthRecordLabel(rec),
+			Provider:    strings.TrimSpace(rec.Provider),
+			Status:      strings.TrimSpace(string(rec.Status)),
+			Disabled:    rec.Disabled,
+			Unavailable: rec.Unavailable,
+			Deleted:     rec.DeletedAt.Valid,
+		}
+		setMeta(rec.UUID, meta)
+		setMeta(rec.ID, meta)
+		setMeta(rec.Index, meta)
+	}
+	return result, nil
+}
+
+func extractAuthRecordLabel(record *AuthRecord) string {
+	if record == nil {
+		return ""
+	}
+	if label := strings.TrimSpace(record.Label); label != "" {
+		return label
+	}
+	if compat := strings.TrimSpace(record.CompatName); compat != "" {
+		return compat
+	}
+	if len(record.AuthJSON) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(record.AuthJSON), &payload); errUnmarshal != nil || payload == nil {
+		return ""
+	}
+	for _, key := range []string{"label", "email", "account", "name"} {
+		if value, ok := payload[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	if metadata, ok := payload["metadata"].(map[string]any); ok && metadata != nil {
+		if email, ok := metadata["email"].(string); ok {
+			if trimmed := strings.TrimSpace(email); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
 }

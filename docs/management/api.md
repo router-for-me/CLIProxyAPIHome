@@ -3884,6 +3884,12 @@ Example response:
       "id": 10,
       "channel_group_id": 1,
       "auth_id": "auth-db-id",
+      "auth_label": "user@example.com",
+      "auth_provider": "antigravity",
+      "auth_status": "active",
+      "auth_disabled": false,
+      "auth_unavailable": false,
+      "auth_deleted": false,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "deleted_at": null
@@ -3892,9 +3898,20 @@ Example response:
 }
 ```
 
+When a matching `auth` record exists (including soft-deleted records), responses also include resolved credential metadata:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `auth_label` | string | Resolved credential label (`label`, `compat_name`, or `auth_json` `label`/`email`/`account`/`name`/`metadata.email`); omitted when empty. |
+| `auth_provider` | string | Credential provider key; omitted when empty. |
+| `auth_status` | string | Credential status; omitted when empty. |
+| `auth_disabled` | boolean | Whether the matched credential is disabled. |
+| `auth_unavailable` | boolean | Whether the matched credential is unavailable. |
+| `auth_deleted` | boolean | Whether the matched credential record is soft-deleted. |
+
 ### GET `/channel-group-details/:id`
 
-Returns one detail row:
+Returns one detail row (including the optional `auth_*` fields above when matched):
 
 ```json
 {
@@ -3902,6 +3919,12 @@ Returns one detail row:
     "id": 10,
     "channel_group_id": 1,
     "auth_id": "auth-db-id",
+    "auth_label": "user@example.com",
+    "auth_provider": "antigravity",
+    "auth_status": "active",
+    "auth_disabled": false,
+    "auth_unavailable": false,
+    "auth_deleted": false,
     "created_at": "2026-05-27T10:00:00Z",
     "updated_at": "2026-05-27T10:00:00Z",
     "deleted_at": null

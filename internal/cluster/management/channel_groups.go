@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -153,9 +154,14 @@ func (h *Handler) ListChannelGroupDetails(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "channel_group_detail_load_failed", errRecords)
 		return
 	}
+	authIDs := make([]string, 0, len(records))
+	for i := range records {
+		authIDs = append(authIDs, records[i].AuthID)
+	}
+	authMeta, _ := h.repo.ResolveChannelGroupDetailAuthMetadata(ctx, authIDs)
 	items := make([]gin.H, 0, len(records))
 	for _, record := range records {
-		items = append(items, channelGroupDetailRecordToMap(&record))
+		items = append(items, channelGroupDetailRecordToMapWithMeta(&record, authMeta))
 	}
 	c.JSON(http.StatusOK, gin.H{"channel_group_details": items})
 }
@@ -174,7 +180,7 @@ func (h *Handler) GetChannelGroupDetail(c *gin.Context) {
 		respondChannelRecordError(c, "channel_group_detail_load_failed", errRecord)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"channel_group_detail": channelGroupDetailRecordToMap(record)})
+	c.JSON(http.StatusOK, gin.H{"channel_group_detail": h.channelGroupDetailResponseMap(ctx, record)})
 }
 
 // CreateChannelGroupDetail creates a channel group detail.
@@ -204,7 +210,7 @@ func (h *Handler) CreateChannelGroupDetail(c *gin.Context) {
 		respondChannelRecordError(c, "channel_group_detail_create_failed", errCreate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"channel_group_detail": channelGroupDetailRecordToMap(record)})
+	c.JSON(http.StatusOK, gin.H{"channel_group_detail": h.channelGroupDetailResponseMap(ctx, record)})
 }
 
 // UpdateChannelGroupDetail updates a channel group detail.
@@ -233,7 +239,7 @@ func (h *Handler) UpdateChannelGroupDetail(c *gin.Context) {
 		respondChannelRecordError(c, "channel_group_detail_update_failed", errUpdate)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"channel_group_detail": channelGroupDetailRecordToMap(record)})
+	c.JSON(http.StatusOK, gin.H{"channel_group_detail": h.channelGroupDetailResponseMap(ctx, record)})
 }
 
 // DeleteChannelGroupDetail deletes a channel group detail.
@@ -326,11 +332,26 @@ func channelGroupRecordToMap(record *cluster.ChannelGroupRecord) gin.H {
 	}
 }
 
-func channelGroupDetailRecordToMap(record *cluster.ChannelGroupDetailRecord) gin.H {
+func (h *Handler) channelGroupDetailResponseMap(ctx context.Context, record *cluster.ChannelGroupDetailRecord) gin.H {
 	if record == nil {
 		return gin.H{}
 	}
-	return gin.H{
+	var authMeta map[string]cluster.ChannelGroupDetailAuthMeta
+	if h != nil && h.repo != nil && strings.TrimSpace(record.AuthID) != "" {
+		authMeta, _ = h.repo.ResolveChannelGroupDetailAuthMetadata(ctx, []string{record.AuthID})
+	}
+	return channelGroupDetailRecordToMapWithMeta(record, authMeta)
+}
+
+func channelGroupDetailRecordToMap(record *cluster.ChannelGroupDetailRecord) gin.H {
+	return channelGroupDetailRecordToMapWithMeta(record, nil)
+}
+
+func channelGroupDetailRecordToMapWithMeta(record *cluster.ChannelGroupDetailRecord, authMeta map[string]cluster.ChannelGroupDetailAuthMeta) gin.H {
+	if record == nil {
+		return gin.H{}
+	}
+	out := gin.H{
 		"id":               record.ID,
 		"channel_group_id": record.ChannelGroupID,
 		"auth_id":          record.AuthID,
@@ -338,6 +359,21 @@ func channelGroupDetailRecordToMap(record *cluster.ChannelGroupDetailRecord) gin
 		"updated_at":       record.UpdatedAt,
 		"deleted_at":       deletedAtValue(record.DeletedAt),
 	}
+	if meta, ok := authMeta[strings.TrimSpace(record.AuthID)]; ok {
+		if meta.Label != "" {
+			out["auth_label"] = meta.Label
+		}
+		if meta.Provider != "" {
+			out["auth_provider"] = meta.Provider
+		}
+		if meta.Status != "" {
+			out["auth_status"] = meta.Status
+		}
+		out["auth_disabled"] = meta.Disabled
+		out["auth_unavailable"] = meta.Unavailable
+		out["auth_deleted"] = meta.Deleted
+	}
+	return out
 }
 
 func deletedAtValue(value gorm.DeletedAt) any {

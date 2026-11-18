@@ -3868,6 +3868,12 @@ Query 参数：
       "id": 10,
       "channel_group_id": 1,
       "auth_id": "auth-db-id",
+      "auth_label": "user@example.com",
+      "auth_provider": "antigravity",
+      "auth_status": "active",
+      "auth_disabled": false,
+      "auth_unavailable": false,
+      "auth_deleted": false,
       "created_at": "2026-05-27T10:00:00Z",
       "updated_at": "2026-05-27T10:00:00Z",
       "deleted_at": null
@@ -3876,9 +3882,20 @@ Query 参数：
 }
 ```
 
+当存在匹配的 `auth` 记录（包括已软删除的记录）时，响应还会包含解析后的凭证元数据：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `auth_label` | string | 解析后的凭证标签（`label`、`compat_name` 或 `auth_json` 中的 `label`/`email`/`account`/`name`/`metadata.email`）；为空时省略。 |
+| `auth_provider` | string | 凭证 provider 标识；为空时省略。 |
+| `auth_status` | string | 凭证状态；为空时省略。 |
+| `auth_disabled` | boolean | 匹配的凭证是否已禁用。 |
+| `auth_unavailable` | boolean | 匹配的凭证是否不可用。 |
+| `auth_deleted` | boolean | 匹配的凭证记录是否已软删除。 |
+
 ### GET `/channel-group-details/:id`
 
-返回单个 detail row：
+返回单个 detail row（匹配到 `auth` 记录时同样包含上述 `auth_*` 字段）：
 
 ```json
 {
@@ -3886,6 +3903,12 @@ Query 参数：
     "id": 10,
     "channel_group_id": 1,
     "auth_id": "auth-db-id",
+    "auth_label": "user@example.com",
+    "auth_provider": "antigravity",
+    "auth_status": "active",
+    "auth_disabled": false,
+    "auth_unavailable": false,
+    "auth_deleted": false,
     "created_at": "2026-05-27T10:00:00Z",
     "updated_at": "2026-05-27T10:00:00Z",
     "deleted_at": null
