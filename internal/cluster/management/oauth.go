@@ -301,7 +301,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 // PostOAuthCallback handles a post o auth callback.
 func (h *Handler) PostOAuthCallback(c *gin.Context) {
-	h.handleOAuthCallback(c)
+	h.handleOAuthCallback(c, false)
+}
+
+// PostOAuthCallbackV8 handles a v8 OAuth callback.
+func (h *Handler) PostOAuthCallbackV8(c *gin.Context) {
+	h.handleOAuthCallback(c, true)
 }
 
 // storeUploadedOAuth stores an uploaded o auth.

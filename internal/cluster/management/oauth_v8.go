@@ -15,7 +15,14 @@ func (h *Handler) StartOAuthV8(c *gin.Context) {
 	case "claude":
 		h.RequestAnthropicToken(c)
 	case "codex":
-		h.RequestCodexToken(c)
+		switch strings.ToLower(strings.TrimSpace(c.Query("flow"))) {
+		case "", "browser":
+			h.RequestCodexToken(c)
+		case "device":
+			h.RequestCodexDeviceToken(c)
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported oauth flow"})
+		}
 	case "antigravity":
 		h.RequestAntigravityToken(c)
 	case "kimi", "kimi-ai":
