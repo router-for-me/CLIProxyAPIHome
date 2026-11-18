@@ -206,17 +206,40 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 	}
 }
 
-func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts Options, tried map[string]struct{}) (*Auth, bool, error) {
+// filterPluginExcludedAuths keeps the scheduler plugin's exclusions local to one pick.
+func filterPluginExcludedAuths(auths []*Auth, excluded map[string]struct{}) []*Auth {
+	if len(excluded) == 0 {
+		return auths
+	}
+	eligible := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if _, skip := excluded[auth.ID]; !skip {
+			eligible = append(eligible, auth)
+		}
+	}
+	return eligible
+}
+
+func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
 	if m == nil || m.scheduler == nil {
 		return nil, false, nil
+	}
+	var candidateIDs map[string]struct{}
+	if candidates != nil {
+		// Keep the same eligible pool as Dispatch, including concurrency exclusions.
+		// Build the lookup before entering the scheduler's critical section.
+		candidateIDs = make(map[string]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			candidateIDs[candidate.ID] = struct{}{}
+		}
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	var selected *Auth
 	var errPick error
 	if providerKey == "mixed" {
-		selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
+		selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy, candidateIDs)
 	} else {
-		selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
+		selected, errPick = m.scheduler.pickSingleWithStrategy(providerKey, model, opts, tried, strategy, candidateIDs)
 	}
 	if errPick != nil {
 		return nil, true, errPick
@@ -227,10 +250,7 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 	return selected, true, nil
 }
 
-func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
-	if scheduler == nil || len(candidates) == 0 {
-		return nil, false, nil
-	}
+func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts Options, tried map[string]struct{}, candidates []*Auth, affinity *SessionAffinitySelector) (selectedAuth *Auth, excludedAuthIDs map[string]struct{}, delegated bool, err error) {
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	requestProvider := providerKey
 	if providerKey == "mixed" {
@@ -245,20 +265,56 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	}
 	resp, handled, errPick := scheduler.PickAuth(ctx, req)
 	if errPick != nil {
-		return nil, true, errPick
+		return nil, nil, false, errPick
+	}
+	if handled && resp.Handled {
+		if resp.Reject {
+			code := strings.TrimSpace(resp.RejectCode)
+			if code == "" {
+				code = "auth_unavailable"
+			}
+			message := strings.TrimSpace(resp.RejectReason)
+			if message == "" {
+				message = "scheduler rejected candidate selection"
+			}
+			return nil, nil, false, &SchedulerRejectError{cause: Error{Code: code, Message: message}}
+		}
+		if selected := pickSchedulerAuthByID(candidates, resp.AuthID); selected != nil {
+			return selected, nil, false, nil
+		}
+	}
+
+	var excluded map[string]struct{}
+	for _, id := range resp.ExcludeCandidates {
+		if id = strings.TrimSpace(id); id != "" {
+			if excluded == nil {
+				excluded = make(map[string]struct{}, len(resp.ExcludeCandidates))
+			}
+			excluded[id] = struct{}{}
+		}
 	}
 	if !handled || !resp.Handled {
-		return nil, false, nil
-	}
-	if selected := pickSchedulerAuthByID(candidates, resp.AuthID); selected != nil {
-		return selected, true, nil
+		return nil, excluded, false, nil
 	}
 	strategy, okStrategy := builtinSchedulerStrategy(resp.DelegateBuiltin)
 	if !okStrategy {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
-	if len(excludedConcurrencyCandidatesFromOptions(opts)) > 0 {
-		return nil, false, nil
+	if affinity != nil && affinity.rebindOn != "never" && len(excludedConcurrencyCandidatesFromOptions(opts)) > 0 {
+		return nil, excluded, false, nil
 	}
-	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
+	eligible := filterPluginExcludedAuths(candidates, excluded)
+	if len(eligible) == 0 {
+		// Preserve the selected strategy when Dispatch checks for cooling candidates.
+		return nil, excluded, true, nil
+	}
+	if affinity != nil && affinity.rebindOn == "never" {
+		selected, errAffinity := affinity.pick(ctx, providerKey, selectionArgForSelector(affinity, model), opts, eligible, func(auths []*Auth) (*Auth, error) {
+			picked, _, errBuiltin := m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried, auths)
+			return picked, errBuiltin
+		})
+		return selected, excluded, true, errAffinity
+	}
+	selected, _, errBuiltin := m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried, eligible)
+	return selected, excluded, true, errBuiltin
 }

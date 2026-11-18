@@ -452,6 +452,12 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // supplies a stable cross-provider scope regardless of provider availability; direct
 // selector calls default to the supplied provider. Models retain separate bindings.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts Options, auths []*Auth) (*Auth, error) {
+	return s.pick(ctx, provider, model, opts, auths, nil)
+}
+
+// pick applies session affinity first. A delegate can replace the cold-pick
+// strategy, but it cannot override an active binding or its admission transaction.
+func (s *SessionAffinitySelector) pick(ctx context.Context, provider, model string, opts Options, auths []*Auth, delegate func([]*Auth) (*Auth, error)) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -460,7 +466,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	defer func() { reservation.finish(false) }()
 	entry := selectorLogEntry(ctx)
 	weighted, _ := s.fallback.(*WeightedRoundRobinSelector)
+	if delegate != nil {
+		weighted = nil
+	}
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" && delegate != nil {
+		return delegate(auths)
+	}
 	if primaryID == "" && weighted == nil {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
@@ -468,7 +480,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	now := time.Now()
 	auths = filterConcurrencyExcludedAuths(auths, model, opts)
-	if isWeightedSelector(s.fallback) {
+	if delegate == nil && isWeightedSelector(s.fallback) {
 		auths = positiveWeightAuths(auths)
 	}
 	available, err := getAvailableAuths(auths, provider, model, now)
@@ -540,7 +552,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		preserveBinding := active && selected == nil && s.rebindOn == "quota" && preserveSessionBinding(ctx, auths, binding.AuthID, model, now)
 		if active && selected == nil && s.rebindOn == "never" {
-			return nil, &Error{Code: "session_auth_unavailable", Message: "bound session credential is unavailable; failover is disabled", Retryable: true, HTTPStatus: 503}
+			return nil, sessionAuthUnavailableError(binding.AuthID)
 		}
 		if err != nil {
 			return nil, err
@@ -579,7 +591,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		} else if selected == nil {
 			var errPick error
-			selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)
+			if delegate != nil {
+				selected, errPick = delegate(auths)
+			} else {
+				selected, errPick = s.fallback.Pick(ctx, provider, model, opts, auths)
+			}
 			if errPick != nil {
 				return nil, errPick
 			}
@@ -629,6 +645,29 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		reservation.finish(false)
 		reservation = nil
 	}
+}
+
+// activeNeverBinding identifies an active binding before classifying an empty pool.
+func (s *SessionAffinitySelector) activeNeverBinding(ctx context.Context, opts Options, model string) (string, error) {
+	if s == nil || s.rebindOn != "never" {
+		return "", nil
+	}
+	sessionID, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if sessionID == "" {
+		return "", nil
+	}
+	binding, errLoad := s.store.LoadSessionBinding(ctx, sessionBindingKey(opts.SessionAffinityScope, sessionID, model))
+	if errLoad != nil {
+		return "", fmt.Errorf("load session affinity binding: %w", errLoad)
+	}
+	if time.Now().Before(binding.ExpiresAt) {
+		return binding.AuthID, nil
+	}
+	return "", nil
+}
+
+func sessionAuthUnavailableError(authID string) *Error {
+	return &Error{Code: "session_auth_unavailable", Message: "bound session credential is unavailable; failover is disabled", Retryable: true, HTTPStatus: 503, boundCredentialID: authID}
 }
 
 // sessionBindingKey hashes a framed tuple to avoid delimiter collisions and

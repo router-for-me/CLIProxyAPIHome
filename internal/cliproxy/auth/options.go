@@ -56,6 +56,8 @@ type Options struct {
 	SessionAffinityScope string
 	// ExcludedProviders fences unavailable pools without changing session-binding namespaces.
 	ExcludedProviders []string
+	// positiveWeightOnly classifies an exhausted weighted fallback, not the plugin's candidate pool.
+	positiveWeightOnly bool
 }
 
 func requestRetryRoundFromOptions(opts Options) int {

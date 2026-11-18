@@ -546,6 +546,17 @@ func buildErrorJSON(message string) string {
 // preserving the structured access error code (e.g. no_credentials, invalid_credential) so the
 // downstream proxy can map it to the correct HTTP status.
 func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
+	var rejection *coreauth.SchedulerRejectError
+	if errors.As(errDispatch, &rejection) {
+		var cause *coreauth.Error
+		if errors.As(rejection, &cause) {
+			// Older CPA prefers type to code and must not mistake a rejection for pool exhaustion.
+			out, _ := sjson.Set("{}", "error.type", "scheduler_rejected")
+			out, _ = sjson.Set(out, "error.code", cause.Code)
+			out, _ = sjson.Set(out, "error.message", cause.Message)
+			return out
+		}
+	}
 	var admissionErr *cluster.ConcurrencyAdmissionError
 	if errors.As(errDispatch, &admissionErr) {
 		out := "{}"
@@ -553,7 +564,14 @@ func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
 		out, _ = sjson.Set(out, "error.message", concurrencyErrorMessage(admissionErr.Type))
 		if cluster.IsConcurrencySaturated(admissionErr) {
 			out, _ = sjson.Set(out, "error.retryable", true)
-			out, _ = sjson.Set(out, "error.retry_after_ms", concurrencyRetryAfterMS(runtime, admissionErr.RetryAfterMS))
+			retryAfterMS := admissionErr.RetryAfterMS
+			var timed interface{ RetryAfter() *time.Duration }
+			if errors.As(errDispatch, &timed) {
+				if delay := timed.RetryAfter(); delay != nil && *delay > 0 {
+					retryAfterMS = delay.Milliseconds()
+				}
+			}
+			out, _ = sjson.Set(out, "error.retry_after_ms", runtime.ConcurrencyRetryAfterMS(retryAfterMS))
 		}
 		return out
 	}
@@ -592,39 +610,6 @@ func concurrencyErrorMessage(errorType string) string {
 		return "credential model concurrency limit exceeded"
 	}
 	return "credential concurrency limit reached"
-}
-
-func wholePositiveMilliseconds(value string) (int64, bool) {
-	duration, errDuration := time.ParseDuration(value)
-	if errDuration != nil || duration <= 0 || duration%time.Millisecond != 0 {
-		return 0, false
-	}
-	return duration.Milliseconds(), true
-}
-
-func concurrencyRetryAfterMS(runtime *home.Runtime, retryAfterMS int64) int64 {
-	if retryAfterMS > 0 {
-		return retryAfterMS
-	}
-	min, max := int64(250), int64(1000)
-	if runtime != nil {
-		if runtimeConfig := runtime.Config(); runtimeConfig != nil {
-			cfg := runtimeConfig.CredentialConcurrency
-			if parsedMin, okMin := wholePositiveMilliseconds(cfg.BusyRetryMin); okMin {
-				min = parsedMin
-			}
-			if parsedMax, okMax := wholePositiveMilliseconds(cfg.BusyRetryMax); okMax {
-				max = parsedMax
-			}
-		}
-	}
-	if min < 1 {
-		min = 1
-	}
-	if max < min {
-		max = min
-	}
-	return min + time.Now().UnixNano()%(max-min+1)
 }
 
 func buildAuthErrorJSON(authErr *access.AuthError) string {
