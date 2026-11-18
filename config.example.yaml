@@ -369,19 +369,37 @@ requests:
   #           protocol: "codex" # restricts the rule to a specific protocol, options: openai, gemini, claude, codex, antigravity
   #       params: # JSON path (gjson/sjson syntax) -> raw JSON value (strings are used as-is, must be valid JSON)
   #         "response_format": "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"schema\":{\"type\":\"object\"}}}"
-  #   replace: # Ordered literal user-text replacements; executed by CPA after overrides, before filter.
+  #   replace: # Ordered literal and Go RE2 replacements; CPA runs them after overrides, before filter.
   #     - models: # Same model, protocol, header, and payload conditions as other rules.
   #         - name: "*"
   #           protocol: "claude"
   #           from-protocol: "openai"
   #       target:
-  #         role: user
-  #         positions: [1, 2] # One-based user positions in the final upstream body; missing positions are skipped.
-  #         # all: true      # Select every user instead of positions.
-  #       replacements: # Exactly one string mapping per entry; list order is preserved.
-  #         - "you are hero": "you are fool"
+  #         role: user # system, developer, or user in the final upstream body.
+  #         positions: [1, 2] # One-based positions within the selected role.
+  #         # all: true      # Select every message of this role instead of positions.
+  #       replacements:
+  #         - "old label": "new label"
+  #         - pattern: '\bitem-(\d+)\b' # Go RE2; $1 or ${1} expands a capture.
+  #           replacement: 'entry-$1'
   #         - "remove this phrase": ""
-  #       # Requires CPA nodes with payload.replace support; Home only stores and distributes rules.
+  #     - models:
+  #         - name: "*"
+  #           protocol: "codex"
+  #       target:
+  #         paths: # Alternative to role/positions/all (mutually exclusive); paths are relative to the provider payload root.
+  #           - 'tools.#(type=="function")#.description'
+  #           - "metadata.description"
+  #       replacements: # Same ordered literal and Go RE2 regex rules as role targets; $1/${1} expand captures.
+  #         - "old name": "new name"
+  #         - "remove this phrase": ""
+  #         - pattern: '(?i)user-(\d+)'
+  #           replacement: 'account-${1}'
+  #         - pattern: '(?s)<debug>.*?</debug>'
+  #           replacement: ""
+  #       # Invalid regex entries are skipped with an index-only warning; other replacements still run.
+  #       # Path targets edit only existing string nodes, regardless of role or field; missing/non-string nodes are skipped.
+  #       # Objects/arrays are not traversed recursively; duplicate resolved paths are replaced once per rule.
   #   filter: # Filter rules remove specified parameters from the payload.
   #     - models:
   #         - name: "gemini-2.5-pro" # Supports wildcards (e.g., "gemini-*")
