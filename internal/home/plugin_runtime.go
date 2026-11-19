@@ -31,9 +31,17 @@ func (r *Runtime) applyPluginConfig(ctx context.Context, cfg *config.Config) {
 	r.pluginHost.ApplyConfig(ctx, pluginRuntimeConfig(cfg))
 }
 
-// HasScheduler reports whether a Home-loaded plugin supplies auth scheduling.
+// HasScheduler reports whether a Home-loaded plugin supplies auth scheduling. While a plugin
+// instance requires a scheduler it stays true, so dispatch keeps asking PickAuth, which refuses.
 func (r *Runtime) HasScheduler() bool {
-	return r != nil && r.pluginHost != nil && r.pluginHost.HasScheduler()
+	if r == nil {
+		return false
+	}
+	if r.schedulerRequired() {
+		return true
+	}
+	host := r.schedulerSource()
+	return host != nil && host.HasScheduler()
 }
 
 // ParseAuth lets Home auth synthesis use provider plugins.
@@ -79,12 +87,27 @@ func (r *Runtime) RefreshAuth(ctx context.Context, auth *homeauth.Auth) (*homeau
 	return next, handled, errRefresh
 }
 
-// PickAuth lets Home dispatch use scheduler plugins.
+// PickAuth lets Home dispatch use scheduler plugins. A required scheduler that is not active,
+// because it never loaded or the host fused it, refuses the pick instead of letting the
+// built-in selector choose.
 func (r *Runtime) PickAuth(ctx context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
-	if r == nil || r.pluginHost == nil {
+	if r == nil {
 		return pluginapi.SchedulerPickResponse{}, false, nil
 	}
-	return r.pluginHost.PickAuth(ctx, req)
+	required := r.schedulerRequired()
+	host := r.schedulerSource()
+	if required && (host == nil || !host.HasScheduler()) {
+		return pluginapi.SchedulerPickResponse{}, true, errSchedulerUnavailable
+	}
+	if host == nil {
+		return pluginapi.SchedulerPickResponse{}, false, nil
+	}
+	resp, handled, errPick := host.PickAuth(ctx, req)
+	if errPick == nil && required && !host.HasScheduler() {
+		// The host fuses a scheduler that panics during this pick and reports the pick unhandled.
+		return pluginapi.SchedulerPickResponse{}, true, errSchedulerUnavailable
+	}
+	return resp, handled, errPick
 }
 
 // RegisteredPlugins returns Home-loaded plugin metadata for management clients.
