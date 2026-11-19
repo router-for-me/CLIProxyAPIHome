@@ -13,7 +13,18 @@ import (
 // lifecyclePostgresConnector only changes BEGIN for explicitly marked operations.
 // Embedding pgx's stdlib connection preserves its pooling, preparation, query,
 // cancellation, and bad-connection behavior for every other database/sql method.
-type lifecyclePostgresConnector struct{ driver.Connector }
+type lifecyclePostgresConnector struct {
+	driver.Connector
+	usageDeliveryPool *sql.DB
+}
+
+// Close ties the isolated delivery pool to the main database/sql pool lifetime.
+func (c lifecyclePostgresConnector) Close() error {
+	if c.usageDeliveryPool != nil {
+		return c.usageDeliveryPool.Close()
+	}
+	return nil
+}
 
 func (c lifecyclePostgresConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	conn, errConnect := c.Connector.Connect(ctx)

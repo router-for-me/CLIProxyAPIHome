@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"hash/maphash"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,13 +37,41 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	modelResolver schedulerModelResolver
-	availability  schedulerAvailabilityResolver
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu              sync.Mutex
+	strategy        schedulerStrategy
+	modelResolver   schedulerModelResolver
+	availability    schedulerAvailabilityResolver
+	providers       map[string]*providerScheduler
+	authProviders   map[string]string
+	mixedCursors    map[mixedCursorKey]int
+	mixedPoolStarts uint64
+}
+
+const maxMixedCursors = 4096
+
+var mixedPoolSeed = maphash.MakeSeed()
+
+type mixedIDSetKey struct {
+	sum, xor uint64
+	count    int
+}
+
+// mixedIDSetFingerprint is order-independent. It affects rotation only, never eligibility.
+func mixedIDSetFingerprint(ids map[string]struct{}) mixedIDSetKey {
+	key := mixedIDSetKey{count: len(ids)}
+	for id := range ids {
+		hash := maphash.String(mixedPoolSeed, id)
+		key.sum += hash
+		key.xor ^= hash
+	}
+	return key
+}
+
+type mixedCursorKey struct {
+	route, weights, policy string
+	allowed, tried         mixedIDSetKey
+	round, defaultRetry    int
+	hasAllowlist           bool
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -71,6 +101,7 @@ type modelScheduler struct {
 	entries               map[string]*scheduledAuth
 	priorityOrder         []int
 	readyByPriority       map[int]*readyBucket
+	readyVersion          uint64
 	blocked               cooldownQueue
 	retryRoundAll         dispatchAvailabilityAggregate
 	retryRoundAlphaSearch dispatchAvailabilityAggregate
@@ -78,6 +109,7 @@ type modelScheduler struct {
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
 type scheduledAuth struct {
+	id                      string // Immutable; safe to read from a published ready view.
 	meta                    *scheduledAuthMeta
 	auth                    *Auth
 	schedulerEligible       bool
@@ -165,8 +197,39 @@ func (a dispatchAvailabilityAggregate) summary(now time.Time, defaultRequestRetr
 
 // readyBucket keeps the ready views for one priority level.
 type readyBucket struct {
-	all readyView
-	ws  readyView
+	all, ws     readyView
+	retry       readyRetryCounts
+	alphaSearch readyRetryCounts
+	pickFacts   []readyPickFacts // Immutable; indexed by the position in all.flat.
+}
+
+type readyPickFacts struct {
+	retry       int // Negative means the credential inherits the request default.
+	alphaSearch bool
+}
+
+// readyRetryCounts answers retry-round counts without walking the ready view.
+type readyRetryCounts struct {
+	total     int
+	overrides []int // Sorted; credentials without an override use the request default.
+}
+
+func (c *readyRetryCounts) add(entry *scheduledAuth) {
+	c.total++
+	if entry.hasRequestRetryOverride {
+		c.overrides = append(c.overrides, entry.requestRetryOverride)
+	}
+}
+
+func (c readyRetryCounts) count(round, defaultRetry int) int {
+	if round == 0 {
+		return c.total
+	}
+	count := len(c.overrides) - sort.SearchInts(c.overrides, round)
+	if defaultRetry >= round {
+		count += c.total - len(c.overrides)
+	}
+	return count
 }
 
 // readyView holds the selection order for round-robin traversal.
@@ -223,7 +286,7 @@ func newAuthScheduler(selector Selector, modelResolver schedulerModelResolver, a
 		availability:  availabilityResolver,
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
+		mixedCursors:  make(map[mixedCursorKey]int),
 	}
 }
 
@@ -294,19 +357,18 @@ func (s *authScheduler) removeAuth(authID string) {
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
 func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts Options, tried map[string]struct{}) (*Auth, error) {
-	return s.pickSingleWithStrategy(ctx, provider, model, opts, tried, schedulerStrategyCurrent)
+	return s.pickSingleWithStrategy(provider, model, opts, tried, schedulerStrategyCurrent, nil)
 }
 
-func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, model string, opts Options, tried map[string]struct{}, strategy schedulerStrategy) (*Auth, error) {
+func (s *authScheduler) pickSingleWithStrategy(provider, model string, opts Options, tried map[string]struct{}, strategy schedulerStrategy, candidateIDs map[string]struct{}) (*Auth, error) {
 	// Build the candidate view before applying availability rules.
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
-	_ = ctx
-	_ = opts
 	preferWebsocket := false
+	predicate := newSchedulerPickFilter(opts, tried, candidateIDs).predicate()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -321,7 +383,6 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	predicate := schedulerPredicate(tried, allowedAuthIDsFromOptions(opts), credentialPolicyFromOptions(opts), requestRetryRoundFromOptions(opts), requestRetryDefaultFromOptions(opts))
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
@@ -330,10 +391,10 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 
 // pickMixed returns the next auth and provider for a mixed-provider request.
 func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts Options, tried map[string]struct{}) (*Auth, string, error) {
-	return s.pickMixedWithStrategy(ctx, providers, model, opts, tried, schedulerStrategyCurrent)
+	return s.pickMixedWithStrategy(ctx, providers, model, opts, tried, schedulerStrategyCurrent, nil)
 }
 
-func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []string, model string, opts Options, tried map[string]struct{}, strategy schedulerStrategy) (*Auth, string, error) {
+func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []string, model string, opts Options, tried map[string]struct{}, strategy schedulerStrategy, candidateIDs map[string]struct{}) (*Auth, string, error) {
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -345,7 +406,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		// When a single provider is eligible, reuse pickSingle so provider-specific preferences
 		// (for example Codex websocket transport) are applied consistently.
 		providerKey := normalized[0]
-		picked, errPick := s.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
+		picked, errPick := s.pickSingleWithStrategy(providerKey, model, opts, tried, strategy, candidateIDs)
 		if errPick != nil {
 			return nil, "", errPick
 		}
@@ -355,34 +416,73 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return picked, providerKey, nil
 	}
 	modelKey := canonicalModelKey(model)
-
-	s.mu.Lock()
+	filter := newSchedulerPickFilter(opts, tried, candidateIDs)
+	cursorKey := mixedCursorKey{
+		route: strings.Join(normalized, ",") + ":" + modelKey, policy: filter.policy,
+		allowed: mixedIDSetFingerprint(filter.allowed), tried: mixedIDSetFingerprint(filter.tried),
+		round: filter.round, defaultRetry: filter.defaultRetry, hasAllowlist: filter.allowed != nil,
+	}
+	const narrowAllowlistLimit = 128
+	broad := len(filter.allowed) > narrowAllowlistLimit
+	shards := make([]*modelScheduler, len(normalized))
+	pools := make([]mixedReadyPool, len(normalized))
+	for {
+		var snapshots []mixedReadySnapshot
+		if broad {
+			if ctx != nil && ctx.Err() != nil {
+				return nil, "", ctx.Err()
+			}
+			snapshots = s.mixedReadySnapshots(normalized, modelKey)
+			for i, snapshot := range snapshots {
+				pools[i] = snapshot.filteredPool(filter)
+			}
+		}
+		s.mu.Lock()
+		stable := true
+		now := time.Now()
+		for i, provider := range normalized {
+			shards[i] = s.providers[provider].ensureModelLocked(modelKey, now)
+			if broad && !snapshots[i].matches(shards[i]) {
+				stable = false
+			}
+		}
+		if stable {
+			break
+		}
+		// The scanned ready view changed. Recompute outside the lock rather
+		// than widening eligibility or moving the broad scan into this section.
+		s.mu.Unlock()
+	}
 	defer s.mu.Unlock()
 	if strategy == schedulerStrategyCurrent {
 		strategy = s.strategy
 	}
-
-	predicate := schedulerPredicate(tried, allowedAuthIDsFromOptions(opts), credentialPolicyFromOptions(opts), requestRetryRoundFromOptions(opts), requestRetryDefaultFromOptions(opts))
-	candidateShards := make([]*modelScheduler, len(normalized))
+	predicate := filter.predicate()
+	var allowedByProvider map[string][]string
+	if !broad && filter.allowed != nil {
+		allowedByProvider = make(map[string][]string, len(normalized))
+		for id := range filter.allowed {
+			if _, tried := filter.tried[id]; !tried {
+				provider := s.authProviders[id]
+				allowedByProvider[provider] = append(allowedByProvider[provider], id)
+			}
+		}
+	}
 	bestPriority := 0
 	hasCandidate := false
-	now := time.Now()
-	for providerIndex, providerKey := range normalized {
-		providerState := s.providers[providerKey]
-		if providerState == nil {
-			continue
-		}
-		shard := providerState.ensureModelLocked(modelKey, now)
-		candidateShards[providerIndex] = shard
+	for providerIndex, shard := range shards {
 		if shard == nil {
 			continue
 		}
-		priorityReady, okPriority := shard.highestReadyPriorityLocked(false, predicate)
-		if !okPriority {
+		if !broad {
+			pools[providerIndex] = shard.mixedReadyPool(filter, predicate, allowedByProvider[normalized[providerIndex]])
+		}
+		pool := pools[providerIndex]
+		if pool.count == 0 {
 			continue
 		}
-		if !hasCandidate || priorityReady > bestPriority {
-			bestPriority = priorityReady
+		if !hasCandidate || pool.priority > bestPriority {
+			bestPriority = pool.priority
 			hasCandidate = true
 		}
 	}
@@ -392,11 +492,11 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 
 	if strategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
-			shard := candidateShards[providerIndex]
-			if shard == nil {
+			pool := &pools[providerIndex]
+			if pool.count == 0 || pool.priority != bestPriority {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := pool.pick(strategy, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -404,24 +504,33 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
-	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
+	var weightKey [32]byte
+	weightBytes := weightKey[:0]
 	weights := make([]int, len(normalized))
 	segmentStarts := make([]int, len(normalized))
 	segmentEnds := make([]int, len(normalized))
 	totalWeight := 0
-	for providerIndex, shard := range candidateShards {
+	for providerIndex, pool := range pools {
 		segmentStarts[providerIndex] = totalWeight
-		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority)
+		if pool.priority == bestPriority {
+			weights[providerIndex] = pool.count
 		}
 		totalWeight += weights[providerIndex]
 		segmentEnds[providerIndex] = totalWeight
+		weightBytes = strconv.AppendInt(weightBytes, int64(weights[providerIndex]), 10)
+		weightBytes = append(weightBytes, ',')
 	}
+	cursorKey.weights = string(weightBytes)
 	if totalWeight == 0 {
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
-	startSlot := s.mixedCursors[cursorKey] % totalWeight
+	cursor, knownPool := s.mixedCursors[cursorKey]
+	if !knownPool {
+		// Stagger first picks across new and evicted pools without sharing their rotation.
+		cursor = int(s.mixedPoolStarts % uint64(totalWeight))
+	}
+	startSlot := cursor % totalWeight
 	startProviderIndex := -1
 	for providerIndex := range normalized {
 		if weights[providerIndex] == 0 {
@@ -446,18 +555,87 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			slot = segmentStarts[providerIndex]
 		}
 		providerKey := normalized[providerIndex]
-		shard := candidateShards[providerIndex]
-		if shard == nil {
-			continue
-		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := pools[providerIndex].pick(schedulerStrategyRoundRobin, predicate)
 		if picked == nil {
 			continue
+		}
+		if !knownPool {
+			s.mixedPoolStarts++
+			if len(s.mixedCursors) >= maxMixedCursors {
+				for key := range s.mixedCursors {
+					delete(s.mixedCursors, key)
+					break
+				}
+			}
 		}
 		s.mixedCursors[cursorKey] = slot + 1
 		return picked, providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+}
+
+type mixedReadySnapshot struct {
+	shard   *modelScheduler
+	version uint64
+	buckets map[int]*readyBucket
+}
+
+func (v mixedReadySnapshot) matches(shard *modelScheduler) bool {
+	return v.shard == shard && (shard == nil || v.version == shard.readyVersion)
+}
+
+// mixedReadySnapshots captures immutable ready membership and filtering facts.
+// The caller verifies the shard version before consuming the result.
+func (s *authScheduler) mixedReadySnapshots(providers []string, model string) []mixedReadySnapshot {
+	snapshots := make([]mixedReadySnapshot, len(providers))
+	s.mu.Lock()
+	now := time.Now()
+	for i, provider := range providers {
+		shard := s.providers[provider].ensureModelLocked(model, now)
+		if shard != nil {
+			snapshots[i] = mixedReadySnapshot{shard, shard.readyVersion, shard.readyByPriority}
+		}
+	}
+	s.mu.Unlock()
+	return snapshots
+}
+
+func (v mixedReadySnapshot) filteredPool(filter schedulerPickFilter) mixedReadyPool {
+	var pool mixedReadyPool
+	for priority, bucket := range v.buckets {
+		if pool.count > 0 && priority <= pool.priority {
+			continue
+		}
+		var positions []int
+		count := 0
+		for i, entry := range bucket.all.flat {
+			_, allowed := filter.allowed[entry.id]
+			_, tried := filter.tried[entry.id]
+			facts := bucket.pickFacts[i]
+			limit := facts.retry
+			if limit < 0 {
+				limit = filter.defaultRetry
+			}
+			if !allowed || tried || limit < filter.round ||
+				(filter.policy != "" && (filter.policy != CredentialPolicyCodexAlphaSearchV1 || !facts.alphaSearch)) {
+				if positions == nil {
+					positions = make([]int, count, len(bucket.all.flat)-1)
+					for j := range positions {
+						positions[j] = j
+					}
+				}
+				continue
+			}
+			count++
+			if positions != nil {
+				positions = append(positions, i)
+			}
+		}
+		if count > 0 {
+			pool = mixedReadyPool{view: &bucket.all, priority: priority, count: count, indexed: true, positions: positions}
+		}
+	}
+	return pool
 }
 
 // summarizeDispatchAvailability reads retry-round state from the same
@@ -773,7 +951,7 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		if meta == nil || meta.auth == nil || (!meta.supportsModel(modelKey) && !meta.hasRegisteredModel(modelKey)) {
 			continue
 		}
-		entry := &scheduledAuth{meta: meta, auth: meta.auth}
+		entry := &scheduledAuth{id: meta.auth.ID, meta: meta, auth: meta.auth}
 		if shard.availability != nil {
 			entry.auth = shard.availability(meta.auth, now)
 		}
@@ -881,7 +1059,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	}
 	entry, ok := m.entries[meta.auth.ID]
 	if !ok || entry == nil {
-		entry = &scheduledAuth{}
+		entry = &scheduledAuth{id: meta.auth.ID}
 		m.entries[meta.auth.ID] = entry
 	}
 	previousState := entry.state
@@ -952,8 +1130,13 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 			// no later entry can be promoted during this pass.
 			break
 		}
+		previous := *entry
 		m.refreshEntryStateLocked(entry, now)
-		changed = true
+		// An expired retry deadline may still be fenced by refresh acquisition.
+		// Only changed scheduling facts invalidate published ready snapshots.
+		if previous != *entry {
+			changed = true
+		}
 	}
 	if changed {
 		m.rebuildIndexesLocked()
@@ -1031,19 +1214,119 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-// readyCountAtPriorityLocked reads a y count at priority locked.
-func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
-	if m == nil {
-		return 0
+// mixedReadyPool holds only the highest eligible priority of one provider.
+type mixedReadyPool struct {
+	view         *readyView
+	priority     int
+	count        int
+	allowedReady []*scheduledAuth // Populated for narrow allowlists.
+	indexed      bool
+	positions    []int // Sorted; nil means the whole view is eligible.
+}
+
+func (m *modelScheduler) mixedReadyPool(filter schedulerPickFilter, predicate func(*scheduledAuth) bool, allowedIDs []string) mixedReadyPool {
+	var pool mixedReadyPool
+	if filter.allowed != nil {
+		for _, id := range allowedIDs {
+			entry := m.entries[id]
+			if entry == nil || !entry.schedulerEligible || entry.state != scheduledStateReady || !predicate(entry) {
+				continue
+			}
+			priority := entry.meta.priority
+			if pool.count == 0 || priority > pool.priority {
+				pool.priority = priority
+				pool.allowedReady = pool.allowedReady[:0]
+			} else if priority < pool.priority {
+				continue
+			}
+			pool.allowedReady = append(pool.allowedReady, entry)
+			pool.count = len(pool.allowedReady)
+		}
+		if pool.count > 0 {
+			pool.view = &m.readyByPriority[pool.priority].all
+		}
+		return pool
 	}
-	bucket := m.readyByPriority[priority]
-	if bucket == nil {
-		return 0
+
+	var excludedByPriority map[int]int
+	if len(filter.tried) > 0 {
+		// Count the exclusions rather than scanning the ready bucket. Use the
+		// same policy and retry filter, ignoring only the tried-ID check.
+		matchesPolicy := schedulerPredicate(nil, nil, filter.policy, filter.round, filter.defaultRetry)
+		excludedByPriority = make(map[int]int)
+		for id := range filter.tried {
+			entry := m.entries[id]
+			if entry != nil && entry.schedulerEligible && entry.state == scheduledStateReady && matchesPolicy(entry) {
+				excludedByPriority[entry.meta.priority]++
+			}
+		}
 	}
-	if preferWebsocket && len(bucket.ws.flat) > 0 {
-		return len(bucket.ws.flat)
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		var count int
+		switch filter.policy {
+		case "":
+			count = bucket.retry.count(filter.round, filter.defaultRetry)
+		case CredentialPolicyCodexAlphaSearchV1:
+			count = bucket.alphaSearch.count(filter.round, filter.defaultRetry)
+		}
+		count -= excludedByPriority[priority]
+		if count > 0 {
+			return mixedReadyPool{view: &bucket.all, priority: priority, count: count}
+		}
 	}
-	return len(bucket.all.flat)
+	return pool
+}
+
+func (p *mixedReadyPool) pick(strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	var picked *scheduledAuth
+	switch {
+	case p.indexed:
+		index := 0
+		if strategy != schedulerStrategyFillFirst {
+			index = p.view.cursor % len(p.view.flat)
+		}
+		if p.positions != nil {
+			next := sort.SearchInts(p.positions, index)
+			index = p.positions[next%len(p.positions)]
+		}
+		picked = p.view.flat[index]
+		if strategy != schedulerStrategyFillFirst {
+			p.view.cursor = index + 1
+		}
+	case p.allowedReady != nil:
+		// Preserve the shared bucket cursor without walking credentials outside
+		// the allowlist. The full ready view is sorted by auth ID.
+		startID := ""
+		if strategy != schedulerStrategyFillFirst {
+			startID = p.view.flat[p.view.cursor%len(p.view.flat)].auth.ID
+		}
+		var first *scheduledAuth
+		for _, entry := range p.allowedReady {
+			id := entry.auth.ID
+			if first == nil || id < first.auth.ID {
+				first = entry
+			}
+			if id >= startID && (picked == nil || id < picked.auth.ID) {
+				picked = entry
+			}
+		}
+		if picked == nil {
+			picked = first
+		}
+		if strategy != schedulerStrategyFillFirst {
+			index := sort.Search(len(p.view.flat), func(i int) bool { return p.view.flat[i].auth.ID >= picked.auth.ID })
+			p.view.cursor = index + 1
+		}
+	case strategy == schedulerStrategyFillFirst:
+		picked = p.view.pickFirst(predicate)
+	default:
+		picked = p.view.pickRoundRobin(predicate)
+	}
+	if picked == nil {
+		return nil
+	}
+	return picked.auth
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
@@ -1112,6 +1395,7 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		}
 	}
 
+	m.readyVersion++
 	m.readyByPriority = make(map[int]*readyBucket)
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
@@ -1179,12 +1463,24 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 	bucket := &readyBucket{}
 	bucket.all = buildReadyView(entries)
+	bucket.pickFacts = make([]readyPickFacts, len(entries))
 	wsEntries := make([]*scheduledAuth, 0, len(entries))
-	for _, entry := range entries {
-		if entry != nil && entry.meta != nil && entry.meta.websocketEnabled {
+	for i, entry := range entries {
+		retry := -1
+		if entry.hasRequestRetryOverride {
+			retry = entry.requestRetryOverride
+		}
+		bucket.pickFacts[i] = readyPickFacts{retry: retry, alphaSearch: entry.alphaSearchAllowed}
+		bucket.retry.add(entry)
+		if entry.alphaSearchAllowed {
+			bucket.alphaSearch.add(entry)
+		}
+		if entry.meta.websocketEnabled {
 			wsEntries = append(wsEntries, entry)
 		}
 	}
+	sort.Ints(bucket.retry.overrides)
+	sort.Ints(bucket.alphaSearch.overrides)
 	bucket.ws = buildReadyView(wsEntries)
 	return bucket
 }

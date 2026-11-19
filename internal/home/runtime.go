@@ -157,10 +157,15 @@ type DispatchResponsePreparer func(*DispatchResult) (unaccounted []byte, account
 
 // DispatchConcurrencyContext carries the RESP connection identity required for admission.
 type DispatchConcurrencyContext struct {
-	Fingerprint     string
-	ConnectedAt     time.Time
-	Controlled      bool
-	ProtocolVersion int
+	Stream             bool
+	RequestID          string
+	TraceID            string
+	ExecutionSessionID string
+	RequestedModel     string
+	Fingerprint        string
+	ConnectedAt        time.Time
+	Controlled         bool
+	ProtocolVersion    int
 	// RetryRound carries the zero-based CPA request retry round.
 	RetryRound int
 	// RetryRoundPresent distinguishes an explicit wire retry_round=0 from an
@@ -852,6 +857,7 @@ func (r *Runtime) clearDisabledCooldowns(ctx context.Context) error {
 }
 
 type DispatchResult struct {
+	SelectionID   string
 	Model         string
 	AccessToken   string
 	BaseURL       string
@@ -898,7 +904,7 @@ func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel
 }
 
 func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, excludedAuthIDs []string, pinnedAuthID string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
-	opts := coreauth.Options{}
+	opts := coreauth.Options{Stream: concurrencyCtx.Stream}
 	if headers != nil {
 		opts.Headers = headers.Clone()
 	}
@@ -907,6 +913,18 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
 	metadata := make(map[string]any)
+	for key, value := range map[string]string{
+		"request_id": concurrencyCtx.RequestID, "trace_id": concurrencyCtx.TraceID,
+		"execution_session_id":             concurrencyCtx.ExecutionSessionID,
+		coreauth.RequestedModelMetadataKey: concurrencyCtx.RequestedModel,
+		"node_kind":                        headers.Get("X-Node-Kind"),
+		"canonical_session_id":             coreauth.NormalizeExplicitID(headers.Get("X-Session-ID")),
+		"parent_session_id":                coreauth.NormalizeExplicitID(headers.Get("X-Parent-Session-ID")),
+	} {
+		if value != "" {
+			metadata[key] = value
+		}
+	}
 	if allowedAuthIDs != nil {
 		metadata[coreauth.AllowedAuthIDsMetadataKey] = allowedAuthIDs
 	}
@@ -987,6 +1005,9 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
 	defer func() { opts.SessionAffinity.Finish(false) }()
 	var lastCandidateError error
+	var capacityRetryError error
+	var capacityRetryDelay time.Duration
+	var admissionErrorsByCredential map[string]error
 	for {
 		opts.SessionAffinity.Reset()
 		if errContext := ctx.Err(); errContext != nil {
@@ -994,8 +1015,29 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
-			if lastCandidateError != nil {
-				return nil, lastCandidateError
+			// A recoverable admission failure may clear sooner than the remaining
+			// pool's cooldown. Only compare typed cooldowns; never mask rejection,
+			// protocol incompatibility, cancellation, or another dispatch failure.
+			var cooldown interface {
+				ErrorCode() string
+				RetryAfter() *time.Duration
+			}
+			if capacityRetryError != nil && errors.As(errDispatch, &cooldown) && cooldown.ErrorCode() == "model_cooldown" {
+				if delay := cooldown.RetryAfter(); delay != nil && capacityRetryDelay < *delay {
+					return nil, capacityRetryError
+				}
+			}
+			if dispatchErr, ok := errDispatch.(*coreauth.Error); ok {
+				switch dispatchErr.Code {
+				case "auth_not_found", "auth_unavailable":
+					if lastCandidateError != nil {
+						return nil, lastCandidateError
+					}
+				case "session_auth_unavailable":
+					if admissionErr := admissionErrorsByCredential[dispatchErr.BoundCredentialID()]; admissionErr != nil {
+						return nil, admissionErr
+					}
+				}
 			}
 			return nil, errDispatch
 		}
@@ -1020,7 +1062,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 		}
 		result := &DispatchResult{
-			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
+			SelectionID: decision.SelectionID,
+			Model:       upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
 			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
 			ModelInfo: dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel),
@@ -1065,7 +1108,28 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				if !concurrencyCandidateIneligible(admissionType) {
 					return nil, errAdmit
 				}
+				if admissionType == "credential_concurrency_exceeded" || admissionType == "credential_model_concurrency_exceeded" {
+					var delay *time.Duration
+					var timed interface{ RetryAfter() *time.Duration }
+					if errors.As(errAdmit, &timed) {
+						delay = timed.RetryAfter()
+					}
+					if delay == nil || *delay <= 0 {
+						retryDelay := time.Duration(r.ConcurrencyRetryAfterMS(0)) * time.Millisecond
+						errAdmit = &concurrencyRetryError{error: errAdmit, retryAfter: retryDelay}
+						delay = &retryDelay
+					}
+					if capacityRetryError == nil || *delay < capacityRetryDelay {
+						capacityRetryError, capacityRetryDelay = errAdmit, *delay
+					}
+				}
 				lastCandidateError = errAdmit
+				// Keep the actionable admission failure for this credential, including
+				// missing protocol support, when a never-rebind session cannot fail over.
+				if admissionErrorsByCredential == nil {
+					admissionErrorsByCredential = make(map[string]error)
+				}
+				admissionErrorsByCredential[auth.ID] = errAdmit
 				excluded := coreauth.ExcludedConcurrencyCandidate{CredentialID: auth.ID}
 				if admissionType == "credential_model_concurrency_exceeded" {
 					excluded.Model = concurrencyModel
@@ -1193,6 +1257,10 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 // visible to this API key. Policy failures omit the optional hint.
 func (r *Runtime) withModelAliasHint(ctx context.Context, err error, reqModel, apiKey string) error {
 	if err == nil || r == nil || r.coreManager == nil {
+		return err
+	}
+	var rejection *coreauth.SchedulerRejectError
+	if errors.As(err, &rejection) {
 		return err
 	}
 	authErr, structured := err.(*coreauth.Error)

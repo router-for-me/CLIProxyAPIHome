@@ -36,6 +36,11 @@ func (r *Runtime) HasScheduler() bool {
 	return r != nil && r.pluginHost != nil && r.pluginHost.HasScheduler()
 }
 
+// SchedulerWantsAcrossPriorities reports the active scheduler's candidate scope.
+func (r *Runtime) SchedulerWantsAcrossPriorities() bool {
+	return r != nil && r.pluginHost != nil && r.pluginHost.SchedulerWantsAcrossPriorities()
+}
+
 // ParseAuth lets Home auth synthesis use provider plugins.
 func (r *Runtime) ParseAuth(ctx context.Context, req pluginapi.AuthParseRequest) (*homeauth.Auth, bool, error) {
 	if r == nil || r.pluginHost == nil {

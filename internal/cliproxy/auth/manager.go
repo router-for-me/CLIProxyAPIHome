@@ -1386,7 +1386,14 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if !modelAllowedByID(routeKey, allowedModelIDs) {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, opts, nil, defaultRequestRetry)
+	// Admission exclusions fence this attempt, not the request's future retry rounds.
+	// Keep API-key, model, pin, provider and credential-policy restrictions intact.
+	retryBudgetOpts := opts
+	if len(excludedConcurrencyCandidatesFromOptions(opts)) > 0 {
+		retryBudgetOpts.Metadata = cloneAnyMap(opts.Metadata)
+		delete(retryBudgetOpts.Metadata, ExcludedConcurrencyCandidatesMetadataKey)
+	}
+	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, retryBudgetOpts, nil, defaultRequestRetry)
 	requestRetry := retrySummary.requestRetry
 	if !retrySummary.hasRequestRetry || requestRetry < 0 {
 		requestRetry = 0
@@ -1397,7 +1404,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		for {
 			auth, providerKey, errPick := m.scheduler.pickMixed(ctx, providers, routeModel, opts, tried)
 			if errPick != nil {
-				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
+				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried, nil, defaultRequestRetry)
 			}
 			if auth == nil {
 				return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1436,7 +1443,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 	}
 
-	filterWeights := !m.hasPluginScheduler()
+	allowPinnedAccounting := !m.hasPluginScheduler()
 	unpinnedAllowedAuthIDs := unpinnedAllowedAuthIDsFromOptions(opts)
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	pinnedAuthID := pinnedAuthIDFromOptions(opts)
@@ -1448,8 +1455,12 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		now := time.Now()
 		m.mu.RLock()
 		selector := m.selector
+		affinity, _ := selector.(*SessionAffinitySelector)
 		pluginScheduler := m.pluginScheduler
-		trackPinnedAccounting := pinnedAuthID != "" && filterWeights && isWeightedSelector(selector)
+		var concurrencyBlocked map[string]struct{}
+		// Match CPA eligibility before priority scoping, independently of plugin accounting.
+		weighted := isWeightedSelector(selector)
+		trackPinnedAccounting := pinnedAuthID != "" && allowPinnedAccounting && weighted
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
 		var transientAuthIDs map[string]struct{}
@@ -1467,7 +1478,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if filterWeights && isWeightedSelector(selector) && authWeight(candidate) <= 0 {
+			if weighted && authWeight(candidate) <= 0 {
 				continue
 			}
 			if !authAllowedByID(candidate.ID, unpinnedAllowedAuthIDs) {
@@ -1522,6 +1533,12 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				continue
 			}
 			if concurrencyCandidateExcluded(opts, candidate.ID, dispatchCandidate.upstreamKey) {
+				if affinity != nil && affinity.rebindOn == "never" && pinnedAllowed {
+					if concurrencyBlocked == nil {
+						concurrencyBlocked = make(map[string]struct{})
+					}
+					concurrencyBlocked[candidate.ID] = struct{}{}
+				}
 				continue
 			}
 			// Pinning restricts selection, not the eligible pool used for accounting.
@@ -1537,24 +1554,56 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		m.mu.RUnlock()
 
 		if len(availableAuths) == 0 {
+			if len(concurrencyBlocked) > 0 {
+				bound, errBinding := affinity.activeNeverBinding(ctx, opts, selectionArgForSelector(selector, routeModel))
+				if errBinding != nil {
+					return nil, errBinding
+				}
+				if _, blocked := concurrencyBlocked[bound]; blocked {
+					return nil, sessionAuthUnavailableError(bound)
+				}
+			}
 			errUnavailable := dispatchUnavailableError(routeModel, providerForSelector, totalCandidates, cooldownCount, earliest, now)
-			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
+			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, nil, defaultRequestRetry)
 		}
 
 		var auth *Auth
+		var pluginExcluded map[string]struct{}
+		var delegated bool
 		if pluginScheduler != nil {
-			pluginAuth, handled, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths)
+			pluginAuth, excluded, delegateBuiltin, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths, affinity)
 			if errPluginPick != nil {
 				return nil, errPluginPick
 			}
-			if handled && pluginAuth != nil {
-				auth = pluginAuth
-			}
+			auth, pluginExcluded, delegated = pluginAuth, excluded, delegateBuiltin
 		}
 
 		if auth == nil {
+			var builtinCandidates []*Auth
+			if len(pluginExcluded) > 0 {
+				availableAuths = filterPluginExcludedAuths(availableAuths, pluginExcluded)
+				weightedFallback := !delegated && isWeightedSelector(selector)
+				if weightedFallback {
+					availableAuths = positiveWeightAuths(availableAuths)
+				}
+				if len(availableAuths) == 0 {
+					bound, errBinding := affinity.activeNeverBinding(ctx, opts, selectionArgForSelector(selector, routeModel))
+					if errBinding != nil {
+						return nil, errBinding
+					}
+					if bound != "" {
+						return nil, sessionAuthUnavailableError(bound)
+					}
+					// The plugin sees only ready credentials. Re-scan with the fallback's
+					// weight rules for this pick.
+					opts.positiveWeightOnly = weightedFallback
+					errUnavailable := &Error{Code: "auth_not_found", Message: "no auth available"}
+					return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, pluginExcluded, defaultRequestRetry)
+				}
+				builtinCandidates = availableAuths
+			}
 			if isBuiltInSelector(selector) && len(excludedConcurrencyCandidatesFromOptions(opts)) == 0 {
-				builtinAuth, handledBuiltin, errBuiltinPick := m.pickViaBuiltinScheduler(ctx, schedulerStrategyCurrent, providerForSelector, normalizedProviders, routeModel, opts, tried)
+				builtinAuth, handledBuiltin, errBuiltinPick := m.pickViaBuiltinScheduler(ctx, schedulerStrategyCurrent, providerForSelector, normalizedProviders, routeModel, opts, tried, builtinCandidates)
 				if errBuiltinPick != nil {
 					return nil, errBuiltinPick
 				}
@@ -1579,6 +1628,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 		if auth == nil {
 			return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if _, excluded := pluginExcluded[auth.ID]; excluded {
+			return nil, &Error{Code: "auth_unavailable", Message: "selector returned auth outside candidates"}
 		}
 		var selectedCandidate dispatchCandidate
 		foundCandidate := false
@@ -1620,7 +1672,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			upstream = routeModel
 		}
 		selectionReturned = true
+		selectionID, _ := opts.Metadata["selection_id"].(string)
 		return &DispatchDecision{
+			SelectionID:   selectionID,
 			Auth:          fullAuth.Clone(),
 			Provider:      providerKey,
 			UpstreamModel: upstream,
@@ -1633,7 +1687,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 }
 
 func (m *Manager) summarizeDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}, defaultRequestRetry int) dispatchAvailabilitySummary {
-	if m != nil && m.scheduler != nil && !m.hasPluginScheduler() && m.useSchedulerFastPath() {
+	if m != nil && m.scheduler != nil && !opts.positiveWeightOnly && !m.hasPluginScheduler() && m.useSchedulerFastPath() {
 		return m.scheduler.summarizeDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRequestRetry)
 	}
 	return m.scanDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRequestRetry)
@@ -1658,13 +1712,14 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	registryRef := registry.GetGlobalRegistry()
 	retryRound := requestRetryRoundFromOptions(opts)
 
-	filterWeights := !m.hasPluginScheduler()
+	hasConcurrencyExclusions := len(excludedConcurrencyCandidatesFromOptions(opts)) > 0
 	m.mu.RLock()
+	weighted := isWeightedSelector(m.selector)
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
 			continue
 		}
-		if filterWeights && isWeightedSelector(m.selector) && authWeight(candidate) <= 0 {
+		if (opts.positiveWeightOnly || weighted) && authWeight(candidate) <= 0 {
 			continue
 		}
 		if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
@@ -1687,7 +1742,7 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 			continue
 		}
 		resolved := m.resolveDispatchModel(candidate, routeModel)
-		if strings.TrimSpace(resolved.Model) == "" {
+		if strings.TrimSpace(resolved.Model) == "" || (hasConcurrencyExclusions && concurrencyCandidateExcluded(opts, candidate.ID, resolved.Key)) {
 			continue
 		}
 		authForAvailability := m.effectiveAvailabilityAuth(candidate, summary.now)
@@ -1713,8 +1768,19 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	return summary
 }
 
-func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs map[string]struct{}, defaultRequestRetry int) error {
-	if m == nil || errDispatch == nil {
+func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs, pluginExcludedAuthIDs map[string]struct{}, defaultRequestRetry int) error {
+	if m == nil {
+		return errDispatch
+	}
+	// Retry-round forecasts are only valid after candidate-pool exhaustion.
+	// In particular, a canceled broad-allowlist scan has no availability result.
+	switch exhausted := errDispatch.(type) {
+	case *modelCooldownError:
+	case *Error:
+		if exhausted.Code != "auth_not_found" && exhausted.Code != "auth_unavailable" {
+			return errDispatch
+		}
+	default:
 		return errDispatch
 	}
 
@@ -1730,6 +1796,9 @@ func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers 
 			nextRound++
 		}
 		nextRoundOpts := withRequestRetryDispatchMetadata(opts, nextRound, defaultRequestRetry)
+		// The next pick runs the plugin again. Neither its exclusions nor its
+		// current fallback strategy are a restriction on that round.
+		nextRoundOpts.positiveWeightOnly = false
 		summary = m.summarizeDispatchAvailability(providers, routeModel, nextRoundOpts, nil, defaultRequestRetry)
 		provider := "mixed"
 		if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
@@ -1740,8 +1809,15 @@ func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers 
 	}
 
 	if !hasSummary {
-		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, triedAuthIDs, defaultRequestRetry)
-		if summary.total > 0 && summary.cooldownCount == summary.total && !summary.earliest.IsZero() {
+		ineligible := triedAuthIDs
+		if len(pluginExcludedAuthIDs) > 0 {
+			ineligible = cloneAuthIDSet(triedAuthIDs)
+			for id := range pluginExcludedAuthIDs {
+				ineligible[id] = struct{}{}
+			}
+		}
+		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, ineligible, defaultRequestRetry)
+		if len(pluginExcludedAuthIDs) > 0 || (summary.total > 0 && summary.cooldownCount == summary.total && !summary.earliest.IsZero()) {
 			provider := "mixed"
 			if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
 				provider = normalizedProviders[0]
