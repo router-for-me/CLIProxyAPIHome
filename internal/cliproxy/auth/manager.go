@@ -1670,7 +1670,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			upstream = routeModel
 		}
 		selectionReturned = true
+		selectionID, _ := opts.Metadata["selection_id"].(string)
 		return &DispatchDecision{
+			SelectionID:   selectionID,
 			Auth:          fullAuth.Clone(),
 			Provider:      providerKey,
 			UpstreamModel: upstream,

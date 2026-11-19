@@ -46,6 +46,7 @@ type ExcludedConcurrencyCandidate struct {
 // This is a deliberately small subset of CPA's execution options: CLIProxyAPIHome only needs
 // headers / query / raw request bytes for selector decisions, and a generic metadata bag.
 type Options struct {
+	Stream          bool
 	Headers         http.Header
 	Query           url.Values
 	OriginalRequest []byte

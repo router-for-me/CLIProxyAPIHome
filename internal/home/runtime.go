@@ -157,10 +157,15 @@ type DispatchResponsePreparer func(*DispatchResult) (unaccounted []byte, account
 
 // DispatchConcurrencyContext carries the RESP connection identity required for admission.
 type DispatchConcurrencyContext struct {
-	Fingerprint     string
-	ConnectedAt     time.Time
-	Controlled      bool
-	ProtocolVersion int
+	Stream             bool
+	RequestID          string
+	TraceID            string
+	ExecutionSessionID string
+	RequestedModel     string
+	Fingerprint        string
+	ConnectedAt        time.Time
+	Controlled         bool
+	ProtocolVersion    int
 	// RetryRound carries the zero-based CPA request retry round.
 	RetryRound int
 	// RetryRoundPresent distinguishes an explicit wire retry_round=0 from an
@@ -852,6 +857,7 @@ func (r *Runtime) clearDisabledCooldowns(ctx context.Context) error {
 }
 
 type DispatchResult struct {
+	SelectionID   string
 	Model         string
 	AccessToken   string
 	BaseURL       string
@@ -898,7 +904,7 @@ func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel
 }
 
 func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, excludedAuthIDs []string, pinnedAuthID string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
-	opts := coreauth.Options{}
+	opts := coreauth.Options{Stream: concurrencyCtx.Stream}
 	if headers != nil {
 		opts.Headers = headers.Clone()
 	}
@@ -907,6 +913,18 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
 	metadata := make(map[string]any)
+	for key, value := range map[string]string{
+		"request_id": concurrencyCtx.RequestID, "trace_id": concurrencyCtx.TraceID,
+		"execution_session_id":             concurrencyCtx.ExecutionSessionID,
+		coreauth.RequestedModelMetadataKey: concurrencyCtx.RequestedModel,
+		"node_kind":                        headers.Get("X-Node-Kind"),
+		"canonical_session_id":             coreauth.NormalizeExplicitID(headers.Get("X-Session-ID")),
+		"parent_session_id":                coreauth.NormalizeExplicitID(headers.Get("X-Parent-Session-ID")),
+	} {
+		if value != "" {
+			metadata[key] = value
+		}
+	}
 	if allowedAuthIDs != nil {
 		metadata[coreauth.AllowedAuthIDsMetadataKey] = allowedAuthIDs
 	}
@@ -1044,7 +1062,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 		}
 		result := &DispatchResult{
-			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
+			SelectionID: decision.SelectionID,
+			Model:       upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
 			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
 			ModelInfo: dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel),

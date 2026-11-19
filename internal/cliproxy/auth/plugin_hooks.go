@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -251,6 +252,41 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 }
 
 func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts Options, tried map[string]struct{}, candidates []*Auth, affinity *SessionAffinitySelector) (selectedAuth *Auth, excludedAuthIDs map[string]struct{}, delegated bool, err error) {
+	if scheduler == nil || len(candidates) == 0 {
+		delete(opts.Metadata, pluginapi.SelectionIDMetadataKey)
+		return nil, nil, false, nil
+	}
+	if state, ok := scheduler.(pluginSchedulerState); ok && !state.HasScheduler() {
+		delete(opts.Metadata, pluginapi.SelectionIDMetadataKey)
+		return nil, nil, false, nil
+	}
+	builtinCandidates := candidates
+	// Scope the plugin's view independently from the session selector's pool.
+	across, wantsAcross := scheduler.(interface{ SchedulerWantsAcrossPriorities() bool })
+	if !wantsAcross || !across.SchedulerWantsAcrossPriorities() {
+		highest := authPriority(candidates[0])
+		for _, candidate := range candidates[1:] {
+			if priority := authPriority(candidate); priority > highest {
+				highest = priority
+			}
+		}
+		priorityCandidates := make([]*Auth, 0, len(candidates))
+		for _, candidate := range candidates {
+			if authPriority(candidate) == highest {
+				priorityCandidates = append(priorityCandidates, candidate)
+			}
+		}
+		candidates = priorityCandidates
+	}
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
+	opts.Metadata[pluginapi.SelectionIDMetadataKey] = uuid.NewString()
+	defer func() {
+		if err != nil || selectedAuth == nil {
+			delete(opts.Metadata, pluginapi.SelectionIDMetadataKey)
+		}
+	}()
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	requestProvider := providerKey
 	if providerKey == "mixed" {
@@ -260,6 +296,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 		Provider:   requestProvider,
 		Providers:  schedulerProviders(providerKey, providers),
 		Model:      model,
+		Stream:     opts.Stream,
 		Options:    schedulerOptions(opts),
 		Candidates: schedulerAuthCandidates(candidates),
 	}
@@ -303,7 +340,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if affinity != nil && affinity.rebindOn != "never" && len(excludedConcurrencyCandidatesFromOptions(opts)) > 0 {
 		return nil, excluded, false, nil
 	}
-	eligible := filterPluginExcludedAuths(candidates, excluded)
+	eligible := filterPluginExcludedAuths(builtinCandidates, excluded)
 	if len(eligible) == 0 {
 		// Preserve the selected strategy when Dispatch checks for cooling candidates.
 		return nil, excluded, true, nil

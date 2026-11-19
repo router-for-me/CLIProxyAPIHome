@@ -34,6 +34,7 @@ func Register(reg *dispatch.Registry) {
 	}
 	_ = reg.RegisterDynamic("RPOP", typeAuth, handleAuth)
 	_ = reg.RegisterDynamic("RPOP", typeAuthValidate, handleAuthValidate)
+	_ = reg.RegisterDynamic("RPOP", "scheduler-continuity", handleSchedulerContinuity)
 	_ = reg.SetDynamicDefault("RPOP", handleAuth)
 }
 
@@ -161,6 +162,11 @@ func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string, cfg
 		if errSet := set("request_retry", result.RequestRetry); errSet != nil {
 			return nil, errSet
 		}
+		if result.SelectionID != "" {
+			if errSet := set("selection_id", result.SelectionID); errSet != nil {
+				return nil, errSet
+			}
+		}
 		if result.ForceMapping && strings.TrimSpace(result.OriginalAlias) != "" {
 			if errSet := set("force_mapping", true); errSet != nil {
 				return nil, errSet
@@ -253,6 +259,23 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		return nil, "", &reply
 	}
 
+	var schedulerContext struct {
+		Stream             bool   `json:"stream"`
+		RequestID          string `json:"request_id"`
+		TraceID            string `json:"trace_id"`
+		ExecutionSessionID string `json:"execution_session_id"`
+		RequestedModel     string `json:"requested_model"`
+	}
+	if field := gjson.Get(jsonArg, "scheduler_context"); field.Exists() {
+		if !field.IsObject() {
+			reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
+			return nil, "", &reply
+		}
+		if errUnmarshal := json.Unmarshal([]byte(field.Raw), &schedulerContext); errUnmarshal != nil {
+			reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
+			return nil, "", &reply
+		}
+	}
 	headers := parseHeaders(jsonArg)
 	sessionID := coreauth.NormalizeExplicitID(gjson.Get(jsonArg, "session_id").String())
 	if sessionID != "" && strings.TrimSpace(headers.Get("X-Session-ID")) == "" {
@@ -288,6 +311,9 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
 	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, excludedAuthIDs, pinnedAuthID, home.DispatchConcurrencyContext{
+		Stream: schedulerContext.Stream, RequestID: schedulerContext.RequestID,
+		TraceID: schedulerContext.TraceID, ExecutionSessionID: schedulerContext.ExecutionSessionID,
+		RequestedModel:    schedulerContext.RequestedModel,
 		Fingerprint:       env.ConnectionLifetime.Fingerprint,
 		ConnectedAt:       env.ConnectionLifetime.ConnectedAt,
 		Controlled:        env.ConnectionLifetime.Controlled,
