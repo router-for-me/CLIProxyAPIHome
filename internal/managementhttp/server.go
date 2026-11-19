@@ -238,6 +238,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodPut, "/channel-groups/:id", handler.UpdateChannelGroup)
 	r.Set(http.MethodPatch, "/channel-groups/:id", handler.UpdateChannelGroup)
 	r.Set(http.MethodDelete, "/channel-groups/:id", handler.DeleteChannelGroup)
+	r.Set(http.MethodGet, "/channel-group-credential-candidates", handler.ListChannelGroupCredentialCandidates)
 	r.Set(http.MethodGet, "/channel-group-details", handler.ListChannelGroupDetails)
 	r.Set(http.MethodPost, "/channel-group-details", handler.CreateChannelGroupDetail)
 	r.Set(http.MethodGet, "/channel-group-details/:id", handler.GetChannelGroupDetail)

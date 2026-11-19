@@ -135,6 +135,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/billing/settings/diagnostics` |
 | `GET` | `/capabilities` |
 | `POST` | `/certificates/clients` |
+| `GET` | `/channel-group-credential-candidates` |
 | `GET` | `/channel-group-details` |
 | `POST` | `/channel-group-details` |
 | `DELETE` | `/channel-group-details/:id` |
@@ -2941,6 +2942,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credentials.in
 | `capabilities.topology` | boolean | 是否支持 `GET /topology` Home + CPA 集群拓扑接口。 |
 | `capabilities.users` | boolean | 是否支持 `/users` 用户管理路由。 |
 | `capabilities.access_groups` | boolean | 是否支持 `/channel-groups` 与 `/model-groups` 访问范围路由。 |
+| `capabilities.channel_group_credential_candidates` | boolean | 添加凭证范围绑定时可读取轻量候选列表。 |
 | `capabilities.user_period_limits` | boolean | 是否支持用户周期限额配置字段，以及 `GET /users/:id/period-limits` 和 `POST /users/:id/period-limits/reset`。 |
 | `capabilities.credential_in_flight_snapshots` | boolean | 是否支持独立的 CPA in-flight observation snapshot 接口。 |
 | `capabilities.credential_in_flight_snapshot_cursor` | boolean | `GET /credentials/in-flight` 是否支持数据库支持的稳定 snapshot cursor 多页读取。 |
@@ -3848,6 +3850,14 @@ Channel groups 限制某个客户端 API key 可以使用哪些 auth records。�
 { "status": "ok" }
 ```
 
+### GET `/channel-group-credential-candidates`
+
+列出可供绑定编辑器展示的 OAuth 凭证和提供商 API 密钥。每项具有可直接作为绑定 `auth_id` 提交的规范 ID、显示名称、可选的 `provider` 和 `state`。已删除的凭证和身份不一致的旧记录会被排除。已禁用或暂不可用的凭证带有状态，可用于解释为何无法选择。
+
+```json
+{ "credential_candidates": [{ "auth_id": "auth-db-id", "display_name": "Team A", "provider": "codex" }] }
+```
+
 ### GET `/channel-group-details`
 
 列出 channel group detail rows。
@@ -3858,6 +3868,7 @@ Query 参数：
 | --- | --- | --- |
 | `channel_group_id` | integer | 按 group ID 过滤；也接受 `channel-group-id`、`group_id`、`group-id`。 |
 | `auth_id` | string | 按 auth ID 过滤；也接受 `auth-id`。 |
+| `include` | string | 传入 `credential` 时附带每条绑定的凭证摘要。 |
 
 输出示例：
 
@@ -3876,7 +3887,13 @@ Query 参数：
 }
 ```
 
+带上 `include=credential` 时，每行增加 `credential`，对象字段与候选列表相同。仅当绑定的原始 `auth_id` 与凭证表的 `uuid`、`id` 和 `index` 完全一致时才解析。名称优先取凭证标签，其次为兼容提供商名称，邮箱标签会脱敏，缺少名称时显示原始 ID。状态按优先级为 `deleted`、`disabled`、`unavailable`，未设置表示没有这些标记；调度还取决于请求与运行时策略。凭证的删除状态独立于绑定行的 `deleted_at`。
+
+已完成查询但无法确认身份时，`credential` 为 `null`。若摘要查询出错，仍返回绑定行，同时省略各行的 `credential` 并在响应顶层设置 `credential_metadata_unavailable: true`。未请求摘要或旧版服务忽略该参数时，响应沿用基础格式。
+
 ### GET `/channel-group-details/:id`
+
+支持与列表接口相同的 `include=credential` 参数和摘要状态。
 
 返回单个 detail row：
 
