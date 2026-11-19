@@ -76,5 +76,11 @@ func (r *Runtime) ObserveSchedulerContinuity(ctx context.Context, query Schedule
 	req.Model, req.Candidates = model, candidates
 	req.Plugin = pluginapi.Metadata{}
 	req.Options = pluginapi.SchedulerOptions{Headers: opts.Headers.Clone(), Metadata: metadata}
-	return r.coreManager.EvaluateSchedulerContinuity(ctx, req)
+	response, handled, errEvaluate := r.coreManager.EvaluateSchedulerContinuity(ctx, req)
+	if errEvaluate != nil || !handled {
+		// CPA disables continuity on callback failure or decline. An unhandled
+		// wire response is reserved for the local empty-candidate path above.
+		return pluginapi.SchedulerContinuityResponse{Decision: pluginapi.SchedulerContinuityDisabled}, true, nil
+	}
+	return response, true, nil
 }

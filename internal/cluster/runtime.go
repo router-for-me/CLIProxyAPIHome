@@ -150,6 +150,14 @@ func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, 
 	return inserted, errAppend
 }
 
+// DeliverPluginUsage fences pending delivery and persists its completion marker.
+func (a *RuntimeAdapter) DeliverPluginUsage(ctx context.Context, payload string, deliver func() error) error {
+	if !a.Enabled() {
+		return fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.DeliverPluginUsage(ctx, payload, deliver)
+}
+
 // StoreAppLogPayload stores a CPA app log payload.
 func (a *RuntimeAdapter) StoreAppLogPayload(ctx context.Context, clientIP string, payload string) error {
 	if !a.Enabled() {

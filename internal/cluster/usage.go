@@ -37,6 +37,9 @@ type UsageRecord struct {
 	// the first committed row. Rows written before the column existed keep an
 	// empty key and stay outside the partial unique index.
 	DedupeKey string `gorm:"column:dedupe_key;not null;default:'';size:80;index:idx_usage_dedupe_key,unique,where:dedupe_key <> ''"`
+	// PluginUsageDelivered is independent of insertion: an uncertain commit may
+	// leave a stored event whose plugin delivery has never started.
+	PluginUsageDelivered bool `gorm:"column:plugin_usage_delivered;not null;default:false"`
 	// Quota identity fields fence activity from concurrent credential replacement;
 	// the key also protects rolling upgrades where an older Home cannot advance the generation.
 	QuotaCredentialID    string `gorm:"column:quota_credential_id;not null;default:''"`
