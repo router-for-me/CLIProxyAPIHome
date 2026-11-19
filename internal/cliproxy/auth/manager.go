@@ -1443,7 +1443,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 	}
 
-	filterWeights := !m.hasPluginScheduler()
+	allowPinnedAccounting := !m.hasPluginScheduler()
 	unpinnedAllowedAuthIDs := unpinnedAllowedAuthIDsFromOptions(opts)
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
 	pinnedAuthID := pinnedAuthIDFromOptions(opts)
@@ -1458,7 +1458,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		affinity, _ := selector.(*SessionAffinitySelector)
 		pluginScheduler := m.pluginScheduler
 		var concurrencyBlocked map[string]struct{}
-		trackPinnedAccounting := pinnedAuthID != "" && filterWeights && isWeightedSelector(selector)
+		// Match CPA eligibility before priority scoping, independently of plugin accounting.
+		weighted := isWeightedSelector(selector)
+		trackPinnedAccounting := pinnedAuthID != "" && allowPinnedAccounting && weighted
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
 		var transientAuthIDs map[string]struct{}
@@ -1476,7 +1478,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if filterWeights && isWeightedSelector(selector) && authWeight(candidate) <= 0 {
+			if weighted && authWeight(candidate) <= 0 {
 				continue
 			}
 			if !authAllowedByID(candidate.ID, unpinnedAllowedAuthIDs) {
@@ -1710,14 +1712,14 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	registryRef := registry.GetGlobalRegistry()
 	retryRound := requestRetryRoundFromOptions(opts)
 
-	filterWeights := !m.hasPluginScheduler()
 	hasConcurrencyExclusions := len(excludedConcurrencyCandidatesFromOptions(opts)) > 0
 	m.mu.RLock()
+	weighted := isWeightedSelector(m.selector)
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
 			continue
 		}
-		if (opts.positiveWeightOnly || (filterWeights && isWeightedSelector(m.selector))) && authWeight(candidate) <= 0 {
+		if (opts.positiveWeightOnly || weighted) && authWeight(candidate) <= 0 {
 			continue
 		}
 		if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {

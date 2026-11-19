@@ -44,10 +44,9 @@ func (m *Manager) CodexContinuityCandidates(ctx context.Context, model string, o
 	}
 	allowed := allowedAuthIDsFromOptions(opts)
 	excluded := excludedAuthIDsFromOptions(opts)
-	// Zero weight restricts the built-in weighted strategy, not plugin selection.
-	filterWeights := !m.hasPluginScheduler()
+	// Match dispatch and CPA: configured weighted selection excludes zero weight.
 	m.mu.RLock()
-	weighted := filterWeights && isWeightedSelector(m.selector)
+	weighted := isWeightedSelector(m.selector)
 	auths := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
 		if auth != nil && strings.EqualFold(auth.Provider, "codex") && !auth.Disabled && auth.Status != StatusDisabled &&

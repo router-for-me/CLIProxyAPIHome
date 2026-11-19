@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -328,20 +329,79 @@ func TestDispatchPluginWeightedFallbackIgnoresZeroWeightForCooldown(t *testing.T
 	}
 }
 
-func TestDispatchPluginFillFirstForecastsZeroWeightCredentialCooldown(t *testing.T) {
-	manager := NewManager(nil, &WeightedRoundRobinSelector{}, nil)
-	const ready = "plugin-delegated-ready"
-	registerDispatchTestAuth(t, manager, &Auth{ID: ready, Provider: "codex", Status: StatusActive}, "gpt")
-	cooling := dispatchRetryCooldownAuth("plugin-delegated-zero", 2)
-	cooling.Attributes["weight"] = "0"
-	registerDispatchTestAuth(t, manager, cooling, "gpt")
-	manager.SetPluginScheduler(&schedulerPickResponseStub{response: pluginapi.SchedulerPickResponse{
-		Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, ExcludeCandidates: []string{ready},
-	}})
-	decision, errDispatch := manager.Dispatch(t.Context(), []string{"codex"}, "gpt", Options{})
-	var cooldown *modelCooldownError
-	if decision != nil || !errors.As(errDispatch, &cooldown) || cooldown.RetryAfter() == nil {
-		t.Fatalf("Dispatch() = %+v, %v; want a timed cooldown for the zero-weight credential", decision, errDispatch)
+func TestDispatchPluginFillFirstForecastRespectsConfiguredWeightEligibility(t *testing.T) {
+	for _, weighted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("weighted=%t", weighted), func(t *testing.T) {
+			var selector Selector = &FillFirstSelector{}
+			if weighted {
+				selector = &WeightedRoundRobinSelector{}
+			}
+			manager := NewManager(nil, selector, nil)
+			const ready = "plugin-delegated-ready"
+			registerDispatchTestAuth(t, manager, &Auth{ID: ready, Provider: "codex", Status: StatusActive}, "gpt")
+			cooling := dispatchRetryCooldownAuth("plugin-delegated-zero", 2)
+			cooling.Attributes["weight"] = "0"
+			registerDispatchTestAuth(t, manager, cooling, "gpt")
+			manager.SetPluginScheduler(&schedulerPickResponseStub{response: pluginapi.SchedulerPickResponse{
+				Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, ExcludeCandidates: []string{ready},
+			}})
+			decision, errDispatch := manager.Dispatch(t.Context(), []string{"codex"}, "gpt", Options{})
+			if decision != nil {
+				t.Fatalf("Dispatch() = %+v, %v; want no credential", decision, errDispatch)
+			}
+			if weighted {
+				var authErr *Error
+				if !errors.As(errDispatch, &authErr) || authErr.Code != "auth_not_found" {
+					t.Fatalf("Dispatch() error = %v; want auth_not_found, not zero-weight cooldown", errDispatch)
+				}
+			} else {
+				var cooldown *modelCooldownError
+				if !errors.As(errDispatch, &cooldown) || cooldown.RetryAfter() == nil {
+					t.Fatalf("Dispatch() error = %v; want zero-weight cooldown under fill-first", errDispatch)
+				}
+			}
+		})
+	}
+}
+
+func TestDispatchPluginWeightedNextRoundIgnoresZeroWeight(t *testing.T) {
+	for _, session := range []bool{false, true} {
+		for _, zeroCooling := range []bool{false, true} {
+			t.Run(fmt.Sprintf("session=%t/zeroCooling=%t", session, zeroCooling), func(t *testing.T) {
+				var selector Selector = &WeightedRoundRobinSelector{}
+				if session {
+					affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: selector})
+					t.Cleanup(affinity.Stop)
+					selector = affinity
+				}
+				manager := NewManager(nil, selector, nil)
+				zero := dispatchRetryCooldownAuth("plugin-next-zero", 9)
+				zero.Attributes["weight"] = "0"
+				if !zeroCooling {
+					zero.ModelStates = nil
+				}
+				positive := dispatchRetryCooldownAuth("plugin-next-positive", 2)
+				deadline := time.Now().Add(time.Hour)
+				positive.ModelStates["gpt"].NextRetryAfter = deadline
+				positive.ModelStates["gpt"].Quota.NextRecoverAt = deadline
+				registerDispatchTestAuth(t, manager, zero, "gpt")
+				registerDispatchTestAuth(t, manager, positive, "gpt")
+				manager.SetPluginScheduler(&schedulerPickResponseStub{})
+				decision, errDispatch := manager.Dispatch(t.Context(), []string{"codex"}, "gpt", Options{Metadata: map[string]any{
+					ExcludedAuthIDsMetadataKey: []string{zero.ID, positive.ID}, RequestRetryRoundMetadataKey: 0,
+				}})
+				var cooldown *modelCooldownError
+				if decision != nil || !errors.As(errDispatch, &cooldown) {
+					t.Fatalf("Dispatch() = %+v, %v; want positive-weight next-round cooldown", decision, errDispatch)
+				}
+				if delay := cooldown.RetryAfter(); delay == nil || *delay < 59*time.Minute || *delay > time.Hour {
+					t.Fatalf("retry delay=%v, want approximately one hour", delay)
+				}
+				if retry, ok := cooldown.RequestRetryLimit(); !ok || retry != 2 {
+					t.Fatalf("request retry=%d, %t, want 2", retry, ok)
+				}
+			})
+		}
 	}
 }
 

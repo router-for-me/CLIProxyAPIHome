@@ -96,69 +96,131 @@ func TestPluginSchedulerStreamAndSelectionIdentity(t *testing.T) {
 }
 
 func TestCodexContinuityWeightFilteringMatchesPluginDispatch(t *testing.T) {
-	for _, session := range []bool{false, true} {
-		for _, plugin := range []string{"none", "inactive", "active"} {
-			t.Run(fmt.Sprintf("session=%t/plugin=%s", session, plugin), func(t *testing.T) {
-				const ready, cooling, model = "weight-zero-ready", "weight-positive-cooling", "continuity-weight-model"
-				var selector Selector = &WeightedRoundRobinSelector{}
-				if session {
-					affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: selector})
-					t.Cleanup(affinity.Stop)
-					selector = affinity
-				}
-				manager := NewManager(nil, selector, nil)
-				deadline := time.Now().Add(time.Hour)
-				registerDispatchTestAuth(t, manager, &Auth{
-					ID: ready, Provider: "codex", Status: StatusActive, Attributes: map[string]string{"weight": "0"},
-				}, model)
-				registerDispatchTestAuth(t, manager, &Auth{
-					ID: cooling, Provider: "codex", Status: StatusActive, Attributes: map[string]string{"weight": "1"},
-					ModelStates: map[string]*ModelState{model: {
-						Unavailable: true, NextRetryAfter: deadline,
-						Quota: QuotaState{Exceeded: true, NextRecoverAt: deadline},
-					}},
-				}, model)
-				switch plugin {
-				case "inactive":
-					manager.SetPluginScheduler(&statefulSchedulerPlugin{active: false})
-				case "active":
-					manager.SetPluginScheduler(&contractScheduler{pick: func(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPickResponse {
-						if len(req.Candidates) != 1 || req.Candidates[0].ID != ready {
-							t.Fatalf("dispatch candidates=%+v, want available zero-weight credential", req.Candidates)
+	for _, weighted := range []bool{false, true} {
+		for _, session := range []bool{false, true} {
+			for _, plugin := range []string{"none", "inactive", "active"} {
+				for _, state := range []string{"positive cooling", "both ready", "both cooling"} {
+					t.Run(fmt.Sprintf("weighted=%t/session=%t/plugin=%s/%s", weighted, session, plugin, state), func(t *testing.T) {
+						const zero, positive, model = "weight-zero", "weight-positive", "continuity-weight-model"
+						var selector Selector = &FillFirstSelector{}
+						if weighted {
+							selector = &WeightedRoundRobinSelector{}
 						}
-						return pluginapi.SchedulerPickResponse{Handled: true, AuthID: ready}
-					}})
+						if session {
+							affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: selector})
+							t.Cleanup(affinity.Stop)
+							selector = affinity
+						}
+						manager := NewManager(nil, selector, nil)
+						zeroDeadline := time.Now().Add(time.Hour)
+						positiveDeadline := zeroDeadline.Add(time.Hour)
+						zeroAuth := &Auth{
+							ID: zero, Provider: "codex", Status: StatusActive,
+							Attributes: map[string]string{"weight": "0", "priority": "10"},
+							Metadata:   map[string]any{"request_retry": 9},
+						}
+						positiveAuth := &Auth{
+							ID: positive, Provider: "codex", Status: StatusActive,
+							Attributes: map[string]string{"weight": "1", "priority": "1"},
+							Metadata:   map[string]any{"request_retry": 2},
+						}
+						if state == "both cooling" {
+							zeroAuth.ModelStates = map[string]*ModelState{model: {
+								Unavailable: true, NextRetryAfter: zeroDeadline,
+								Quota: QuotaState{Exceeded: true, NextRecoverAt: zeroDeadline},
+							}}
+						}
+						if state != "both ready" {
+							positiveAuth.ModelStates = map[string]*ModelState{model: {
+								Unavailable: true, NextRetryAfter: positiveDeadline,
+								Quota: QuotaState{Exceeded: true, NextRecoverAt: positiveDeadline},
+							}}
+						}
+						registerDispatchTestAuth(t, manager, zeroAuth, model)
+						registerDispatchTestAuth(t, manager, positiveAuth, model)
+						// CPA filters zero weight before priority scoping, even with an active plugin.
+						wantID, wantRetry := zero, 9
+						wantCooldown := state == "both cooling"
+						wantDelay := time.Hour
+						if weighted {
+							wantID, wantRetry = positive, 2
+							wantCooldown = state != "both ready"
+							wantDelay = 2 * time.Hour
+						}
+						switch plugin {
+						case "inactive":
+							manager.SetPluginScheduler(&statefulSchedulerPlugin{active: false})
+						case "active":
+							manager.SetPluginScheduler(&contractScheduler{pick: func(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPickResponse {
+								if wantCooldown || len(req.Candidates) != 1 || req.Candidates[0].ID != wantID {
+									t.Fatalf("dispatch candidates=%+v, want only %s when ready", req.Candidates, wantID)
+								}
+								return pluginapi.SchedulerPickResponse{Handled: true, AuthID: wantID}
+							}})
+						}
+						decision, errDispatch := manager.Dispatch(t.Context(), []string{"codex"}, model, Options{})
+						if wantCooldown {
+							var cooldown *modelCooldownError
+							if decision != nil || !errors.As(errDispatch, &cooldown) {
+								t.Fatalf("dispatch=%+v error=%v, want cooldown", decision, errDispatch)
+							}
+							if delay := cooldown.RetryAfter(); delay == nil || *delay < wantDelay-time.Minute || *delay > wantDelay {
+								t.Fatalf("retry delay=%v, want approximately %v", delay, wantDelay)
+							}
+							if retry, ok := cooldown.RequestRetryLimit(); !ok || retry != wantRetry {
+								t.Fatalf("request retry=%d, %t, want %d", retry, ok, wantRetry)
+							}
+						} else if errDispatch != nil || decision == nil || decision.Auth.ID != wantID || decision.RequestRetry != wantRetry {
+							t.Fatalf("dispatch=%+v error=%v, want %s with request retry %d", decision, errDispatch, wantID, wantRetry)
+						}
+						candidates, errCandidates := manager.CodexContinuityCandidates(t.Context(), model, Options{}, false)
+						wantCount := 2
+						if weighted {
+							wantCount = 1
+						}
+						if errCandidates != nil || len(candidates) != wantCount || candidates[0].ID != wantID {
+							t.Fatalf("continuity candidates=%+v error=%v, want %d candidates starting with %s", candidates, errCandidates, wantCount, wantID)
+						}
+						for _, candidate := range candidates {
+							deadline := positiveDeadline
+							inCooldown := state != "both ready"
+							if candidate.ID == zero {
+								deadline, inCooldown = zeroDeadline, state == "both cooling"
+							}
+							if candidate.InCooldown != inCooldown || inCooldown && (candidate.CooldownUntil == nil || !candidate.CooldownUntil.Equal(deadline)) {
+								t.Fatalf("continuity candidate=%+v, want cooldown=%t until %v", candidate, inCooldown, deadline)
+							}
+						}
+						for _, allowed := range []string{zero, positive} {
+							candidates, errCandidates = manager.CodexContinuityCandidates(t.Context(), model, Options{Metadata: map[string]any{AllowedAuthIDsMetadataKey: []string{allowed}}}, false)
+							if weighted && allowed == zero {
+								if errCandidates != nil || len(candidates) != 0 {
+									t.Fatalf("zero-weight allowlist candidates=%+v error=%v, want none", candidates, errCandidates)
+								}
+							} else if errCandidates != nil || len(candidates) != 1 || candidates[0].ID != allowed {
+								t.Fatalf("permission-filtered candidates=%+v error=%v, want only %s", candidates, errCandidates, allowed)
+							}
+						}
+						if weighted {
+							for _, metadata := range []map[string]any{
+								{AllowedAuthIDsMetadataKey: []string{zero}},
+								{PinnedAuthIDMetadataKey: zero},
+							} {
+								opts := Options{Metadata: metadata}
+								restricted, errRestricted := manager.Dispatch(t.Context(), []string{"codex"}, model, opts)
+								var authErr *Error
+								if restricted != nil || !errors.As(errRestricted, &authErr) || authErr.Code != "auth_not_found" {
+									t.Fatalf("metadata=%v dispatch=%+v error=%v, want no eligible credential", metadata, restricted, errRestricted)
+								}
+								observed, errObserved := manager.CodexContinuityCandidates(t.Context(), model, opts, false)
+								if errObserved != nil || len(observed) != 0 {
+									t.Fatalf("metadata=%v candidates=%+v error=%v, want none", metadata, observed, errObserved)
+								}
+							}
+						}
+					})
 				}
-				decision, errDispatch := manager.Dispatch(t.Context(), []string{"codex"}, model, Options{})
-				if plugin == "active" {
-					if errDispatch != nil || decision == nil || decision.Auth == nil || decision.Auth.ID != ready {
-						t.Fatalf("dispatch=%+v error=%v, want zero-weight credential", decision, errDispatch)
-					}
-				} else {
-					var cooldown *modelCooldownError
-					if decision != nil || !errors.As(errDispatch, &cooldown) {
-						t.Fatalf("dispatch=%+v error=%v, want builtin weighted cooldown", decision, errDispatch)
-					}
-				}
-				candidates, errCandidates := manager.CodexContinuityCandidates(t.Context(), model, Options{}, false)
-				if errCandidates != nil {
-					t.Fatal(errCandidates)
-				}
-				wantCount := 1
-				if plugin == "active" {
-					wantCount = 2
-				}
-				if len(candidates) != wantCount || candidates[0].ID != cooling || !candidates[0].InCooldown {
-					t.Fatalf("continuity candidates=%+v, want %d candidates including cooled positive-weight credential", candidates, wantCount)
-				}
-				if plugin == "active" && (candidates[1].ID != ready || candidates[1].InCooldown) {
-					t.Fatalf("continuity candidates=%+v, want available zero-weight credential", candidates)
-				}
-				candidates, errCandidates = manager.CodexContinuityCandidates(t.Context(), model, Options{Metadata: map[string]any{AllowedAuthIDsMetadataKey: []string{cooling}}}, false)
-				if errCandidates != nil || len(candidates) != 1 || candidates[0].ID != cooling {
-					t.Fatalf("permission-filtered candidates=%+v error=%v", candidates, errCandidates)
-				}
-			})
+			}
 		}
 	}
 }
