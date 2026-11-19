@@ -118,6 +118,14 @@ func extractHeaderValue(headersObj gjson.Result, wantKeyLower string) string {
 
 // extractRequestLogURL extracts a request log url.
 func extractRequestLogURL(requestLog string) string {
+	trimmed := strings.TrimSpace(requestLog)
+	if strings.HasPrefix(trimmed, "{") && gjson.Valid(trimmed) {
+		if urlRes := gjson.Get(trimmed, "url"); urlRes.Type == gjson.String {
+			if urlValue := strings.TrimSpace(urlRes.String()); urlValue != "" {
+				return urlValue
+			}
+		}
+	}
 	requestLog = strings.ReplaceAll(requestLog, "\r\n", "\n")
 	for _, line := range strings.Split(requestLog, "\n") {
 		line = strings.TrimSpace(line)
