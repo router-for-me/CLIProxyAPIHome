@@ -4,18 +4,16 @@ set -euo pipefail
 # workflows build, test and later propose the digest-pinned images.
 : "${DEPLOY_REPO:?}" "${DEPLOY_BRANCH:?}" "${NEW_SHA:?}" "${UPSTREAM_BASE:?}" "${FORK_DIR:?}" "${FORK_REPO:?}" "${RUN_URL:?}"
 [[ $NEW_SHA =~ ^[0-9a-f]{40}$ ]]
-workflow=.github/workflows/build-home-image.yml
-script=deploy/home/build-home-image.sh
-old=$(sed -n 's/^  HOME_COMMIT: \([0-9a-f]\{40\}\)$/\1/p' "$workflow")
-[[ $old =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Cannot find HOME_COMMIT in $workflow"; exit 1; }
-grep -qxF "HOME_COMMIT=\"\${HOME_COMMIT:-$old}\"" "$script" || { echo "::error::$script and $workflow pin different Home commits"; exit 1; }
+# The pin lives outside .github/workflows so this token needs no workflow scope.
+pin_file=deploy/home/home-source.env
+old=$(sed -n 's/^HOME_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "$pin_file")
+[[ $old =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Cannot find HOME_COMMIT in $pin_file"; exit 1; }
 if [[ $old == "$NEW_SHA" ]]; then
   echo "ai-gate already pins $NEW_SHA"
   exit 0
 fi
-sed -i "s/^  HOME_COMMIT: $old\$/  HOME_COMMIT: $NEW_SHA/" "$workflow"
-sed -i "s/^HOME_COMMIT=\"\${HOME_COMMIT:-$old}\"\$/HOME_COMMIT=\"\${HOME_COMMIT:-$NEW_SHA}\"/" "$script"
-[[ $(git diff --name-only | sort | paste -sd' ') == "$(printf '%s\n' "$workflow" "$script" | sort | paste -sd' ')" ]]
+sed -i "s/^HOME_COMMIT=$old\$/HOME_COMMIT=$NEW_SHA/" "$pin_file"
+[[ $(git diff --name-only) == "$pin_file" ]]
 
 body=$(mktemp)
 {
@@ -49,7 +47,7 @@ lease=$(git ls-remote origin "refs/heads/$DEPLOY_BRANCH" | awk '{print $1}')
 git config user.name 'github-actions[bot]'
 git config user.email 'github-actions[bot]@users.noreply.github.com'
 git switch -c "$DEPLOY_BRANCH"
-git add "$workflow" "$script"
+git add "$pin_file"
 git commit -m "deploy: bump Home source to ${NEW_SHA:0:12}"
 git push "--force-with-lease=refs/heads/$DEPLOY_BRANCH:$lease" origin "HEAD:refs/heads/$DEPLOY_BRANCH"
 title="deploy: bump Home source ${old:0:7} → ${NEW_SHA:0:7}"
