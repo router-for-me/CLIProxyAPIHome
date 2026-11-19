@@ -107,6 +107,7 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 			root = map[string]any{}
 		}
 	}
+	submitted := root
 	var errNormalize error
 	root, errNormalize = appconfig.NormalizeConfigRoot(root)
 	if errNormalize != nil {
@@ -115,7 +116,7 @@ func ImportLocalState(ctx context.Context, opts ImportOptions) (ImportStats, err
 	if _, errSecret := normalizeConfigRootSecrets(root); errSecret != nil {
 		return stats, errSecret
 	}
-	cfg, _, errRuntimeConfig := RuntimeConfigFromRoot(root)
+	cfg, _, errRuntimeConfig := RuntimeConfigFromRoot(submitted)
 	if errRuntimeConfig != nil {
 		return stats, errRuntimeConfig
 	}
@@ -282,7 +283,7 @@ func ExportLocalState(ctx context.Context, opts ExportOptions) (ExportStats, err
 		})
 		root["auth-dir"] = authDirName
 		root["credential-concurrency"] = lifecycleConfig
-		if _, errApply := ApplyCredentialConfigToRoot(root, auths); errApply != nil {
+		if errApply := ApplyV8CredentialConfigToRoot(root, auths); errApply != nil {
 			return errApply
 		}
 		return exportCredentialConcurrencyPoliciesForAuthsTx(ctx, tx, root, auths)

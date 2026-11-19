@@ -47,6 +47,24 @@ type credentialModelPair struct {
 	Thinking                   *registry.ThinkingSupport
 }
 
+// ApplyV8CredentialConfigToRoot retains source scopes for management and file
+// export. The legacy runtime and CPA still consume the effective projection.
+func ApplyV8CredentialConfigToRoot(root map[string]any, auths []*coreauth.Auth) error {
+	if _, errApply := ApplyCredentialConfigToRoot(root, auths); errApply != nil {
+		return errApply
+	}
+	scopes := make(map[string]map[string]any)
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if scope, ok := auth.Metadata[appconfig.HomeCredentialGroupMetadataKey].(map[string]any); ok {
+			scopes[auth.ID] = scope
+		}
+	}
+	return appconfig.RestoreV8CredentialGroups(root, scopes)
+}
+
 type credentialOpenAICompatGroup struct {
 	Config      appconfig.OpenAICompatibility
 	SeenEntry   map[string]struct{}

@@ -224,6 +224,7 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 				if errCurrent != nil {
 					return errCurrent
 				}
+				next := auth.Clone()
 				if !existing.DeletedAt.Valid {
 					currentConfig, nextConfig := make(map[string]any), make(map[string]any)
 					if _, errApplyCurrent := ApplyCredentialConfigToRoot(currentConfig, []*coreauth.Auth{current}); errApplyCurrent != nil {
@@ -253,14 +254,20 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 					if errCompare != nil {
 						return errCompare
 					}
-					// Re-synthesis changes timestamps and omits runtime state. An unchanged
-					// provider credential must keep its entire persisted row and version.
+					// A scope-only edit retains live cooldowns and timestamps. The normal
+					// JSON comparison below also preserves the revision on a true no-op.
 					if len(currentConfig) > 0 && sameConfig {
-						out = &existing
-						return nil
+						next = current
+						if scope := auth.Metadata[appconfig.HomeCredentialGroupMetadataKey]; scope != nil {
+							if next.Metadata == nil {
+								next.Metadata = make(map[string]any)
+							}
+							next.Metadata[appconfig.HomeCredentialGroupMetadataKey] = scope
+						} else {
+							delete(next.Metadata, appconfig.HomeCredentialGroupMetadataKey)
+						}
 					}
 				}
-				next := auth.Clone()
 				next.Disabled = current.Disabled
 				next.Status = current.Status
 				next.StatusMessage = current.StatusMessage
@@ -1243,6 +1250,7 @@ func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfig(ctx context.Contex
 }
 
 func (r *Repository) replaceConfigSnapshotWithLockedActivationGateTx(ctx context.Context, tx *gorm.DB, nodeHeartbeatTimeout time.Duration, gate *ConcurrencyActivationGateRecord, values map[string]any) error {
+	submitted := values
 	values, errNormalize := appconfig.NormalizeConfigRoot(values)
 	if errNormalize != nil {
 		return errNormalize
@@ -1264,7 +1272,7 @@ func (r *Repository) replaceConfigSnapshotWithLockedActivationGateTx(ctx context
 	} else if _, errEnsure := ensureLifecycleConfigTx(tx, nodeHeartbeatTimeout); errEnsure != nil {
 		return errEnsure
 	}
-	if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values); errReconcile != nil {
+	if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values, submitted); errReconcile != nil {
 		return mapCredentialConcurrencyOrphan(errReconcile)
 	}
 	if errImportPolicies := r.importCredentialConcurrencyPoliciesWithLockedActivationGateTx(ctx, tx, gate, values); errImportPolicies != nil {

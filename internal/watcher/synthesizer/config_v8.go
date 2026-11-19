@@ -31,6 +31,9 @@ func addV8CredentialOptions(entry any, attrs map[string]string, metadata map[str
 	for _, field := range appconfig.HomeCredentialFields {
 		delete(source, field)
 	}
+	if scoped, ok := entry.(interface{ V8GroupScope() map[string]any }); ok && scoped.V8GroupScope() != nil {
+		metadata[appconfig.HomeCredentialGroupMetadataKey] = scoped.V8GroupScope()
+	}
 	switch entry.(type) {
 	case appconfig.OpenAICompatibility, *appconfig.OpenAICompatibility:
 		delete(source, "api-key-entries")
