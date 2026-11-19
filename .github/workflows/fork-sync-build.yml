@@ -1,0 +1,148 @@
+name: Fork Sync and Propose
+
+# Rebase the ai-gate Home source branch onto upstream, test it with ai-gate's
+# tracked patches, and propose the tested commit as ai-gate's Home source pin.
+# ai-gate builds, publishes and proposes the digest-pinned images itself.
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Test and propose even when upstream has no new commits
+        type: boolean
+        default: false
+      skip_rebase:
+        description: Test and propose the current branch without rebasing upstream
+        type: boolean
+        default: false
+  push:
+    branches: [fix/home-json-logs-codex-429]
+    paths-ignore: ['**.md', '.gitignore']
+
+# One writer across sync and proposal. Never cancel a push half way through.
+concurrency:
+  group: fork-sync-propose
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET_BRANCH: fix/home-json-logs-codex-429
+  UPSTREAM_REPO: https://github.com/router-for-me/CLIProxyAPIHome.git
+  UPSTREAM_BRANCH: main
+  DEPLOY_REPO: hex-drift/ai-gate
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  sync-and-test:
+    if: github.repository == 'nosovk/CLIProxyAPIHome'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      should_build: ${{ steps.sync.outputs.should_build }}
+      commit_sha: ${{ steps.sync.outputs.commit_sha }}
+      upstream_base: ${{ steps.sync.outputs.upstream_base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || env.TARGET_BRANCH }}
+          path: fork
+          fetch-depth: 0
+      - name: Configure Git identity
+        working-directory: fork
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+      - name: Sync upstream and capture immutable build identity
+        id: sync
+        working-directory: fork
+        env:
+          SKIP_REBASE: ${{ inputs.skip_rebase }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: bash scripts/fork-ci/sync.sh
+      - name: Report rebase conflict
+        if: failure() && steps.sync.outputs.conflict == 'true'
+        working-directory: fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          FORK_SHA: ${{ steps.sync.outputs.fork_sha }}
+          CONFLICT_COMMIT: ${{ steps.sync.outputs.conflict_commit }}
+          CONFLICT_FILES: ${{ steps.sync.outputs.conflict_files }}
+        run: bash scripts/fork-ci/conflicts.sh
+      - uses: actions/checkout@v4
+        if: steps.sync.outputs.should_build == 'true'
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          ref: main
+          token: ${{ secrets.AI_GATE_PR_TOKEN }}
+          path: ai-gate
+          persist-credentials: false
+      # Setup after rebase: upstream may have changed go.mod's toolchain.
+      - uses: actions/setup-go@v5
+        if: steps.sync.outputs.should_build == 'true'
+        with:
+          go-version-file: fork/go.mod
+          cache-dependency-path: fork/go.sum
+      - name: Test candidate with ai-gate patches
+        if: steps.sync.outputs.should_build == 'true'
+        working-directory: fork
+        env:
+          AI_GATE_DIR: ${{ github.workspace }}/ai-gate
+          TESTED_SHA: ${{ steps.sync.outputs.commit_sha }}
+        run: bash scripts/fork-ci/test.sh
+      - name: Push verified rebase with captured lease
+        if: steps.sync.outputs.should_build == 'true' && github.event_name != 'push'
+        working-directory: fork
+        env:
+          FORK_LEASE: ${{ steps.sync.outputs.fork_lease }}
+          TESTED_SHA: ${{ steps.sync.outputs.commit_sha }}
+        run: bash scripts/fork-ci/push-sync.sh
+      - name: Close resolved conflict issues after tests and push
+        if: steps.sync.outputs.should_build == 'true' && github.event_name != 'push'
+        working-directory: fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/fork-ci/conflicts.sh close
+
+  propose-deploy:
+    needs: sync-and-test
+    if: needs.sync-and-test.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      DEPLOY_BRANCH: deploy/home-source-bump
+      GH_TOKEN: ${{ secrets.AI_GATE_PR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          ref: main
+          token: ${{ secrets.AI_GATE_PR_TOKEN }}
+          path: ai-gate
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-test.outputs.commit_sha }}
+          path: fork
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch upstream for the changelog
+        working-directory: fork
+        run: git fetch "$UPSTREAM_REPO" "$UPSTREAM_BRANCH"
+      - name: Pin the tested commit and open or update the ai-gate PR
+        working-directory: ai-gate
+        env:
+          NEW_SHA: ${{ needs.sync-and-test.outputs.commit_sha }}
+          UPSTREAM_BASE: ${{ needs.sync-and-test.outputs.upstream_base }}
+          FORK_DIR: ${{ github.workspace }}/fork
+          FORK_REPO: ${{ github.repository }}
+        run: bash ../fork/scripts/fork-ci/propose-deploy.sh
