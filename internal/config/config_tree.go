@@ -13,38 +13,46 @@ func (cfg *Config) captureConfigTree(source, flat *yaml.Node) error {
 	if errDecode := flat.Decode(&effective); errDecode != nil {
 		return errDecode
 	}
-	entry := func(family string, index int) map[string]any {
+	groups, _ := cfg.RawConfig["api-keys"].(map[string]any)
+	scopes, errScopes := credentialGroupScopes(groups)
+	if errScopes != nil {
+		return errScopes
+	}
+	entry := func(family string, index int) CredentialConfig {
+		var result CredentialConfig
 		entries, _ := effective[family].([]any)
-		if index >= len(entries) {
-			return nil
+		if index < len(entries) {
+			result.RawConfig, _ = entries[index].(map[string]any)
 		}
-		value, _ := entries[index].(map[string]any)
-		return value
+		if index < len(scopes[family]) {
+			result.GroupScope = scopes[family][index]
+		}
+		return result
 	}
 	for i := range cfg.GeminiKey {
-		cfg.GeminiKey[i].RawConfig = entry("gemini-api-key", i)
+		cfg.GeminiKey[i].CredentialConfig = entry("gemini-api-key", i)
 	}
 	for i := range cfg.InteractionsKey {
-		cfg.InteractionsKey[i].RawConfig = entry("interactions-api-key", i)
+		cfg.InteractionsKey[i].CredentialConfig = entry("interactions-api-key", i)
 	}
 	for i := range cfg.VertexCompatAPIKey {
-		cfg.VertexCompatAPIKey[i].RawConfig = entry("vertex-api-key", i)
+		cfg.VertexCompatAPIKey[i].CredentialConfig = entry("vertex-api-key", i)
 	}
 	for i := range cfg.CodexKey {
-		cfg.CodexKey[i].RawConfig = entry("codex-api-key", i)
+		cfg.CodexKey[i].CredentialConfig = entry("codex-api-key", i)
 	}
 	for i := range cfg.ClaudeKey {
-		cfg.ClaudeKey[i].RawConfig = entry("claude-api-key", i)
+		cfg.ClaudeKey[i].CredentialConfig = entry("claude-api-key", i)
 	}
 	for i := range cfg.XAIKey {
-		cfg.XAIKey[i].RawConfig = entry("xai-api-key", i)
+		cfg.XAIKey[i].CredentialConfig = entry("xai-api-key", i)
 	}
 	for i := range cfg.MetaKey {
-		cfg.MetaKey[i].RawConfig = entry("meta-api-key", i)
+		cfg.MetaKey[i].CredentialConfig = entry("meta-api-key", i)
 	}
 	for i := range cfg.OpenAICompatibility {
 		group := &cfg.OpenAICompatibility[i]
-		group.RawConfig = entry("openai-compatibility", i)
+		group.CredentialConfig = entry("openai-compatibility", i)
 		keys, _ := group.RawConfig["api-key-entries"].([]any)
 		for j := range group.APIKeyEntries {
 			if j < len(keys) {

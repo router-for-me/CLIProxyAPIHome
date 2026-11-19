@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -58,7 +59,7 @@ func (r *Repository) LoadConfigAsRuntimeConfig(ctx context.Context) (*appconfig.
 	return cfg, payload, nil
 }
 
-func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context, tx *gorm.DB, values map[string]any) error {
+func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context, tx *gorm.DB, values, submitted map[string]any) error {
 	if tx == nil {
 		return fmt.Errorf("database connection is nil")
 	}
@@ -69,7 +70,7 @@ func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context,
 	if len(explicitKeys) == 0 {
 		return nil
 	}
-	cfg, _, errConfig := RuntimeConfigFromRoot(values)
+	cfg, _, errConfig := RuntimeConfigFromRoot(submitted)
 	if errConfig != nil {
 		return errConfig
 	}
@@ -144,6 +145,7 @@ func ConfigRootFromSnapshot(snapshot map[string]json.RawMessage) (map[string]any
 // RuntimeConfigFromRoot derives runtime config from root.
 func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, error) {
 	// Normalize before inspecting roots, including v8 imports and snapshots.
+	groups, _ := root["api-keys"].(map[string]any)
 	var errNormalize error
 	root, errNormalize = appconfig.NormalizeConfigRoot(root)
 	if errNormalize != nil {
@@ -168,7 +170,18 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg.CredentialConcurrency = appconfig.DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = appconfig.DefaultCredentialInFlightConfig()
 	cfg.RemoteManagement.PanelGitHubRepository = appconfig.DefaultPanelGitHubRepository
-	if errUnmarshal := yaml.Unmarshal(data, cfg); errUnmarshal != nil {
+	source := data
+	if len(groups) > 0 {
+		// Keep the flat runtime payload, but decode credential ownership from the V8 input.
+		scoped := maps.Clone(root)
+		appconfig.SetV8CredentialGroups(scoped, groups)
+		var errScope error
+		source, errScope = yaml.Marshal(scoped)
+		if errScope != nil {
+			return nil, nil, errScope
+		}
+	}
+	if errUnmarshal := yaml.Unmarshal(source, cfg); errUnmarshal != nil {
 		return nil, nil, errUnmarshal
 	}
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
@@ -331,7 +344,7 @@ func (r *Repository) MutateConfigSnapshot(ctx context.Context, nodeHeartbeatTime
 		if errAuths != nil {
 			return errAuths
 		}
-		if _, errApply := ApplyCredentialConfigToRoot(root, auths); errApply != nil {
+		if errApply := ApplyV8CredentialConfigToRoot(root, auths); errApply != nil {
 			return errApply
 		}
 		values, errMutate := mutate(root)

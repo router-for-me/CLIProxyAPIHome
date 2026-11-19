@@ -429,6 +429,8 @@ Home 在数据库和下发配置中保留兼容的
 
 `connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
 
+八类 API Key 的 V8 回读和 YAML 导出都会保留提交时的组成员、分组连接池和单 Key 覆盖。可以区分字段缺省、`null`、`{}`、显式的 `enabled: false` 和 `max-idle-conns-per-host: 0`。旧凭据若已丢失原始分组，会保留现有表示，直到用户重新提交分组。凭据 ID、轮换后的密钥和删除状态均以数据库中的当前记录为准。
+
 `api-keys.vertex[].models[].openapi` 和 `oauth.model-alias.vertex[].openapi` 的显式 `true`/`false` 会在凭证下发时投影到 `vertex_model_openapi` 属性；未设置或 `null` 时保留 CPA 的自动路由。凭证级规则优先于 OAuth 别名规则，别名规则不影响 API Key 凭证。删除设置后，下次派发或刷新即不再携带该投影，无需重写数据库凭证。凭证执行选项格式损坏时，合成、派发或刷新会明确失败，不会静默丢弃。
 
 `server.github-token` 是下发给可信 CPA 节点的秘密，不是 Home 管理密钥。凭证身份、秘密和调度信息仍保存在 Auth 记录中；凭证的原始私有配置仅保留供导出，不随凭证下发给 CPA。

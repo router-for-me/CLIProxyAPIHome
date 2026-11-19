@@ -110,6 +110,7 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth, cfg *config.Config) (*coreau
 		delete(out.Metadata, "service_account")
 		delete(out.Metadata, homeConfigModelsMetadataKey)
 		delete(out.Metadata, config.HomeCredentialConfigMetadataKey)
+		delete(out.Metadata, config.HomeCredentialGroupMetadataKey)
 		removeRefreshTokenFromNestedMap(out.Metadata, "token")
 		removeRefreshTokenFromNestedMap(out.Metadata, "Token")
 	}

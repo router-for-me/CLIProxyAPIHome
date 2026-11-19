@@ -77,7 +77,7 @@ func executionLifecycleDispatch(t *testing.T, repo *cluster.Repository) map[stri
 		if errDecode := json.Unmarshal(encoded, &cpa); errDecode != nil {
 			t.Fatal(errDecode)
 		}
-		for _, private := range []string{"home_config", "home_config_models", "refresh_token", "service_account"} {
+		for _, private := range []string{"home_config", "home_v8_group", "home_config_models", "refresh_token", "service_account"} {
 			if _, exists := cpa.Metadata[private]; exists {
 				t.Fatalf("private field %s reached CPA", private)
 			}
@@ -169,6 +169,30 @@ func TestConfigV8ExecutionLifecycleAllProviders(t *testing.T) {
 	}
 	if _, errImport := cluster.ImportLocalState(t.Context(), cluster.ImportOptions{Repository: repo, ConfigPath: input}); errImport != nil {
 		t.Fatal(errImport)
+	}
+	// The editing view must preserve the two source levels as well as the effective dispatch options.
+	for _, family := range families {
+		var records []map[string]any
+		if errDecode := json.Unmarshal([]byte(request("GET", "/v8/management/config/api-keys/"+family, "", http.StatusOK)), &records); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		if len(records) != 1 || records[0]["name"] != "lifecycle-"+family {
+			t.Fatalf("%s did not retain its authored group", family)
+		}
+		members := records[0]["keys"].([]any)
+		if len(members) != 5 {
+			t.Fatalf("%s returned %d group members", family, len(members))
+		}
+		for _, member := range members {
+			key := member.(map[string]any)
+			secret := key["api-key"].(string)
+			pool, exists := key["connection-pool"]
+			want := []any{nil, nil, map[string]any{}, map[string]any{"enabled": false}, map[string]any{"enabled": nil, "max-idle-conns-per-host": float64(0)}}
+			index := int(secret[len(secret)-1] - '0')
+			if exists != (index != 0) || !reflect.DeepEqual(pool, want[index]) {
+				t.Fatalf("%s key %d lost its connection pool scope: %#v", family, index, pool)
+			}
+		}
 	}
 	initial := executionLifecycleDispatch(t, repo)
 	if len(initial) != len(families)*5 {
@@ -372,6 +396,173 @@ func TestConfigV8ExecutionCompatibilityInheritanceRoundTrip(t *testing.T) {
 			}
 			if after := executionLifecycleDispatch(t, next); !reflect.DeepEqual(before, after) {
 				t.Fatalf("group merging changed inherited execution options: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestConfigV8PoolScopeWriteExportAndCredentialLifecycle(t *testing.T) {
+	for _, family := range []string{"codex", "openai-compatibility"} {
+		t.Run(family, func(t *testing.T) {
+			repo, request := newConfigV8AuthIndexRouter(t)
+			path := "/v8/management/config/api-keys/" + family
+			firstID := "11111111-1111-4111-8111-111111111111"
+			secondID := "22222222-2222-4222-8222-222222222222"
+			first := map[string]any{"id": firstID, "api-key": "first"}
+			second := map[string]any{"id": secondID, "api-key": "second", "connection-pool": nil}
+			group := map[string]any{"name": "group", "base-url": "https://example.test", "keys": []any{first, second}, "connection-pool": map[string]any{}}
+			write := func() {
+				t.Helper()
+				body, errMarshal := json.Marshal([]any{group})
+				if errMarshal != nil {
+					t.Fatal(errMarshal)
+				}
+				request("PUT", path, string(body), http.StatusOK)
+			}
+			read := func(body string) (map[string]any, map[string]map[string]any) {
+				t.Helper()
+				var groups []map[string]any
+				if errDecode := json.Unmarshal([]byte(body), &groups); errDecode != nil {
+					t.Fatal(errDecode)
+				}
+				if len(groups) != 1 {
+					t.Fatalf("expected one group, got %d", len(groups))
+				}
+				byID := make(map[string]map[string]any)
+				for _, raw := range groups[0]["keys"].([]any) {
+					key := raw.(map[string]any)
+					byID[key["id"].(string)] = key
+				}
+				return groups[0], byID
+			}
+			write()
+			request("PUT", "/v8/management/config/access/api-keys", `["client-access"]`, http.StatusOK)
+			// Moving an empty pool from the group to the individual keys changes only its source.
+			if family == "codex" {
+				auths, errAuths := repo.ListAuths(t.Context())
+				if errAuths != nil {
+					t.Fatal(errAuths)
+				}
+				for _, auth := range auths {
+					auth.Metadata["runtime-marker"] = auth.ID
+					if _, errUpsert := repo.UpsertAuth(t.Context(), auth, "upsert"); errUpsert != nil {
+						t.Fatal(errUpsert)
+					}
+				}
+			}
+			delete(group, "connection-pool")
+			first["connection-pool"], second["connection-pool"] = map[string]any{}, map[string]any{}
+			write()
+			got, keys := read(request("GET", path, "", http.StatusOK))
+			if family == "codex" {
+				auths, errAuths := repo.ListAuths(t.Context())
+				if errAuths != nil {
+					t.Fatal(errAuths)
+				}
+				for _, auth := range auths {
+					if auth.Metadata["runtime-marker"] != auth.ID {
+						t.Fatal("scope-only edit reset live credential state")
+					}
+				}
+			}
+			if _, exists := got["connection-pool"]; exists || !reflect.DeepEqual(keys[firstID]["connection-pool"], map[string]any{}) || !reflect.DeepEqual(keys[secondID]["connection-pool"], map[string]any{}) {
+				t.Fatal("a scope-only edit was discarded")
+			}
+			group["connection-pool"] = map[string]any{"idle-conn-timeout": "45s", "max-idle-conns-per-host": 4}
+			first["connection-pool"] = map[string]any{"enabled": nil, "max-idle-conns-per-host": 0}
+			second["connection-pool"] = map[string]any{"enabled": false}
+			write()
+			before := request("GET", path, "", http.StatusOK)
+			output := t.TempDir()
+			if _, errExport := cluster.ExportLocalState(t.Context(), cluster.ExportOptions{Repository: repo, OutputDir: output, AuthDirName: "auth"}); errExport != nil {
+				t.Fatal(errExport)
+			}
+			fresh, next := newConfigV8AuthIndexRouter(t)
+			if _, errImport := cluster.ImportLocalState(t.Context(), cluster.ImportOptions{Repository: fresh, ConfigPath: filepath.Join(output, "config.yaml")}); errImport != nil {
+				t.Fatal(errImport)
+			}
+			beforeGroup, beforeKeys := read(before)
+			afterGroup, afterKeys := read(next("GET", path, "", http.StatusOK))
+			if !reflect.DeepEqual(beforeGroup["connection-pool"], afterGroup["connection-pool"]) || !reflect.DeepEqual(beforeKeys, afterKeys) {
+				t.Fatal("export/import changed the credential scope or identity")
+			}
+			if data := next("GET", "/v8/management/config/access/api-keys", "", http.StatusOK); !strings.Contains(data, "client-access") {
+				t.Fatal("lost the independent client access keys")
+			}
+			auths, errAuths := fresh.ListAuths(t.Context())
+			if errAuths != nil {
+				t.Fatal(errAuths)
+			}
+			for _, auth := range auths {
+				if auth.ID == firstID {
+					auth.Attributes["api_key"] = "rotated"
+					if _, errUpsert := fresh.UpsertAuth(t.Context(), auth, "upsert"); errUpsert != nil {
+						t.Fatal(errUpsert)
+					}
+				}
+			}
+			if errDelete := fresh.SoftDeleteAuth(t.Context(), secondID); errDelete != nil {
+				t.Fatal(errDelete)
+			}
+			_, live := read(next("GET", path, "", http.StatusOK))
+			if len(live) != 1 || live[firstID]["api-key"] != "rotated" || !reflect.DeepEqual(live[firstID]["connection-pool"], beforeKeys[firstID]["connection-pool"]) {
+				t.Fatal("group source did not respect live credential rotation or deletion")
+			}
+		})
+	}
+}
+
+func TestConfigV8PoolScopesKeepDistinctIdenticalGroups(t *testing.T) {
+	for _, family := range []string{"claude", "openai-compatibility"} {
+		t.Run(family, func(t *testing.T) {
+			repo, request := newConfigV8AuthIndexRouter(t)
+			path := "/v8/management/config/api-keys/" + family
+			group := func(key string) map[string]any {
+				return map[string]any{"name": "duplicate", "base-url": "https://example.test", "connection-pool": map[string]any{}, "keys": []any{map[string]any{"api-key": key, "connection-pool": nil}}}
+			}
+			body, errMarshal := json.Marshal([]any{group("first"), group("second")})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			request("PUT", path, string(body), http.StatusOK)
+			saved := request("GET", path, "", http.StatusOK)
+			request("PUT", path, saved, http.StatusOK)
+			var groups []map[string]any
+			if errDecode := json.Unmarshal([]byte(request("GET", path, "", http.StatusOK)), &groups); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			if len(groups) != 2 {
+				t.Fatalf("distinct submitted groups collapsed into %d groups", len(groups))
+			}
+			for _, item := range groups {
+				if len(item["keys"].([]any)) != 1 {
+					t.Fatal("key migrated between groups")
+				}
+			}
+			// Independently authored groups also remain distinct if a live edit makes their endpoints equal.
+			groups[0]["base-url"] = "https://alternate.test"
+			updated, errEncode := json.Marshal(groups)
+			if errEncode != nil {
+				t.Fatal(errEncode)
+			}
+			request("PUT", path, string(updated), http.StatusOK)
+			auths, errAuths := repo.ListAuths(t.Context())
+			if errAuths != nil {
+				t.Fatal(errAuths)
+			}
+			for _, auth := range auths {
+				if auth.Attributes["base_url"] == "https://alternate.test" {
+					auth.Attributes["base_url"] = "https://example.test"
+					if _, errUpsert := repo.UpsertAuth(t.Context(), auth, "upsert"); errUpsert != nil {
+						t.Fatal(errUpsert)
+					}
+				}
+			}
+			if errDecode := json.Unmarshal([]byte(request("GET", path, "", http.StatusOK)), &groups); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			if len(groups) != 2 || groups[0]["base-url"] != groups[1]["base-url"] {
+				t.Fatal("live endpoint change merged two source groups")
 			}
 		})
 	}

@@ -11,6 +11,9 @@ import (
 // HomeCredentialConfigMetadataKey is private persistence data, never a CPA payload.
 const HomeCredentialConfigMetadataKey = "home_config"
 
+// HomeCredentialGroupMetadataKey records the V8 editing scope on its owning auth.
+const HomeCredentialGroupMetadataKey = "home_v8_group"
+
 // These fields are stored authoritatively on auth records, not in CPA options.
 var HomeCredentialFields = [...]string{"id", "uuid", "api-key", "base-url", "proxy-url", "prefix", "priority", "headers", "excluded-models", "disable-cooling", "request-retry", "name", "disabled"}
 
@@ -18,10 +21,13 @@ var HomeCredentialFields = [...]string{"id", "uuid", "api-key", "base-url", "pro
 // cloak settings. Credential fields project Home scheduling policy, while model
 // definitions retain the complete model configuration shared with CPA.
 type CredentialConfig struct {
-	RawConfig map[string]any `yaml:"-" json:"-"`
+	RawConfig  map[string]any `yaml:"-" json:"-"`
+	GroupScope map[string]any `yaml:"-" json:"-"`
 }
 
 func (c *CredentialConfig) SetConfigTree(tree map[string]any) { c.RawConfig = tree }
+
+func (c CredentialConfig) V8GroupScope() map[string]any { return c.GroupScope }
 
 // SDK credential types define the CPA wire contract; Home does not mirror it.
 func newSDKCredential(entry any) (any, error) {
