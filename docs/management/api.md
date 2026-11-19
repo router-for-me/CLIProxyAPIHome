@@ -135,6 +135,7 @@ The following v8 routes are derived from `internal/managementhttp/routes_v8.go` 
 | `GET` | `/billing/settings/diagnostics` |
 | `GET` | `/capabilities` |
 | `POST` | `/certificates/clients` |
+| `GET` | `/channel-group-credential-candidates` |
 | `GET` | `/channel-group-details` |
 | `POST` | `/channel-group-details` |
 | `DELETE` | `/channel-group-details/:id` |
@@ -2951,6 +2952,7 @@ Response fields:
 | `capabilities.topology` | boolean | Whether `GET /topology` is available for Home + CPA cluster topology. |
 | `capabilities.users` | boolean | Whether the `/users` user-management routes are available. |
 | `capabilities.access_groups` | boolean | Whether the `/channel-groups` and `/model-groups` access-scope routes are available. |
+| `capabilities.channel_group_credential_candidates` | boolean | Whether the binding editor can read the lightweight credential candidate list. |
 | `capabilities.user_period_limits` | boolean | Whether user period-limit configuration fields plus `GET /users/:id/period-limits` and `POST /users/:id/period-limits/reset` are available. |
 | `capabilities.credential_in_flight_snapshots` | boolean | Whether the independent CPA in-flight observation snapshot APIs are available. |
 | `capabilities.credential_in_flight_snapshot_cursor` | boolean | Whether `GET /credentials/in-flight` supports database-backed stable snapshot cursors for multi-page reads. |
@@ -3864,6 +3866,14 @@ Response:
 { "status": "ok" }
 ```
 
+### GET `/channel-group-credential-candidates`
+
+Lists OAuth and provider API-key identities for the binding editor. Each item has the canonical `auth_id` to submit, a display name and optional `provider` and `state`. Deleted and noncanonical records are excluded. Disabled and temporarily unavailable credentials carry their state so the editor can explain why they cannot be selected.
+
+```json
+{ "credential_candidates": [{ "auth_id": "auth-db-id", "display_name": "Team A", "provider": "codex" }] }
+```
+
 ### GET `/channel-group-details`
 
 Lists channel group detail rows.
@@ -3874,6 +3884,7 @@ Query parameters:
 | --- | --- | --- |
 | `channel_group_id` | integer | Filter by group ID. Aliases: `channel-group-id`, `group_id`, `group-id`. |
 | `auth_id` | string | Filter by auth ID. Alias: `auth-id`. |
+| `include` | string | Set to `credential` to include a credential summary on each binding. |
 
 Example response:
 
@@ -3892,7 +3903,13 @@ Example response:
 }
 ```
 
+With `include=credential`, each row gains a `credential` object with the same fields as a candidate. The stored binding `auth_id` must match the credential's `uuid`, `id` and `index` exactly. The display name prefers the credential label, then the compatibility provider name, with email labels masked. An unnamed credential uses its original ID. Optional state in priority order is `deleted`, `disabled`, or `unavailable`. An absent state means none of those flags apply. Dispatch also depends on the request and runtime policies. Credential deletion is independent of the binding row's `deleted_at`.
+
+A completed lookup with no confirmed identity returns `credential: null`. If the metadata lookup fails, the server still returns the binding rows, omits their `credential` fields and sets the top-level `credential_metadata_unavailable: true`. A basic request or an older server that ignores the parameter returns the original shape.
+
 ### GET `/channel-group-details/:id`
+
+Supports the same `include=credential` parameter and metadata states as the list.
 
 Returns one detail row:
 

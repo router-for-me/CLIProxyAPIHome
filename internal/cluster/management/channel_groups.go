@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -153,11 +154,7 @@ func (h *Handler) ListChannelGroupDetails(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "channel_group_detail_load_failed", errRecords)
 		return
 	}
-	items := make([]gin.H, 0, len(records))
-	for _, record := range records {
-		items = append(items, channelGroupDetailRecordToMap(&record))
-	}
-	c.JSON(http.StatusOK, gin.H{"channel_group_details": items})
+	h.respondChannelGroupDetails(c, ctx, records, false)
 }
 
 // GetChannelGroupDetail returns a channel group detail.
@@ -174,7 +171,49 @@ func (h *Handler) GetChannelGroupDetail(c *gin.Context) {
 		respondChannelRecordError(c, "channel_group_detail_load_failed", errRecord)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"channel_group_detail": channelGroupDetailRecordToMap(record)})
+	h.respondChannelGroupDetails(c, ctx, []cluster.ChannelGroupDetailRecord{*record}, true)
+}
+
+func (h *Handler) respondChannelGroupDetails(c *gin.Context, ctx context.Context, records []cluster.ChannelGroupDetailRecord, single bool) {
+	response := gin.H{}
+	var credentials map[string]cluster.ChannelGroupCredential
+	if c.Query("include") == "credential" {
+		var errLookup error
+		credentials, errLookup = h.repo.ChannelGroupBoundCredentials(ctx, records)
+		if errLookup != nil {
+			response["credential_metadata_unavailable"] = true
+		}
+	}
+	items := make([]gin.H, 0, len(records))
+	for _, record := range records {
+		item := channelGroupDetailRecordToMap(&record)
+		if credentials != nil {
+			if credential, ok := credentials[record.AuthID]; ok {
+				item["credential"] = credential
+			} else {
+				item["credential"] = nil
+			}
+		}
+		items = append(items, item)
+	}
+	if single {
+		response["channel_group_detail"] = items[0]
+	} else {
+		response["channel_group_details"] = items
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// ListChannelGroupCredentialCandidates returns the selectable identity fields for the binding editor.
+func (h *Handler) ListChannelGroupCredentialCandidates(c *gin.Context) {
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+	items, errList := h.repo.ListChannelGroupCredentialCandidates(ctx)
+	if errList != nil {
+		respondError(c, http.StatusInternalServerError, "channel_group_credential_candidates_load_failed", errList)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"credential_candidates": items})
 }
 
 // CreateChannelGroupDetail creates a channel group detail.
