@@ -347,7 +347,7 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 	if strings.EqualFold(session.Status, "complete") {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		h.respondCompletedOAuthStatus(c, session)
 		return
 	}
 	if strings.EqualFold(session.Status, "error") {

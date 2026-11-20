@@ -60,7 +60,7 @@ func TestOAuthSessionAtomicCredentialCompletion(t *testing.T) {
 			}
 			switch outcome {
 			case "success":
-				if current.Status != "complete" || len(current.Data) != 0 {
+				if current.Status != "complete" || string(current.Data) != `{"auth_ids":["oauth-atomic"]}` {
 					t.Fatalf("session = %+v", current)
 				}
 				if errRepeat := repo.CompleteOAuthSessionWithAuths(ctx, session.State, auths); !errors.Is(errRepeat, ErrOAuthSessionNotPending) {
