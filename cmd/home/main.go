@@ -109,6 +109,10 @@ func newRuntimeConcurrencyAdmitter(repo concurrencyAdmissionRepository, currentH
 	})
 }
 
+// refreshDrainTimeout bounds the wait for claimed refreshes on stop: 30 s for the provider call
+// plus 10 s for the write-back, with margin. The supervisor's stop grace must exceed it.
+const refreshDrainTimeout = 45 * time.Second
+
 // run executes the home command and returns the process exit code.
 func run() int {
 	// Keep validation before state changes so failures leave existing data intact.
@@ -489,6 +493,12 @@ func run() int {
 			}
 		}()
 	}
+	// Runs before the retire above: a claimed refresh finishes its write-back before Home stops.
+	defer func() {
+		if !cluster.DrainRefreshes(refreshDrainTimeout) {
+			log.Warnf("credential refresh drain timed out in_flight=%d", cluster.RefreshesInFlight())
+		}
+	}()
 
 	baseListener, errListen := net.Listen("tcp", addr)
 	if errListen != nil {

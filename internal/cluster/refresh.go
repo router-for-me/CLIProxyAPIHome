@@ -287,6 +287,11 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	finishRefresh, errBegin := beginRefresh()
+	if errBegin != nil {
+		return nil, errBegin
+	}
+	defer finishRefresh()
 	refreshCtx, cancelRefresh := context.WithTimeout(ctx, credentialRefreshTimeout)
 	defer cancelRefresh()
 	core := c.runtime.CoreManager()
@@ -309,6 +314,10 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 		return nil, errLock
 	}
 	defer refreshLock.Unlock()
+	// A refresh that waited on this credential's lock while a drain began must not start one.
+	if refreshDraining.Load() {
+		return nil, errRefreshDraining
+	}
 
 	now := time.Now().UTC()
 	leaseID := newRefreshLeaseID()
@@ -364,7 +373,12 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 	}
 	updated := leased
 	if !skipRefresh && leaseClaimed {
-		refreshed, errRefresh := core.RefreshAuthCredential(refreshCtx, leased.Clone())
+		// Once claimed, a stop must not abort the provider call: the provider may already have
+		// rotated the refresh token, and only this call's write-back keeps the new one.
+		providerDeadline, _ := refreshCtx.Deadline()
+		providerCtx, cancelProvider := context.WithDeadline(context.WithoutCancel(refreshCtx), providerDeadline)
+		refreshed, errRefresh := core.RefreshAuthCredential(providerCtx, leased.Clone())
+		cancelProvider()
 		refreshErr = errRefresh
 		if refreshed == nil {
 			refreshed = leased.Clone()
@@ -374,10 +388,15 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 		finalized, finalizedLease, refreshSuperseded, disabledTarget, errFinalize := c.retryRefreshFinalize(finalizeCtx, targetUUID, leaseID, leased, beforeClaim, refreshed, refreshErr)
 		cancelFinalize()
 		if errFinalize != nil {
-			go c.continueRefreshFinalize(targetUUID, leaseID, leased.Clone(), beforeClaim.Clone(), refreshed.Clone(), refreshErr, now.Add(refreshLeaseDuration))
+			finishContinued := holdRefresh()
+			go func() {
+				defer finishContinued()
+				c.continueRefreshFinalize(targetUUID, leaseID, leased.Clone(), beforeClaim.Clone(), refreshed.Clone(), refreshErr, now.Add(refreshLeaseDuration))
+			}()
 			return nil, errFinalize
 		}
 		updated = finalized
+		noteRefreshRejection(targetUUID, refreshErr, finalized, finalizedLease, refreshSuperseded, disabledTarget)
 		switch {
 		case disabledTarget:
 			refreshErr = newClusterUnauthorizedRefreshError()
@@ -487,9 +506,10 @@ func (c *RefreshController) continueRefreshFinalize(targetUUID, leaseID string, 
 	}
 	for time.Now().UTC().Before(deadline) {
 		attemptCtx, cancelAttempt := context.WithTimeout(context.Background(), 5*time.Second)
-		finalized, finalizedLease, _, _, errFinalize := c.finalizeRefreshLease(attemptCtx, targetUUID, leaseID, leased, beforeClaim, refreshed, errRefresh)
+		finalized, finalizedLease, superseded, disabledTarget, errFinalize := c.finalizeRefreshLease(attemptCtx, targetUUID, leaseID, leased, beforeClaim, refreshed, errRefresh)
 		cancelAttempt()
 		if errFinalize == nil {
+			noteRefreshRejection(targetUUID, errRefresh, finalized, finalizedLease, superseded, disabledTarget)
 			if finalizedLease && finalized != nil {
 				syncCtx, cancelSync := context.WithTimeout(context.Background(), refreshFinalizeTimeout)
 				if errSync := c.syncForwardedAuth(syncCtx, targetUUID); errSync != nil {
