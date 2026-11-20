@@ -32,9 +32,9 @@ func (r *Runtime) antigravityTOSPauseWindow() time.Duration {
 	return window
 }
 
-// antigravityTOSPauseDeadline reads the authoritative pool fence on every dispatch.
+// AntigravityTOSPauseDeadline reads the shared deadline used by Home dispatch.
 // No node-local cache may keep dispatching after another Home arms the pause.
-func (r *Runtime) antigravityTOSPauseDeadline(ctx context.Context) (time.Time, error) {
+func (r *Runtime) AntigravityTOSPauseDeadline(ctx context.Context) (time.Time, error) {
 	if r.antigravityTOSPauseWindow() <= 0 || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
 		return time.Time{}, nil
 	}

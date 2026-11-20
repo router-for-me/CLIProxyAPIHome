@@ -974,7 +974,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if provider != "antigravity" {
 			continue
 		}
-		until, errPause := r.antigravityTOSPauseDeadline(ctx)
+		until, errPause := r.AntigravityTOSPauseDeadline(ctx)
 		if errPause != nil {
 			return nil, fmt.Errorf("read Antigravity pool pause: %w", errPause)
 		}

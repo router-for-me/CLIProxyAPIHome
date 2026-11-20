@@ -232,6 +232,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/request-events/filter-options` |
 | `GET` | `/request-logs` |
 | `POST` | `/requests/api-call` |
+| `GET` | `/routing/antigravity/tos-pause` |
 | `POST` | `/routing/cooldown/reset` |
 | `GET` | `/routing/model-definitions/:channel` |
 | `GET` | `/server/latest-version` |
@@ -2640,6 +2641,14 @@ Home 会把生成的 credential 作为 DB-backed OAuth auth records 存储，并
 
 ## 凭证额度和冷却操作
 
+### GET `/routing/antigravity/tos-pause`
+
+Home 读取调度器使用的 Antigravity 共享暂停截止时间。截止时间晚于观测时间时，整个池处于暂停状态。窗口已关闭、截止时间缺失或已过期时，返回 `"paused": false, "resume_at": null`。`observed_at` 为服务端观测时间，`resume_at` 为预计恢复时间，两者均使用 UTC（RFC 3339）。运行时不可用或截止时间读取失败时返回 `503 antigravity_tos_pause_unavailable`。响应使用 `Cache-Control: no-store`。
+
+```json
+{ "paused": true, "resume_at": "2026-11-20T04:30:00Z", "observed_at": "2026-11-20T04:25:00Z" }
+```
+
 ### POST `/routing/cooldown/reset`
 
 清除所选凭证在 Home 中的调度冷却，包括模型冷却。不会重置上游账号额度，也不会删除持久化额度快照。仅清理某个模型时，使用已有的 `DELETE /credentials/:credential_id/cooldown`。
@@ -2919,6 +2928,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credentials.in
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `capabilities.usage` | boolean | 是否支持旧版 `GET /observability/usage/api-keys` 能力。 |
+| `capabilities.antigravity_tos_pause_status` | boolean | 是否支持读取 Antigravity 凭据池当前的暂停状态。 |
 | `capabilities.quota_snapshots` | boolean | 是否支持 DB-backed `GET /quota/credentials` 额度快照列表。 |
 | `capabilities.quota_snapshot_details` | boolean | 是否支持 `GET /quota/credentials/:credential_id`。 |
 | `capabilities.quota_recollect` | boolean | 是否支持 `POST /quota/collect` 按需额度采集。 |
