@@ -143,6 +143,13 @@ func (r *Repository) CreateUser(ctx context.Context, update UserUpdate) (*UserRe
 	if errDB != nil {
 		return nil, errDB
 	}
+	return createUserTx(ctx, db, update)
+}
+
+func createUserTx(ctx context.Context, db *gorm.DB, update UserUpdate) (*UserRecord, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database connection is nil")
+	}
 	if update.Username == nil {
 		return nil, fmt.Errorf("username is required")
 	}

@@ -2,6 +2,8 @@ package userapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +20,10 @@ import (
 	"gorm.io/gorm"
 )
 
-const maxUserJSONBodyBytes int64 = 1 << 20
+const (
+	maxUserJSONBodyBytes int64 = 1 << 20
+	apiKeyLoginPrefix          = "aig-"
+)
 
 type Handler struct {
 	repo                        *cluster.Repository
@@ -739,17 +744,54 @@ func (h *Handler) authenticatedUser(c *gin.Context, ctx context.Context, fields 
 func (h *Handler) userByPassword(c *gin.Context, ctx context.Context, fields authFields) (*cluster.UserRecord, bool) {
 	username := fields.username()
 	password := fields.Password
-	if username == "" || password == "" {
-		respondError(c, http.StatusUnauthorized, "invalid_credentials", fmt.Errorf("invalid credentials"))
-		return nil, false
+	if username != "" && password != "" {
+		record, errUser := h.repo.GetUserByUsername(ctx, username)
+		if errUser != nil {
+			if !errors.Is(errUser, gorm.ErrRecordNotFound) {
+				respondAuthError(c, errUser)
+				return nil, false
+			}
+		} else if passwordMatches(record.Password, password) {
+			return record, true
+		}
 	}
-	record, errUser := h.repo.GetUserByUsername(ctx, username)
-	if errUser != nil {
-		respondAuthError(c, errUser)
-		return nil, false
+
+	if candidateKey := candidateAPIKeyFromLogin(username, password); candidateKey != "" {
+		return h.userByAPIKey(c, ctx, candidateKey)
 	}
-	if !passwordMatches(record.Password, password) {
-		respondError(c, http.StatusUnauthorized, "invalid_credentials", fmt.Errorf("invalid credentials"))
+
+	respondError(c, http.StatusUnauthorized, "invalid_credentials", fmt.Errorf("invalid credentials"))
+	return nil, false
+}
+
+func candidateAPIKeyFromLogin(username string, password string) string {
+	trimmedUser := strings.TrimSpace(username)
+	trimmedPass := strings.TrimSpace(password)
+	if strings.HasPrefix(trimmedPass, apiKeyLoginPrefix) && len(trimmedPass) > len(apiKeyLoginPrefix) {
+		if strings.HasPrefix(trimmedUser, apiKeyLoginPrefix) && trimmedUser != trimmedPass {
+			return ""
+		}
+		return trimmedPass
+	}
+	if strings.HasPrefix(trimmedUser, apiKeyLoginPrefix) && len(trimmedUser) > len(apiKeyLoginPrefix) {
+		if trimmedPass == "" || trimmedPass == trimmedUser {
+			return trimmedUser
+		}
+	}
+	return ""
+}
+
+func (h *Handler) userByAPIKey(c *gin.Context, ctx context.Context, apiKey string) (*cluster.UserRecord, bool) {
+	record, errResolve := h.repo.ResolveOrProvisionUserForAPIKey(ctx, apiKey, func() (string, error) {
+		passwordInput := apiKey
+		if len([]byte(passwordInput)) > maxPasswordBytes {
+			sum := sha256.Sum256([]byte(passwordInput))
+			passwordInput = hex.EncodeToString(sum[:])
+		}
+		return hashPassword(passwordInput)
+	})
+	if errResolve != nil {
+		respondAuthError(c, errResolve)
 		return nil, false
 	}
 	return record, true
@@ -803,14 +845,15 @@ func (h *Handler) userResponse(record *cluster.UserRecord) gin.H {
 	_, totpEnabled := loadTOTP(record.MFA)
 	passkeys, _ := loadPasskeys(record.Passkey)
 	return gin.H{
-		"id":            record.ID,
-		"username":      record.Username,
-		"credits":       record.Credits,
-		"totp_enabled":  totpEnabled,
-		"passkey_count": len(passkeys),
-		"email_status":  userEmailStatusResponse(record, h.userEmailEnabled()),
-		"created_at":    record.CreatedAt,
-		"updated_at":    record.UpdatedAt,
+		"id":                record.ID,
+		"username":          record.Username,
+		"credits":           record.Credits,
+		"credits_unlimited": record.CreditsUnlimited,
+		"totp_enabled":      totpEnabled,
+		"passkey_count":     len(passkeys),
+		"email_status":      userEmailStatusResponse(record, h.userEmailEnabled()),
+		"created_at":        record.CreatedAt,
+		"updated_at":        record.UpdatedAt,
 	}
 }
 

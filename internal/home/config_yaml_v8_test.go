@@ -66,3 +66,27 @@ observability:
 		t.Fatal("legacy projection missing")
 	}
 }
+
+func TestSanitizeConfigYAMLForDownstreamForwardsRequestLogFormat(t *testing.T) {
+	for name, source := range map[string]string{
+		"legacy": "request-log: true\nrequest-log-format: json\n",
+		"v8":     "config-version: 8\nobservability:\n  logs:\n    request-log: true\n    request-log-format: JSON\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, errSanitize := sanitizeConfigYAMLForDownstream([]byte(source))
+			if errSanitize != nil {
+				t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+			}
+			var downstream map[string]any
+			if errUnmarshal := yaml.Unmarshal(data, &downstream); errUnmarshal != nil {
+				t.Fatalf("yaml.Unmarshal() error = %v", errUnmarshal)
+			}
+			if downstream["request-log"] != true {
+				t.Fatalf("downstream request-log = %#v, want true", downstream["request-log"])
+			}
+			if downstream["request-log-format"] != "json" {
+				t.Fatalf("downstream request-log-format = %#v, want json", downstream["request-log-format"])
+			}
+		})
+	}
+}

@@ -41,7 +41,7 @@ func sessionAffinityQuotaBlocked(auth *Auth, model string, now time.Time) bool {
 	if RefreshBlocksDispatch(auth) && sessionAffinityRebindFailure(auth.LastError) {
 		return true
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
+	if auth.Quota.Exceeded && auth.Quota.Reason == quotaReasonCredential && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
 		return true
 	}
 	if state := auth.ModelStates[canonicalModelKey(model)]; state != nil {
