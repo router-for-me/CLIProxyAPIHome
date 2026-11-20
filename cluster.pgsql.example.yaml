@@ -33,6 +33,12 @@ pgsql:
   # Defaults to 2, capped by max-open-conns when that limit is positive.
   # Explicit values must not exceed a positive max-open-conns.
   # max-idle-conns: 2
+  # Separate pool for heartbeats, election and CPA node liveness; 0 shares the main pool (default).
+  # With a positive max-open-conns, request work can hold every connection for seconds and
+  # delay heartbeats. Each attached CPA node refreshes its liveness through this pool every
+  # second, so size it for the nodes on this Home (2 suits a Home with one or two nodes).
+  # Behind a transaction pooler, both pools still share the pooler's server connections.
+  # coordination-max-open-conns: 0
 
   # Queries taking longer than this threshold are logged as slow SQL.
   # Optional; defaults to "200ms". Uses Go duration syntax such as "1s".

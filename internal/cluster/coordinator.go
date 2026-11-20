@@ -36,10 +36,13 @@ type CoordinatorOptions struct {
 	HeartbeatTimeout  time.Duration
 	OnMasterChanged   func(bool)
 	StartupRecovery   StartupRecovery
+	// CoordinationRepository serves heartbeats, election and master lookup when set.
+	CoordinationRepository *Repository
 }
 
 type Coordinator struct {
 	repo              *Repository
+	coordination      *Repository
 	node              NodeIdentity
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
@@ -84,8 +87,13 @@ func NewCoordinator(repo *Repository, node NodeIdentity, opts CoordinatorOptions
 		node.Secret = generateNodeSecret()
 	}
 
+	coordination := opts.CoordinationRepository
+	if coordination == nil {
+		coordination = repo
+	}
 	return &Coordinator{
 		repo:              repo,
+		coordination:      coordination,
 		node:              node,
 		heartbeatInterval: interval,
 		heartbeatTimeout:  timeout,
@@ -127,7 +135,7 @@ func (c *Coordinator) Initialize(ctx context.Context) error {
 	if errRegister != nil {
 		return errRegister
 	}
-	if errHeartbeat := c.repo.HeartbeatHomeIncarnation(ctx, incarnation); errHeartbeat != nil {
+	if errHeartbeat := c.coordination.HeartbeatHomeIncarnation(ctx, incarnation); errHeartbeat != nil {
 		return c.retireFailedInitialization(ctx, incarnation, errHeartbeat)
 	}
 	if errRecovery := c.runStartupRecovery(ctx, incarnation); errRecovery != nil {
@@ -210,7 +218,7 @@ func (c *Coordinator) RetireHomeIncarnation(ctx context.Context) error {
 	if !initialized {
 		return nil
 	}
-	return c.repo.RetireHomeIncarnation(ctx, incarnation)
+	return c.coordination.RetireHomeIncarnation(ctx, incarnation)
 }
 
 // Start starts subsequent coordinator heartbeats after initialization.
@@ -230,14 +238,27 @@ func (c *Coordinator) Start(ctx context.Context) error {
 
 	cleanupCtx, cancelCleanup := context.WithCancel(ctx)
 	defer cancelCleanup()
-	if sqlDB, errDB := c.repo.db.DB(); errDB != nil {
-		log.Warn("cluster database pool observation unavailable")
-	} else {
+	observed := []struct {
+		db      *gorm.DB
+		backend string
+	}{{c.repo.db, c.repo.db.Dialector.Name()}}
+	if c.coordination != c.repo && c.coordination != nil && c.coordination.db != nil {
+		observed = append(observed, struct {
+			db      *gorm.DB
+			backend string
+		}{c.coordination.db, c.coordination.db.Dialector.Name() + "/coordination"})
+	}
+	for _, pool := range observed {
+		sqlDB, errDB := pool.db.DB()
+		if errDB != nil {
+			log.Warn("cluster database pool observation unavailable")
+			continue
+		}
 		poolTicker := time.NewTicker(time.Minute)
 		poolDone := make(chan struct{})
 		go func() {
 			defer close(poolDone)
-			observeDatabasePool(cleanupCtx, sqlDB, c.repo.db.Dialector.Name(), poolTicker.C)
+			observeDatabasePool(cleanupCtx, sqlDB, pool.backend, poolTicker.C)
 		}()
 		defer func() {
 			cancelCleanup()
@@ -364,7 +385,7 @@ func (c *Coordinator) UpdateClientCount(ctx context.Context, clientCount int) er
 	if clientCount < 0 {
 		clientCount = 0
 	}
-	db, errDB := c.repo.database()
+	db, errDB := c.coordination.database()
 	if errDB != nil {
 		return errDB
 	}
@@ -400,7 +421,7 @@ func (c *Coordinator) CurrentMaster(ctx context.Context) (*ClusterNodeRecord, er
 	if c.repo == nil {
 		return nil, fmt.Errorf("cluster coordinator repository is nil")
 	}
-	db, errDB := c.repo.database()
+	db, errDB := c.coordination.database()
 	if errDB != nil {
 		return nil, errDB
 	}
@@ -426,7 +447,7 @@ func (c *Coordinator) CurrentMaster(ctx context.Context) (*ClusterNodeRecord, er
 // heartbeatAndElect handles a heartbeat and elect.
 func (c *Coordinator) heartbeatAndElect(ctx context.Context, home HomeIncarnationID) error {
 	// Keep validation before state changes so failures leave existing data intact.
-	db, errDB := c.repo.database()
+	db, errDB := c.coordination.database()
 	if errDB != nil {
 		return errDB
 	}
@@ -504,7 +525,7 @@ func (c *Coordinator) heartbeatHomeIncarnation(ctx context.Context) (HomeIncarna
 	if !initialized {
 		return HomeIncarnationID{}, fmt.Errorf("cluster coordinator is not initialized")
 	}
-	if errHeartbeat := c.repo.HeartbeatHomeIncarnation(ctx, incarnation); errHeartbeat != nil {
+	if errHeartbeat := c.coordination.HeartbeatHomeIncarnation(ctx, incarnation); errHeartbeat != nil {
 		return HomeIncarnationID{}, errHeartbeat
 	}
 	return incarnation, nil
