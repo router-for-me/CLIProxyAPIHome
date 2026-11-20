@@ -178,6 +178,7 @@ func registerClusterManagementRoutes(r *RouteRegistry, handler *clustermanagemen
 	r.Set(http.MethodDelete, "/access/api-keys", handler.DeleteAPIKeys)
 	r.Set(http.MethodGet, "/observability/usage/api-keys", handler.GetAPIKeyUsage)
 	r.Set(http.MethodGet, "/capabilities", handler.GetCapabilities)
+	r.Set(http.MethodGet, "/routing/antigravity/tos-pause", handler.GetAntigravityTOSPause)
 	r.Set(http.MethodGet, "/credentials/in-flight", handler.GetInFlightDetails)
 	r.Set(http.MethodGet, "/credentials/in-flight/summary", handler.GetInFlightSummary)
 	r.Set(http.MethodGet, "/credentials/concurrency-policies", handler.ListCredentialConcurrencyPolicies)

@@ -45,7 +45,7 @@ func TestAntigravityTOSPauseDefaultDoesNotReadOrWriteFence(t *testing.T) {
 	if errRecord := runtime.recordAntigravityTOSPause(t.Context(), result, false); errRecord != nil {
 		t.Fatal(errRecord)
 	}
-	if deadline, errRead := runtime.antigravityTOSPauseDeadline(t.Context()); errRead != nil || !deadline.IsZero() {
+	if deadline, errRead := runtime.AntigravityTOSPauseDeadline(t.Context()); errRead != nil || !deadline.IsZero() {
 		t.Fatalf("default pause deadline = %v, %v", deadline, errRead)
 	}
 	if adapter.value != nil {

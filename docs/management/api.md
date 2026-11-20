@@ -232,6 +232,7 @@ The following v8 routes are derived from `internal/managementhttp/routes_v8.go` 
 | `GET` | `/request-events/filter-options` |
 | `GET` | `/request-logs` |
 | `POST` | `/requests/api-call` |
+| `GET` | `/routing/antigravity/tos-pause` |
 | `POST` | `/routing/cooldown/reset` |
 | `GET` | `/routing/model-definitions/:channel` |
 | `GET` | `/server/latest-version` |
@@ -2650,6 +2651,14 @@ Home stores the resulting credential as DB-backed OAuth auth records and returns
 
 ## Credential Quota and Cooldown Operations
 
+### GET `/routing/antigravity/tos-pause`
+
+Home reads the shared Antigravity pause deadline used during dispatch. A future deadline means the entire pool is paused. When the window is disabled or the deadline is missing or expired, Home returns `"paused": false, "resume_at": null`. `observed_at` is the server observation time and `resume_at` is the scheduled resumption time, both in UTC (RFC 3339). If the runtime or its stored deadline cannot be read, the endpoint returns `503 antigravity_tos_pause_unavailable`. Responses use `Cache-Control: no-store`.
+
+```json
+{ "paused": true, "resume_at": "2026-11-20T04:30:00Z", "observed_at": "2026-11-20T04:25:00Z" }
+```
+
 ### POST `/routing/cooldown/reset`
 
 Clears Home's routing cooldown for the selected credential, including its model cooldowns. It does not reset upstream account quota or delete stored quota snapshots. For a single model, use the existing `DELETE /credentials/:credential_id/cooldown` route.
@@ -2929,6 +2938,7 @@ Response fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `capabilities.usage` | boolean | Whether the legacy `GET /observability/usage/api-keys` capability is available. |
+| `capabilities.antigravity_tos_pause_status` | boolean | Whether Home reports the current Antigravity pool pause. |
 | `capabilities.quota_snapshots` | boolean | Whether the DB-backed `GET /quota/credentials` snapshot list is available. |
 | `capabilities.quota_snapshot_details` | boolean | Whether `GET /quota/credentials/:credential_id` is available. |
 | `capabilities.quota_recollect` | boolean | Whether `POST /quota/collect` on-demand collection is available. |

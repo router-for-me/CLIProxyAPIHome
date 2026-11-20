@@ -31,6 +31,7 @@ func TestManagementV8Routes(t *testing.T) {
 		"GET /credentials/model-states", "GET /credentials/:credential_id/model-states",
 		"GET /oauth/auth-url", "POST /oauth/import", "GET /oauth/status", "DELETE /oauth/session",
 		"GET /server/latest-version", "POST /requests/api-call", "POST /routing/cooldown/reset",
+		"GET /routing/antigravity/tos-pause",
 		"GET /observability/logs", "GET /observability/usage/api-keys", "GET /plugins/store", "DELETE /plugins/:id",
 		"GET /credentials/quota/providers", "POST /credentials/quota/fetch", "POST /credentials/quota/reset",
 		"GET /plugins/:id/quota", "POST /plugins/:id/quota", "DELETE /plugins/:id/quota",
