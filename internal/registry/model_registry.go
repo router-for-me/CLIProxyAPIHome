@@ -28,6 +28,8 @@ type ModelInfo struct {
 	ID string `json:"id"`
 	// MetadataModelID preserves the original upstream identity for OAuth settings.
 	MetadataModelID string `json:"-" yaml:"-"`
+	// ResponseModelAlias is the forced response name on a published Copilot route, before credential prefixing.
+	ResponseModelAlias string `json:"-" yaml:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
 	// Created timestamp when the model was created

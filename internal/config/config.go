@@ -151,7 +151,7 @@ type Config struct {
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// vertex, antigravity, claude, codex, kimi, xai, meta, devin.
+	// vertex, antigravity, claude, codex, kimi, xai, meta, devin, copilot.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, meta-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
@@ -275,6 +275,21 @@ type OAuthModelAlias struct {
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// OpenAPI selects the Vertex execution endpoint without changing Home alias resolution.
 	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
+}
+
+// ForRouting returns the names used to publish and resolve the alias on its channel.
+func (a OAuthModelAlias) ForRouting(channel string) (OAuthModelAlias, bool) {
+	a.Name = strings.TrimSpace(a.Name)
+	a.Alias = strings.TrimSpace(a.Alias)
+	if a.Name == "" || a.Alias == "" || strings.EqualFold(a.Name, a.Alias) {
+		return a, false
+	}
+	if channel == "copilot" {
+		a.Name = "copilot/" + strings.TrimPrefix(a.Name, "copilot/")
+		a.Alias = "copilot/" + strings.TrimPrefix(a.Alias, "copilot/")
+		return a, !strings.EqualFold(a.Name, a.Alias)
+	}
+	return a, true
 }
 
 // ClaudeKey represents the configuration for a Claude API key,

@@ -54,6 +54,9 @@ func (h *Handler) getCredentialModels(c *gin.Context, includeCandidates bool) {
 		authID = name
 	}
 
+	if includeCandidates {
+		h.runtime.PruneCopilotModels()
+	}
 	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
 	response := gin.H{"models": credentialModelEntries(models)}
 	if includeCandidates {
@@ -106,6 +109,7 @@ func (h *Handler) getModels(c *gin.Context, includeBillingModels bool) {
 	switch scope {
 	case "available", "active", "current":
 		if includeBillingModels {
+			h.runtime.PruneCopilotModels()
 			c.JSON(http.StatusOK, gin.H{"scope": "available", "models": h.availableBillingModelDefinitions()})
 			return
 		}

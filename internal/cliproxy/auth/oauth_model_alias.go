@@ -43,22 +43,18 @@ func compileOAuthModelAliasTable(aliases map[string][]internalconfig.OAuthModelA
 			continue
 		}
 		rev := make(map[string]oauthModelAliasEntry, len(entries))
-		for _, entry := range entries {
-			name := strings.TrimSpace(entry.Name)
-			alias := strings.TrimSpace(entry.Alias)
-			if name == "" || alias == "" {
+		for _, configured := range entries {
+			entry, ok := configured.ForRouting(channel)
+			if !ok {
 				continue
 			}
-			if strings.EqualFold(name, alias) {
-				continue
-			}
-			aliasKey := strings.ToLower(alias)
+			aliasKey := strings.ToLower(entry.Alias)
 			if _, exists := rev[aliasKey]; exists {
 				continue
 			}
 			rev[aliasKey] = oauthModelAliasEntry{
-				upstreamModel: name,
-				alias:         alias,
+				upstreamModel: entry.Name,
+				alias:         entry.Alias,
 				forceMapping:  entry.ForceMapping,
 			}
 		}
@@ -301,7 +297,7 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: vertex, antigravity, claude, codex, kimi, xai, meta, devin.
+// Supported channels: vertex, antigravity, claude, codex, kimi, xai, meta, devin, copilot.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authKind = strings.ToLower(strings.TrimSpace(authKind))
@@ -319,7 +315,7 @@ func OAuthModelAliasChannel(provider, authKind string) string {
 		return "claude"
 	case "codex":
 		return "codex"
-	case "antigravity", "kimi", "kimi-ai", "xai", "meta", "devin":
+	case "antigravity", "kimi", "kimi-ai", "xai", "meta", "devin", "copilot":
 		return provider
 	default:
 		return ""

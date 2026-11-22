@@ -10,7 +10,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/refraction-networking/utls v1.8.2
-	github.com/router-for-me/CLIProxyAPI/v8 v8.0.79
+	github.com/router-for-me/CLIProxyAPI/v8 v8.1.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5

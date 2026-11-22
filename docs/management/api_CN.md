@@ -2347,6 +2347,8 @@ Query 参数：
 
 ### POST `/credentials`
 
+GitHub Copilot 支持导入 CPA 生成的 `type: copilot` 凭据 JSON。Home 将 GitHub 长期凭据存入 `refresh_token`，并在 Copilot 短期 token 到期前五分钟刷新。Home 向每个账号的可信 API 主机发现模型，发布账号可用模型与通用目录 `copilot` 段的交集。账号模型在发现成功后可用。空目录、权限拒绝、过期快照或旧主机的快照均不会为该账号发布模型。发布 ID 为 `copilot/<原生模型 ID>`，支持 OAuth 别名、排除规则和凭据前缀。
+
 上传一个或多个 credential JSON payload。
 
 Multipart 输入：
@@ -2528,6 +2530,7 @@ Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_r
 | `xai` | xAI OAuth。 |
 | `devin` | Devin PKCE OAuth。 |
 | `meta` | Meta 设备授权流程。 |
+| `copilot` | GitHub Copilot 设备授权流程。 |
 | 插件 `oauth_provider` | 由 Home 已加载并注册的插件处理登录。 |
 
 通用响应：
@@ -2540,7 +2543,7 @@ Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_r
 }
 ```
 
-Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。通过 `/oauth/status?state=...` 轮询完成状态。
+Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。GitHub Copilot 用户打开 `url` 并输入返回的 `user_code`。通过 `/oauth/status?state=...` 轮询完成状态，也可调用 `DELETE /oauth/session?state=...` 取消会话。
 
 插件需在 `/plugins` 中满足 `supports_oauth: true`、`effective_enabled: true` 且 `oauth_provider` 非空。插件 provider key 由小写字母、数字、连字符组成；v8 插件收到的回调路由为 `/v8/management/oauth/callback`。缺少 provider 返回 `400 {"error":"provider is required"}`，未知或不可用 provider 返回 `404 {"error":"provider_not_found"}`。
 
@@ -2603,7 +2606,7 @@ Query 参数：
 | `provider` | 否 | 默认取 state 对应会话的 provider。内置回调兼容 `anthropic`/`claude`、`codex`/`openai`、`antigravity`/`anti-gravity`、`xai`/`x-ai`/`grok`、`devin`；插件会话使用其 `oauth_provider`。 |
 | `redirect_url` | 否，仅 POST | 完整回调 URL，用于补全缺失的 state、code 或 error。 |
 
-Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
+Kimi、Kimi AI、Meta 和 Copilot 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
 
 | 状态码 | error |
 | --- | --- |

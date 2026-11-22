@@ -19,6 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
@@ -322,6 +323,43 @@ func (h *Handler) RequestMetaToken(c *gin.Context) {
 	c.JSON(http.StatusOK, payload)
 }
 
+// RequestCopilotToken starts GitHub device authorization.
+func (h *Handler) RequestCopilotToken(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(requestContextOrBackground(c), 30*time.Second)
+	defer cancel()
+
+	state, errState := generateOAuthState("cpl")
+	if errState != nil {
+		respondError(c, http.StatusInternalServerError, "oauth_session_failed", errState)
+		return
+	}
+	client := h.oauthHTTPClient()
+	device, errDevice := copilotauth.StartDeviceFlow(ctx, client)
+	if errDevice != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+	if errRegister := h.registerOAuthSession(c, "copilot", state, nil); errRegister != nil {
+		respondError(c, http.StatusInternalServerError, "oauth_session_failed", errRegister)
+		return
+	}
+	go func() {
+		sessionCtx, cancelSession := h.oauthSessionContext(context.Background(), state, cluster.OAuthSessionTTL)
+		defer cancelSession()
+		auth, errLogin := cpasdkauth.CompleteCopilotDeviceLogin(sessionCtx, client, device)
+		if errLogin != nil {
+			_ = h.repo.SetOAuthSessionError(context.Background(), state, "Authentication failed")
+			return
+		}
+		storeCtx, cancelStore := context.WithTimeout(sessionCtx, 30*time.Second)
+		defer cancelStore()
+		if errStore := h.storeOAuthMetadataWithContext(storeCtx, auth.Metadata, auth.FileName); errStore != nil {
+			_ = h.repo.SetOAuthSessionError(context.Background(), state, "Failed to save authentication tokens")
+		}
+	}()
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": device.VerificationURI, "user_code": device.UserCode, "state": state})
+}
+
 // GetAuthStatus returns an auth status.
 func (h *Handler) GetAuthStatus(c *gin.Context) {
 	// Validate request inputs before mutating persisted state.
@@ -456,7 +494,7 @@ func (h *Handler) handleOAuthCallback(c *gin.Context) {
 	} else {
 		provider, errProvider = normalizeOAuthProvider(providerInput)
 	}
-	if errProvider != nil || (!isPlugin && (provider == "kimi" || provider == "kimi-ai" || provider == "meta")) {
+	if errProvider != nil || (!isPlugin && (provider == "kimi" || provider == "kimi-ai" || provider == "meta" || provider == "copilot")) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unsupported provider"})
 		return
 	}
@@ -1324,6 +1362,8 @@ func normalizeOAuthProvider(provider string) (string, error) {
 		return "xai", nil
 	case "devin":
 		return "devin", nil
+	case "copilot":
+		return "copilot", nil
 	case "meta", "muse":
 		return "meta", nil
 	default:

@@ -51,6 +51,9 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	r.registerModelsForAuth(auth)
 	r.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 	r.coreManager.RefreshSchedulerEntry(auth.ID)
+	if auth.Provider == "copilot" {
+		r.wakeCopilotDiscovery()
+	}
 }
 
 // mergeModelStates merges locally accumulated execution state into the
@@ -172,6 +175,11 @@ func (r *Runtime) applyCoreAuthRemove(ctx context.Context, authID string) {
 
 	if errDel := r.coreManager.Delete(ctx, authID); errDel != nil {
 		log.Errorf("failed to delete auth %s: %v", authID, errDel)
+	}
+	if provider == "copilot" {
+		r.copilotMu.Lock()
+		delete(r.copilotAccounts, authID)
+		r.copilotMu.Unlock()
 	}
 	r.cancelStaleAntigravityProbes(authID)
 	registry.GetGlobalRegistry().UnregisterClient(authID)

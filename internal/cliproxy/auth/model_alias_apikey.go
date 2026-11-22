@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
 const homeConfigModelsMetadataKey = "home_config_models"
@@ -98,6 +99,20 @@ func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
 
 // resolveDispatchModel resolves the auth-specific upstream model used for execution and runtime state.
 func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchModelResolution {
+	isCopilot := auth != nil && strings.EqualFold(auth.Provider, "copilot")
+	if isCopilot {
+		// Publication resolves collisions per account and keeps the response alias across prefixing.
+		suffix := parseModelSuffix(routeModel)
+		route := registry.GetGlobalRegistry().GetModelInfoForClient(auth.ID, suffix.ModelName)
+		if route != nil && route.MetadataModelID != "" {
+			return dispatchModelResolution{
+				Model:         preserveResolvedModelSuffix(route.MetadataModelID, suffix),
+				Key:           canonicalModelKey(route.MetadataModelID),
+				ForceMapping:  route.ResponseModelAlias != "",
+				OriginalAlias: route.ResponseModelAlias,
+			}
+		}
+	}
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	oauthAlias := m.resolveOAuthModelAlias(auth, requestedModel)
 	if strings.TrimSpace(oauthAlias.upstreamModel) != "" {
@@ -111,6 +126,9 @@ func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchMo
 		resolved = strings.TrimSpace(routeModel)
 	}
 	resolved = strings.TrimSpace(resolved)
+	if isCopilot {
+		resolved = strings.TrimPrefix(resolved, "copilot/")
+	}
 	if resolved == "" {
 		return dispatchModelResolution{}
 	}

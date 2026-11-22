@@ -32,6 +32,12 @@ type staticModelsJSON struct {
 	XAI         []*ModelInfo `json:"xai"`
 	Devin       []*ModelInfo `json:"devin"`
 	Meta        []*ModelInfo `json:"meta"`
+	Copilot     []*ModelInfo `json:"copilot"`
+}
+
+// GetCopilotModels returns the Copilot presets from the active catalog.
+func GetCopilotModels() []*ModelInfo {
+	return cloneModelInfos(getModels().Copilot)
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -146,6 +152,7 @@ func GetAllStaticModelDefinitions() map[string][]*ModelInfo {
 		"xai",
 		"devin",
 		"meta",
+		"copilot",
 	}
 	definitions := make(map[string][]*ModelInfo, len(channels))
 	for _, channel := range channels {
@@ -389,6 +396,9 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		provider = "xai"
 	case "devin":
 		models = GetDevinModels()
+	case "copilot":
+		models = GetCopilotModels()
+		provider = "copilot"
 	case "meta", "muse":
 		models = GetMetaModels()
 		provider = "meta"
@@ -401,7 +411,6 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
 // Returns nil if no matching model is found.
 func LookupStaticModelInfo(modelID string) *ModelInfo {
-	// Normalize source data before building the derived payload.
 	if modelID == "" {
 		return nil
 	}
@@ -417,6 +426,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.XAI,
 		GetDevinModels(),
 		GetMetaModels(),
+		data.Copilot,
 	}
 	for _, models := range allModels {
 		for _, m := range models {
