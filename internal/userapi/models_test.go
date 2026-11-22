@@ -332,7 +332,11 @@ func TestAccessibleModelsReportInsufficientAvailabilityData(t *testing.T) {
 	user := createUserModelTestUser(t, handler, "availability-user")
 	createUserModelAPIKey(t, handler, user.ID, "availability-client-key", nil)
 	// Twelve observations, two of them failures: enough to publish a rate.
-	seedUserModelUsage(t, handler, "gpt-4.1-mini", "availability-client-key", 10, 2)
+	seedUserModelUsage(t, handler, "gpt-4.1-mini", "availability-client-key", 9, 2)
+	if _, errAppend := handler.repo.AppendUsage(context.Background(),
+		fmt.Sprintf(`{"timestamp":%q,"provider":"antigravity","model":"gpt-4.1-mini","request_id":"req-split-output","latency_ms":13790,"tokens":{"input_tokens":296790,"output_tokens":78,"reasoning_tokens":1460,"total_tokens":298328}}`, time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)), "192.0.2.10"); errAppend != nil {
+		t.Fatalf("AppendUsage(split output) error = %v", errAppend)
+	}
 	// Three observations: a sample, but not a measurement.
 	seedUserModelUsage(t, handler, "text-only-model", "availability-client-key", 3, 0)
 
@@ -358,8 +362,12 @@ func TestAccessibleModelsReportInsufficientAvailabilityData(t *testing.T) {
 	if observed.AvgTTFTMS == nil || *observed.AvgTTFTMS <= 0 {
 		t.Errorf("observed avg_ttft_ms = %v, want a positive mean", observed.AvgTTFTMS)
 	}
-	if observed.OutputTokensPerSecond == nil || *observed.OutputTokensPerSecond <= 0 {
-		t.Errorf("observed output_tokens_per_second = %v, want a positive rate", observed.OutputTokensPerSecond)
+	// The split-output sample contributes all 1538 output tokens, not just its 78 non-reasoning tokens.
+	const wantTPS = 187.81 // (9*500 + 1538) / (18.36 + 13.79)
+	if observed.OutputTokensPerSecond == nil {
+		t.Error("observed output_tokens_per_second missing")
+	} else if got := *observed.OutputTokensPerSecond; got != wantTPS {
+		t.Errorf("observed output_tokens_per_second = %v, want %v", got, wantTPS)
 	}
 	if observed.Window.Hours != int(modelAvailabilityWindow/time.Hour) {
 		t.Errorf("observed window hours = %d, want %d", observed.Window.Hours, int(modelAvailabilityWindow/time.Hour))
