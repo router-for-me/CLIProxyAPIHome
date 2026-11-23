@@ -389,6 +389,8 @@ func (a *RuntimeAdapter) SaveWithStateVersion(ctx context.Context, auth *coreaut
 	}
 
 	saveAuth.StateVersion = record.Version
+	saveAuth.CredentialIdentityVersion = quotaCredentialIdentityVersion(*record)
+	auth.CredentialIdentityVersion = saveAuth.CredentialIdentityVersion
 	a.cacheAuthSnapshot(auth.ID, record, saveAuth)
 	return auth.ID, record.Version, nil
 }
@@ -851,7 +853,7 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 		metadata[antigravityCapabilityHintsMetadataKey] = cloneMetadataValue(raw)
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
-		for _, key := range []string{"project_id", "base_url", "user_agent"} {
+		for _, key := range []string{"project_id", "projectId", "project", "base_url", "user_agent"} {
 			if s, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(s) != "" {
 				metadata[key] = strings.TrimSpace(s)
 			}

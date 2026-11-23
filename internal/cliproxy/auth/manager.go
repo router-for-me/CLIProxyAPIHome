@@ -585,6 +585,7 @@ func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth,
 			return false, nil
 		}
 		auth.StateVersion = stateVersion
+		auth.CredentialIdentityVersion = persisted.CredentialIdentityVersion
 		if !synchronizeCurrent {
 			return true, nil
 		}
@@ -592,6 +593,7 @@ func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth,
 		if current := m.auths[auth.ID]; current != nil {
 			if current == auth || current.StateVersion == previousVersion {
 				current.StateVersion = stateVersion
+				current.CredentialIdentityVersion = persisted.CredentialIdentityVersion
 			}
 		}
 		m.mu.Unlock()

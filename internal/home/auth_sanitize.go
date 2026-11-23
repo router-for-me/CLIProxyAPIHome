@@ -25,6 +25,13 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth, cfg *config.Config) (*coreau
 
 	out := auth.Clone()
 	out.LastRefreshError = nil
+	delete(out.Attributes, antigravityModelEnumScopeAttribute)
+	if scope := antigravityModelEnumScope(auth); scope != "" {
+		if len(out.Attributes) == 0 {
+			out.Attributes = make(map[string]string)
+		}
+		out.Attributes[antigravityModelEnumScopeAttribute] = scope
+	}
 	if raw := out.Metadata["credential_options"]; raw != nil {
 		data, errMarshal := json.Marshal(raw)
 		if errMarshal != nil {

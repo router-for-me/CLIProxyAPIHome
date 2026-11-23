@@ -155,6 +155,7 @@ func RecordToAuth(record *AuthRecord) (*coreauth.Auth, error) {
 	}
 	auth.Index = record.Index
 	auth.StateVersion = record.Version
+	auth.CredentialIdentityVersion = quotaCredentialIdentityVersion(*record)
 
 	return auth, nil
 }
