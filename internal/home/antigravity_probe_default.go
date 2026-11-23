@@ -24,6 +24,7 @@ var antigravityHubChangelists = map[string]string{
 	"2.23.0": "998057262",
 	"2.24.0": "1000335682",
 	"2.29.0": "1013060670",
+	"2.33.0": "1023160026",
 }
 
 type antigravityProbeStatus int
