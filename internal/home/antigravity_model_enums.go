@@ -44,8 +44,10 @@ func antigravityModelProbeKey(cacheKey, enumScope, accessToken string) string {
 type antigravityModelEnumPublication struct {
 	// Zero means reservation failed and a new probe must reserve its own
 	// version. Do not keep the unversioned catalog for publication.
-	version int64
-	models  map[string]string
+	version           int64
+	models            map[string]string
+	thinkingGroups    map[string]map[string]int
+	thinkingWebSearch map[string]bool
 }
 
 // Home nodes allocate a shared version before making the upstream request.
@@ -68,7 +70,7 @@ func (r *Runtime) reserveAntigravityModelEnumVersion(ctx context.Context, scope 
 func (r *Runtime) publishAntigravityModelEnums(ctx context.Context, authID, cacheKey string, entry antigravityCapabilityCacheEntry) {
 	pending := entry.pendingEnum
 	if pending == nil || pending.version == 0 ||
-		!r.storeAntigravityModelEnums(ctx, authID, entry.hints.modelEnumScope, pending.version, pending.models) {
+		!r.storeAntigravityModelEnums(ctx, authID, entry.hints.modelEnumScope, pending) {
 		return
 	}
 	antigravityCapabilityMu.Lock()
@@ -82,7 +84,7 @@ func (r *Runtime) publishAntigravityModelEnums(ctx context.Context, authID, cach
 
 // storeAntigravityModelEnums reports completion, including when a newer
 // snapshot has already been published by another node.
-func (r *Runtime) storeAntigravityModelEnums(ctx context.Context, authID, scope string, version int64, models map[string]string) bool {
+func (r *Runtime) storeAntigravityModelEnums(ctx context.Context, authID, scope string, snapshot *antigravityModelEnumPublication) bool {
 	if scope == "" || ctx.Err() != nil {
 		return false
 	}
@@ -91,24 +93,30 @@ func (r *Runtime) storeAntigravityModelEnums(ctx context.Context, authID, scope 
 		return false
 	}
 	key := fmt.Sprintf("%s%x:%s", antigravityModelEnumKeyPrefix, sha256.Sum256([]byte(authID)), scope)
-	if models == nil {
+	if snapshot == nil {
 		// Keep the last success for an actively probed credential, without
-		// retaining abandoned scopes forever or rewriting any model values.
+		// retaining abandoned scopes forever or rewriting the snapshot.
 		kept, errExpire := store.KVExpire(ctx, key, antigravityModelEnumTTL)
 		return kept && errExpire == nil
 	}
-	if version <= 0 {
+	if snapshot.version <= 0 {
 		return false
 	}
 	previous, found, errGet := store.KVGet(ctx, key)
 	if errGet == nil {
-		if found && ojson.GetBytes(previous, "version").Int() >= version {
+		if found && ojson.GetBytes(previous, "version").Int() >= snapshot.version {
 			return true
 		}
 		doc := ojson.NewDocString("{}")
 		doc.Set("scope", scope)
-		doc.Set("version", version)
-		doc.Set("models", models)
+		doc.Set("version", snapshot.version)
+		doc.Set("models", snapshot.models)
+		if len(snapshot.thinkingGroups) > 0 {
+			doc.Set("thinkingGroups", snapshot.thinkingGroups)
+		}
+		if len(snapshot.thinkingWebSearch) > 0 {
+			doc.Set("thinkingWebSearch", snapshot.thinkingWebSearch)
+		}
 		swapped, errSwap := store.KVCompareAndSwap(ctx, key, previous, found, doc.Bytes(), antigravityModelEnumTTL)
 		if errSwap == nil {
 			// On contention, let the next scan recheck the winning version.

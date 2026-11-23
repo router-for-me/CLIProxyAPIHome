@@ -188,6 +188,25 @@ func TestPrepareDispatchResponseIncludesForceMapping(t *testing.T) {
 	}
 }
 
+func TestPrepareDispatchResponsePreservesAntigravityCredentialExclusions(t *testing.T) {
+	auth := &coreauth.Auth{ID: "antigravity-excluded-models-auth", Provider: "antigravity", Attributes: map[string]string{}}
+	result := &home.DispatchResult{Auth: auth, Provider: "antigravity", Model: "gemini-demo"}
+	for _, rules := range []string{"gemini-demo-low,gemini-demo-very-*", "gemini-demo-high", ""} {
+		if rules == "" {
+			delete(auth.Attributes, "excluded_models")
+		} else {
+			auth.Attributes["excluded_models"] = rules
+		}
+		payload, _, errPrepare := prepareDispatchResponse(result, "user-key", nil)
+		if errPrepare != nil {
+			t.Fatal(errPrepare)
+		}
+		if got := gjson.GetBytes(payload, "auth.attributes.excluded_models").Str; got != rules {
+			t.Fatalf("dispatched excluded_models = %q, want %q", got, rules)
+		}
+	}
+}
+
 func TestPrepareDispatchResponseIncludesModelInfo(t *testing.T) {
 	result := &home.DispatchResult{
 		Model:    "gemini-3.8-flash-high",

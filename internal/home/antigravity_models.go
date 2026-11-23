@@ -70,9 +70,13 @@ type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
 	ModelIDs       map[string]struct{}
-	modelEnums     map[string]string
 	modelEnumScope string
 	revision       uint64
+
+	// Catalog fields are only retained for the pending KV publication.
+	modelEnums        map[string]string
+	thinkingGroups    map[string]map[string]int
+	thinkingWebSearch map[string]bool
 }
 
 func (h antigravityModelCapabilityHints) clone() antigravityModelCapabilityHints {
@@ -391,9 +395,13 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 				current.pendingEnum = &antigravityModelEnumPublication{version: enumVersion}
 				if enumVersion > 0 {
 					current.pendingEnum.models = hints.modelEnums
+					current.pendingEnum.thinkingGroups = hints.thinkingGroups
+					current.pendingEnum.thinkingWebSearch = hints.thinkingWebSearch
 				}
 			}
 			hints.modelEnums = nil
+			hints.thinkingGroups = nil
+			hints.thinkingWebSearch = nil
 			current.hints, current.expiresAt, current.lastUsed = hints.clone(), now.Add(antigravityCapabilityCacheTTL), now
 			antigravityCapabilityCache[cacheKey] = current
 			delete(antigravityAuthFailureCache, failureKey)
@@ -403,7 +411,7 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 		}
 		antigravityAuthFailureCache[failureKey] = nextAntigravityFailure(antigravityAuthFailureCache[failureKey], now, rand.Int64N)
 		antigravityCapabilityMu.Unlock()
-		r.storeAntigravityModelEnums(probeCtx, probeAuth.ID, enumScope, enumVersion, nil)
+		r.storeAntigravityModelEnums(probeCtx, probeAuth.ID, enumScope, nil)
 		retained := current.hints.clone()
 		if status == antigravityProbeStatusSuccess && len(hints.WebSearchModelIDs) > 0 {
 			retained.WebSearchModelIDs = hints.WebSearchModelIDs

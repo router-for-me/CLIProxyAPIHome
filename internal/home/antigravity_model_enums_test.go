@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -46,7 +47,7 @@ func (a *antigravityEnumTestAdapter) KVIncrBy(_ context.Context, _ string, delta
 }
 
 func (a *antigravityEnumTestAdapter) KVExpire(_ context.Context, key string, ttl time.Duration) (bool, error) {
-	if key != a.key || ttl <= 0 {
+	if key != a.key || ttl != antigravityModelEnumTTL {
 		return false, nil
 	}
 	a.renewed++
@@ -64,8 +65,8 @@ func (a *antigravityEnumTestAdapter) KVCompareAndSwap(_ context.Context, key str
 	if found != (key == a.key) || (found && !bytes.Equal(previous, a.raw)) {
 		return false, nil
 	}
-	if ttl <= 0 {
-		return false, fmt.Errorf("expected expiring enum snapshot")
+	if ttl != antigravityModelEnumTTL {
+		return false, fmt.Errorf("unexpected enum snapshot TTL: %v", ttl)
 	}
 	a.key, a.raw = key, raw
 	a.writes++
@@ -92,7 +93,11 @@ func TestAntigravityModelEnumPublicationRecoversOnScan(t *testing.T) {
 			t.Cleanup(resetAntigravityCapabilityCache)
 			var calls atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = fmt.Fprintf(w, `{"models":{"gemini-2.5-pro":{"model":"MODEL_%d"}}}`, calls.Add(1))
+				call := calls.Add(1)
+				_, _ = fmt.Fprintf(w, `{
+					"models":{"gemini-test-high":{"model":"MODEL_%d","maxOutputTokens":%d}},
+					"groupedModels":{"gemini-test":{"supportedThinkingLevels":[{"thinkingSuffix":"high"}]}}
+				}`, call, 500+call)
 			}))
 			t.Cleanup(srv.Close)
 			const id = "enum-publication-recovery"
@@ -147,6 +152,9 @@ func TestAntigravityModelEnumPublicationRecoversOnScan(t *testing.T) {
 				t.Fatalf("after scan: snapshot = %s, reserved version = %d, probes = %d; want version %d, probes %d, %s",
 					adapter.raw, adapter.version.Load(), calls.Load(), tc.wantVersion, tc.wantCalls, tc.wantModel)
 			}
+			if limit := ojson.GetBytes(adapter.raw, "thinkingGroups.gemini-test.high").Int(); limit != 500+int64(tc.wantCalls) {
+				t.Fatalf("retried or superseded publication has wrong thinking limit: %s", adapter.raw)
+			}
 			reads := adapter.readAttempts
 			rt.refreshAntigravityModels(t.Context())
 			rt.WaitAntigravityProbes()
@@ -161,6 +169,51 @@ func TestAntigravityModelEnumsFromRefresh(t *testing.T) {
 	resetAntigravityCapabilityCache()
 	t.Cleanup(resetAntigravityCapabilityCache)
 	var calls, response atomic.Int32
+	const (
+		legacyResponse int32 = iota
+		groupedResponse
+		failedResponse
+		groupedResponseWithoutSearch
+		emptyResponse
+	)
+	const modelCatalog = `{
+		"gemini-9.9-test-low":{"model":"MODEL_LOW","maxOutputTokens":512},
+		"gemini-9.9-test-high":{"model":"MODEL_HIGH"},
+		"gemini-9.9-test-very-high":{"model":"MODEL_VERY_HIGH","maxOutputTokens":1024},
+		"gemini-9.9-test-tiered":{"model":"MODEL_TIERED","maxOutputTokens":2048},
+		"gemini-9.9-test-neighbor-high":{"maxOutputTokens":768},
+		"gemini-9.9-test--leading":{"maxOutputTokens":512},
+		"gemini-9.9-test-trailing-":{"maxOutputTokens":512},
+		"gemini-9.9-test-double--dash":{"maxOutputTokens":512},
+		"gemini-9.9-test-under_score":{"maxOutputTokens":512},
+		"gemini-9.9-test-padded":{"maxOutputTokens":512},
+		"gemini-9.9-test-élevé":{"maxOutputTokens":512},
+		"gemini-9.9-test-scalar":42,
+		"gemini-9.9-test-zero":{"maxOutputTokens":0},
+		"gemini-9.9-test-negative":{"maxOutputTokens":-1},
+		"gemini-9.9-test-decimal":{"maxOutputTokens":1.5},
+		"gemini-9.9-test-exponent":{"maxOutputTokens":1e3},
+		"gemini-9.9-test-quoted":{"maxOutputTokens":"512"},
+		"gemini-9.9-test-overflow":{"maxOutputTokens":9223372036854775808},
+		"gemini-9.9-test-nolimit":{"model":42},
+		"gemini-9.9-test-CASE":{"maxOutputTokens":512},
+		"gemini-9.9-test-incomplete-high":{"maxOutputTokens":256}
+	}`
+	const groupCatalog = `{
+		"gemini-9.9-test":{"supportedThinkingLevels":[
+			{"thinkingSuffix":"low"},{"thinkingSuffix":"HIGH"},{"thinkingSuffix":"very-high"},
+			{"thinkingSuffix":"-leading"},{"thinkingSuffix":"trailing-"},{"thinkingSuffix":"double--dash"},
+			{"thinkingSuffix":"under_score"},{"thinkingSuffix":" padded "},{"thinkingSuffix":"élevé"},{"thinkingSuffix":"scalar"},
+			{"thinkingSuffix":"zero"},{"thinkingSuffix":"negative"},{"thinkingSuffix":"decimal"},
+			{"thinkingSuffix":"exponent"},{"thinkingSuffix":"quoted"},{"thinkingSuffix":"overflow"},
+			{"thinkingSuffix":"nolimit"},{"thinkingSuffix":"absent"},{"thinkingSuffix":"case"},
+			{"thinkingSuffix":42},"tiered",{},null
+		]},
+		"gemini-9.9-test-neighbor":{"supportedThinkingLevels":[{"thinkingSuffix":"high"}]},
+		"gemini-9.9-test-incomplete":{"supportedThinkingLevels":{"thinkingSuffix":"high"}},
+		"gemini-9.9-unknown":{"supportedThinkingLevels":[{"thinkingSuffix":"high","maxOutputTokens":512}]}
+	}`
+	const webSearchCatalog = `["gemini-9.9-test-low","gemini-9.9-test-high","gemini-9.9-test-tiered","gemini-9.9-test-absent","Gemini-9.9-test-very-high"]`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.URL.Path != antigravityModelsPath {
@@ -168,12 +221,16 @@ func TestAntigravityModelEnumsFromRefresh(t *testing.T) {
 			return
 		}
 		switch response.Load() {
-		case 1:
+		case groupedResponse:
+			_, _ = fmt.Fprintf(w, `{"models":%s,"groupedModels":%s,"webSearchModelIds":%s}`, modelCatalog, groupCatalog, webSearchCatalog)
+		case failedResponse:
 			w.WriteHeader(http.StatusServiceUnavailable)
-		case 2:
+		case groupedResponseWithoutSearch:
+			_, _ = fmt.Fprintf(w, `{"models":%s,"groupedModels":%s}`, modelCatalog, groupCatalog)
+		case emptyResponse:
 			_, _ = fmt.Fprint(w, `{"models":{}}`)
 		default:
-			_, _ = fmt.Fprint(w, `{"models":{"gemini-2.5-pro":{"model":"MODEL_GOOGLE_GEMINI_2_5_PRO"},"gemini-3.1-flash-lite":{"model":"MODEL_PLACEHOLDER_M50"},"gemini-3-flash":{"model":42}}}`)
+			_, _ = fmt.Fprintf(w, `{"models":%s,"webSearchModelIds":%s}`, modelCatalog, webSearchCatalog)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -197,11 +254,13 @@ func TestAntigravityModelEnumsFromRefresh(t *testing.T) {
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
 	rt.applyCoreAuthAddOrUpdate(coreauth.WithSkipPersist(t.Context()), minimal.Clone())
 	rt.WaitAntigravityProbes()
-	waitForSnapshot := func(want map[string]string) string {
+	checkSnapshot := func(models map[string]string, groups map[string]map[string]int, version int64) string {
 		t.Helper()
+		// A legacy reader only decodes the original fields.
 		var state struct {
-			Scope  string            `json:"scope"`
-			Models map[string]string `json:"models"`
+			Scope   string            `json:"scope"`
+			Models  map[string]string `json:"models"`
+			Version int64             `json:"version"`
 		}
 		if errDecode := json.Unmarshal(adapter.raw, &state); errDecode != nil {
 			t.Fatal(errDecode)
@@ -210,12 +269,18 @@ func TestAntigravityModelEnumsFromRefresh(t *testing.T) {
 		if adapter.key != wantKey {
 			t.Fatalf("successful refresh wrote key %q, want %q", adapter.key, wantKey)
 		}
-		if len(state.Models) != len(want) || state.Scope == "" || state.Models == nil {
-			t.Fatalf("bad snapshot: %s", adapter.raw)
+		if state.Scope == "" || state.Version != version || state.Models == nil || !maps.Equal(state.Models, models) {
+			t.Fatalf("bad v1 snapshot: %s", adapter.raw)
 		}
-		for id, enum := range want {
-			if state.Models[id] != enum {
-				t.Fatalf("model %q = %q, want %q", id, state.Models[id], enum)
+		groupField := ojson.GetBytes(adapter.raw, "thinkingGroups")
+		if groups == nil {
+			if groupField.Exists() {
+				t.Fatalf("expected absent thinkingGroups, got %s", adapter.raw)
+			}
+		} else {
+			var got map[string]map[string]int
+			if errDecode := json.Unmarshal([]byte(groupField.Raw), &got); errDecode != nil || !maps.EqualFunc(got, groups, maps.Equal) {
+				t.Fatalf("thinkingGroups = %s, want %v (error = %v)", groupField.Raw, groups, errDecode)
 			}
 		}
 		if strings.Contains(string(adapter.raw), "access-value") || strings.Contains(string(adapter.raw), "refresh-value") {
@@ -223,8 +288,35 @@ func TestAntigravityModelEnumsFromRefresh(t *testing.T) {
 		}
 		return state.Scope
 	}
-	want := map[string]string{"gemini-2.5-pro": "MODEL_GOOGLE_GEMINI_2_5_PRO", "gemini-3.1-flash-lite": "MODEL_PLACEHOLDER_M50"}
-	scope := waitForSnapshot(want)
+	checkWebSearch := func(want map[string]bool) {
+		t.Helper()
+		field := ojson.GetBytes(adapter.raw, "thinkingWebSearch")
+		if want == nil {
+			if field.Exists() {
+				t.Fatalf("expected absent thinkingWebSearch, got %s", field.Raw)
+			}
+			return
+		}
+		var got map[string]bool
+		if errDecode := json.Unmarshal([]byte(field.Raw), &got); errDecode != nil || !maps.Equal(got, want) {
+			t.Fatalf("thinkingWebSearch = %s, want %v (error = %v)", field.Raw, want, errDecode)
+		}
+	}
+	wantModels := map[string]string{
+		"gemini-9.9-test-low":       "MODEL_LOW",
+		"gemini-9.9-test-high":      "MODEL_HIGH",
+		"gemini-9.9-test-very-high": "MODEL_VERY_HIGH",
+		"gemini-9.9-test-tiered":    "MODEL_TIERED",
+	}
+	wantGroups := map[string]map[string]int{
+		"gemini-9.9-test": {
+			"low": 512, "high": 0, "very-high": 1024,
+			"zero": 0, "negative": 0, "decimal": 0, "exponent": 0, "quoted": 0, "overflow": 0, "nolimit": 0,
+		},
+		"gemini-9.9-test-neighbor": {"high": 768},
+	}
+	scope := checkSnapshot(wantModels, nil, 1)
+	checkWebSearch(nil)
 	rt.refreshAntigravityModels(t.Context())
 	rt.WaitAntigravityProbes()
 	if calls.Load() != 1 || adapter.writes != 1 {
@@ -257,23 +349,36 @@ func TestAntigravityModelEnumsFromRefresh(t *testing.T) {
 		rt.executeAntigravityModelRefresh(&antigravityModelRefreshRequest{ctx: t.Context(), auth: minimal, provider: "antigravity"})
 		rt.WaitAntigravityProbes()
 	}
-	refresh(1)
-	waitForSnapshot(want)
-	if adapter.writes != 1 || adapter.renewed != 1 {
-		t.Fatalf("failed refresh: %d writes, %d renewals; want 1 and 1", adapter.writes, adapter.renewed)
+	refresh(groupedResponse)
+	if checkSnapshot(wantModels, wantGroups, 2) != scope {
+		t.Fatal("adding groups changed the credential scope")
 	}
-	refresh(2)
-	waitForSnapshot(map[string]string{})
-	if calls.Load() != 3 || adapter.writes != 2 {
-		t.Fatalf("probes = %d, writes = %d; want 3 and 2", calls.Load(), adapter.writes)
+	checkWebSearch(map[string]bool{"gemini-9.9-test-low": true, "gemini-9.9-test-high": true})
+	previous := bytes.Clone(adapter.raw)
+	refresh(failedResponse)
+	if !bytes.Equal(previous, adapter.raw) || adapter.writes != 2 || adapter.renewed != 1 {
+		t.Fatalf("failed refresh changed the snapshot or failed to renew it: %d writes, %d renewals", adapter.writes, adapter.renewed)
+	}
+	refresh(groupedResponseWithoutSearch)
+	checkSnapshot(wantModels, wantGroups, 4)
+	checkWebSearch(nil)
+	refresh(legacyResponse)
+	if checkSnapshot(wantModels, nil, 5) != scope {
+		t.Fatal("removing groups changed the credential scope")
+	}
+	checkWebSearch(nil)
+	refresh(emptyResponse)
+	checkSnapshot(map[string]string{}, nil, 6)
+	if calls.Load() != 6 || adapter.writes != 5 {
+		t.Fatalf("probes = %d, writes = %d; want 6 and 5", calls.Load(), adapter.writes)
 	}
 	adapter.mu.Lock()
 	adapter.full[id] = rotated
 	adapter.mu.Unlock()
-	response.Store(0)
+	response.Store(legacyResponse)
 	rt.refreshAntigravityModels(t.Context())
 	rt.WaitAntigravityProbes()
-	if replaced := waitForSnapshot(want); replaced == scope || calls.Load() != 4 || adapter.writes != 3 {
+	if replaced := checkSnapshot(wantModels, nil, 7); replaced == scope || calls.Load() != 7 || adapter.writes != 6 {
 		t.Fatalf("replacement refresh: reused scope = %v, probes = %d, writes = %d", replaced == scope, calls.Load(), adapter.writes)
 	}
 }

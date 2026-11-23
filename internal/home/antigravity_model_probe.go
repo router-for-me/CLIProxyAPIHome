@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
@@ -96,13 +97,14 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 	}
 
 	var hints antigravityModelCapabilityHints
+	var webSearchItems []ojson.Result
 	hints.WebSearchModelIDs = make(map[string]struct{})
 	if webSearch := root.Get("webSearchModelIds"); webSearch.Exists() && webSearch.Type != ojson.Null {
-		items := webSearch.Array()
-		if !webSearch.IsArray() || len(items) > antigravityMaxCatalogModels {
+		webSearchItems = webSearch.Array()
+		if !webSearch.IsArray() || len(webSearchItems) > antigravityMaxCatalogModels {
 			return antigravityModelCapabilityHints{}, false
 		}
-		for _, item := range items {
+		for _, item := range webSearchItems {
 			if item.Type != ojson.String {
 				return antigravityModelCapabilityHints{}, false
 			}
@@ -131,6 +133,99 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 				hints.modelEnums[strings.Clone(id)] = strings.Clone(value.Str)
 			}
 		}
+		hints.thinkingGroups = parseAntigravityThinkingGroups(root.Get("groupedModels"), items)
+		hints.thinkingWebSearch = antigravityThinkingWebSearch(hints.thinkingGroups, webSearchItems)
 	}
 	return hints, true
+}
+
+func antigravityThinkingWebSearch(groups map[string]map[string]int, webSearchItems []ojson.Result) map[string]bool {
+	if len(groups) == 0 || len(webSearchItems) == 0 {
+		return nil
+	}
+	// Match exact upstream variant IDs rather than the normalized registration hints.
+	declared := make(map[string]struct{}, len(webSearchItems))
+	for _, item := range webSearchItems {
+		declared[item.Str] = struct{}{}
+	}
+	var supported map[string]bool
+	for group, levels := range groups {
+		for level := range levels {
+			id := group + "-" + level
+			if _, ok := declared[id]; ok {
+				if supported == nil {
+					supported = make(map[string]bool)
+				}
+				supported[id] = true
+			}
+		}
+	}
+	return supported
+}
+
+func parseAntigravityThinkingGroups(groupedModels ojson.Result, models map[string]ojson.Result) map[string]map[string]int {
+	if !groupedModels.IsObject() || len(models) == 0 {
+		return nil
+	}
+	var groups map[string]map[string]int
+	groupedModels.ForEach(func(key, entry ojson.Result) bool {
+		group := key.Str
+		if group == "" || len(group) >= antigravityMaxModelIDBytes || !entry.IsObject() {
+			return true
+		}
+		declared := entry.Get("supportedThinkingLevels")
+		if !declared.IsArray() {
+			return true
+		}
+		var levels map[string]int
+		declared.ForEach(func(_, item ojson.Result) bool {
+			if !item.IsObject() {
+				return true
+			}
+			suffix := item.Get("thinkingSuffix")
+			if suffix.Type != ojson.String || len(group)+1+len(suffix.Str) > antigravityMaxModelIDBytes || !validAntigravityThinkingSuffix(suffix.Str) {
+				return true
+			}
+			level := strings.ToLower(suffix.Str)
+			member := models[group+"-"+level]
+			if !member.IsObject() {
+				return true
+			}
+			// Zero records a declared member that is not eligible as a switch target.
+			limit := 0
+			if value := member.Get("maxOutputTokens"); value.Type == ojson.Number {
+				if n, errLimit := strconv.Atoi(value.Raw); errLimit == nil && n > 0 {
+					limit = n
+				}
+			}
+			if levels == nil {
+				levels = make(map[string]int)
+			}
+			levels[strings.Clone(level)] = limit
+			return true
+		})
+		if len(levels) > 0 {
+			if groups == nil {
+				groups = make(map[string]map[string]int)
+			}
+			groups[strings.Clone(group)] = levels
+		}
+		return true
+	})
+	return groups
+}
+
+func validAntigravityThinkingSuffix(suffix string) bool {
+	lastAlnum := false
+	for i := range len(suffix) {
+		switch ch := suffix[i]; {
+		case ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9':
+			lastAlnum = true
+		case ch == '-' && lastAlnum:
+			lastAlnum = false
+		default:
+			return false
+		}
+	}
+	return lastAlnum
 }

@@ -134,7 +134,6 @@ var downstreamExcludedConfigKeys = []string{
 	"openai-compatibility",
 	"vertex-api-key",
 	"oauth-model-alias",
-	"oauth-excluded-models",
 }
 
 // sanitizeConfigYAMLForDownstream sanitizes a config yaml for downstream.
@@ -176,6 +175,18 @@ func sanitizeConfigYAMLForDownstream(payload []byte, continuity ...bool) ([]byte
 	}
 	for _, key := range downstreamExcludedConfigKeys {
 		delete(normalized, key)
+	}
+	// CPA needs Antigravity exclusions for variants selected after Home dispatch.
+	// Keep the other providers' rules Home-only and preserve each pattern intact.
+	const exclusionsKey = "oauth-excluded-models"
+	exclusions, _ := normalized[exclusionsKey].(map[string]any)
+	for provider := range exclusions {
+		if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+			delete(exclusions, provider)
+		}
+	}
+	if len(exclusions) == 0 {
+		delete(normalized, exclusionsKey)
 	}
 	// Advertise the optional read-only scheduler RPC separately from user config.
 	normalized["home-scheduler-protocol"] = 0
