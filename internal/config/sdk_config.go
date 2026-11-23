@@ -19,4 +19,7 @@ type SDKConfig struct {
 
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
+
+	// RequestLogFormat selects the downstream CPA request log format ("text" or "json").
+	RequestLogFormat string `yaml:"request-log-format,omitempty" json:"request-log-format,omitempty"`
 }

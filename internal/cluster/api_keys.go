@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ErrAPIKeyExists indicates that an API key value is already owned by another record.
@@ -1020,10 +1022,14 @@ type UserModelAccess struct {
 	// cannot call anything yet, which is a different situation from holding a
 	// key that happens to allow nothing.
 	APIKeyCount int
-	// Restricted reports whether every key is scoped to model groups. One
-	// unscoped key is enough to reach everything the cluster serves, so a false
-	// value here makes ModelIDs meaningless.
+	// Restricted reports whether every key is scoped to one or more access
+	// groups. One unscoped key is enough to reach everything the cluster serves,
+	// so a false value here makes ModelIDs meaningless.
 	Restricted bool
+	// ModelGroups and ChannelGroups identify which access-group types contribute
+	// to the restriction reason shown to user-facing clients.
+	ModelGroups   bool
+	ChannelGroups bool
 	// ModelIDs is the union of canonical model identifiers the scoped keys
 	// allow, sorted for stable output. It is only meaningful when Restricted.
 	ModelIDs []string
@@ -1035,47 +1041,159 @@ type UserModelAccess struct {
 // a broad key and a narrow one can call everything the broad key reaches, and
 // reporting the intersection would hide models they can actually use today.
 func (r *Repository) UserModelAccess(ctx context.Context, userID uint) (UserModelAccess, error) {
+	return r.UserModelAccessForClients(ctx, userID, nil, nil)
+}
+
+// ResolveOrProvisionUserForAPIKey resolves the active UserRecord owning an
+// active API key, auto-provisioning an unlimited-credits UTC user and binding
+// api_key.user_id when the key is unbound or references a deleted user.
+// Returns gorm.ErrRecordNotFound if no active API key matches.
+func (r *Repository) ResolveOrProvisionUserForAPIKey(ctx context.Context, apiKey string, buildPasswordHash func() (string, error)) (*UserRecord, error) {
 	db, errDB := r.database()
 	if errDB != nil {
-		return UserModelAccess{}, errDB
+		return nil, errDB
 	}
-	if userID == 0 {
-		return UserModelAccess{}, fmt.Errorf("user id is required")
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, gorm.ErrRecordNotFound
 	}
-
 	ctx = contextOrBackground(ctx)
-	var records []APIKeyRecord
-	if errFind := db.WithContext(ctx).Where("user_id = ?", userID).Order("id").Find(&records).Error; errFind != nil {
-		return UserModelAccess{}, errFind
+
+	// Fast path for keys already bound to an active user: avoid bcrypt and write locks.
+	var keyRecord APIKeyRecord
+	if errFirst := db.WithContext(ctx).Where("api_key = ?", apiKey).First(&keyRecord).Error; errFirst != nil {
+		return nil, errFirst
+	}
+	if keyRecord.UserID != nil && *keyRecord.UserID > 0 {
+		var existing UserRecord
+		errUser := db.WithContext(ctx).Where("id = ?", *keyRecord.UserID).First(&existing).Error
+		if errUser == nil {
+			return &existing, nil
+		}
+		if !errors.Is(errUser, gorm.ErrRecordNotFound) {
+			return nil, errUser
+		}
 	}
 
-	access := UserModelAccess{APIKeyCount: len(records), Restricted: true}
-	if len(records) == 0 {
-		return access, nil
+	var passwordHash string
+	if buildPasswordHash != nil {
+		var errHash error
+		passwordHash, errHash = buildPasswordHash()
+		if errHash != nil {
+			return nil, errHash
+		}
 	}
 
-	seen := make(map[string]struct{})
-	allowed := make([]string, 0)
-	for i := range records {
-		details, restricted, errDetails := allowedModelGroupDetailsForAPIKeyRecord(ctx, db, &records[i])
-		if errDetails != nil {
-			return UserModelAccess{}, errDetails
-		}
-		if !restricted {
-			return UserModelAccess{APIKeyCount: len(records), Restricted: false}, nil
-		}
-		for _, modelID := range allowedModelIDsFromDetails(details, restricted) {
-			key := strings.ToLower(modelID)
-			if _, ok := seen[key]; ok {
-				continue
+	var resolved *UserRecord
+	for attempt := 0; attempt < 3; attempt++ {
+		errTx := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if errLock := lockAPIKeyMutationTransaction(tx); errLock != nil {
+				return errLock
 			}
-			seen[key] = struct{}{}
-			allowed = append(allowed, modelID)
+			var lockedKey APIKeyRecord
+			if errFind := tx.WithContext(ctx).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("api_key = ?", apiKey).
+				First(&lockedKey).Error; errFind != nil {
+				return errFind
+			}
+			if lockedKey.UserID != nil && *lockedKey.UserID > 0 {
+				var existing UserRecord
+				errUser := tx.WithContext(ctx).Where("id = ?", *lockedKey.UserID).First(&existing).Error
+				if errUser == nil {
+					resolved = &existing
+					return nil
+				}
+				if !errors.Is(errUser, gorm.ErrRecordNotFound) {
+					return errUser
+				}
+			}
+
+			username, errUsername := nextAPIKeyProvisionUsernameTx(ctx, tx, &lockedKey, apiKey)
+			if errUsername != nil {
+				return errUsername
+			}
+			unlimited := true
+			timezone := "UTC"
+			update := UserUpdate{
+				Username:         &username,
+				CreditsUnlimited: &unlimited,
+				Timezone:         &timezone,
+			}
+			if passwordHash != "" {
+				update.Password = &passwordHash
+			}
+			created, errCreate := createUserTx(ctx, tx, update)
+			if errCreate != nil {
+				return errCreate
+			}
+			if errBind := tx.WithContext(ctx).
+				Model(&APIKeyRecord{}).
+				Where("id = ? AND deleted_at IS NULL", lockedKey.ID).
+				Update("user_id", created.ID).Error; errBind != nil {
+				return errBind
+			}
+			resolved = created
+			return nil
+		})
+		if errTx == nil {
+			return resolved, nil
+		}
+		if !IsUserConflictError(errTx) {
+			return nil, errTx
 		}
 	}
-	sort.Strings(allowed)
-	access.ModelIDs = allowed
-	return access, nil
+	return nil, fmt.Errorf("provision api key user: username conflict retries exhausted")
+}
+
+func nextAPIKeyProvisionUsernameTx(ctx context.Context, tx *gorm.DB, record *APIKeyRecord, apiKey string) (string, error) {
+	sum := sha256.Sum256([]byte(apiKey))
+	hexSum := hex.EncodeToString(sum[:])
+
+	base := ""
+	if record != nil && record.DisplayName != nil {
+		base = strings.TrimSpace(*record.DisplayName)
+	}
+	if base == "" {
+		base = "key-" + hexSum[:12]
+	}
+
+	candidates := []string{
+		base,
+		base + "-" + hexSum[:6],
+		base + "-" + hexSum[:12],
+	}
+	for _, candidate := range candidates {
+		taken, errTaken := usernameExistsTx(ctx, tx, candidate)
+		if errTaken != nil {
+			return "", errTaken
+		}
+		if !taken {
+			return candidate, nil
+		}
+	}
+	for suffix := 2; suffix <= 100; suffix++ {
+		candidate := fmt.Sprintf("%s-%s-%d", base, hexSum[:6], suffix)
+		taken, errTaken := usernameExistsTx(ctx, tx, candidate)
+		if errTaken != nil {
+			return "", errTaken
+		}
+		if !taken {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("unable to allocate unique username for api key")
+}
+
+func usernameExistsTx(ctx context.Context, tx *gorm.DB, username string) (bool, error) {
+	var count int64
+	if errCount := tx.WithContext(contextOrBackground(ctx)).
+		Model(&UserRecord{}).
+		Where("username = ?", username).
+		Count(&count).Error; errCount != nil {
+		return false, errCount
+	}
+	return count > 0, nil
 }
 
 func allowedAuthIDsForAPIKeyRecord(ctx context.Context, db *gorm.DB, record *APIKeyRecord) ([]string, error) {

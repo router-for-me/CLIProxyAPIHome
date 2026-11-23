@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,12 @@ const (
 	quotaBackoffMax             = 30 * time.Minute
 	unauthorizedRetryBackoff    = time.Minute
 	quotaScopeModel             = "model"
+	quotaScopeCredential        = "credential"
+	quotaReasonCredential       = "credential_quota"
 	providerQuotaHintMaxHorizon = 60 * 24 * time.Hour
+	genericCodex429Window       = 5 * time.Minute
+	genericCodex429Cooldown     = 5 * time.Minute
+	genericCodex429ModelLimit   = 2
 )
 
 // Result captures an upstream execution result reported by a downstream CPA node.
@@ -243,8 +249,17 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	refreshLastError := cloneError(auth.LastError)
 	refreshNextRetryAfter := auth.NextRetryAfter
 	refreshRuntimeBlocked := auth.RuntimeRefreshBlocked
+	credentialQuota := auth.Quota
+	preserveCredentialQuota := credentialQuotaActive(auth, now)
+	credentialStatus := auth.Status
+	credentialStatusMessage := auth.StatusMessage
+	credentialLastError := cloneError(auth.LastError)
 
 	if result.Success {
+		// A successful request is evidence that the transient generic-429
+		// observation window recovered. Keep any active credential cooldown
+		// intact, but do not carry stale evidence into a later window.
+		auth.GenericCodex429 = nil
 		state := ensureModelState(auth, resultModel)
 		resetModelState(state, now)
 		markModelObserved(state, result)
@@ -260,6 +275,14 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 			auth.LastError = nil
 			auth.StatusMessage = ""
 			auth.Status = StatusActive
+		}
+		if preserveCredentialQuota {
+			auth.Quota = credentialQuota
+			auth.Unavailable = true
+			auth.NextRetryAfter = credentialQuota.NextRecoverAt
+			auth.Status = credentialStatus
+			auth.StatusMessage = credentialStatusMessage
+			auth.LastError = credentialLastError
 		}
 		auth.UpdatedAt = now
 		transition.shouldResumeModel = true
@@ -285,6 +308,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	}
 	state := ensureModelState(auth, resultModel)
 	markModelObserved(state, result)
+	escalateCredential := !disableCooling && isGenericCodex429Result(result) && recordGenericCodex429(auth, resultModel, now)
 	state.Unavailable = true
 	state.Status = StatusError
 	state.UpdatedAt = now
@@ -368,6 +392,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
+	if escalateCredential {
+		applyGenericCodex429CredentialCooldown(auth, now)
+	}
 	if preserveRefreshAcquisition {
 		auth.Status = refreshStatus
 		auth.StatusMessage = refreshStatusMessage
@@ -420,7 +447,7 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 		return false
 	}
 	if result.Success {
-		return authHasClearableAvailabilityState(auth, resultModel, now)
+		return credentialQuotaActive(auth, now) || auth.GenericCodex429 != nil || authHasClearableAvailabilityState(auth, resultModel, now)
 	}
 	statusCode := statusCodeFromResult(result.Error)
 	if statusCode == http.StatusUnauthorized {
@@ -431,6 +458,9 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	}
 	if statusCode != http.StatusTooManyRequests {
 		return false
+	}
+	if !disableCooling && isGenericCodex429Result(result) {
+		return true
 	}
 	if isModelSupportResultError(result.Error) {
 		return false
@@ -510,6 +540,101 @@ func authQuotaWindowOpen(auth *Auth, resultModel string, now time.Time) bool {
 	return state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) && state.Quota.NextRecoverAt.Sub(now) <= providerQuotaHintMaxHorizon
 }
 
+// credentialQuotaActive reports whether a new credential-wide quota owns
+// dispatch availability. Legacy credential quota records intentionally use a
+// different reason and retain their historical selector behavior.
+func credentialQuotaActive(auth *Auth, now time.Time) bool {
+	if auth == nil || !auth.Quota.Exceeded || !strings.EqualFold(strings.TrimSpace(auth.Quota.Scope), quotaScopeCredential) ||
+		!strings.EqualFold(strings.TrimSpace(auth.Quota.Reason), quotaReasonCredential) {
+		return false
+	}
+	return auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)
+}
+
+// isGenericCodex429Result identifies an unclassified Codex 429 that may be a
+// credential-wide limit. Explicit provider quota, request-scoped, and
+// per-model capacity classifications remain on their existing paths.
+func isGenericCodex429Result(result Result) bool {
+	if result.Success || result.Error == nil || strings.ToLower(strings.TrimSpace(result.Provider)) != "codex" ||
+		statusCodeFromResult(result.Error) != http.StatusTooManyRequests || result.RequestScoped() ||
+		isForceCooldownResultError(result.Error) || isModelSupportResultError(result.Error) {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(result.Error.Code))
+	message := strings.ToLower(strings.TrimSpace(result.Error.Message))
+	combined := code + " " + message
+	for _, excluded := range []string{
+		quotaReasonCredential,
+		"insufficient_quota",
+		"quota_exceeded",
+		"usage_limit_reached",
+		"usage limit",
+		"billing_hard_limit",
+		"quota",
+		"turn_rate_limit_exceeded",
+		"transient_rate_limit",
+	} {
+		if strings.Contains(combined, excluded) {
+			return false
+		}
+	}
+	return true
+}
+
+// recordGenericCodex429 records one distinct model in the bounded escalation
+// window and reports whether the credential-wide threshold has been reached.
+func recordGenericCodex429(auth *Auth, resultModel string, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	model := strings.ToLower(strings.TrimSpace(canonicalModelKey(resultModel)))
+	if model == "" {
+		return false
+	}
+	state := auth.GenericCodex429
+	if state == nil || state.WindowStartedAt.IsZero() || now.Before(state.WindowStartedAt) || now.Sub(state.WindowStartedAt) >= genericCodex429Window {
+		state = &GenericCodex429State{WindowStartedAt: now.UTC()}
+	}
+	seen := false
+	for _, recordedModel := range state.Models {
+		if recordedModel == model {
+			seen = true
+			break
+		}
+	}
+	if !seen && len(state.Models) < genericCodex429ModelLimit {
+		state.Models = append(state.Models, model)
+		sort.Strings(state.Models)
+	}
+	auth.GenericCodex429 = state
+	return len(state.Models) >= genericCodex429ModelLimit
+}
+
+// applyGenericCodex429CredentialCooldown applies the bounded cross-model
+// escalation without shortening an existing credential-wide cooldown.
+func applyGenericCodex429CredentialCooldown(auth *Auth, now time.Time) {
+	if auth == nil || auth.GenericCodex429 == nil || len(auth.GenericCodex429.Models) < genericCodex429ModelLimit {
+		return
+	}
+	next := now.Add(genericCodex429Cooldown)
+	if credentialQuotaActive(auth, now) && auth.Quota.NextRecoverAt.After(next) {
+		next = auth.Quota.NextRecoverAt
+	}
+	backoffLevel := 1
+	if strings.EqualFold(strings.TrimSpace(auth.Quota.Scope), quotaScopeCredential) && auth.Quota.BackoffLevel > 0 {
+		backoffLevel = auth.Quota.BackoffLevel
+	}
+	auth.Quota = QuotaState{
+		Exceeded:      true,
+		Scope:         quotaScopeCredential,
+		Reason:        quotaReasonCredential,
+		NextRecoverAt: next,
+		BackoffLevel:  backoffLevel,
+	}
+	auth.Unavailable = true
+	auth.NextRetryAfter = next
+}
+
 // authHasClearableAvailabilityState reports whether a success outcome would
 // clear availability state that other Home nodes can observe.
 func authHasClearableAvailabilityState(auth *Auth, resultModel string, now time.Time) bool {
@@ -551,6 +676,12 @@ type availabilityFingerprintValue struct {
 	modelResetUnix  int64
 	modelObservedAt time.Time
 	modelQuota      quotaFingerprint
+	genericCodex429 genericCodex429Fingerprint
+}
+
+type genericCodex429Fingerprint struct {
+	windowUnix int64
+	models     string
 }
 
 // fingerprintUnix normalizes a time for fingerprint comparison.
@@ -592,6 +723,12 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 			fp.modelResetUnix = fingerprintUnix(state.QuotaResetAt)
 			fp.modelObservedAt = state.LastObservedAt
 			fp.modelQuota = fingerprintQuota(state.Quota)
+		}
+	}
+	if generic := auth.GenericCodex429; generic != nil {
+		fp.genericCodex429 = genericCodex429Fingerprint{
+			windowUnix: fingerprintUnix(generic.WindowStartedAt),
+			models:     strings.Join(generic.Models, "\x00"),
 		}
 	}
 	return fp
@@ -686,6 +823,7 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	local.StateVersion = persisted.StateVersion
 	local.LastRefreshError = cloneError(persisted.LastRefreshError)
 	local.NextRefreshAfter = persisted.NextRefreshAfter
+	local.GenericCodex429 = persisted.GenericCodex429.Clone()
 	if state := persisted.ModelStates[resultModel]; state != nil {
 		if local.ModelStates == nil {
 			local.ModelStates = make(map[string]*ModelState)
@@ -832,8 +970,18 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
+	var preservedCredentialQuota QuotaState
+	preserveCredentialQuota := credentialQuotaActive(auth, now)
+	if preserveCredentialQuota {
+		preservedCredentialQuota = auth.Quota
+	}
 	if len(auth.ModelStates) == 0 {
 		clearAggregatedAvailability(auth)
+		if preserveCredentialQuota {
+			auth.Quota = preservedCredentialQuota
+			auth.Unavailable = true
+			auth.NextRetryAfter = preservedCredentialQuota.NextRecoverAt
+		}
 		return
 	}
 	allUnavailable := true
@@ -875,6 +1023,11 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.NextRetryAfter = time.Time{}
 	}
 	auth.Quota = aggregateModelQuota(auth.ModelStates)
+	if preserveCredentialQuota {
+		auth.Quota = preservedCredentialQuota
+		auth.Unavailable = true
+		auth.NextRetryAfter = preservedCredentialQuota.NextRecoverAt
+	}
 }
 
 // aggregateModelQuota builds the credential-level quota view derived from all

@@ -80,6 +80,9 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// GenericCodex429 tracks bounded cross-model generic Codex rate-limit observations.
+	// It is persisted so concurrent Home nodes share the escalation window.
+	GenericCodex429 *GenericCodex429State `json:"generic_codex_429,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -128,6 +131,23 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+}
+
+// GenericCodex429State tracks distinct models that returned a generic Codex 429
+// during one bounded observation window.
+type GenericCodex429State struct {
+	WindowStartedAt time.Time `json:"window_started_at,omitzero"`
+	Models          []string  `json:"models,omitempty"`
+}
+
+// Clone returns an independent copy of the generic Codex 429 state.
+func (s *GenericCodex429State) Clone() *GenericCodex429State {
+	if s == nil {
+		return nil
+	}
+	cloned := *s
+	cloned.Models = append([]string(nil), s.Models...)
+	return &cloned
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
@@ -234,6 +254,7 @@ func (a *Auth) Clone() *Auth {
 	copyAuth.ProxyConnectionPool = a.ProxyConnectionPool.Clone()
 	copyAuth.LastError = cloneError(a.LastError)
 	copyAuth.LastRefreshError = cloneError(a.LastRefreshError)
+	copyAuth.GenericCodex429 = a.GenericCodex429.Clone()
 	if a.RuntimeDisableCooling != nil {
 		disableCooling := *a.RuntimeDisableCooling
 		copyAuth.RuntimeDisableCooling = &disableCooling

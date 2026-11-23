@@ -850,9 +850,9 @@ Authorization: Bearer user.jwt.token
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `restricted` | boolean | 当用户的每一个 API key 都被限定在 model groups 内时为 `true`。 |
+| `restricted` | boolean | 当用户的每一个 API key 都被限定在一个或多个访问组内时为 `true`。 |
 | `api_key_count` | number | 用户持有的 API key 数量。 |
-| `reason` | string | `unrestricted`、`model_groups` 或 `no_api_keys`。用于向用户解释列表为什么是空的，而不是只显示一个空态。 |
+| `reason` | string | `unrestricted`、`model_groups`、`channel_groups`、`access_groups` 或 `no_api_keys`。用于向用户解释列表为什么是空的，而不是只显示一个空态。 |
 
 访问范围是用户各个 key 的并集而非交集：只要持有一个未限定范围的 key，整个目录都可访问。一个 key 都没有则任何模型都不可访问，因为没有凭据的账号无法调用集群。
 

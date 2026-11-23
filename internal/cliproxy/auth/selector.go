@@ -351,6 +351,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if RefreshBlocksDispatch(auth) {
 		return true, blockReasonOther, auth.NextRetryAfter
 	}
+	if credentialQuotaActive(auth, now) {
+		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]

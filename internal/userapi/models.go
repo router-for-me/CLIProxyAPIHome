@@ -64,9 +64,11 @@ var structuredOutputParameterNames = map[string]struct{}{
 // empty is never self-explanatory, and a console that cannot say why would leave
 // the buyer guessing whether the cluster is empty or their key is narrow.
 const (
-	modelAccessReasonUnrestricted = "unrestricted"
-	modelAccessReasonModelGroups  = "model_groups"
-	modelAccessReasonNoAPIKeys    = "no_api_keys"
+	modelAccessReasonUnrestricted  = "unrestricted"
+	modelAccessReasonModelGroups   = "model_groups"
+	modelAccessReasonChannelGroups = "channel_groups"
+	modelAccessReasonAccessGroups  = "access_groups"
+	modelAccessReasonNoAPIKeys     = "no_api_keys"
 )
 
 // ListModels returns the public model catalog: every model the cluster can
@@ -143,7 +145,7 @@ func (h *Handler) ListAccessibleModels(c *gin.Context) {
 		return
 	}
 
-	access, errAccess := h.repo.UserModelAccess(ctx, user.ID)
+	access, errAccess := h.repo.UserModelAccessForClients(ctx, user.ID, h.activeCatalogAuthIDs(), registryModelsForClient)
 	if errAccess != nil {
 		respondError(c, http.StatusInternalServerError, "model_access_load_failed", errAccess)
 		return
@@ -183,6 +185,50 @@ func (h *Handler) ListAccessibleModels(c *gin.Context) {
 			"reason":        modelAccessReason(access),
 		},
 	})
+}
+
+func (h *Handler) activeCatalogAuthIDs() []string {
+	if h == nil || h.runtime == nil {
+		return nil
+	}
+	manager := h.runtime.CoreManager()
+	if manager == nil {
+		return nil
+	}
+	auths := manager.List()
+	if len(auths) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+			continue
+		}
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return []string{}
+	}
+	return ids
+}
+
+func registryModelsForClient(authID string) []string {
+	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	if len(models) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if id := strings.TrimSpace(model.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // availableUserModels returns the registry's currently servable definitions with
@@ -240,6 +286,12 @@ func modelAccessReason(access cluster.UserModelAccess) string {
 	}
 	if access.APIKeyCount == 0 {
 		return modelAccessReasonNoAPIKeys
+	}
+	if access.ModelGroups && access.ChannelGroups {
+		return modelAccessReasonAccessGroups
+	}
+	if access.ChannelGroups {
+		return modelAccessReasonChannelGroups
 	}
 	return modelAccessReasonModelGroups
 }

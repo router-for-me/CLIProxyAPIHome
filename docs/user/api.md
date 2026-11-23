@@ -850,9 +850,9 @@ Example response:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `restricted` | boolean | `true` when every one of the user's API keys is scoped to model groups. |
+| `restricted` | boolean | `true` when every one of the user's API keys is scoped to one or more access groups. |
 | `api_key_count` | number | How many API keys the user holds. |
-| `reason` | string | `unrestricted`, `model_groups`, or `no_api_keys`. Lets a client explain an empty list instead of showing a bare zero state. |
+| `reason` | string | `unrestricted`, `model_groups`, `channel_groups`, `access_groups`, or `no_api_keys`. Lets a client explain an empty list instead of showing a bare zero state. |
 
 Access is a union across the user's keys, not an intersection: holding one unscoped key makes the whole catalog accessible. Holding no key makes nothing accessible, because an account without a credential cannot call the cluster.
 

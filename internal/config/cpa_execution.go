@@ -18,6 +18,11 @@ func (cfg *Config) ValidateHomePolicies() error {
 		return fmt.Errorf("routing.session-affinity-rebind-on must be any, quota, or never")
 	}
 	cfg.Routing.SessionAffinityRebindOn = mode
+	requestLogFormat := strings.ToLower(strings.TrimSpace(cfg.RequestLogFormat))
+	if requestLogFormat != "" && requestLogFormat != "text" && requestLogFormat != "json" {
+		return fmt.Errorf("observability.logs.request-log-format must be text or json")
+	}
+	cfg.RequestLogFormat = requestLogFormat
 	window := strings.TrimSpace(cfg.Antigravity.TOSPauseWindow)
 	switch strings.ToLower(window) {
 	case "", "0", "off", "false", "none", "disabled":

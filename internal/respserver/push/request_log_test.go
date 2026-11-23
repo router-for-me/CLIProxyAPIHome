@@ -47,3 +47,39 @@ func TestHandleRequestLogFallsBackToHeaderRequestID(t *testing.T) {
 		t.Fatalf("header request id log files = %d, want 1", len(files))
 	}
 }
+
+func TestHandleRequestLogExtractsURLFromJSON(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	payload := `{"request_id":"json-req-1","request_log":"{\"version\":\"dev\",\"url\":\"/v1/responses?stream=true\",\"method\":\"POST\"}"}`
+	reply := handleRequestLog(context.Background(), dispatch.Env{ClientIP: "10.0.0.5"}, []string{"RPUSH", "request-log", payload})
+	if reply.Kind != dispatch.ReplyKindInteger || reply.Integer != 1 {
+		t.Fatalf("reply = %+v, want integer 1", reply)
+	}
+
+	files, errGlob := filepath.Glob("logs/10.0.0.5-v1-responses-*-json-req-1.log")
+	if errGlob != nil {
+		t.Fatalf("glob request log: %v", errGlob)
+	}
+	if len(files) != 1 {
+		t.Fatalf("json url request log files = %d, want 1", len(files))
+	}
+}
+
+func TestHandleRequestLogJSONFallsBackToRoot(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	payload := `{"request_id":"json-req-2","request_log":"{\"version\":\"dev\",\"method\":\"POST\"}"}`
+	reply := handleRequestLog(context.Background(), dispatch.Env{ClientIP: "10.0.0.5"}, []string{"RPUSH", "request-log", payload})
+	if reply.Kind != dispatch.ReplyKindInteger || reply.Integer != 1 {
+		t.Fatalf("reply = %+v, want integer 1", reply)
+	}
+
+	files, errGlob := filepath.Glob("logs/10.0.0.5-root-*-json-req-2.log")
+	if errGlob != nil {
+		t.Fatalf("glob request log: %v", errGlob)
+	}
+	if len(files) != 1 {
+		t.Fatalf("json root fallback log files = %d, want 1", len(files))
+	}
+}
