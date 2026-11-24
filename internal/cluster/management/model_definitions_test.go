@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -50,5 +51,59 @@ func TestCredentialModelsV8ExclusionCandidates(t *testing.T) {
 	modelRegistry.RegisterClientWithCandidates(auth.ID, "claude", nil, []*registry.ModelInfo{})
 	if got := string(read("/v8/management/credentials/models")["exclusion_models"]); got != "[]" {
 		t.Fatalf("known empty catalog must be [], got %s", got)
+	}
+}
+
+func TestGetStaticModelDefinitionsNamespacesCopilotAndDevin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, "", 0)
+	engine := gin.New()
+	engine.GET("/v8/management/routing/model-definitions/:channel", handler.GetStaticModelDefinitions)
+	engine.GET("/v8/management/models", handler.GetModelsV8)
+
+	fetchDefs := func(path string) []registry.ModelInfo {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+		var body struct {
+			Models []registry.ModelInfo `json:"models"`
+		}
+		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &body); errDecode != nil {
+			t.Fatalf("decode %s: %v", path, errDecode)
+		}
+		if len(body.Models) == 0 {
+			t.Fatalf("GET %s returned no models", path)
+		}
+		return body.Models
+	}
+
+	for _, tc := range []struct {
+		query, channel string
+	}{
+		{"Copilot", "copilot"},
+		{"Devin", "devin"},
+	} {
+		prefix := tc.channel + "/"
+		routingDefs := fetchDefs("/v8/management/routing/model-definitions/" + tc.query)
+		staticCatalog := fetchDefs("/v8/management/models?scope=static&channel=" + tc.channel)
+		if len(routingDefs) != len(staticCatalog) {
+			t.Fatalf("%s lengths: routing=%d static=%d", tc.channel, len(routingDefs), len(staticCatalog))
+		}
+		for i := range routingDefs {
+			if strings.HasPrefix(staticCatalog[i].ID, prefix) {
+				t.Fatalf("%s scope=static unexpectedly prefixed: %q", tc.channel, staticCatalog[i].ID)
+			}
+			if want := prefix + staticCatalog[i].ID; routingDefs[i].ID != want {
+				t.Fatalf("%s routing model[%d] = %q, want %q", tc.channel, i, routingDefs[i].ID, want)
+			}
+		}
+	}
+
+	claudeDefs := fetchDefs("/v8/management/routing/model-definitions/claude")
+	if strings.HasPrefix(claudeDefs[0].ID, "claude/") {
+		t.Fatalf("claude model unexpectedly prefixed: %q", claudeDefs[0].ID)
 	}
 }

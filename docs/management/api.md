@@ -3726,6 +3726,7 @@ Available model metadata reflects configured `display-name`, positive `max-conte
 
 Returns static model metadata for one channel.
 Returned model entries include the same authoritative `providers` field described above.
+For `copilot` and `devin`, returned model `id` values are namespace-prefixed (`copilot/<id>`, `devin/<id>`) to match OAuth exclusion and alias rules before aliases and credential prefixes.
 
 Supported channels:
 
@@ -3745,6 +3746,7 @@ antigravity
 xai
 x-ai
 grok
+copilot
 devin
 meta
 muse

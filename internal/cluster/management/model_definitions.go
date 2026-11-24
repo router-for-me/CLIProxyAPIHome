@@ -152,14 +152,28 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 		return
 	}
 
-	models := registry.GetStaticModelDefinitionsByChannel(channel)
+	normalizedChannel := strings.ToLower(channel)
+	models := registry.GetStaticModelDefinitionsByChannel(normalizedChannel)
 	if models == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown channel", "channel": channel})
 		return
 	}
+	if normalizedChannel == "copilot" || normalizedChannel == "devin" {
+		// Expose the same IDs used for OAuth rules before aliases and credential prefixes.
+		prefix := normalizedChannel + "/"
+		for _, model := range models {
+			if model == nil {
+				continue
+			}
+			id := strings.TrimSpace(model.ID)
+			if id != "" && !strings.HasPrefix(id, prefix) {
+				model.ID = prefix + id
+			}
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"channel": strings.ToLower(strings.TrimSpace(channel)),
+		"channel": normalizedChannel,
 		"models":  models,
 	})
 }

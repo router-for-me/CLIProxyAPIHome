@@ -3710,6 +3710,7 @@ Query 参数：
 
 返回指定 channel 的静态模型 metadata。
 返回的模型记录同样包含上文所述的权威 `providers` 字段。
+对于 `copilot` 和 `devin`，返回的模型 `id` 会带有命名空间前缀（`copilot/<id>`、`devin/<id>`），与 OAuth 排除规则和别名规则（应用别名与凭证前缀前）保持一致。
 
 支持的 channel：
 
@@ -3729,6 +3730,7 @@ antigravity
 xai
 x-ai
 grok
+copilot
 devin
 meta
 muse
