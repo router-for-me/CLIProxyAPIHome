@@ -332,12 +332,10 @@ func modelAliasEntriesFromMetadata(raw any) []modelAliasEntry {
 	}
 	out := make([]modelAliasEntry, 0, len(items))
 	for _, item := range items {
-		if !metadataBool(item["user_defined"]) {
-			continue
-		}
 		alias := strings.TrimSpace(metadataString(item["id"]))
 		name := strings.TrimSpace(metadataString(item["name"]))
-		if name == "" {
+		if name == "" && metadataBool(item["user_defined"]) {
+			// Older configured models stored the upstream name in display_name.
 			name = strings.TrimSpace(metadataString(item["display_name"]))
 		}
 		if alias == "" || name == "" {
