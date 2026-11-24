@@ -1092,7 +1092,7 @@ oauth:
 
   # Global OAuth model name aliases (per channel)
   # These aliases rename model IDs for both model listing and request routing.
-  # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai, meta.
+  # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, copilot, devin.
   # NOTE: These aliases do not apply to any of the upstream groups under api-keys.
   # NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
   # client-visible names can become ambiguous across providers. For strict backend pinning, use
@@ -1177,6 +1177,10 @@ oauth:
   #     - "grok-3-mini"
   #   meta:
   #     - "muse-spark-1.1"
+  #   copilot:
+  #     - "copilot/claude-haiku-*" # match Copilot model IDs before aliases and auth prefixes
+  #   devin:
+  #     - "devin/swe-2-flash" # match Devin model IDs before aliases and auth prefixes
 
   # CPA OAuth request-scoped error classification. Home retains its existing cooldown policy.
   # request-scoped-errors:
@@ -1224,14 +1228,31 @@ oauth:
   #       match:
   #         - "context_length_exceeded"
   #       action: "stop"
+  #   copilot:
+  #     - status: 400
+  #       match:
+  #         - "context_length_exceeded"
+  #       action: "stop"
 
   # OAuth provider model settings (per channel). Applies only to OAuth/file-backed credentials,
   # not to API-key model entries. max-context-length overrides the advertised context window
   # after model aliases and before prefixes are applied. An optional alias targets one public
   # route and takes precedence over name-only settings. Home publishes this catalog in Home
   # mode; standalone CPA applies the settings locally.
-  # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai, meta.
+  # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, copilot, devin.
   # settings:
+  #   copilot:
+  #     - name: "copilot/gpt-5.3-codex" # bare catalog ID or canonical source ID, shared by its aliases
+  #       max-context-length: 131072
+  #     - name: "copilot/gpt-5.3-codex"
+  #       alias: "coding" # exact public alias before any credential prefix
+  #       max-context-length: 262144
+  #   devin:
+  #     - name: "devin/swe-2" # bare catalog ID or canonical source ID, shared by its aliases
+  #       max-context-length: 131072
+  #     - name: "devin/swe-2"
+  #       alias: "team/chat" # exact public alias before any credential prefix
+  #       max-context-length: 262144
   #   codex:
   #     - name: "gpt-6-sol"
   #       max-context-length: 524288
