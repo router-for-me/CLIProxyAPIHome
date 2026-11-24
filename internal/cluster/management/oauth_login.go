@@ -348,13 +348,15 @@ func (h *Handler) RequestCopilotToken(c *gin.Context) {
 		defer cancelSession()
 		auth, errLogin := cpasdkauth.CompleteCopilotDeviceLogin(sessionCtx, client, device)
 		if errLogin != nil {
-			_ = h.repo.SetOAuthSessionError(context.Background(), state, "Authentication failed")
+			h.recordOAuthSessionError("copilot", state, "Authentication failed")
+			log.Errorf("cluster oauth: copilot authorization failed: %v", errLogin)
 			return
 		}
 		storeCtx, cancelStore := context.WithTimeout(sessionCtx, 30*time.Second)
 		defer cancelStore()
 		if errStore := h.storeOAuthMetadataWithContext(storeCtx, auth.Metadata, auth.FileName); errStore != nil {
-			_ = h.repo.SetOAuthSessionError(context.Background(), state, "Failed to save authentication tokens")
+			h.recordOAuthSessionError("copilot", state, "Failed to save authentication tokens")
+			log.Errorf("cluster oauth: store copilot token failed: %v", errStore)
 		}
 	}()
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": device.VerificationURI, "user_code": device.UserCode, "state": state})
@@ -1470,6 +1472,40 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+const oauthSessionErrorAttemptTimeout = 5 * time.Second
+
+var (
+	oauthSessionErrorRetryDelays = []time.Duration{250 * time.Millisecond, time.Second, 2 * time.Second}
+	oauthSessionErrorSleep       = time.Sleep
+)
+
+// recordOAuthSessionError persists a terminal session error with bounded per-attempt timeouts and retries.
+func (h *Handler) recordOAuthSessionError(provider, state, message string) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	if errSet := recordOAuthSessionErrorWith(h.repo.SetOAuthSessionError, state, message); errSet != nil {
+		log.Errorf("cluster oauth: failed to mark %s session error after %d attempts: %v", provider, len(oauthSessionErrorRetryDelays)+1, errSet)
+	}
+}
+
+func recordOAuthSessionErrorWith(write func(context.Context, string, string) error, state, message string) error {
+	var errLast error
+	for attempt := 0; attempt <= len(oauthSessionErrorRetryDelays); attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), oauthSessionErrorAttemptTimeout)
+		errSet := write(ctx, state, message)
+		cancel()
+		if errSet == nil {
+			return nil
+		}
+		errLast = errSet
+		if attempt < len(oauthSessionErrorRetryDelays) {
+			oauthSessionErrorSleep(oauthSessionErrorRetryDelays[attempt])
+		}
+	}
+	return errLast
 }
 
 // oauthSessionStateKey binds credential persistence to the session that authorized it.
