@@ -1095,15 +1095,7 @@ func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
 	}
 
 	for registryModel, stateModel := range models {
-		blocked, reason, _ := isAuthBlockedForModel(authForAvailability, stateModel, now)
-		legacyModel := canonicalModelKey(registryModel)
-		if !blocked && stateModel != legacyModel {
-			if legacyBlocked, legacyReason, _ := isAuthBlockedForModel(authForAvailability, legacyModel, now); legacyBlocked {
-				blocked = true
-				reason = legacyReason
-				stateModel = legacyModel
-			}
-		}
+		stateModel, blocked, reason, _ := dispatchModelBlockStatus(authForAvailability, stateModel, registryModel, now)
 		if blocked && reason == blockReasonCooldown {
 			modelRegistry.SetModelQuotaExceeded(auth.ID, registryModel)
 		} else {
@@ -1250,11 +1242,16 @@ func classifyDispatchAvailability(auth *Auth, blockedModel string, blocked bool,
 }
 
 // dispatchModelBlockStatus preserves the upstream-first check and legacy route fallback.
+// Published-route providers only check source state (including any legacy
+// unqualified source key) so rebinding an alias never inherits another source's cooldown.
 // Returning the checked model lets diagnostics identify the state that blocks dispatch.
 func dispatchModelBlockStatus(auth *Auth, resolvedModel, routeModel string, now time.Time) (string, bool, blockReason, time.Time) {
-	blockedModel := resolvedModel
+	blockedModel := publishedModelStateKey(auth, resolvedModel)
 	blocked, reason, next := isAuthBlockedForModel(auth, blockedModel, now)
-	if !blocked && resolvedModel != canonicalModelKey(routeModel) {
+	if blocked || isPublishedSourceModelKey(auth, resolvedModel) {
+		return blockedModel, blocked, reason, next
+	}
+	if resolvedModel != canonicalModelKey(routeModel) {
 		blockedModel = routeModel
 		blocked, reason, next = isAuthBlockedForModel(auth, blockedModel, now)
 	}

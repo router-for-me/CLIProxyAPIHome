@@ -526,7 +526,6 @@ func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex, observ
 	}
 	if updated != nil && updated.Provider == "copilot" {
 		r.publishCopilotModels(updated.ID)
-		r.wakeCopilotDiscovery()
 	}
 	return BuildRefreshPayload(updated, r.Config())
 }
@@ -571,7 +570,6 @@ func (r *Runtime) UpdateAuthInMemory(ctx context.Context, auth *coreauth.Auth) (
 	applied, errUpdate := r.coreManager.Update(coreauth.WithSkipPersist(ctx), update)
 	if errUpdate == nil && applied != nil && applied.Provider == "copilot" {
 		r.publishCopilotModels(applied.ID)
-		r.wakeCopilotDiscovery()
 	}
 	return applied, errUpdate
 }

@@ -29,6 +29,52 @@ const (
 
 type copilotTestTransport func(*http.Request) (*http.Response, error)
 
+func TestCopilotDispatchRechecksCurrentCatalog(t *testing.T) {
+	const id = "upstream-only"
+	auth := &coreauth.Auth{ID: t.Name(), Provider: "copilot", Status: coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "fixture", "base_url": copilotTestBase}}
+	rt := &Runtime{copilotAccounts: map[string]copilotAccountModels{auth.ID: {
+		identity: copilotIdentity(auth), ids: map[string]struct{}{id: {}}, expiresAt: time.Now().Add(time.Hour),
+	}}}
+	const route = "copilot/" + id
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "copilot", []*ModelInfo{{ID: route, SourceModelID: route, MetadataModelID: id}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	decision := &coreauth.DispatchDecision{Auth: auth, UpstreamModel: route}
+	if got := rt.copilotDispatchModelInfo(decision, route, time.Now()); got != nil {
+		t.Fatalf("stale registry entry dispatched outside the catalog: %+v", got)
+	}
+}
+
+func TestCopilotPruneExpiredProjectedToken(t *testing.T) {
+	for _, excluded := range []string{"", "*"} {
+		t.Run("excluded="+excluded, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+			rt := &Runtime{cfg: &config.Config{}, coreManager: manager, copilotAccounts: make(map[string]copilotAccountModels)}
+			auth := &coreauth.Auth{ID: t.Name(), Provider: "copilot", Status: coreauth.StatusActive, RuntimeProjection: true,
+				Attributes: map[string]string{"excluded_models": excluded},
+				Metadata:   map[string]any{"base_url": copilotTestBase, "expired": time.Now().Add(time.Hour).Format(time.RFC3339Nano)}}
+			rt.copilotAccounts[auth.ID] = copilotAccountModels{identity: copilotIdentity(auth),
+				ids: map[string]struct{}{copilotTestX: {}}, expiresAt: time.Now().Add(time.Hour)}
+			reg := registry.GetGlobalRegistry()
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+			ctx := coreauth.WithSkipPersist(t.Context())
+			rt.applyCoreAuthAddOrUpdate(ctx, auth)
+			if len(reg.GetModelCandidatesForClient(auth.ID)) != 1 {
+				t.Fatal("missing candidates before expiry")
+			}
+			auth.Metadata["expired"] = time.Now().Add(-time.Minute).Format(time.RFC3339Nano)
+			if _, errUpdate := manager.Update(ctx, auth); errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+			rt.PruneCopilotModels()
+			if len(reg.GetModelsForClient(auth.ID)) != 0 || reg.GetModelCandidatesForClient(auth.ID) != nil {
+				t.Fatal("expired projected token retained routes or candidates")
+			}
+		})
+	}
+}
+
 func (transport copilotTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return transport(req)
 }
@@ -40,15 +86,16 @@ func (transport copilotTestTransport) RoundTripperFor(*coreauth.Auth) http.Round
 func TestCopilotPublishedAliasDispatch(t *testing.T) {
 	cfg := &config.Config{OAuthModelAlias: map[string][]config.OAuthModelAlias{
 		"copilot": {
-			{Name: copilotTestY, Alias: copilotTestX + "(high)", Fork: true, ForceMapping: true},
-			{Name: copilotTestY, Alias: "friendly", Fork: true, ForceMapping: true},
+			{Name: "copilot/" + copilotTestY, Alias: "copilot/" + copilotTestX + "(high)", Fork: true, ForceMapping: true},
+			{Name: "copilot/" + copilotTestY, Alias: "friendly", Fork: true, ForceMapping: true},
+			{Name: "copilot/" + copilotTestY, Alias: "copilot/legacy-friendly", Fork: true, ForceMapping: true},
 		},
 	}}
 	m := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
 	m.SetConfig(cfg)
 	m.SetOAuthModelAlias(cfg.OAuthModelAlias)
 	rt := &Runtime{cfg: cfg, coreManager: m, copilotAccounts: make(map[string]copilotAccountModels)}
-	a := &coreauth.Auth{ID: t.Name(), Index: t.Name(), Prefix: "copilot", Provider: "copilot", Status: coreauth.StatusActive,
+	a := &coreauth.Auth{ID: t.Name(), Index: t.Name(), Prefix: "team", Provider: "copilot", Status: coreauth.StatusActive,
 		Metadata: map[string]any{"access_token": "mock", "base_url": copilotTestBase}}
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
 	rt.applyCoreAuthAddOrUpdate(t.Context(), a)
@@ -57,11 +104,13 @@ func TestCopilotPublishedAliasDispatch(t *testing.T) {
 	}))
 	rt.discoverCopilotModels(t.Context(), a.ID)
 	for _, tc := range []struct{ request, model, responseAlias string }{
-		{"copilot/" + copilotTestX + "(high)", copilotTestX + "(high)", ""},
-		{"copilot/" + copilotTestX + "(low)", copilotTestX + "(low)", ""},
-		{"copilot/friendly", copilotTestY, "copilot/friendly"},
-		{"copilot/copilot/friendly", copilotTestY, "copilot/friendly"},
-		{"copilot/friendly(high)", copilotTestY + "(high)", "copilot/friendly"},
+		{"copilot/" + copilotTestX + "(high)", "copilot/" + copilotTestX + "(high)", ""},
+		{"copilot/" + copilotTestX + "(low)", "copilot/" + copilotTestX + "(low)", ""},
+		{"friendly", "copilot/" + copilotTestY, "friendly"},
+		{"team/friendly", "copilot/" + copilotTestY, "friendly"},
+		{"team/friendly(high)", "copilot/" + copilotTestY + "(high)", "friendly"},
+		{"copilot/legacy-friendly", "copilot/" + copilotTestY, "copilot/legacy-friendly"},
+		{"team/copilot/legacy-friendly(high)", "copilot/" + copilotTestY + "(high)", "copilot/legacy-friendly"},
 	} {
 		t.Run(tc.request, func(t *testing.T) {
 			got, err := rt.dispatchWithOptions(t.Context(), tc.request, coreauth.Options{}, DispatchConcurrencyContext{})
@@ -74,7 +123,9 @@ func TestCopilotPublishedAliasDispatch(t *testing.T) {
 			}
 		})
 	}
-
+	if _, err := rt.dispatchWithOptions(t.Context(), "copilot/friendly", coreauth.Options{}, DispatchConcurrencyContext{}); err == nil {
+		t.Fatal("bare alias unexpectedly generated a copilot/-prefixed public route")
+	}
 }
 
 func TestCopilotAccountEligibilityRecheckedAfterRefresh(t *testing.T) {
@@ -89,7 +140,7 @@ func TestCopilotAccountEligibilityRecheckedAfterRefresh(t *testing.T) {
 		for _, accounts := range []int{1, 2} {
 			t.Run(fmt.Sprintf("%s/%d_accounts", tc.name, accounts), func(t *testing.T) {
 				cfg := &config.Config{OAuthModelAlias: map[string][]config.OAuthModelAlias{
-					"copilot": {{Name: copilotTestY, Alias: alias, ForceMapping: true}},
+					"copilot": {{Name: "copilot/" + copilotTestY, Alias: alias, ForceMapping: true}},
 				}}
 				manager := coreauth.NewManager(nil, tc.selector, nil)
 				manager.SetConfig(cfg)
@@ -128,8 +179,8 @@ func TestCopilotAccountEligibilityRecheckedAfterRefresh(t *testing.T) {
 					}
 					return
 				}
-				if errDispatch != nil || got == nil || got.AuthID == refreshed || got.Model != copilotTestY ||
-					!got.ForceMapping || got.OriginalAlias != alias || got.ModelInfo == nil || got.ModelInfo.ID != copilotTestY {
+				if errDispatch != nil || got == nil || got.AuthID == refreshed || got.Model != "copilot/"+copilotTestY ||
+					!got.ForceMapping || got.OriginalAlias != alias || got.ModelInfo == nil || got.ModelInfo.ID != "copilot/"+copilotTestY {
 					t.Fatalf("expected the remaining GPT alias: result=%+v error=%v", got, errDispatch)
 				}
 			})
@@ -264,7 +315,7 @@ func TestCopilotDiscoveryFailureDiagnostics(t *testing.T) {
 func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 	cfg := &config.Config{
 		OAuthModelAlias: map[string][]config.OAuthModelAlias{
-			"copilot": {{Name: copilotTestX, Alias: "x-alias", Fork: true}},
+			"copilot": {{Name: "copilot/" + copilotTestX, Alias: "x-alias", Fork: true}},
 		},
 		OAuthExcludedModels: map[string][]string{"copilot": {"copilot/claude-sonnet-5"}},
 	}
@@ -327,11 +378,16 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 	if _, err := dispatch("copilot/" + copilotTestX); err == nil {
 		t.Fatal("an undiscovered account was eligible")
 	}
+	if candidates := registry.GetGlobalRegistry().GetModelCandidatesForClient(a.ID); candidates != nil {
+		t.Fatalf("undiscovered candidates = %v, want nil", candidates)
+	}
 	rt.discoverCopilotModels(t.Context(), a.ID)
 	rt.discoverCopilotModels(t.Context(), b.ID)
 	if requests != 2 {
 		t.Fatalf("discovery request count = %d, want 2", requests)
 	}
+	const sourceX = "copilot/" + copilotTestX
+	const sourceY = "copilot/" + copilotTestY
 	checkDispatch := func(route, wantID, wantModel string) {
 		t.Helper()
 		decision, err := dispatch(route)
@@ -339,24 +395,27 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 			t.Fatalf("dispatch %s: %v", route, err)
 		}
 		if decision.AuthID != wantID || decision.Model != wantModel || decision.ModelInfo == nil || decision.ModelInfo.ID != wantModel {
-			t.Fatalf("unexpected credential or model for %s", route)
+			t.Fatalf("unexpected credential or model for %s: got auth=%q model=%q info=%+v, want auth=%q model=%q", route, decision.AuthID, decision.Model, decision.ModelInfo, wantID, wantModel)
 		}
 		info := decision.ModelInfo
-		if wantModel == preset.ID && (info.ContextLength != preset.ContextLength || info.InputTokenLimit != preset.InputTokenLimit ||
+		if wantModel == sourceX && (info.ContextLength != preset.ContextLength || info.InputTokenLimit != preset.InputTokenLimit ||
 			info.OutputTokenLimit != preset.OutputTokenLimit || info.MaxCompletionTokens != preset.MaxCompletionTokens ||
 			!reflect.DeepEqual(info.Thinking, preset.Thinking)) {
 			t.Fatalf("%s on %s returned capabilities inconsistent with the catalog: %+v", route, wantID, info)
 		}
 	}
-	checkDispatch("copilot/"+copilotTestY, b.ID, copilotTestY)
-	checkDispatch("team/copilot/x-alias", a.ID, copilotTestX)
+	checkDispatch(sourceY, b.ID, sourceY)
+	checkDispatch("team/x-alias", a.ID, sourceX)
 	for _, auth := range []*coreauth.Auth{a, b} {
-		published := registry.GetGlobalRegistry().GetModelInfoForClient(auth.ID, "copilot/"+copilotTestX)
-		if published == nil || !slices.Equal(published.SupportedInputModalities, preset.SupportedInputModalities) {
-			t.Fatalf("published input modalities for %s differ from the catalog: %+v", auth.ID, published)
+		published := registry.GetGlobalRegistry().GetModelInfoForClient(auth.ID, sourceX)
+		if published == nil || published.SourceModelID != sourceX || published.MetadataModelID != copilotTestX || !slices.Equal(published.SupportedInputModalities, preset.SupportedInputModalities) {
+			t.Fatalf("published metadata for %s differs from the catalog: %+v", auth.ID, published)
+		}
+		if want := preset.DisplayName + " (Copilot)"; published.DisplayName != want {
+			t.Errorf("published display name for %s = %q, want %q", auth.ID, published.DisplayName, want)
 		}
 	}
-	for _, hidden := range []string{"copilot/claude-sonnet-5", "copilot/upstream-only", "copilot/claude-fable-5", copilotTestX} {
+	for _, hidden := range []string{"copilot/claude-sonnet-5", "copilot/upstream-only", "copilot/claude-fable-5", copilotTestX, "team/copilot/x-alias"} {
 		if _, err := dispatch(hidden); err == nil {
 			t.Fatalf("unexpected dispatch for %s", hidden)
 		}
@@ -364,18 +423,18 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			payload := fmt.Sprintf(`{"auth_index":%q,"provider":"copilot","model":%q,"failed":true,"fail":{"status_code":%d}}`, a.ID, copilotTestX, status)
+			payload := fmt.Sprintf(`{"auth_index":%q,"provider":"copilot","model":%q,"failed":true,"fail":{"status_code":%d}}`, a.ID, sourceX, status)
 			if err := rt.RecordUsagePayload(t.Context(), payload); err != nil {
 				t.Fatal(err)
 			}
 			current, _ := manager.GetByID(a.ID)
-			state := current.ModelStates[copilotTestX]
+			state := current.ModelStates[sourceX]
 			if state == nil || state.LastError == nil || state.LastError.HTTPStatus != status {
-				t.Fatal("failure was not recorded against the native model")
+				t.Fatalf("failure was not recorded against canonical source %q: states=%+v", sourceX, current.ModelStates)
 			}
-			checkDispatch("copilot/"+copilotTestX, b.ID, copilotTestX)
-			checkDispatch("team/copilot/x-alias", b.ID, copilotTestX)
-			payload = fmt.Sprintf(`{"auth_index":%q,"provider":"copilot","model":%q}`, a.ID, copilotTestX)
+			checkDispatch(sourceX, b.ID, sourceX)
+			checkDispatch("team/x-alias", b.ID, sourceX)
+			payload = fmt.Sprintf(`{"auth_index":%q,"provider":"copilot","model":%q}`, a.ID, sourceX)
 			if err := rt.RecordUsagePayload(t.Context(), payload); err != nil {
 				t.Fatal(err)
 			}
@@ -393,7 +452,7 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 		if requests != before+1 || rt.copilotAccounts[a.ID].expiresAt != snapshot.expiresAt {
 			t.Fatal("transient failure ignored the retry interval or extended the snapshot")
 		}
-		checkDispatch("copilot/"+copilotTestX, a.ID, copilotTestX)
+		checkDispatch(sourceX, a.ID, sourceX)
 	})
 
 	for _, test := range []struct {
@@ -402,6 +461,7 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 		body   string
 	}{
 		{"confirmed empty", http.StatusOK, `{"data":[]}`},
+		{"outside catalog", http.StatusOK, `{"data":[{"id":"upstream-only"}]}`},
 		{"unauthorized", http.StatusUnauthorized, `{}`},
 		{"permission denied", http.StatusForbidden, `{}`},
 		{"expired snapshot", http.StatusServiceUnavailable, `{}`},
@@ -412,7 +472,7 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 			snapshot.nextProbeAt = time.Time{}
 			rt.copilotAccounts[a.ID] = snapshot
 			rt.discoverCopilotModels(t.Context(), a.ID)
-			checkDispatch("copilot/"+copilotTestX, a.ID, copilotTestX)
+			checkDispatch(sourceX, a.ID, sourceX)
 
 			statusA, modelsA = test.status, test.body
 			snapshot = rt.copilotAccounts[a.ID]
@@ -423,12 +483,79 @@ func TestCopilotAccountDiscoveryAndDispatch(t *testing.T) {
 			rt.copilotAccounts[a.ID] = snapshot
 			if test.status == http.StatusServiceUnavailable {
 				// Dispatch must reject expired permissions before the background prune runs.
-				checkDispatch("copilot/"+copilotTestX, b.ID, copilotTestX)
+				checkDispatch(sourceX, b.ID, sourceX)
 			}
 			rt.discoverCopilotModels(t.Context(), a.ID)
-			checkDispatch("copilot/"+copilotTestX, b.ID, copilotTestX)
+			checkDispatch(sourceX, b.ID, sourceX)
 			if models := registry.GetGlobalRegistry().GetModelsForClient(a.ID); len(models) != 0 {
 				t.Fatal("unavailable account still publishes models")
+			}
+			rt.PruneCopilotModels()
+			candidates := registry.GetGlobalRegistry().GetModelCandidatesForClient(a.ID)
+			if len(candidates) != 0 || (candidates != nil) != (test.status == http.StatusOK) {
+				t.Fatalf("exclusion candidates = %#v for status %d", candidates, test.status)
+			}
+		})
+	}
+}
+
+func TestCopilotModelDiscoveryAfterCredentialRebinding(t *testing.T) {
+	for _, change := range []string{"replace provider", "delete credential"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := coreauth.WithSkipPersist(t.Context())
+			manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+			rt := &Runtime{cfg: &config.Config{}, coreManager: manager, copilotAccounts: make(map[string]copilotAccountModels), copilotWake: make(chan struct{}, 1)}
+			auth := &coreauth.Auth{ID: t.Name(), Provider: "copilot", StateVersion: 2,
+				Metadata: map[string]any{"base_url": copilotTestBase, "account_id": "same-account", "access_token": "fixture"}}
+			reg := registry.GetGlobalRegistry()
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+			allowed := copilotTestX
+			manager.SetRoundTripperProvider(copilotTestTransport(func(*http.Request) (*http.Response, error) {
+				body := fmt.Sprintf(`{"data":[{"id":%q}]}`, allowed)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+			}))
+			rt.applyCoreAuthAddOrUpdate(ctx, auth)
+			select {
+			case <-rt.copilotWake:
+			default:
+				t.Fatal("new credential did not wake model discovery")
+			}
+			rt.discoverCopilotModels(ctx, auth.ID)
+			oldRoute := "copilot/" + copilotTestX
+			if reg.GetModelInfoForClient(auth.ID, oldRoute) == nil {
+				t.Fatal("first discovery did not publish the account model")
+			}
+			if change == "replace provider" {
+				other := &coreauth.Auth{ID: auth.ID, Provider: "claude", StateVersion: 1}
+				rt.applyCoreAuthAddOrUpdate(ctx, other)
+				if reg.GetModelInfoForClient(auth.ID, oldRoute) == nil {
+					t.Fatal("a rejected provider change retired the current account")
+				}
+				other.StateVersion = 3
+				rt.applyCoreAuthAddOrUpdate(ctx, other)
+				if len(reg.GetModelsForClient(auth.ID)) == 0 {
+					t.Fatal("replacement provider did not publish its own models")
+				}
+			} else {
+				rt.applyCoreAuthRemove(ctx, auth.ID)
+			}
+			if reg.GetModelInfoForClient(auth.ID, oldRoute) != nil {
+				t.Fatal("old provider route remained registered")
+			}
+			auth.StateVersion = 4
+			rt.applyCoreAuthAddOrUpdate(ctx, auth)
+			if len(reg.GetModelsForClient(auth.ID)) != 0 {
+				t.Fatal("reused credential ID published the previous discovery result")
+			}
+			select {
+			case <-rt.copilotWake:
+			default:
+				t.Fatal("reused credential ID did not wake model discovery")
+			}
+			allowed = copilotTestY
+			rt.discoverCopilotModels(ctx, auth.ID)
+			if models := reg.GetModelsForClient(auth.ID); len(models) != 1 || models[0].ID != "copilot/"+allowed {
+				t.Fatalf("models after rediscovery = %v, want only copilot/%s", models, allowed)
 			}
 		})
 	}

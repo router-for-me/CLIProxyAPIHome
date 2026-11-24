@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	cpaauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/modelconfig"
@@ -18,6 +20,11 @@ const (
 )
 
 type ModelInfo = registry.ModelInfo
+
+type modelPluginSource interface {
+	ModelsForAuth(context.Context, *cpaauth.Auth) sdkpluginhost.AuthModelResult
+	ModelsForProvider(string) []sdkpluginhost.ModelInfo
+}
 
 // modelInfosFromAuthMetadata derives model infos from auth metadata.
 func modelInfosFromAuthMetadata(a *coreauth.Auth, key string) []*ModelInfo {
@@ -141,9 +148,21 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 	var selected *ModelInfo
 	// OAuth aliases can override capabilities independently of their upstream.
 	// API-key pools retain the upstream-first lookup below.
-	for _, route := range []string{strings.TrimSpace(routeModel), coreauth.CanonicalModelID(routeModel)} {
-		info := modelRegistry.GetModelInfoForClient(authID, route)
-		if info != nil && info.MetadataModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.MetadataModelID), coreauth.CanonicalModelID(upstreamModel)) {
+	upstreamCanonical := coreauth.CanonicalModelID(upstreamModel)
+	baseID := coreauth.CanonicalModelID(routeModel)
+	base := modelRegistry.GetModelInfoForClient(authID, baseID)
+	route := base
+	// Namespaced sources follow the base route selected by the scheduler.
+	// Other OAuth providers can configure a literal suffixed alias independently.
+	if exact := strings.TrimSpace(routeModel); exact != baseID && (base == nil || base.SourceModelID == "") {
+		route = modelRegistry.GetModelInfoForClient(authID, exact)
+	}
+	for _, info := range []*ModelInfo{route, base} {
+		if info == nil {
+			continue
+		}
+		if (info.SourceModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.SourceModelID), upstreamCanonical)) ||
+			(info.MetadataModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.MetadataModelID), upstreamCanonical)) {
 			selected = info
 			break
 		}
@@ -196,6 +215,25 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		return
 	}
 	r.cancelStaleAntigravityProbes(a.ID)
+	r.publishModelsForAuth(a, r.pluginHost)
+}
+
+// pruneStaleAuthModels releases obsolete model state and returns the credential that still owns the ID.
+func (r *Runtime) pruneStaleAuthModels(authID string) *coreauth.Auth {
+	r.copilotMu.Lock()
+	defer r.copilotMu.Unlock()
+	current, _ := r.coreManager.GetByID(authID)
+	if !activeCopilotAccount(current) {
+		delete(r.copilotAccounts, authID)
+	}
+	if current == nil {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	}
+	return current
+}
+
+// publishModelsForAuth resolves plugin models and applies the current account model policy.
+func (r *Runtime) publishModelsForAuth(a *coreauth.Auth, plugins modelPluginSource) {
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	compatProviderKey, compatDisplayName, compatDetected := openAICompatInfoFromAuth(a)
 	if compatDetected {
@@ -217,8 +255,11 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	unregisterLegacyModelClient(a)
 	authKind, excluded := r.modelRegistrationAuthSettings(cfg, provider, a)
 	configModels := modelInfosFromAuthMetadata(a, homeConfigModelsMetadataKey)
-	if r.tryRegisterPluginModelsForAuth(context.Background(), a, provider, authKind, excluded) {
-		return
+	if plugins != nil {
+		result := plugins.ModelsForAuth(context.Background(), homeAuthToPluginAuth(a))
+		if r.tryRegisterPluginModelsForAuth(a, provider, excluded, result) {
+			return
+		}
 	}
 
 	var models []*ModelInfo
@@ -331,6 +372,11 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		}
 	case "devin":
 		models = registry.GetDevinModels()
+		for _, model := range models {
+			if model != nil {
+				applyModelNamespace(model, provider, model.ID, model.ID)
+			}
+		}
 	case "meta":
 		models = registry.GetMetaModels()
 		if len(configModels) > 0 {
@@ -465,7 +511,9 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if key == "" {
 		key = strings.ToLower(strings.TrimSpace(a.Provider))
 	}
-	models = r.appendPluginModels(key, models)
+	if plugins != nil {
+		models = appendDistinctModels(models, pluginModelsToHomeModels(plugins.ModelsForProvider(key)))
+	}
 	models, candidates := applyOAuthModelConfig(cfg, provider, authKind, models, excluded)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix), candidates)
@@ -700,9 +748,32 @@ func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey) 
 	return nil
 }
 
-// applyExcludedModels applies an excluded models.
+// applyModelNamespace qualifies a provider catalog entry for public routing while
+// keeping its canonical source and bare metadata key separate.
+func applyModelNamespace(model *ModelInfo, provider, nativeID, routeID string) {
+	if model == nil {
+		return
+	}
+	prefix := provider + "/"
+	model.ID = prefix + routeID
+	model.SourceModelID = prefix + nativeID
+	model.MetadataModelID = nativeID
+}
+
+func setCopilotModelDisplayName(model *ModelInfo, nativeID string) {
+	if model == nil {
+		return
+	}
+	displayName := strings.TrimSpace(model.DisplayName)
+	if displayName == "" {
+		displayName = nativeID
+	}
+	const suffix = " (Copilot)"
+	model.DisplayName = strings.TrimSuffix(displayName, suffix) + suffix
+}
+
+// applyExcludedModels filters models matching any exclusion pattern.
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
-	// Normalize source data before building the derived payload.
 	if len(models) == 0 || len(excluded) == 0 {
 		return models
 	}
@@ -723,10 +794,10 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 			continue
 		}
 		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		sourceID := strings.ToLower(strings.TrimSpace(model.SourceModelID))
 		blocked := false
 		for _, pattern := range patterns {
-			if matchWildcard(pattern, modelID) ||
-				(model.Type == "copilot" && strings.HasPrefix(modelID, "copilot/") && matchWildcard(pattern, strings.TrimPrefix(modelID, "copilot/"))) {
+			if matchWildcard(pattern, modelID) || (sourceID != "" && sourceID != modelID && matchWildcard(pattern, sourceID)) {
 				blocked = true
 				break
 			}
@@ -738,12 +809,24 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	return filtered
 }
 
-// applyModelPrefixes applies a model prefixes.
+// applyModelPrefixes applies credential prefixes to published models.
+// When prefixes are optional, explicit published names take precedence over
+// prefixed copies that would collide with them.
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
-	// Normalize source data before building the derived payload.
 	trimmedPrefix := strings.TrimSpace(prefix)
 	if trimmedPrefix == "" || len(models) == 0 {
 		return models
+	}
+
+	// A published name can already contain the credential prefix. Preserve
+	// that route when an optional prefixed copy would have the same name.
+	explicitNames := make(map[string]struct{})
+	if !forceModelPrefix {
+		for _, model := range models {
+			if model != nil && model.SourceModelID != "" {
+				explicitNames[strings.TrimSpace(model.ID)] = struct{}{}
+			}
+		}
 	}
 
 	out := make([]*ModelInfo, 0, len(models)*2)
@@ -775,8 +858,18 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		if !forceModelPrefix || trimmedPrefix == baseID {
 			addModel(model)
 		}
+		prefixedID := trimmedPrefix + "/" + baseID
+		if _, exists := explicitNames[prefixedID]; exists {
+			continue
+		}
 		clone := *model
-		clone.ID = trimmedPrefix + "/" + baseID
+		clone.ID = prefixedID
+		if clone.MetadataModelID == "" {
+			clone.MetadataModelID = baseID
+		}
+		if clone.Name != "" {
+			clone.Name = rewriteModelInfoName(clone.Name, baseID, clone.ID)
+		}
 		addModel(&clone)
 	}
 	return out
@@ -1004,11 +1097,15 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 
 	forward := make(map[string][]config.OAuthModelAlias, len(aliases))
 	for _, configured := range aliases {
-		entry, ok := configured.ForRouting(channel)
-		if !ok {
+		name := strings.TrimSpace(configured.Name)
+		alias := strings.TrimSpace(configured.Alias)
+		if name == "" || alias == "" || strings.EqualFold(name, alias) {
 			continue
 		}
-		key := strings.ToLower(entry.Name)
+		entry := configured
+		entry.Name = name
+		entry.Alias = alias
+		key := strings.ToLower(name)
 		forward[key] = append(forward[key], entry)
 	}
 	if len(forward) == 0 {
@@ -1053,6 +1150,9 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 		addedAlias := false
 		for _, entry := range entries {
 			mappedID := entry.Alias
+			if strings.EqualFold(mappedID, id) {
+				continue
+			}
 			aliasKey := strings.ToLower(mappedID)
 			if _, exists := seen[aliasKey]; exists {
 				continue
@@ -1060,7 +1160,7 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			seen[aliasKey] = struct{}{}
 			clone := *model
 			clone.ID = mappedID
-			if channel == "copilot" && entry.ForceMapping {
+			if clone.SourceModelID != "" && entry.ForceMapping {
 				clone.ResponseModelAlias = mappedID
 			}
 			if clone.MetadataModelID == "" {

@@ -6,9 +6,35 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 )
+
+func TestCopilotProjectionPreservesTokenExpiry(t *testing.T) {
+	ctx := t.Context()
+	repo := newQuotaTestRepository(t)
+	expiry := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	auth := &coreauth.Auth{ID: t.Name(), Index: t.Name(), Provider: "copilot", Status: coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "fixture-access", "refresh_token": "fixture-refresh",
+			"base_url": "https://api.individual.githubcopilot.com", "account_id": "account", "expired": expiry}}
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+	adapter := NewRuntimeAdapter(repo, "127.0.0.1")
+	if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	minimal := adapter.ListMinimalAuths()[0]
+	got, ok := minimal.ExpirationTime()
+	if !minimal.RuntimeProjection || !ok || got.UTC().Format(time.RFC3339Nano) != expiry ||
+		minimal.Metadata["base_url"] != auth.Metadata["base_url"] || minimal.Metadata["account_id"] != "account" {
+		t.Fatal("database projection lost the Copilot identity or expiry")
+	}
+	if minimal.Metadata["access_token"] != nil || minimal.Metadata["refresh_token"] != nil {
+		t.Fatal("database projection retained a token")
+	}
+}
 
 func TestProjectionPreservesCredentialAndExistingSharedTransitions(t *testing.T) {
 	for _, tc := range []struct {

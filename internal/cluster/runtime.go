@@ -863,6 +863,9 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 				metadata[key] = value
 			}
 		}
+		if expiry, ok := auth.ExpirationTime(); ok {
+			metadata["expired"] = expiry.UTC().Format(time.RFC3339Nano)
+		}
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		metadata["request_retry"] = requestRetry

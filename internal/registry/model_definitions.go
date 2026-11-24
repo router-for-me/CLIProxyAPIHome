@@ -90,50 +90,9 @@ func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
 }
 
-// GetDevinModels returns the active Devin model catalog.
-// It prefers the independent/embedded devin_models.json catalog, then models.json's
-// devin section, and finally hardcoded staticDevinModels.
-func GetDevinModels() []*ModelInfo {
-	devinCatalogStore.mu.RLock()
-	models := devinCatalogStore.models
-	devinCatalogStore.mu.RUnlock()
-	if len(models) > 0 {
-		return cloneModelInfos(models)
-	}
-	if m := getModels(); m != nil && len(m.Devin) > 0 {
-		return cloneModelInfos(m.Devin)
-	}
-	return cloneModelInfos(staticDevinModels)
-}
-
 // GetMetaModels returns the standard Meta Muse model definitions.
 func GetMetaModels() []*ModelInfo {
-	if m := getModels(); m != nil && len(m.Meta) > 0 {
-		return cloneModelInfos(m.Meta)
-	}
-	return cloneModelInfos(staticMetaModels)
-}
-
-var staticDevinModels = []*ModelInfo{
-	{ID: "devin/swe-2", Object: "model", Type: "devin", OwnedBy: "cognition", DisplayName: "SWE-2", ContextLength: 262000, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"medium", "high", "max"}}},
-	{ID: "devin/claude-fable-5-1", Object: "model", Type: "devin", OwnedBy: "anthropic", DisplayName: "Claude Fable 5.1", ContextLength: 1000000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}}},
-	{ID: "devin/gpt-6-astra", Object: "model", Type: "devin", OwnedBy: "openai", DisplayName: "GPT-6 Astra", ContextLength: 1000000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}}},
-	{ID: "devin/glm-5-2", Object: "model", Type: "devin", OwnedBy: "zhipu", DisplayName: "GLM-5.2", ContextLength: 200000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"none", "high"}}},
-	{ID: "devin/glm-5-3", Object: "model", Type: "devin", OwnedBy: "zhipu", DisplayName: "GLM-5.3", ContextLength: 1048576, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"low", "high", "max"}}},
-	{ID: "devin/glm-5-3-flash", Object: "model", Type: "devin", OwnedBy: "zhipu", DisplayName: "GLM-5.3 Flash", ContextLength: 1000000, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"low", "high", "max"}}},
-	{ID: "devin/gpt-5-6-sol", Object: "model", Type: "devin", OwnedBy: "openai", DisplayName: "GPT-5.6 Sol", ContextLength: 1000000, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh", "max"}}},
-	{ID: "devin/gemini-3-8-flash", Object: "model", Type: "devin", OwnedBy: "google", DisplayName: "Gemini 3.8 Flash", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high"}}},
-	{ID: "devin/grok-4-6", Object: "model", Type: "devin", OwnedBy: "xai", DisplayName: "Grok 4.6", ContextLength: 500000, MaxCompletionTokens: 131072, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}},
-	{ID: "devin/deepseek-v4-flash", Object: "model", Type: "devin", OwnedBy: "deepseek", DisplayName: "DeepSeek V4 Flash", ContextLength: 1048576, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"high", "max"}}},
-	{ID: "devin/deepseek-v4-1-flash", Object: "model", Type: "devin", OwnedBy: "deepseek", DisplayName: "DeepSeek V4.1 Flash", ContextLength: 1048576, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"high", "max"}}},
-}
-
-var staticMetaModels = []*ModelInfo{
-	{ID: "muse-spark-1.3", Object: "model", Created: 1787000000, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.3", Name: "muse-spark-1.3", Description: "Meta Muse Spark 1.3 flagship reasoning and agentic coding model", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"minimal", "low", "medium", "high", "xhigh", "max"}}},
-	{ID: "muse-spark-1.3-contributor", Object: "model", Created: 1787000000, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.3 Contributor", Name: "muse-spark-1.3-contributor", Description: "Meta Muse Spark 1.3 contributor model", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"minimal", "low", "medium", "high", "xhigh", "max"}}},
-	{ID: "muse-spark-1.2", Object: "model", Created: 1785000000, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.2", Name: "muse-spark-1.2", Description: "Meta Muse Spark 1.2 reasoning and agentic coding model", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"minimal", "low", "medium", "high", "xhigh"}}},
-	{ID: "muse-spark-1.2-contributor", Object: "model", Created: 1785000000, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.2 Contributor", Name: "muse-spark-1.2-contributor", Description: "Meta Muse Spark 1.2 contributor model", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"minimal", "low", "medium", "high", "xhigh"}}},
-	{ID: "muse-spark-1.1", Object: "model", Created: 1783000000, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.1", Name: "muse-spark-1.1", Description: "Meta Muse Spark 1.1 reasoning model", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}},
+	return cloneModelInfos(getModels().Meta)
 }
 
 // GetAllStaticModelDefinitions returns static model definitions grouped by channel.
@@ -360,63 +319,104 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - antigravity
 //   - xai
 //   - devin
+//   - copilot
 //   - meta
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
-	// Normalize source data before building the derived payload.
-	key := strings.ToLower(strings.TrimSpace(channel))
-	provider := key
-	var models []*ModelInfo
-	switch key {
-	case "claude":
-		models = GetClaudeModels()
-	case "gemini":
-		models = GetGeminiModels()
-	case "gemini-interactions":
-		models = GetGeminiModels()
-	case "vertex":
-		models = GetGeminiVertexModels()
-	case "codex", "codex-pro":
-		models = GetCodexProModels()
-		provider = "codex"
-	case "codex-plus":
-		models = GetCodexPlusModels()
-		provider = "codex"
-	case "codex-team":
-		models = GetCodexTeamModels()
-		provider = "codex"
-	case "codex-free":
-		models = GetCodexFreeModels()
-		provider = "codex"
-	case "kimi", "kimi-ai":
-		models = GetKimiModels()
-	case "antigravity":
-		models = GetAntigravityModels()
-	case "xai", "x-ai", "grok":
-		models = GetXAIModels()
-		provider = "xai"
-	case "devin":
-		models = GetDevinModels()
-	case "copilot":
-		models = GetCopilotModels()
-		provider = "copilot"
-	case "meta", "muse":
-		models = GetMetaModels()
-		provider = "meta"
-	default:
+	models, provider := staticModelDefinitionsByChannel(strings.ToLower(strings.TrimSpace(channel)))
+	if models == nil {
 		return nil
 	}
-	return withStaticModelProviders(models, provider)
+	return withStaticModelProviders(cloneModelInfos(models), provider)
+}
+
+// staticModelDefinitionsByChannel returns read-only catalog entries and the
+// billing provider key for a normalized channel.
+func staticModelDefinitionsByChannel(channel string) ([]*ModelInfo, string) {
+	data := getModels()
+	if data == nil {
+		data = &staticModelsJSON{}
+	}
+	switch channel {
+	case "claude":
+		return data.Claude, "claude"
+	case "gemini", "gemini-interactions":
+		return data.Gemini, channel
+	case "vertex":
+		return data.Vertex, "vertex"
+	case "codex", "codex-pro":
+		return upsertModelInfos(data.CodexPro, WithCodexBuiltins(nil)...), "codex"
+	case "codex-plus":
+		return upsertModelInfos(data.CodexPlus, WithCodexBuiltins(nil)...), "codex"
+	case "codex-team":
+		return upsertModelInfos(data.CodexTeam, WithCodexBuiltins(nil)...), "codex"
+	case "codex-free":
+		return upsertModelInfos(data.CodexFree, WithCodexBuiltins(nil)...), "codex"
+	case "kimi", "kimi-ai":
+		return data.Kimi, channel
+	case "antigravity":
+		return data.Antigravity, "antigravity"
+	case "xai", "x-ai", "grok":
+		return WithXAIBuiltins(data.XAI), "xai"
+	case "copilot":
+		return data.Copilot, "copilot"
+	case "devin":
+		return devinModelDefinitions(), "devin"
+	case "meta", "muse":
+		return data.Meta, "meta"
+	default:
+		return nil, ""
+	}
+}
+
+// LookupStaticModelInfoByChannel searches one provider-specific static section.
+// A channel-qualified query can also match a bare catalog ID.
+// It does not fall back across providers, so callers can preserve provenance.
+func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	models, _ := staticModelDefinitionsByChannel(channel)
+	if model := findStaticModel(models, modelID); model != nil {
+		return cloneModelInfo(model)
+	}
+	if prefix, nativeID, qualified := strings.Cut(modelID, "/"); qualified && nativeID != "" && strings.EqualFold(prefix, channel) {
+		model := findStaticModel(models, nativeID)
+		if lowerID := strings.ToLower(nativeID); model == nil && lowerID != nativeID {
+			model = findStaticModel(models, lowerID)
+		}
+		if model != nil {
+			info := cloneModelInfo(model)
+			info.ID = channel + "/" + info.ID
+			return info
+		}
+	}
+	return nil
 }
 
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
 // Returns nil if no matching model is found.
 func LookupStaticModelInfo(modelID string) *ModelInfo {
+	return lookupStaticModelInfo(modelID, devinModelDefinitions())
+}
+
+func lookupStaticModelInfo(modelID string, additionalCatalog []*ModelInfo) *ModelInfo {
+	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return nil
 	}
+	if channel, _, qualified := strings.Cut(modelID, "/"); qualified {
+		if info := LookupStaticModelInfoByChannel(modelID, channel); info != nil {
+			return info
+		}
+	}
 
 	data := getModels()
-	allModels := [][]*ModelInfo{
+	if data == nil {
+		data = &staticModelsJSON{}
+	}
+	for _, models := range [][]*ModelInfo{
 		data.Claude,
 		data.Gemini,
 		data.Vertex,
@@ -424,17 +424,24 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Kimi,
 		data.Antigravity,
 		data.XAI,
-		GetDevinModels(),
-		GetMetaModels(),
+		data.Meta,
 		data.Copilot,
-	}
-	for _, models := range allModels {
-		for _, m := range models {
-			if m != nil && m.ID == modelID {
-				return cloneModelInfo(m)
-			}
+		// Keep the existing lookup order for bare IDs shared with independent catalogs.
+		additionalCatalog,
+	} {
+		if model := findStaticModel(models, modelID); model != nil {
+			return cloneModelInfo(model)
 		}
 	}
 
+	return nil
+}
+
+func findStaticModel(models []*ModelInfo, modelID string) *ModelInfo {
+	for _, model := range models {
+		if model != nil && model.ID == modelID {
+			return model
+		}
+	}
 	return nil
 }

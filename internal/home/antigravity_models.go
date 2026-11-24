@@ -532,7 +532,7 @@ func (r *Runtime) antigravityModelsAndCandidatesForHintsWithConfig(auth *coreaut
 		baseModels = filterAntigravityModels(baseModels, hints)
 	}
 	baseModels = applyAntigravityFetchedModelCapabilities(baseModels, hints)
-	baseModels = r.appendPluginModels("antigravity", baseModels)
+	baseModels = appendDistinctModels(baseModels, r.pluginModelsForProvider("antigravity"))
 	authKind := antigravityAuthKind(auth)
 	excluded := r.oauthExcludedModels(cfg, "antigravity", authKind)
 	if auth != nil && auth.Attributes != nil {

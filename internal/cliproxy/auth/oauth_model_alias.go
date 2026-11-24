@@ -43,18 +43,19 @@ func compileOAuthModelAliasTable(aliases map[string][]internalconfig.OAuthModelA
 			continue
 		}
 		rev := make(map[string]oauthModelAliasEntry, len(entries))
-		for _, configured := range entries {
-			entry, ok := configured.ForRouting(channel)
-			if !ok {
+		for _, entry := range entries {
+			name := strings.TrimSpace(entry.Name)
+			alias := strings.TrimSpace(entry.Alias)
+			if name == "" || alias == "" || strings.EqualFold(name, alias) {
 				continue
 			}
-			aliasKey := strings.ToLower(entry.Alias)
+			aliasKey := strings.ToLower(alias)
 			if _, exists := rev[aliasKey]; exists {
 				continue
 			}
 			rev[aliasKey] = oauthModelAliasEntry{
-				upstreamModel: entry.Name,
-				alias:         entry.Alias,
+				upstreamModel: name,
+				alias:         alias,
 				forceMapping:  entry.ForceMapping,
 			}
 		}

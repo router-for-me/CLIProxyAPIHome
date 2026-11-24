@@ -1144,6 +1144,12 @@ oauth:
   #   meta:
   #     - name: "muse-spark-1.3"
   #       alias: "muse-latest"
+  #   copilot:
+  #     - name: "copilot/gpt-5.3-codex" # use the listed Copilot source ID, before any auth prefix
+  #       alias: "friendly"             # published verbatim; no automatic copilot/ prefix
+  #   devin:
+  #     - name: "devin/swe-2"           # use the listed Devin source ID, before any auth prefix
+  #       alias: "team/chat"            # published verbatim; credential prefixes apply afterward
   #   sample-provider:                  # plugin provider keys are supported for OAuth plugins
   #     - name: "sample-model-latest"
   #       alias: "sample-latest"

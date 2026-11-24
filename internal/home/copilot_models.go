@@ -41,7 +41,27 @@ func (s copilotAccountModels) due(identity copilotAccountIdentity, now time.Time
 }
 
 func activeCopilotAccount(auth *coreauth.Auth) bool {
-	return auth != nil && auth.Provider == copilotauth.Provider && !auth.Disabled && auth.Status != coreauth.StatusDisabled
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), copilotauth.Provider) && !auth.Disabled && auth.Status != coreauth.StatusDisabled
+}
+
+func copilotTokenUsable(auth *coreauth.Auth, now time.Time) bool {
+	if !activeCopilotAccount(auth) {
+		return false
+	}
+	if !auth.RuntimeProjection && extractAccessToken(auth) == "" {
+		return false
+	}
+	if expiry, hasExpiry := auth.ExpirationTime(); hasExpiry && !now.Before(expiry) {
+		return false
+	}
+	return true
+}
+
+func copilotSnapshotUsable(auth *coreauth.Auth, snapshot copilotAccountModels, now time.Time) bool {
+	return copilotTokenUsable(auth, now) &&
+		snapshot.identity == copilotIdentity(auth) &&
+		now.Before(snapshot.expiresAt) &&
+		snapshot.ids != nil
 }
 
 func copilotIdentity(auth *coreauth.Auth) copilotAccountIdentity {
@@ -53,97 +73,116 @@ func copilotIdentity(auth *coreauth.Auth) copilotAccountIdentity {
 func (r *Runtime) registerCopilotModelsForAuth(auth *coreauth.Auth) {
 	r.copilotMu.Lock()
 	defer r.copilotMu.Unlock()
-	// Registration may have been requested with a credential from before a refresh.
-	if r.coreManager != nil {
-		current, _ := r.coreManager.GetByID(auth.ID)
-		if current == nil {
-			delete(r.copilotAccounts, auth.ID)
-			registry.GetGlobalRegistry().UnregisterClient(auth.ID)
-			return
-		}
-		if !strings.EqualFold(strings.TrimSpace(current.Provider), copilotauth.Provider) {
-			delete(r.copilotAccounts, auth.ID)
-			return
-		}
-		auth = current
-	}
 	r.registerCopilotModelsLocked(auth)
 }
 
+// registerCopilotModelsLocked publishes a Copilot account's eligible catalog models under copilotMu.
 func (r *Runtime) registerCopilotModelsLocked(auth *coreauth.Auth) {
-	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		delete(r.copilotAccounts, auth.ID)
-		if r.coreManager != nil {
-			r.coreManager.SetModelAliasHints(auth, nil)
-		}
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	if r.coreManager != nil {
+		auth, _ = r.coreManager.GetByID(auth.ID)
+	}
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), copilotauth.Provider) {
 		return
 	}
-
+	if _, _, compat := openAICompatInfoFromAuth(auth); compat {
+		return
+	}
 	unregisterLegacyModelClient(auth)
 	snapshot := r.copilotAccounts[auth.ID]
-	var models []*ModelInfo
-	if snapshot.identity != copilotIdentity(auth) {
+	identity := copilotIdentity(auth)
+	active := activeCopilotAccount(auth)
+	now := time.Now()
+	if active && snapshot.due(identity, now) {
+		r.wakeCopilotDiscovery()
+	}
+	if !active || snapshot.identity != identity {
 		delete(r.copilotAccounts, auth.ID)
-	} else if time.Now().Before(snapshot.expiresAt) {
-		// Discovery grants access by ID. Model definitions come from the active Copilot catalog.
-		models = make([]*ModelInfo, 0, len(snapshot.ids))
-		for _, model := range registry.GetCopilotModels() {
+		r.registerResolvedModelsForAuth(auth, copilotauth.Provider, nil, nil)
+		return
+	}
+	if !copilotSnapshotUsable(auth, snapshot, now) {
+		r.registerResolvedModelsForAuth(auth, copilotauth.Provider, nil, nil)
+		return
+	}
+	// Discovery grants access by ID. Model definitions come from the active Copilot catalog.
+	models := make([]*ModelInfo, 0, len(snapshot.ids))
+	for _, model := range registry.GetCopilotModels() {
+		if model != nil {
 			if _, allowed := snapshot.ids[model.ID]; allowed {
-				model.MetadataModelID = model.ID
-				model.ID = copilotauth.Provider + "/" + model.ID
+				setCopilotModelDisplayName(model, model.ID)
+				applyModelNamespace(model, copilotauth.Provider, model.ID, model.ID)
 				models = append(models, model)
 			}
 		}
 	}
-
 	cfg := r.Config()
 	authKind, excluded := r.modelRegistrationAuthSettings(cfg, copilotauth.Provider, auth)
 	models, candidates := applyOAuthModelConfig(cfg, copilotauth.Provider, authKind, models, excluded)
-	forcePrefix := cfg != nil && cfg.ForceModelPrefix
-	r.registerResolvedModelsForAuth(auth, copilotauth.Provider, applyModelPrefixes(models, auth.Prefix, forcePrefix), candidates)
+	r.registerResolvedModelsForAuth(auth, copilotauth.Provider, applyModelPrefixes(models, auth.Prefix, cfg != nil && cfg.ForceModelPrefix), candidates)
 }
 
 func (r *Runtime) copilotDispatchModelInfo(decision *coreauth.DispatchDecision, route string, now time.Time) *DispatchModelInfo {
 	auth := decision.Auth
-	expiry, hasExpiry := auth.ExpirationTime()
-	if extractAccessToken(auth) == "" || (hasExpiry && !now.Before(expiry)) {
+	if !copilotTokenUsable(auth, now) {
+		return nil
+	}
+	upstream := coreauth.CanonicalModelID(decision.UpstreamModel)
+	nativeID, qualified := strings.CutPrefix(upstream, copilotauth.Provider+"/")
+	if !qualified || nativeID == "" {
 		return nil
 	}
 	r.copilotMu.RLock()
 	defer r.copilotMu.RUnlock()
 	snapshot := r.copilotAccounts[auth.ID]
-	upstream := coreauth.CanonicalModelID(decision.UpstreamModel)
-	if _, allowed := snapshot.ids[upstream]; !allowed ||
-		!now.Before(snapshot.expiresAt) || snapshot.identity != copilotIdentity(auth) {
+	if _, allowed := snapshot.ids[nativeID]; !allowed || !copilotSnapshotUsable(auth, snapshot, now) {
+		return nil
+	}
+	if registry.LookupStaticModelInfoByChannel(nativeID, copilotauth.Provider) == nil {
 		return nil
 	}
 	// Check the current publication under the same lock as the account permissions.
 	published := registry.GetGlobalRegistry().GetModelInfoForClient(auth.ID, coreauth.CanonicalModelID(route))
-	if published == nil || published.MetadataModelID != upstream || published.ResponseModelAlias != decision.OriginalAlias {
+	if published == nil {
+		published = registry.GetGlobalRegistry().GetModelInfoForClient(auth.ID, strings.TrimSpace(route))
+	}
+	if published == nil || published.SourceModelID != upstream || published.MetadataModelID != nativeID || published.ResponseModelAlias != decision.OriginalAlias {
 		return nil
 	}
 	return newDispatchModelInfo(upstream, published)
 }
 
-// PruneCopilotModels removes expired account models from the published registry.
+// PruneCopilotModels removes expired or otherwise ineligible account models from the published registry.
 func (r *Runtime) PruneCopilotModels() {
 	if r == nil {
 		return
 	}
 	now := time.Now()
-	var expired []string
+	republish := make(map[string]struct{})
 	r.copilotMu.Lock()
 	for id, snapshot := range r.copilotAccounts {
 		if !snapshot.expiresAt.IsZero() && !now.Before(snapshot.expiresAt) {
 			snapshot.ids = nil
 			snapshot.expiresAt = time.Time{}
 			r.copilotAccounts[id] = snapshot
-			expired = append(expired, id)
+			republish[id] = struct{}{}
 		}
 	}
 	r.copilotMu.Unlock()
-	for _, id := range expired {
+	if r.coreManager != nil {
+		reg := registry.GetGlobalRegistry()
+		for _, auth := range r.coreManager.ListByProvider(copilotauth.Provider) {
+			if auth == nil {
+				continue
+			}
+			r.copilotMu.RLock()
+			snapshot := r.copilotAccounts[auth.ID]
+			r.copilotMu.RUnlock()
+			if !copilotSnapshotUsable(auth, snapshot, now) && reg.GetModelCandidatesForClient(auth.ID) != nil {
+				republish[auth.ID] = struct{}{}
+			}
+		}
+	}
+	for id := range republish {
 		r.publishCopilotModels(id)
 	}
 }
@@ -232,11 +271,10 @@ func (r *Runtime) discoverCopilotModels(ctx context.Context, id string) {
 	if full == nil {
 		return
 	}
-	token := extractAccessToken(full)
-	expiry, hasExpiry := full.ExpirationTime()
-	if token == "" || (hasExpiry && !time.Now().Before(expiry)) {
+	if !copilotTokenUsable(full, time.Now()) {
 		return
 	}
+	token := extractAccessToken(full)
 	client := &http.Client{Transport: r.coreManager.AuthRoundTripper(full)}
 	if client.Transport == nil {
 		cfg := r.Config()

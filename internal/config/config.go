@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -277,19 +278,39 @@ type OAuthModelAlias struct {
 	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
 }
 
-// ForRouting returns the names used to publish and resolve the alias on its channel.
-func (a OAuthModelAlias) ForRouting(channel string) (OAuthModelAlias, bool) {
-	a.Name = strings.TrimSpace(a.Name)
-	a.Alias = strings.TrimSpace(a.Alias)
-	if a.Name == "" || a.Alias == "" || strings.EqualFold(a.Name, a.Alias) {
-		return a, false
+// ResolveOAuthModelSetting finds the best matching OAuthModelSetting for a given model.
+// An exact Alias match on the model ID takes precedence over a general Name match.
+// Within the same match specificity, later entries in the slice override earlier ones.
+func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID string, modelNames ...string) *OAuthModelSetting {
+	if len(settings) == 0 {
+		return nil
 	}
-	if channel == "copilot" {
-		a.Name = "copilot/" + strings.TrimPrefix(a.Name, "copilot/")
-		a.Alias = "copilot/" + strings.TrimPrefix(a.Alias, "copilot/")
-		return a, !strings.EqualFold(a.Name, a.Alias)
+	id := strings.ToLower(strings.TrimSpace(modelID))
+
+	var aliasMatch *OAuthModelSetting
+	var nameMatch *OAuthModelSetting
+
+	for i := range settings {
+		entry := &settings[i]
+		entryName := strings.ToLower(strings.TrimSpace(entry.Name))
+		entryAlias := strings.ToLower(strings.TrimSpace(entry.Alias))
+		if entryName == "" && entryAlias == "" {
+			continue
+		}
+
+		if entryAlias != "" && id != "" && id == entryAlias {
+			aliasMatch = entry
+		} else if entryAlias == "" && (id == entryName || slices.ContainsFunc(modelNames, func(name string) bool {
+			return strings.ToLower(strings.TrimSpace(name)) == entryName
+		})) {
+			nameMatch = entry
+		}
 	}
-	return a, true
+
+	if aliasMatch != nil {
+		return aliasMatch
+	}
+	return nameMatch
 }
 
 // ClaudeKey represents the configuration for a Claude API key,

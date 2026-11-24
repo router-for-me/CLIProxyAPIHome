@@ -426,7 +426,7 @@ Home 在数据库和下发配置中保留兼容的
 
 `tos-pause-window` 在 Home 中默认 `0`（关闭）。省略或留空时显式下发 `"0"`，避免 CPA 节点回退到自身默认值；显式非空值保持不变。设置 `6h` 等正时长可启用；设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
 
-`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。匹配 `alias` 的条目优先于匹配原名 `name` 的条目。不影响 API Key 模型。
+`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。对于带命名空间的渠道（`copilot`、`devin`），`name` 同时支持裸目录 ID 和 provider 限定源名（例如 `gpt-5.3-codex` 或 `copilot/gpt-5.3-codex`、`swe-2` 或 `devin/swe-2`）。匹配 `alias` 的条目优先于匹配 `name` 的条目，凭据前缀副本会继承解析结果。不影响 API Key 模型。
 
 `connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
 
@@ -2347,7 +2347,7 @@ Query 参数：
 
 ### POST `/credentials`
 
-GitHub Copilot 支持导入 CPA 生成的 `type: copilot` 凭据 JSON。Home 将 GitHub 长期凭据存入 `refresh_token`，并在 Copilot 短期 token 到期前五分钟刷新。Home 向每个账号的可信 API 主机发现模型，发布账号可用模型与通用目录 `copilot` 段的交集。账号模型在发现成功后可用。空目录、权限拒绝、过期快照或旧主机的快照均不会为该账号发布模型。发布 ID 为 `copilot/<原生模型 ID>`，支持 OAuth 别名、排除规则和凭据前缀。
+GitHub Copilot 支持导入 CPA 生成的 `type: copilot` 凭据 JSON。Home 将 GitHub 长期凭据存入 `refresh_token`，并在 Copilot 短期 token 到期前五分钟刷新。Home 向每个账号的可信 API 主机发现模型，发布账号可用模型与通用目录 `copilot` 段的交集。账号模型在发现成功后可用。空目录、权限拒绝、快照过期、token 过期或旧主机的快照均不会为该账号发布模型。基础路由发布为 `copilot/<原生模型 ID>`（与 Devin 的 `devin/<原生模型 ID>` 语义一致），支持 OAuth 别名、排除规则、OAuth 模型设置和凭据前缀。
 
 上传一个或多个 credential JSON payload。
 
@@ -4195,6 +4195,8 @@ Query 参数：
 | `force-mapping` | boolean | 响应模型字段使用映射后的上游名称。 |
 
 修改单个 channel 时，向 `/config/oauth/model-alias/claude` 提交原始别名数组；删除时对该路径执行 `DELETE`。v8 不使用 v0 的 `items`、`channel`、`provider`、`aliases` 包装。写入成功返回 `{"status":"ok","config-version":8}`。与其他配置树接口一致，`null` 保留为值，不表示删除。
+
+对于带命名空间的渠道（`copilot`、`devin`），排除规则与别名 `name` 均使用公开的 provider 限定源名（例如 `copilot/gpt-5.3-codex`、`devin/swe-2`），`alias` 按配置原样发布（Home 不会自动补 `copilot/` 或 `devin/` 前缀；如需发布 `copilot/friendly`，请显式配置 `alias: "copilot/friendly"`）。凭据前缀在别名之后应用：可选前缀下，显式别名与前缀副本同名时显式别名优先；开启 `force-model-prefix` 时只发布加过凭据前缀的路由。启用 `force-mapping: true` 时，响应名使用配置的原始 `alias`（保留 `alias` 中显式写入的前缀，不含凭据前缀）。
 
 当下游请求使用了已通过别名发布的上游模型 ID 时，Home 可能在 `auth_not_found` 或 `model_not_found` 错误中附加最多三个可见的对外模型 ID，包括因缺少价格而拒绝的请求。提示覆盖 API Key 和 OAuth 别名，包含必要的凭据前缀，并遵守客户端 Key 的凭据、模型及模型专属渠道权限。禁用凭据、未发布或被排除的模型不会出现在提示中；权限查询失败时省略提示。错误码和路由规则保持不变。
 

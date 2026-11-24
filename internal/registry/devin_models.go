@@ -30,8 +30,37 @@ var devinCatalogStore = &devinModelsStore{}
 
 func init() {
 	if _, err := loadDevinModelsFromBytes(embeddedDevinModelsJSON, "embed"); err != nil {
-		log.Warnf("registry: failed to parse embedded devin_models.json (will rely on static fallback and remote refresh): %v", err)
+		log.Warnf("registry: failed to parse embedded devin_models.json (will rely on legacy definitions and remote refresh): %v", err)
 	}
+}
+
+// GetDevinModels returns a copy of the active Devin model catalog.
+func GetDevinModels() []*ModelInfo {
+	return cloneModelInfos(devinModelDefinitions())
+}
+
+// devinModelDefinitions returns read-only definitions from the active snapshot,
+// with the legacy models.json section available as a fallback.
+func devinModelDefinitions() []*ModelInfo {
+	devinCatalogStore.mu.RLock()
+	models := devinCatalogStore.models
+	devinCatalogStore.mu.RUnlock()
+
+	if len(models) > 0 {
+		return models
+	}
+
+	if m := getModels(); m != nil && len(m.Devin) > 0 {
+		models = cloneModelInfos(m.Devin)
+		for _, model := range models {
+			if model != nil {
+				model.ID = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model.ID)), "devin/")
+			}
+		}
+		return models
+	}
+
+	return nil
 }
 
 func loadDevinModelsFromBytes(data []byte, source string) (bool, error) {
@@ -88,14 +117,10 @@ func sanitizeAndValidateDevinModels(models []*ModelInfo) ([]*ModelInfo, error) {
 		if m == nil {
 			return nil, fmt.Errorf("model at index %d is null", i)
 		}
-		id := strings.TrimSpace(m.ID)
+		id := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(m.ID)), "devin/")
 		if id == "" {
 			return nil, fmt.Errorf("model at index %d has empty id", i)
 		}
-		if !strings.HasPrefix(strings.ToLower(id), "devin/") {
-			id = "devin/" + id
-		}
-		id = strings.ToLower(id)
 		cloned := cloneModelInfo(m)
 		cloned.ID = id
 		if _, exists := seen[id]; exists {

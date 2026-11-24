@@ -26,9 +26,11 @@ type NativeCapabilities struct {
 type ModelInfo struct {
 	// ID is the unique identifier for the model
 	ID string `json:"id"`
-	// MetadataModelID preserves the original upstream identity for OAuth settings.
+	// SourceModelID identifies the provider model behind this published route.
+	SourceModelID string `json:"-" yaml:"-"`
+	// MetadataModelID identifies the catalog key used to resolve client metadata.
 	MetadataModelID string `json:"-" yaml:"-"`
-	// ResponseModelAlias is the forced response name on a published Copilot route, before credential prefixing.
+	// ResponseModelAlias is the forced response name on a published route, before credential prefixing.
 	ResponseModelAlias string `json:"-" yaml:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
@@ -157,7 +159,9 @@ func GetGlobalRegistry() *ModelRegistry {
 	return globalRegistry
 }
 
-// LookupModelInfo searches dynamic registry (provider-specific > global) then static definitions.
+// LookupModelInfo looks up ModelInfo by checking dynamic registrations first
+// (strictly scoped to provider when non-empty, or global when empty) and then
+// falling back to channel-specific or shared static definitions.
 func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
@@ -172,7 +176,10 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	if info := GetGlobalRegistry().GetModelInfo(modelID, p); info != nil {
 		return cloneModelInfo(info)
 	}
-	return cloneModelInfo(LookupStaticModelInfo(modelID))
+	if p != "" {
+		return LookupStaticModelInfoByChannel(modelID, p)
+	}
+	return lookupStaticModelInfo(modelID, nil)
 }
 
 const modelQuotaExceededWindow = 5 * time.Minute
@@ -860,20 +867,20 @@ func modelInfoSortKey(model *ModelInfo) string {
 	return strings.ToLower(strings.TrimSpace(model.ID))
 }
 
-// GetModelInfo returns ModelInfo, prioritizing provider-specific definition if available.
+// GetModelInfo returns ModelInfo, strictly scoped to provider when non-empty.
 func (r *ModelRegistry) GetModelInfo(modelID, provider string) *ModelInfo {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 	if reg, ok := r.models[modelID]; ok && reg != nil {
-		// Try provider specific definition first
-		if provider != "" && reg.InfoByProvider != nil {
-			if reg.Providers != nil {
+		if provider != "" {
+			if reg.InfoByProvider != nil && reg.Providers != nil {
 				if count, ok := reg.Providers[provider]; ok && count > 0 {
 					if info, ok := reg.InfoByProvider[provider]; ok && info != nil {
 						return cloneModelInfo(info)
 					}
 				}
 			}
+			return nil
 		}
 		// Fallback to global info (last registered)
 		return cloneModelInfo(reg.Info)
