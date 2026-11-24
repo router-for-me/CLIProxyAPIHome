@@ -426,7 +426,7 @@ Home 在数据库和下发配置中保留兼容的
 
 `tos-pause-window` 在 Home 中默认 `0`（关闭）。省略或留空时显式下发 `"0"`，避免 CPA 节点回退到自身默认值；显式非空值保持不变。设置 `6h` 等正时长可启用；设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
 
-`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。匹配 `alias` 的条目优先于匹配原名 `name` 的条目。不影响 API Key 模型。
+`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。对于带命名空间的渠道（`copilot`、`devin`），`name` 同时支持裸目录 ID 和 provider 限定源名（例如 `gpt-5.3-codex` 或 `copilot/gpt-5.3-codex`、`swe-2` 或 `devin/swe-2`）。匹配 `alias` 的条目优先于匹配 `name` 的条目，凭据前缀副本会继承解析结果。不影响 API Key 模型。
 
 `connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
 
@@ -2347,6 +2347,8 @@ Query 参数：
 
 ### POST `/credentials`
 
+GitHub Copilot 支持导入 CPA 生成的 `type: copilot` 凭据 JSON。Home 将 GitHub 长期凭据存入 `refresh_token`，并在 Copilot 短期 token 到期前五分钟刷新。Home 向每个账号的可信 API 主机发现模型，发布账号可用模型与通用目录 `copilot` 段的交集。账号模型在发现成功后可用。空目录、权限拒绝、快照过期、token 过期或旧主机的快照均不会为该账号发布模型。基础路由发布为 `copilot/<原生模型 ID>`（与 Devin 的 `devin/<原生模型 ID>` 语义一致），支持 OAuth 别名、排除规则、OAuth 模型设置和凭据前缀。
+
 上传一个或多个 credential JSON payload。
 
 Multipart 输入：
@@ -2528,6 +2530,7 @@ Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_r
 | `xai` | xAI OAuth。 |
 | `devin` | Devin PKCE OAuth。 |
 | `meta` | Meta 设备授权流程。 |
+| `copilot` | GitHub Copilot 设备授权流程。 |
 | 插件 `oauth_provider` | 由 Home 已加载并注册的插件处理登录。 |
 
 通用响应：
@@ -2540,7 +2543,7 @@ Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_r
 }
 ```
 
-Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。通过 `/oauth/status?state=...` 轮询完成状态。
+Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。GitHub Copilot 用户打开 `url` 并输入返回的 `user_code`。通过 `/oauth/status?state=...` 轮询完成状态，也可调用 `DELETE /oauth/session?state=...` 取消会话。
 
 插件需在 `/plugins` 中满足 `supports_oauth: true`、`effective_enabled: true` 且 `oauth_provider` 非空。插件 provider key 由小写字母、数字、连字符组成；v8 插件收到的回调路由为 `/v8/management/oauth/callback`。缺少 provider 返回 `400 {"error":"provider is required"}`，未知或不可用 provider 返回 `404 {"error":"provider_not_found"}`。
 
@@ -2603,7 +2606,7 @@ Query 参数：
 | `provider` | 否 | 默认取 state 对应会话的 provider。内置回调兼容 `anthropic`/`claude`、`codex`/`openai`、`antigravity`/`anti-gravity`、`xai`/`x-ai`/`grok`、`devin`；插件会话使用其 `oauth_provider`。 |
 | `redirect_url` | 否，仅 POST | 完整回调 URL，用于补全缺失的 state、code 或 error。 |
 
-Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
+Kimi、Kimi AI、Meta 和 Copilot 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
 
 | 状态码 | error |
 | --- | --- |
@@ -3193,7 +3196,7 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 
 只有 `capabilities.usage_token_breakdown_v2=true` 时，客户端才能消费规范化 Token Accounting。客户端必须读取该显式能力，不能通过探测 usage 路由推断支持，也不能使用旧 Token 字段自行拼装明细。能力为 `false` 时，服务端可能已经为新归一化记录返回 `token_breakdown`，但所选范围仍可能包含等待回填的历史记录。旧的 `input_tokens`、`output_tokens`、`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens` 和 `total_tokens` 继续用于诊断与向后兼容；这些字段并非互斥，不能直接堆叠求和。
 
-`input_tokens` 与 `output_tokens` 在以下接口使用同一显示口径：`/usage/overview`（`totals`、`trend[]`、`model_efficiency[]` 与 `top`）、`/usage/records`、`/usage/records/:id`、`/usage/export`、`/usage/aggregates`、`/usage/realtime`（`current_usage[]`）、`/usage/session-tree`，以及 `/request-events` 的列表、详情和导出。该口径与 `/billing/charges`、`/billing/overview` 一致。usage 记录为 Token Accounting v2 且质量为 `complete` 时，`input_tokens` 包含未缓存输入、缓存读取和缓存写入，`output_tokens` 包含普通输出与推理 Token；等待回填以及 `unclassified`、`inconsistent` 记录保留原始计数。聚合结果按该逐条口径求和。`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens`、`total_tokens`、`token_breakdown` 与 `performance.tps` 不变。该转换只在读取时进行，不改写已存储的 usage 记录。
+`input_tokens` 与 `output_tokens` 在以下接口使用同一显示口径：`/usage/overview`（`totals`、`trend[]`、`model_efficiency[]` 与 `top`）、`/usage/records`、`/usage/records/:id`、`/usage/export`、`/usage/aggregates`、`/usage/realtime`（`current_usage[]`）、`/usage/session-tree`，以及 `/request-events` 的列表、详情和导出。该口径与 `/billing/charges`、`/billing/overview` 一致。usage 记录为 Token Accounting v2 且质量为 `complete` 时，`input_tokens` 包含未缓存输入、缓存读取和缓存写入，`output_tokens` 包含普通输出与推理 Token；等待回填以及 `unclassified`、`inconsistent` 记录保留原始计数。聚合结果按该逐条口径求和。`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens`、`total_tokens` 和 `token_breakdown` 不变。请求事件和用量记录（含导出）的 `performance.tps` 为显示的 `output_tokens` 除以请求总耗时（秒），不扣除 TTFT。耗时或显示输出量非正时，TPS 返回 `null`。该转换只在读取时进行，不改写已存储的 usage 记录。
 
 能力启用后，`totals`、每个 `trend[]` 桶、每条 usage record 和每个 aggregate item 都包含以下结构：
 
@@ -3707,6 +3710,7 @@ Query 参数：
 
 返回指定 channel 的静态模型 metadata。
 返回的模型记录同样包含上文所述的权威 `providers` 字段。
+对于 `copilot` 和 `devin`，返回的模型 `id` 会带有命名空间前缀（`copilot/<id>`、`devin/<id>`），与 OAuth 排除规则和别名规则（应用别名与凭证前缀前）保持一致。
 
 支持的 channel：
 
@@ -3726,6 +3730,7 @@ antigravity
 xai
 x-ai
 grok
+copilot
 devin
 meta
 muse
@@ -4192,6 +4197,8 @@ Query 参数：
 | `force-mapping` | boolean | 响应模型字段使用映射后的上游名称。 |
 
 修改单个 channel 时，向 `/config/oauth/model-alias/claude` 提交原始别名数组；删除时对该路径执行 `DELETE`。v8 不使用 v0 的 `items`、`channel`、`provider`、`aliases` 包装。写入成功返回 `{"status":"ok","config-version":8}`。与其他配置树接口一致，`null` 保留为值，不表示删除。
+
+对于带命名空间的渠道（`copilot`、`devin`），排除规则与别名 `name` 均使用公开的 provider 限定源名（例如 `copilot/gpt-5.3-codex`、`devin/swe-2`），`alias` 按配置原样发布（Home 不会自动补 `copilot/` 或 `devin/` 前缀；如需发布 `copilot/friendly`，请显式配置 `alias: "copilot/friendly"`）。凭据前缀在别名之后应用：可选前缀下，显式别名与前缀副本同名时显式别名优先；开启 `force-model-prefix` 时只发布加过凭据前缀的路由。启用 `force-mapping: true` 时，响应名使用配置的原始 `alias`（保留 `alias` 中显式写入的前缀，不含凭据前缀）。
 
 当下游请求使用了已通过别名发布的上游模型 ID 时，Home 可能在 `auth_not_found` 或 `model_not_found` 错误中附加最多三个可见的对外模型 ID，包括因缺少价格而拒绝的请求。提示覆盖 API Key 和 OAuth 别名，包含必要的凭据前缀，并遵守客户端 Key 的凭据、模型及模型专属渠道权限。禁用凭据、未发布或被排除的模型不会出现在提示中；权限查询失败时省略提示。错误码和路由规则保持不变。
 

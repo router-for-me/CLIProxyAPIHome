@@ -163,7 +163,7 @@ func TestAntigravityDynamicModelFetchIntersectionAndPersistence(t *testing.T) {
 	resetAntigravityCapabilityCache()
 	t.Cleanup(resetAntigravityCapabilityCache)
 
-	const wantDefaultUA = "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"
+	wantDefaultUA := defaultAntigravityModelUserAgent("")
 
 	var (
 		gotUA      string

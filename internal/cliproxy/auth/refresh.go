@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/antigravity"
 	claudeauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/claude"
 	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
@@ -20,6 +21,7 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -48,6 +50,8 @@ func refreshCredential(ctx context.Context, cfg *config.Config, auth *Auth, rt h
 		return refreshXAI(ctx, cfg, auth)
 	case "meta":
 		return refreshMeta(ctx, cfg, auth)
+	case "copilot":
+		return refreshCopilot(ctx, cfg, auth, rt)
 	default:
 		return auth, nil
 	}
@@ -404,6 +408,35 @@ func refreshXAI(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, err
 	auth.Metadata["type"] = "xai"
 	auth.Metadata["auth_kind"] = "oauth"
 	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	return auth, nil
+}
+
+// refreshCopilot exchanges the GitHub credential for a short-lived Copilot token.
+func refreshCopilot(ctx context.Context, cfg *config.Config, auth *Auth, rt http.RoundTripper) (*Auth, error) {
+	client := &http.Client{Transport: rt, Timeout: 30 * time.Second}
+	if rt == nil && cfg != nil {
+		sdkCfg := cfg.SDKConfig
+		sdkCfg.ProxyURL = cfg.ProxyURL
+		client = util.SetProxy(&sdkCfg, client)
+	}
+	token, errExchange := copilotauth.Exchange(ctx, client, metaStringValue(auth.Metadata, "refresh_token"))
+	if errExchange != nil {
+		var status copilotauth.HTTPError
+		if errors.As(errExchange, &status) && status.Code == http.StatusUnauthorized {
+			errExchange = fmt.Errorf("%w: %w", newUnauthorizedRefreshError(), errExchange)
+		}
+		return nil, builtInRefreshError(copilotauth.Provider, "token_exchange", errExchange)
+	}
+	base, errBase := token.API()
+	if errBase != nil {
+		return nil, builtInRefreshError(copilotauth.Provider, "token_endpoint", errBase)
+	}
+	auth.Metadata["access_token"] = token.Value
+	auth.Metadata["base_url"] = base
+	auth.Metadata["expired"] = time.Unix(token.ExpiresAt, 0).UTC().Format(time.RFC3339)
+	if _, exists := auth.Attributes["base_url"]; exists {
+		auth.Attributes["base_url"] = base
+	}
 	return auth, nil
 }
 

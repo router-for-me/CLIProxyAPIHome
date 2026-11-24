@@ -12,6 +12,28 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
+func TestListByProviderClonesOnlyMatchingCredentials(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for _, provider := range []string{"codex", "claude"} {
+		manager.auths[provider] = &Auth{ID: provider, Provider: provider, Metadata: map[string]any{"type": provider}}
+	}
+	if allocs := testing.AllocsPerRun(10, func() {
+		if got := manager.ListByProvider("copilot"); len(got) != 0 {
+			t.Fatalf("returned %d credentials for an empty provider", len(got))
+		}
+	}); allocs != 0 {
+		t.Fatalf("empty provider scan allocated %v times, want zero", allocs)
+	}
+	got := manager.ListByProvider("codex")
+	if len(got) != 1 || got[0].ID != "codex" {
+		t.Fatalf("provider scan returned %v, want only the Codex credential", got)
+	}
+	got[0].Metadata["type"] = "changed"
+	if manager.auths["codex"].Metadata["type"] != "codex" {
+		t.Fatal("mutating a snapshot changed the manager's credential")
+	}
+}
+
 type blockingVersionedUpdateStore struct {
 	mu              sync.Mutex
 	persisted       *Auth

@@ -198,8 +198,8 @@ func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
 	m.mu.Unlock()
 }
 
-// roundTripperFor returns a round tripper for.
-func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
+// AuthRoundTripper returns the transport configured for a credential.
+func (m *Manager) AuthRoundTripper(auth *Auth) http.RoundTripper {
 	m.mu.RLock()
 	p := m.rtProvider
 	m.mu.RUnlock()
@@ -950,6 +950,22 @@ func (m *Manager) List() []*Auth {
 	return out
 }
 
+// ListByProvider returns snapshots only for credentials from the specified provider.
+func (m *Manager) ListByProvider(provider string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*Auth
+	for _, auth := range m.auths {
+		if auth != nil && auth.Provider == provider {
+			out = append(out, auth.Clone())
+		}
+	}
+	return out
+}
+
 // GetByID returns a by id.
 func (m *Manager) GetByID(id string) (*Auth, bool) {
 	if m == nil {
@@ -1081,15 +1097,7 @@ func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
 	}
 
 	for registryModel, stateModel := range models {
-		blocked, reason, _ := isAuthBlockedForModel(authForAvailability, stateModel, now)
-		legacyModel := canonicalModelKey(registryModel)
-		if !blocked && stateModel != legacyModel {
-			if legacyBlocked, legacyReason, _ := isAuthBlockedForModel(authForAvailability, legacyModel, now); legacyBlocked {
-				blocked = true
-				reason = legacyReason
-				stateModel = legacyModel
-			}
-		}
+		stateModel, blocked, reason, _ := dispatchModelBlockStatus(authForAvailability, stateModel, registryModel, now)
 		if blocked && reason == blockReasonCooldown {
 			modelRegistry.SetModelQuotaExceeded(auth.ID, registryModel)
 		} else {
@@ -1236,11 +1244,16 @@ func classifyDispatchAvailability(auth *Auth, blockedModel string, blocked bool,
 }
 
 // dispatchModelBlockStatus preserves the upstream-first check and legacy route fallback.
+// Published-route providers only check source state (including any legacy
+// unqualified source key) so rebinding an alias never inherits another source's cooldown.
 // Returning the checked model lets diagnostics identify the state that blocks dispatch.
 func dispatchModelBlockStatus(auth *Auth, resolvedModel, routeModel string, now time.Time) (string, bool, blockReason, time.Time) {
-	blockedModel := resolvedModel
+	blockedModel := publishedModelStateKey(auth, resolvedModel)
 	blocked, reason, next := isAuthBlockedForModel(auth, blockedModel, now)
-	if !blocked && resolvedModel != canonicalModelKey(routeModel) {
+	if blocked || isPublishedSourceModelKey(auth, resolvedModel) {
+		return blockedModel, blocked, reason, next
+	}
+	if resolvedModel != canonicalModelKey(routeModel) {
 		blockedModel = routeModel
 		blocked, reason, next = isAuthBlockedForModel(auth, blockedModel, now)
 	}
@@ -2191,7 +2204,7 @@ func unsupportedRefreshDiagnostic(auth *Auth) string {
 	}
 	reason := "no_refresh_handler"
 	switch provider {
-	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai":
+	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai", "copilot":
 		if auth == nil || strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token")) == "" {
 			reason = "missing_refresh_token"
 		}
@@ -2393,7 +2406,7 @@ func authSupportsBuiltInRefresh(auth *Auth) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
-	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai":
+	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai", "copilot":
 		return metaStringValue(auth.Metadata, "refresh_token") != ""
 	case "meta":
 		return extractMetaDCAToken(auth) != ""
@@ -2854,7 +2867,7 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.AuthRoundTripper(target))
 	}
 	cancelRefresh()
 	now = time.Now().UTC()
@@ -2971,7 +2984,7 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.AuthRoundTripper(target))
 	}
 	cancelRefresh()
 	now := time.Now().UTC()

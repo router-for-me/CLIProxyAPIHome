@@ -859,6 +859,16 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 			}
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "copilot") {
+		for _, key := range []string{"base_url", "account_id"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				metadata[key] = value
+			}
+		}
+		if expiry, ok := auth.ExpirationTime(); ok {
+			metadata["expired"] = expiry.UTC().Format(time.RFC3339Nano)
+		}
+	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		metadata["request_retry"] = requestRetry
 	}

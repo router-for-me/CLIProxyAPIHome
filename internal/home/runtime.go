@@ -62,6 +62,11 @@ type Runtime struct {
 
 	cancel context.CancelFunc
 
+	copilotMu       sync.RWMutex
+	copilotAccounts map[string]copilotAccountModels
+	copilotWake     chan struct{}
+	copilotDone     chan struct{}
+
 	antigravityProbeMu        sync.Mutex
 	antigravityProbeWg        sync.WaitGroup
 	antigravityAccountProbes  map[string]map[*antigravityAccountProbe]struct{}
@@ -266,12 +271,14 @@ func NewRuntime(cfg *config.Config) (*Runtime, error) {
 	accessManager := access.NewManager()
 
 	runtime := &Runtime{
-		cfg:           cfg,
-		authDir:       cfg.AuthDir,
-		accessManager: accessManager,
-		coreManager:   coreManager,
-		pluginHost:    pluginHost,
-		originalStore: store,
+		cfg:             cfg,
+		authDir:         cfg.AuthDir,
+		accessManager:   accessManager,
+		coreManager:     coreManager,
+		pluginHost:      pluginHost,
+		originalStore:   store,
+		copilotWake:     make(chan struct{}, 1),
+		copilotAccounts: make(map[string]copilotAccountModels),
 	}
 	coreManager.SetPluginAuthRefresher(runtime)
 	coreManager.SetPluginScheduler(runtime)
@@ -384,6 +391,9 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 		return errLoad
 	}
 
+	r.copilotDone = make(chan struct{})
+	go r.runCopilotDiscovery(runCtx, r.copilotDone)
+
 	clusterMode := r.clusterAutoRefreshGated()
 	if clusterMode {
 		log.Infof("core auth auto-refresh waiting for cluster master")
@@ -420,6 +430,10 @@ func (r *Runtime) Stop() {
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
+	}
+	if r.copilotDone != nil {
+		<-r.copilotDone
+		r.copilotDone = nil
 	}
 	if r.fileWatcher != nil {
 		_ = r.fileWatcher.Stop()
@@ -510,6 +524,9 @@ func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex, observ
 	if errRefresh != nil {
 		return nil, errRefresh
 	}
+	if updated != nil && updated.Provider == "copilot" {
+		r.publishCopilotModels(updated.ID)
+	}
 	return BuildRefreshPayload(updated, r.Config())
 }
 
@@ -550,7 +567,11 @@ func (r *Runtime) UpdateAuthInMemory(ctx context.Context, auth *coreauth.Auth) (
 			update.ModelStates = mergeModelStates(update.ModelStates, current.ModelStates)
 		}
 	}
-	return r.coreManager.Update(coreauth.WithSkipPersist(ctx), update)
+	applied, errUpdate := r.coreManager.Update(coreauth.WithSkipPersist(ctx), update)
+	if errUpdate == nil && applied != nil && applied.Provider == "copilot" {
+		r.publishCopilotModels(applied.ID)
+	}
+	return applied, errUpdate
 }
 
 // RefreshClusterAuthIndex refreshes refresh cluster auth index.
@@ -1054,6 +1075,22 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if !validConcurrencyModel {
 			return nil, fmt.Errorf("home runtime: invalid canonical concurrency model key")
 		}
+		var modelInfo *DispatchModelInfo
+		if decision.Provider == "copilot" {
+			modelInfo = r.copilotDispatchModelInfo(decision, reqModel, time.Now())
+			if modelInfo == nil {
+				// The full credential can have changed since the scheduler read the registry.
+				if opts.Metadata == nil {
+					opts.Metadata = make(map[string]any)
+				}
+				excluded, _ := opts.Metadata[coreauth.ExcludedAuthIDsMetadataKey].([]string)
+				opts.Metadata[coreauth.ExcludedAuthIDsMetadataKey] = append(append([]string(nil), excluded...), auth.ID)
+				r.wakeCopilotDiscovery()
+				continue
+			}
+		} else {
+			modelInfo = dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel)
+		}
 		accessToken := extractAccessToken(auth)
 		baseURL := ""
 		apiKey := ""
@@ -1066,7 +1103,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			Model:       upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
 			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
-			ModelInfo: dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel),
+			ModelInfo: modelInfo,
 			AuthID:    auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
 			Concurrency: ConcurrencyAdmissionResult{CredentialID: auth.ID, Model: concurrencyModel},
 		}

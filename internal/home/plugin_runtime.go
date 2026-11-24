@@ -167,14 +167,7 @@ func (r *Runtime) pluginLoginPollAuths(resp pluginapi.AuthLoginPollResponse) ([]
 	return auths, nil
 }
 
-func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *homeauth.Auth, provider, authKind string, excluded []string) bool {
-	if r == nil || r.pluginHost == nil || auth == nil {
-		return false
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result := r.pluginHost.ModelsForAuth(ctx, homeAuthToPluginAuth(auth))
+func (r *Runtime) tryRegisterPluginModelsForAuth(auth *homeauth.Auth, provider string, excluded []string, result sdkpluginhost.AuthModelResult) bool {
 	if !result.Handled {
 		return false
 	}
@@ -184,67 +177,49 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(ctx context.Context, auth *home
 	}
 
 	activeAuth := auth
-	providerKey := strings.ToLower(strings.TrimSpace(result.Provider))
-	if providerKey == "" {
-		providerKey = strings.ToLower(strings.TrimSpace(provider))
-	}
 	if result.Auth != nil && r.coreManager != nil {
-		updatedAuth := pluginAuthToHomeAuth(result.Auth)
-		if updatedAuth != nil {
-			updatedAuth.ID = auth.ID
-			if updatedAuth.Provider == "" {
-				updatedAuth.Provider = auth.Provider
-			}
-			if updatedAuth.FileName == "" {
-				updatedAuth.FileName = auth.FileName
-			}
-			if updatedAuth.Attributes == nil {
-				updatedAuth.Attributes = make(map[string]string)
-			}
-			for key, value := range auth.Attributes {
-				if _, exists := updatedAuth.Attributes[key]; !exists {
-					updatedAuth.Attributes[key] = value
-				}
-			}
-			if updated, errUpdate := r.coreManager.Update(context.Background(), updatedAuth); errUpdate == nil && updated != nil {
-				activeAuth = updated.Clone()
-			}
-		}
+		activeAuth = r.applyPluginModelAuthUpdate(auth, pluginAuthToHomeAuth(result.Auth))
 	}
-	if activeAuth == nil {
-		activeAuth = auth
-	}
+	providerKey := strings.ToLower(strings.TrimSpace(result.Provider))
 	if activeProvider := strings.ToLower(strings.TrimSpace(activeAuth.Provider)); activeProvider != "" {
 		providerKey = activeProvider
 	}
 	if providerKey == "" {
 		providerKey = strings.ToLower(strings.TrimSpace(provider))
 	}
-	activeAuthKind := strings.ToLower(strings.TrimSpace(activeAuth.Attributes["auth_kind"]))
-	if activeAuthKind == "" {
-		if kind, _ := activeAuth.AccountInfo(); strings.EqualFold(kind, "api_key") {
-			activeAuthKind = "apikey"
-		}
-	}
-
-	r.cfgMu.RLock()
-	cfg := r.cfg
-	r.cfgMu.RUnlock()
-	activeExcluded := r.oauthExcludedModels(cfg, providerKey, activeAuthKind)
+	cfg := r.Config()
+	activeAuthKind, activeExcluded := r.modelRegistrationAuthSettings(cfg, providerKey, activeAuth)
 	if auth == activeAuth && len(activeExcluded) == 0 {
 		activeExcluded = excluded
-	}
-	// Credential-level exclusions take priority over the global oauth-excluded-models config.
-	if activeAuth.Attributes != nil {
-		if val, ok := activeAuth.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
-			activeExcluded = strings.Split(val, ",")
-		}
 	}
 
 	models, candidates := applyOAuthModelConfig(cfg, providerKey, activeAuthKind, pluginModelsToHomeModels(result.Models), activeExcluded)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, forcePrefix), candidates)
 	return true
+}
+
+func (r *Runtime) applyPluginModelAuthUpdate(auth, update *homeauth.Auth) *homeauth.Auth {
+	update.ID = auth.ID
+	if update.Provider == "" {
+		update.Provider = auth.Provider
+	}
+	if update.FileName == "" {
+		update.FileName = auth.FileName
+	}
+	if update.Attributes == nil {
+		update.Attributes = make(map[string]string)
+	}
+	for key, value := range auth.Attributes {
+		if _, exists := update.Attributes[key]; !exists {
+			update.Attributes[key] = value
+		}
+	}
+	updated, errUpdate := r.coreManager.Update(context.Background(), update)
+	if errUpdate != nil || updated == nil {
+		return auth
+	}
+	return updated
 }
 
 func (r *Runtime) pluginModelsForProvider(providerKey string) []*ModelInfo {
@@ -254,13 +229,12 @@ func (r *Runtime) pluginModelsForProvider(providerKey string) []*ModelInfo {
 	return pluginModelsToHomeModels(r.pluginHost.ModelsForProvider(providerKey))
 }
 
-func (r *Runtime) appendPluginModels(providerKey string, models []*ModelInfo) []*ModelInfo {
-	pluginModels := r.pluginModelsForProvider(providerKey)
-	if len(pluginModels) == 0 {
+func appendDistinctModels(models, extras []*ModelInfo) []*ModelInfo {
+	if len(extras) == 0 {
 		return models
 	}
-	out := make([]*ModelInfo, 0, len(models)+len(pluginModels))
-	seen := make(map[string]struct{}, len(models)+len(pluginModels))
+	out := make([]*ModelInfo, 0, len(models)+len(extras))
+	seen := make(map[string]struct{}, len(models)+len(extras))
 	for _, model := range models {
 		if model == nil {
 			continue
@@ -271,7 +245,7 @@ func (r *Runtime) appendPluginModels(providerKey string, models []*ModelInfo) []
 		}
 		out = append(out, model)
 	}
-	for _, model := range pluginModels {
+	for _, model := range extras {
 		if model == nil {
 			continue
 		}

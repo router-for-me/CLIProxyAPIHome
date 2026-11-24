@@ -120,6 +120,9 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 			}
 			result.Model = resolvedModel
 			modelKeys = append(modelKeys, resolvedModel)
+			if native, ok := publishedNativeSourceModelKey(auth, resolvedModel); ok {
+				modelKeys = append(modelKeys, native)
+			}
 			if requestedModel != resolvedModel {
 				// Clear the pre-upstream-key route state too so rolling upgrades do
 				// not leave the scheduler blocked by its compatibility fallback.

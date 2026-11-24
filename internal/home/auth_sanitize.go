@@ -114,6 +114,10 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth, cfg *config.Config) (*coreau
 
 	if out.Metadata != nil {
 		delete(out.Metadata, "refresh_token")
+		if strings.EqualFold(out.Provider, "copilot") {
+			delete(out.Metadata, "copilot_catalog")
+			delete(out.Metadata, "supported_endpoints")
+		}
 		delete(out.Metadata, "service_account")
 		delete(out.Metadata, homeConfigModelsMetadataKey)
 		delete(out.Metadata, config.HomeCredentialConfigMetadataKey)

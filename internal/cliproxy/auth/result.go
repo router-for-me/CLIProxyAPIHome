@@ -13,6 +13,7 @@ import (
 	"regexp"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -95,6 +96,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 		unlockUpdate()
 		return ErrAuthNotLoaded
 	}
+	reg := registry.GetGlobalRegistry()
+	resultModel = publishedResultModelKey(reg, auth, resultModel)
 	var mutator StateMutator
 	stateMutatorAvailable := false
 	cfg, _ := m.runtimeConfig.Load().(*config.Config)
@@ -116,7 +119,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 		disableCooling = false
 	}
 	m.recordResultRequestStatsLocked(auth, result, now)
-	if result.RequestScoped() || resultObservationStale(auth, result, resultModel) {
+	if result.RequestScoped() || resultObservationStale(auth, result, publishedModelStateKey(auth, resultModel)) {
 		// Count the request failure without publishing a stale credential snapshot
 		// or adopting shared availability state through the status-based paths.
 		// The local model state never runs ahead of the persisted one, so a
@@ -125,6 +128,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 		unlockUpdate()
 		return nil
 	}
+	migratedModelState := migratePublishedModelState(auth, resultModel)
 	localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
 		!isModelSupportResultError(result.Error) &&
 		disableCooling &&
@@ -134,7 +138,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	}
 	if stateMutator, ok := m.store.(StateMutator); ok {
 		stateMutatorAvailable = true
-		if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
+		if migratedModelState || m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
 			mutator = stateMutator
 		}
 	}
@@ -158,17 +162,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
 		// results reported to other Home nodes cannot clobber the shared state.
+		effectiveResultModel := resultModel
 		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) StateMutation {
 			evaluateResultErrorCode(persisted)
 			effectiveDisableCooling := disableCooling
 			if isForceCooldownResultError(result.Error) {
 				effectiveDisableCooling = false
 			}
-			before := availabilityFingerprint(persisted, resultModel)
+			effectiveResultModel = publishedResultModelKey(reg, persisted, resultModel)
+			migratedPersistedModelState := migratePublishedModelState(persisted, effectiveResultModel)
+			before := availabilityFingerprint(persisted, effectiveResultModel)
 			baseVersion := persisted.StateVersion
-			transition = m.applyResultTransition(persisted, result, resultModel, now, effectiveDisableCooling)
-			after := availabilityFingerprint(persisted, resultModel)
-			changed := after != before
+			transition = m.applyResultTransition(persisted, result, effectiveResultModel, now, effectiveDisableCooling)
+			after := availabilityFingerprint(persisted, effectiveResultModel)
+			changed := migratedPersistedModelState || after != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
 				if changed {
@@ -181,7 +188,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 			// Peers read the authoritative fence before applying timestamped results.
 			// Advancing it alone must not trigger a full credential reload per request.
 			before.modelObservedAt, after.modelObservedAt = time.Time{}, time.Time{}
-			if before == after {
+			if !migratedPersistedModelState && before == after {
 				return StateMutationObservation
 			}
 			return StateMutationChanged
@@ -196,7 +203,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 			transition = markResultTransition{}
 		}
 		var adopted bool
-		authSnapshot, adopted = m.adoptPersistedResultState(result, resultModel, persisted, now)
+		authSnapshot, adopted = m.adoptPersistedResultState(result, effectiveResultModel, persisted, now)
 		if !adopted {
 			transition = markResultTransition{}
 		}
@@ -655,6 +662,8 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	if persisted == nil {
 		return nil, false
 	}
+	resultModel = publishedResultModelKey(registry.GetGlobalRegistry(), persisted, resultModel)
+	migratePublishedModelState(persisted, resultModel)
 	unlockUpdate := m.updateLocks.lock(persisted.ID)
 	defer unlockUpdate()
 	m.mu.Lock()
@@ -686,6 +695,7 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	local.StateVersion = persisted.StateVersion
 	local.LastRefreshError = cloneError(persisted.LastRefreshError)
 	local.NextRefreshAfter = persisted.NextRefreshAfter
+	migratePublishedModelState(local, resultModel)
 	if state := persisted.ModelStates[resultModel]; state != nil {
 		if local.ModelStates == nil {
 			local.ModelStates = make(map[string]*ModelState)
