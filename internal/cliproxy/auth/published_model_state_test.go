@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -191,6 +192,70 @@ func TestPublishedClearQuotaCooldownIncludesLegacySource(t *testing.T) {
 			for _, snapshot := range []*Auth{current, store.persistedSnapshot()} {
 				if _, blocked, _, _ := dispatchModelBlockStatus(snapshot, source, "friendly", time.Now()); blocked {
 					t.Fatal("manual reset left the legacy source blocked")
+				}
+			}
+		})
+	}
+}
+
+func TestPublishedClearQuotaCooldownPreservesReboundAliasTarget(t *testing.T) {
+	for _, provider := range []string{"copilot", "devin"} {
+		t.Run(provider, func(t *testing.T) {
+			sourceA := provider + "/model-a"
+			sourceB := provider + "/model-b"
+			deadline := time.Now().Add(time.Hour)
+			cooldownState := func() *ModelState {
+				return &ModelState{
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: deadline,
+					Quota:          QuotaState{Exceeded: true, NextRecoverAt: deadline},
+				}
+			}
+			auth := &Auth{
+				ID:       t.Name(),
+				Provider: provider,
+				Status:   StatusActive,
+				ModelStates: map[string]*ModelState{
+					sourceA: cooldownState(),
+					sourceB: cooldownState(),
+				},
+			}
+			store := &fakeMutatorStore{persisted: auth.Clone()}
+			manager := NewManager(store, nil, nil)
+			if _, errRegister := manager.Register(WithSkipPersist(t.Context()), auth); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(auth.ID, provider, []*registry.ModelInfo{
+				{ID: "friendly", SourceModelID: sourceA, MetadataModelID: "model-a"},
+				{ID: sourceA, SourceModelID: sourceB, MetadataModelID: "model-b"},
+			})
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+			cleared, errClear := manager.ClearQuotaCooldown(t.Context(), auth.ID, sourceA)
+			if errClear != nil || !cleared.Cleared || cleared.Model != sourceB || !reflect.DeepEqual(cleared.ClearedModels, []string{sourceB}) {
+				t.Fatalf("ClearQuotaCooldown(%q) = (%+v, %v), want only %q cleared", sourceA, cleared, errClear, sourceB)
+			}
+			current, _ := manager.GetByID(auth.ID)
+			for _, snapshot := range []*Auth{current, store.persistedSnapshot()} {
+				if _, blocked, _, _ := dispatchModelBlockStatus(snapshot, sourceB, sourceA, time.Now()); blocked {
+					t.Fatalf("target source %q remained blocked after reset", sourceB)
+				}
+				if _, blocked, _, _ := dispatchModelBlockStatus(snapshot, sourceA, "friendly", time.Now()); !blocked {
+					t.Fatalf("unrelated source %q was cleared by resetting rebound route %q", sourceA, sourceA)
+				}
+			}
+
+			// Resetting again when sourceB is no longer cooling must be a no-op and keep sourceA blocked.
+			again, errAgain := manager.ClearQuotaCooldown(t.Context(), auth.ID, sourceA)
+			if errAgain != nil || again.Cleared || len(again.ClearedModels) != 0 {
+				t.Fatalf("second ClearQuotaCooldown(%q) = (%+v, %v), want no-op", sourceA, again, errAgain)
+			}
+			current, _ = manager.GetByID(auth.ID)
+			for _, snapshot := range []*Auth{current, store.persistedSnapshot()} {
+				if _, blocked, _, _ := dispatchModelBlockStatus(snapshot, sourceA, "friendly", time.Now()); !blocked {
+					t.Fatalf("unrelated source %q was cleared by no-op reset of %q", sourceA, sourceA)
 				}
 			}
 		})
