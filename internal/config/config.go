@@ -1004,6 +1004,19 @@ func validateProviderCredentialID(id string) error {
 	return nil
 }
 
+// OpenAICompatibleProviderKey maps a configured group name to CPA's internal routing namespace.
+func OpenAICompatibleProviderKey(name string) string {
+	const prefix = "openai-compatible-"
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "openai-compatibility"
+	}
+	if name == "openai-compatibility" || strings.HasPrefix(name, prefix) {
+		return name
+	}
+	return prefix + name
+}
+
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
 // not actionable, specifically those missing a BaseURL. It trims whitespace before
 // evaluation and preserves the relative order of remaining entries.

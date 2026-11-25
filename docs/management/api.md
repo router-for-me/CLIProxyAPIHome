@@ -2021,7 +2021,7 @@ Upstream provider keys are configured through the v8 config tree. They are disti
 | `/config/api-keys/claude` | `claude` |
 | `/config/api-keys/xai` | `xai` |
 | `/config/api-keys/meta` | `meta` |
-| `/config/api-keys/openai-compatibility` | Configured compatibility provider name |
+| `/config/api-keys/openai-compatibility` | `openai-compatible-<lowercase group name>` (e.g. `openai-compatible-copilot`) |
 
 All paths support `GET`, `PUT`, `PATCH`, and `DELETE`. `GET` returns a raw group array. `PUT` and `PATCH` replace the entire array for that family; neither appends nor patches one key by index. `DELETE` removes that family and clears its provider-key records. Send `[]` to replace it with an empty list. Removing one key requires writing the remaining complete family list with retained `id` values. These writes return `{"status":"ok","config-version":8}`.
 
@@ -2108,6 +2108,8 @@ Gemini/Interactions accepts an API key or a non-empty group base URL. Vertex sen
 ### OpenAI-compatible Groups
 
 `api-keys.openai-compatibility[]` preserves the compatibility-provider schema, with `keys` replacing the legacy `api-key-entries`. Group fields include `name`, `base-url`, `priority`, `disabled`, `prefix`, `models`, `headers`, `disable-cooling`, `request-retry`, `request-scoped-errors`, and `support-prompt-cache-key`. Individual keys accept `id`/input-only `uuid`, `api-key`, `proxy-url`, and `weight`; native-provider shared-field overrides are not available on these individual key entries. An empty `keys` list uses the existing keyless fallback-credential behavior, whose identity is the group's `id`.
+
+Keep the configured group name unchanged. Routing, dispatch, and model billing targets use the namespaced provider key; an existing `openai-compatible-` prefix is not repeated. The empty or reserved `openai-compatibility` name uses `openai-compatibility`. Before upgrading a shared database to version 21, stop all older Home nodes so they cannot write back bare keys. The migration preserves credential IDs and model aliases. Review price rules keyed by a bare group name: they are not automatically reassigned to the compatibility group.
 
 Example `PUT /config/api-keys/openai-compatibility` body:
 

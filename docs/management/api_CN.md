@@ -2012,7 +2012,7 @@ OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考�
 | `/config/api-keys/claude` | `claude` |
 | `/config/api-keys/xai` | `xai` |
 | `/config/api-keys/meta` | `meta` |
-| `/config/api-keys/openai-compatibility` | 配置的兼容 provider 名称 |
+| `/config/api-keys/openai-compatibility` | `openai-compatible-<小写组名>`（例如 `openai-compatible-copilot`） |
 
 所有路径支持 `GET`、`PUT`、`PATCH` 和 `DELETE`。`GET` 直接返回分组数组。`PUT` 和 `PATCH` 都替换该家族的整个数组，不追加元素，也不按下标修改单个 key。`DELETE` 移除家族并清空其 provider-key 记录；也可提交 `[]` 清空列表。删除单个 key 时，需提交保留其他 key 及其 `id` 的完整家族列表。成功响应为 `{"status":"ok","config-version":8}`。
 
@@ -2099,6 +2099,8 @@ Gemini/Interactions 接受 API key 或非空分组 base URL。Vertex 将 `api-ke
 ### OpenAI 兼容分组
 
 `api-keys.openai-compatibility[]` 保留兼容 provider 的结构，用 `keys` 替代旧 `api-key-entries`。分组字段包括 `name`、`base-url`、`priority`、`disabled`、`prefix`、`models`、`headers`、`disable-cooling`、`request-retry`、`request-scoped-errors` 和 `support-prompt-cache-key`。每个 key 仅接受 `id` / 输入兼容 `uuid`、`api-key`、`proxy-url` 和 `weight`，不支持原生 provider 的 key 级共享字段覆盖。`keys` 为空数组时保留已有的无 key 回退凭证行为，其身份由分组 `id` 表示。
+
+配置中仍使用原组名。路由、分发和模型计费目标使用带前缀的 provider 键；已有的 `openai-compatible-` 前缀不会重复添加。空名称或保留名 `openai-compatibility` 使用 `openai-compatibility`。共享数据库升级到版本 21 前，请先停止所有旧版 Home，避免旧节点写回裸键。迁移保留凭证 ID 和模型别名；请核对使用裸组名的价格规则，它们不会自动改绑到兼容组。
 
 `PUT /config/api-keys/openai-compatibility` 请求体示例：
 

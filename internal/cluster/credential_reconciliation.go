@@ -310,7 +310,7 @@ func isProviderAuthForConfigKey(auth *coreauth.Auth, key string) bool {
 	case "claude-api-key":
 		return auth.Provider == "claude" && strings.HasPrefix(source, "config:claude[")
 	case "openai-compatibility":
-		return strings.TrimSpace(auth.Attributes["compat_name"]) != ""
+		return isOpenAICompatConfigAuth(auth)
 	default:
 		return false
 	}
