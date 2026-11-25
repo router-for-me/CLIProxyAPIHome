@@ -1884,7 +1884,9 @@ Charge `price_snapshot` audit data includes `requested_service_tier`, optional `
 
 OpenRouter time-based pricing expressions retain image/audio, reasoning, and cache-write TTL token prices in every branch. Optional token prices use their parent rate when unset and remain free when explicitly zero, including when another branch configures the same dimension.
 
-Creates a server-side, immutable model-price import preview from `source` (`"models.dev"`, `"openrouter"`, `"litellm"`, or `"auto"`). The server fetches and pins the source snapshot (or parses inline `catalog_json` when provided); clients provide `targets` (or `auto_discover: true` to discover models from stored usage and rules), matching policy, aliases, row multipliers, and optional source-match overrides. Invalid request-controlled input returns `422 invalid_import_preview`, a catalog fetch failure returns `502 models_dev_fetch_failed`, and an internal preview persistence failure returns `500 billing_import_preview_failed`. A successful response contains `preview_id`, `preview_revision`, source provenance, `generated_at`, `expires_at`, explicit `atomic: true`, rows, and an exact summary.
+Creates a server-side, immutable model-price import preview from `source` (`"models.dev"`, `"openrouter"`, `"litellm"`, or `"auto"`). The server fetches and pins the source snapshot (or parses inline `catalog_json` when provided); clients provide `targets` (or `auto_discover: true` to combine model IDs from stored usage and price rules with the Copilot and Devin static catalogs and the per-credential billing identities of other available routes, including Devin plugin and legacy routes), matching policy, aliases, row multipliers, and optional source-match overrides. Invalid request-controlled input returns `422 invalid_import_preview`, a catalog fetch failure returns `502 models_dev_fetch_failed`, and an internal preview persistence failure returns `500 billing_import_preview_failed`. A successful response contains `preview_id`, `preview_revision`, source provenance, `generated_at`, `expires_at`, explicit `atomic: true`, rows, and an exact summary.
+
+Auto-discovery accepts up to 10,000 distinct targets across all sources. If the combined set exceeds this limit, Home returns `422 import_target_limit_exceeded` before fetching the pricing catalog and creates no preview. Submit explicit `targets` in smaller batches instead.
 
 Preview targets currently describe only the wildcard base rule (`service_tier: "*"`, `min_input_tokens: 0`); other target scopes are rejected rather than silently rewritten. A matched row includes official prices, final multiplied prices, the exact `write_rule`, optional complete `existing_rule` snapshot with `revision`, and a machine-readable reason. Models.dev context bands create distinct wildcard rows at their inclusive lower bounds. `row_multipliers` apply to the exact returned row key, including a context-band key. Cache-read and cache-write prices are imported from the pinned catalog snapshot. When a cost object has an input price but omits `cache_read` or `cache_write`, Home derives the missing price as `input * 0.1` or `input * 1.25`, respectively; explicit values, including zero, are preserved. Unsupported dimensions, malformed or invalid prices/bands, duplicate bands, or a tier that omits a price dimension configured by its base rule make the whole target non-applicable; the server never imports a potentially undercharged subset.
 
@@ -2019,7 +2021,7 @@ Upstream provider keys are configured through the v8 config tree. They are disti
 | `/config/api-keys/claude` | `claude` |
 | `/config/api-keys/xai` | `xai` |
 | `/config/api-keys/meta` | `meta` |
-| `/config/api-keys/openai-compatibility` | Configured compatibility provider name |
+| `/config/api-keys/openai-compatibility` | `openai-compatible-<lowercase group name>` (e.g. `openai-compatible-copilot`) |
 
 All paths support `GET`, `PUT`, `PATCH`, and `DELETE`. `GET` returns a raw group array. `PUT` and `PATCH` replace the entire array for that family; neither appends nor patches one key by index. `DELETE` removes that family and clears its provider-key records. Send `[]` to replace it with an empty list. Removing one key requires writing the remaining complete family list with retained `id` values. These writes return `{"status":"ok","config-version":8}`.
 
@@ -2106,6 +2108,8 @@ Gemini/Interactions accepts an API key or a non-empty group base URL. Vertex sen
 ### OpenAI-compatible Groups
 
 `api-keys.openai-compatibility[]` preserves the compatibility-provider schema, with `keys` replacing the legacy `api-key-entries`. Group fields include `name`, `base-url`, `priority`, `disabled`, `prefix`, `models`, `headers`, `disable-cooling`, `request-retry`, `request-scoped-errors`, and `support-prompt-cache-key`. Individual keys accept `id`/input-only `uuid`, `api-key`, `proxy-url`, and `weight`; native-provider shared-field overrides are not available on these individual key entries. An empty `keys` list uses the existing keyless fallback-credential behavior, whose identity is the group's `id`.
+
+Keep the configured group name unchanged. Routing, dispatch, and model billing targets use the namespaced provider key; an existing `openai-compatible-` prefix is not repeated. The empty or reserved `openai-compatibility` name uses `openai-compatibility`. Before upgrading a shared database to version 21, stop all older Home nodes so they cannot write back bare keys. The migration preserves credential IDs and model aliases. Review price rules keyed by a bare group name: they are not automatically reassigned to the compatibility group.
 
 Example `PUT /config/api-keys/openai-compatibility` body:
 
@@ -3657,8 +3661,12 @@ under the same provider. Billing editors must use these pairs instead of the pub
 merged display `name`. Targets are unique and sorted by provider/model; an empty array means no
 billing identity could be resolved and must not be replaced with an alias-based guess.
 
-Static models and older responses omit `billing_models`; clients can retain their existing
-`(providers[], id)` candidates for those responses. Clients must not derive Billing providers from
+The v8 Copilot and Devin static catalogs also include `billing_models`. For example, a Copilot
+entry with catalog `id` `claude-fable-5` has the billing pair
+`{"provider":"copilot","model":"copilot/claude-fable-5"}`. The Devin entry `swe-2` has the billing
+model `devin/swe-2`. Billing editors merge static and available entries by billing pair.
+When an older Home omits this field, editors can qualify the native Copilot and Devin static IDs
+with their provider prefix. Other static models use `(providers[], id)`. Clients must not derive Billing providers from
 `type`, `owned_by`, or a static catalog group name, and must omit records without a safe Billing
 identity. This metadata does not rewrite existing price rules or historical charges.
 

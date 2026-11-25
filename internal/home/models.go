@@ -110,11 +110,12 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 			if providerKey == "" {
 				providerKey = compatName
 			}
-			return strings.ToLower(providerKey), compatName, true
+			return config.OpenAICompatibleProviderKey(providerKey), compatName, true
 		}
 	}
 	if strings.EqualFold(strings.TrimSpace(a.Provider), "openai-compatibility") {
-		return "openai-compatibility", strings.TrimSpace(a.Label), true
+		compatName = strings.TrimSpace(a.Label)
+		return config.OpenAICompatibleProviderKey(compatName), compatName, true
 	}
 	return "", "", false
 }
@@ -393,12 +394,7 @@ func (r *Runtime) publishModelsForAuth(a *coreauth.Auth, plugins modelPluginSour
 		if len(configModels) > 0 {
 			providerKey := provider
 			if compatDetected {
-				if compatProviderKey != "" {
-					providerKey = compatProviderKey
-				}
-				if strings.EqualFold(providerKey, "openai-compatibility") && compatDisplayName != "" {
-					providerKey = strings.ToLower(compatDisplayName)
-				}
+				providerKey = compatProviderKey
 			}
 			if providerKey == "" {
 				providerKey = "openai-compatibility"
@@ -412,38 +408,11 @@ func (r *Runtime) publishModelsForAuth(a *coreauth.Auth, plugins modelPluginSour
 			compatName := strings.TrimSpace(a.Provider)
 			isCompatAuth := false
 			if compatDetected {
-				if compatProviderKey != "" {
-					providerKey = compatProviderKey
-				}
-				if compatDisplayName != "" {
-					compatName = compatDisplayName
-				}
+				providerKey, compatName = compatProviderKey, compatDisplayName
 				isCompatAuth = true
-			}
-
-			if strings.EqualFold(providerKey, "openai-compatibility") {
+			} else if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
+				providerKey = strings.ToLower(v)
 				isCompatAuth = true
-				if a.Attributes != nil {
-					if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
-						compatName = v
-					}
-					if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
-						providerKey = strings.ToLower(v)
-						isCompatAuth = true
-					}
-				}
-				if providerKey == "openai-compatibility" && compatName != "" {
-					providerKey = strings.ToLower(compatName)
-				}
-			} else if a.Attributes != nil {
-				if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
-					compatName = v
-					isCompatAuth = true
-				}
-				if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
-					providerKey = strings.ToLower(v)
-					isCompatAuth = true
-				}
 			}
 
 			for i := range cfg.OpenAICompatibility {

@@ -61,25 +61,23 @@ func TestGetStaticModelDefinitionsNamespacesCopilotAndDevin(t *testing.T) {
 	engine.GET("/v8/management/routing/model-definitions/:channel", handler.GetStaticModelDefinitions)
 	engine.GET("/v8/management/models", handler.GetModelsV8)
 
-	fetchDefs := func(path string) []registry.ModelInfo {
+	fetchModels := func(path string, dest any) {
 		t.Helper()
 		recorder := httptest.NewRecorder()
 		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("GET %s status=%d body=%s", path, recorder.Code, recorder.Body.String())
 		}
-		var body struct {
-			Models []registry.ModelInfo `json:"models"`
-		}
+		body := struct {
+			Models any `json:"models"`
+		}{Models: dest}
 		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &body); errDecode != nil {
 			t.Fatalf("decode %s: %v", path, errDecode)
 		}
-		if len(body.Models) == 0 {
-			t.Fatalf("GET %s returned no models", path)
-		}
-		return body.Models
 	}
 
+	var grouped map[string][]billingModelDefinition
+	fetchModels("/v8/management/models?scope=static", &grouped)
 	for _, tc := range []struct {
 		query, channel string
 	}{
@@ -87,10 +85,12 @@ func TestGetStaticModelDefinitionsNamespacesCopilotAndDevin(t *testing.T) {
 		{"Devin", "devin"},
 	} {
 		prefix := tc.channel + "/"
-		routingDefs := fetchDefs("/v8/management/routing/model-definitions/" + tc.query)
-		staticCatalog := fetchDefs("/v8/management/models?scope=static&channel=" + tc.channel)
-		if len(routingDefs) != len(staticCatalog) {
-			t.Fatalf("%s lengths: routing=%d static=%d", tc.channel, len(routingDefs), len(staticCatalog))
+		var routingDefs []registry.ModelInfo
+		var staticCatalog []billingModelDefinition
+		fetchModels("/v8/management/routing/model-definitions/"+tc.query, &routingDefs)
+		fetchModels("/v8/management/models?scope=static&channel="+tc.query, &staticCatalog)
+		if len(routingDefs) == 0 || len(routingDefs) != len(staticCatalog) || len(grouped[tc.channel]) != len(staticCatalog) {
+			t.Fatalf("%s lengths: routing=%d static=%d grouped=%d", tc.channel, len(routingDefs), len(staticCatalog), len(grouped[tc.channel]))
 		}
 		for i := range routingDefs {
 			if strings.HasPrefix(staticCatalog[i].ID, prefix) {
@@ -99,11 +99,18 @@ func TestGetStaticModelDefinitionsNamespacesCopilotAndDevin(t *testing.T) {
 			if want := prefix + staticCatalog[i].ID; routingDefs[i].ID != want {
 				t.Fatalf("%s routing model[%d] = %q, want %q", tc.channel, i, routingDefs[i].ID, want)
 			}
+			want := billingModelTarget{Provider: tc.channel, Model: routingDefs[i].ID}
+			for _, model := range []billingModelDefinition{staticCatalog[i], grouped[tc.channel][i]} {
+				if model.ID != staticCatalog[i].ID || len(model.BillingModels) != 1 || model.BillingModels[0] != want {
+					t.Fatalf("%s static model %q has billing targets %v, want %v", tc.channel, model.ID, model.BillingModels, want)
+				}
+			}
 		}
 	}
 
-	claudeDefs := fetchDefs("/v8/management/routing/model-definitions/claude")
-	if strings.HasPrefix(claudeDefs[0].ID, "claude/") {
-		t.Fatalf("claude model unexpectedly prefixed: %q", claudeDefs[0].ID)
+	var claudeDefs []registry.ModelInfo
+	fetchModels("/v8/management/routing/model-definitions/claude", &claudeDefs)
+	if len(claudeDefs) == 0 || strings.HasPrefix(claudeDefs[0].ID, "claude/") {
+		t.Fatal("expected a native Claude catalog ID")
 	}
 }

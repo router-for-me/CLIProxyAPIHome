@@ -313,6 +313,7 @@ func runCustomMigrations(db *gorm.DB) error {
 		{name: "migrate_usage_service_tiers", run: migrateUsageServiceTiers},
 		{name: "migrate_legacy_api_keys", run: migrateLegacyAPIKeys},
 		{name: "migrate_deleted_access_group_bindings", run: migrateDeletedAccessGroupBindings},
+		{name: "migrate_openai_compatible_providers", run: migrateOpenAICompatibleProviders},
 		{name: "migrate_oauth_excluded_models_attributes", run: migrateOAuthExcludedModelsAttributes},
 	}
 	for _, migration := range migrations {

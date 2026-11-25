@@ -12,10 +12,11 @@ import (
 const homeConfigModelsMetadataKey = "home_config_models"
 
 type dispatchModelResolution struct {
-	Model         string
-	Key           string
-	ForceMapping  bool
-	OriginalAlias string
+	Model           string
+	Key             string
+	ForceMapping    bool
+	OriginalAlias   string
+	PublishedSource bool
 }
 
 // rewriteModelForAuth returns a rewrite model for auth.
@@ -95,6 +96,13 @@ func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
 		return resolved
 	}
 	return strings.TrimSpace(routeModel)
+}
+
+// ResolveBillingModel returns the canonical execution ID and whether dispatch
+// resolved it from a source recorded on the published route.
+func (m *Manager) ResolveBillingModel(auth *Auth, routeModel string) (model string, publishedSource bool) {
+	resolved := m.resolveDispatchModel(auth, routeModel)
+	return resolved.Key, resolved.PublishedSource
 }
 
 func isCopilotAuth(auth *Auth) bool {
@@ -249,10 +257,11 @@ func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchMo
 		if route != nil {
 			if sourceID := publishedSourceModelID(route.SourceModelID, route.MetadataModelID, isCopilotAuth(auth)); sourceID != "" {
 				return dispatchModelResolution{
-					Model:         preserveResolvedModelSuffix(sourceID, suffix),
-					Key:           canonicalModelKey(sourceID),
-					ForceMapping:  route.ResponseModelAlias != "",
-					OriginalAlias: route.ResponseModelAlias,
+					Model:           preserveResolvedModelSuffix(sourceID, suffix),
+					Key:             canonicalModelKey(sourceID),
+					ForceMapping:    route.ResponseModelAlias != "",
+					OriginalAlias:   route.ResponseModelAlias,
+					PublishedSource: true,
 				}
 			}
 		}

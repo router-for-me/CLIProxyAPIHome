@@ -254,13 +254,13 @@ api-keys:
 			t.Fatalf("%s dispatch lost model compatibility", auth.Provider)
 		}
 		switch auth.Provider {
-		case "codex", "gateway":
+		case "codex", "openai-compatible-gateway":
 			pool := downstream.ProxyConnectionPool
 			if pool == nil || pool.Enabled == nil || *pool.Enabled || pool.MaxIdleConnsPerHost == nil {
 				t.Fatalf("%s dispatch pool = %+v", auth.Provider, pool)
 			}
 			wantIdle, wantCount := "300s", 7
-			if auth.Provider == "gateway" {
+			if auth.Provider == "openai-compatible-gateway" {
 				wantIdle, wantCount = "123s", 9
 			}
 			if pool.IdleConnTimeout != wantIdle || *pool.MaxIdleConnsPerHost != wantCount {
