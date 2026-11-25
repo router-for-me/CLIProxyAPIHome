@@ -51,6 +51,40 @@ func TestBillingModelPriceImportAppliesAtomicallyAndReplaysIdempotently(t *testi
 	}
 }
 
+func TestDiscoverBillingImportTargetsCountsDistinctMergedTargets(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	if _, errCreate := repo.CreateBillingModelPrice(ctx, BillingModelPriceUpdate{Provider: "openai", Model: "model-0", Enabled: true}); errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	atLimit := func(yield func(string, string) bool) {
+		for i := range billingImportMaxTargets {
+			if !yield(" OPENAI ", fmt.Sprintf("model-%d", i)) {
+				return
+			}
+		}
+	}
+	targets, errDiscover := repo.DiscoverBillingImportTargets(ctx, atLimit)
+	if errDiscover != nil || len(targets) != billingImportMaxTargets {
+		t.Fatalf("at limit: got %d targets, err=%v", len(targets), errDiscover)
+	}
+	targets, errDiscover = repo.DiscoverBillingImportTargets(ctx, func(yield func(string, string) bool) {
+		for provider, model := range atLimit {
+			if !yield(provider, model) {
+				return
+			}
+		}
+		if yield("openai", "additional-model") {
+			t.Error("discovery kept consuming targets after overflow")
+		}
+	})
+	if !errors.Is(errDiscover, ErrBillingImportTargetLimitExceeded) || targets != nil {
+		t.Fatalf("above limit: got %d targets, err=%v", len(targets), errDiscover)
+	}
+}
+
 func TestBillingModelPriceImportUsesContextBandRowMultiplier(t *testing.T) {
 	t.Parallel()
 

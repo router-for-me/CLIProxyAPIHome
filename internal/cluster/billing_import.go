@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"regexp"
 	"sort"
@@ -42,6 +43,7 @@ var (
 	ErrBillingImportOverwriteRequired   = errors.New("billing import overwrite confirmation required")
 	ErrBillingImportIdempotencyConflict = errors.New("billing import idempotency key was reused with a different request")
 	ErrBillingImportOperationNotFound   = errors.New("billing import operation not found")
+	ErrBillingImportTargetLimitExceeded = fmt.Errorf("billing import exceeds the limit of %d distinct targets; provide explicit targets in smaller batches", billingImportMaxTargets)
 )
 
 // BillingModelPriceImportPreviewRecord stores a server-generated import plan.
@@ -320,7 +322,7 @@ func (r *Repository) CreateBillingModelPriceImportPreview(ctx context.Context, i
 	ctx = contextOrBackground(ctx)
 	input = normalizeBillingModelPriceImportPreviewInput(input)
 	if len(input.Targets) == 0 && input.AutoDiscover {
-		discovered, errDiscover := r.discoverBillingImportTargets(ctx, db)
+		discovered, errDiscover := r.discoverBillingImportTargets(ctx, db, nil)
 		if errDiscover != nil {
 			return nil, errDiscover
 		}
@@ -1392,57 +1394,64 @@ func billingImportVersionDelimiterVariants(model string) []string {
 	return out
 }
 
-func (r *Repository) DiscoverBillingImportTargets(ctx context.Context) ([]BillingModelPriceImportTarget, error) {
+// DiscoverBillingImportTargets merges stored targets with optional provider/model pairs from the runtime.
+func (r *Repository) DiscoverBillingImportTargets(ctx context.Context, extra iter.Seq2[string, string]) ([]BillingModelPriceImportTarget, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
 	}
-	return r.discoverBillingImportTargets(contextOrBackground(ctx), db)
+	return r.discoverBillingImportTargets(contextOrBackground(ctx), db, extra)
 }
 
-func (r *Repository) discoverBillingImportTargets(ctx context.Context, db *gorm.DB) ([]BillingModelPriceImportTarget, error) {
-	type pair struct {
-		Provider string
-		Model    string
-	}
-	var usagePairs []pair
-	if errUsage := db.WithContext(ctx).Model(&UsageRecord{}).
-		Select(" DISTINCT LOWER(TRIM(provider)) AS provider, TRIM(model) AS model").
-		Where("provider <> '' AND model <> ''").
-		Limit(billingImportMaxTargets).
-		Scan(&usagePairs).Error; errUsage != nil {
-		return nil, errUsage
-	}
-	var pricePairs []pair
-	if errPrices := db.WithContext(ctx).Model(&BillingModelPriceRecord{}).
-		Select("DISTINCT LOWER(TRIM(provider)) AS provider, TRIM(model) AS model").
-		Where("provider <> '' AND provider <> '*' AND model <> '' AND model NOT LIKE '%*'").
-		Limit(billingImportMaxTargets).
-		Scan(&pricePairs).Error; errPrices != nil {
-		return nil, errPrices
-	}
+func (r *Repository) discoverBillingImportTargets(ctx context.Context, db *gorm.DB, extra iter.Seq2[string, string]) ([]BillingModelPriceImportTarget, error) {
 	seen := make(map[string]struct{})
-	out := make([]BillingModelPriceImportTarget, 0, len(usagePairs)+len(pricePairs))
-	for _, item := range append(usagePairs, pricePairs...) {
-		p := strings.ToLower(strings.TrimSpace(item.Provider))
-		m := strings.TrimSpace(item.Model)
-		if p == "" || m == "" || strings.Contains(p, "*") || strings.Contains(m, "*") {
-			continue
+	out := make([]BillingModelPriceImportTarget, 0)
+	add := func(provider, model string) bool {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		model = strings.TrimSpace(model)
+		if provider == "" || model == "" || strings.Contains(provider, "*") || strings.Contains(model, "*") {
+			return true
 		}
-		key := billingImportTargetKey(p, m)
+		key := billingImportTargetKey(provider, model)
 		if _, ok := seen[key]; ok {
-			continue
+			return true
+		}
+		if len(out) == billingImportMaxTargets {
+			return false
 		}
 		seen[key] = struct{}{}
 		out = append(out, BillingModelPriceImportTarget{
-			Provider:       p,
-			Model:          m,
-			ServiceTier:    BillingServiceTierWildcard,
-			MinInputTokens: 0,
-			Label:          m,
+			Provider:    provider,
+			Model:       model,
+			ServiceTier: BillingServiceTierWildcard,
+			Label:       model,
 		})
-		if len(out) >= billingImportMaxTargets {
-			break
+		return true
+	}
+	for _, table := range []any{&UsageRecord{}, &BillingModelPriceRecord{}} {
+		var pairs []struct {
+			Provider string
+			Model    string
+		}
+		// Read one extra distinct pair so an oversized source is never silently truncated.
+		if errScan := db.WithContext(ctx).Model(table).
+			Select("DISTINCT LOWER(TRIM(provider)) AS provider, TRIM(model) AS model").
+			Where("TRIM(provider) <> '' AND TRIM(model) <> '' AND provider NOT LIKE ? AND model NOT LIKE ?", "%*%", "%*%").
+			Limit(billingImportMaxTargets + 1).
+			Scan(&pairs).Error; errScan != nil {
+			return nil, errScan
+		}
+		for _, pair := range pairs {
+			if !add(pair.Provider, pair.Model) {
+				return nil, ErrBillingImportTargetLimitExceeded
+			}
+		}
+	}
+	if extra != nil {
+		for provider, model := range extra {
+			if !add(provider, model) {
+				return nil, ErrBillingImportTargetLimitExceeded
+			}
 		}
 	}
 	return out, nil

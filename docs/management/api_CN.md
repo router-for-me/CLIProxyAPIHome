@@ -1875,7 +1875,9 @@ OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表�
 
 OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考及缓存写入 TTL token 单价。可选 token 单价未设置时使用父桶单价，显式为零时保持免费；即使其他分支配置了同一细分维度，也不会漏计。
 
-创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 自动从已有 usage 与价格规则发现模型）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 合并已有用量与价格规则中的模型 ID、Copilot/Devin 静态目录以及其余可用路由按凭证解析出的计价 ID，其中包括 Devin 插件路由和旧版注册路由）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+
+自动发现合并各来源后最多接受 10,000 个不同的目标。超出上限时，Home 会在拉取定价目录前返回 `422 import_target_limit_exceeded`，不创建预览。此时可显式提供 `targets` 分批导入。
 
 当前 preview target 只描述通配符 base 规则（`service_tier: "*"`、`min_input_tokens: 0`）；其他 target scope 会被拒绝，不会被静默改写。已匹配行会包含官方价格、倍率后的最终价格、精确的 `write_rule`、带 `revision` 的完整可选 `existing_rule` 快照，以及机器可读的原因。models.dev 上下文分段会生成不同包含式下界的通配符行；`row_multipliers` 按返回的精确 row key 生效，包含 context-band 行。cache-read 和 cache-write 价格从固定的 catalog snapshot 导入。当 cost 对象包含 input 价格但省略 `cache_read` 或 `cache_write` 时，Home 分别按 `input * 0.1` 或 `input * 1.25` 派生缺失价格；显式值（包括零）保持不变。出现不支持的价格维度、格式错误或无效的价格/分段、重复分段，或 tier 缺少 base 已配置价格维度时，整个 target 都不可应用；服务端不会导入可能低估计费的子集。
 
@@ -3636,7 +3638,9 @@ Query 参数：
 
 ### GET `/models?scope=available|static`
 
-可用模型在 v8 响应中额外包含 `billing_models`，元素为 `{"provider": "z-ai", "model": "glm-5.3-flash"}`。这些计价身份按凭证使用实际调度解析器生成，去重后按供应商和模型排序。公开 `id`（例如 `team/MY-MODEL`）可能对应多个上游模型，同一供应商下也可能存在多个映射。模型价格编辑器应使用这些组合，不能把公开别名或合并后的 `name` 当作计价模型。空数组表示未解析到可靠身份，不应回退猜测。静态模型和旧版响应不含该字段，可继续使用原有 `(providers[], id)` 候选。此元数据不会修改已有价格规则或历史账单。
+可用模型在 v8 响应中额外包含 `billing_models`，元素为 `{"provider": "z-ai", "model": "glm-5.3-flash"}`。这些计价身份按凭证使用实际调度解析器生成，去重后按供应商和模型排序。公开 `id`（例如 `team/MY-MODEL`）可能对应多个上游模型，同一供应商下也可能存在多个映射。模型价格编辑器应使用这些组合，不能把公开别名或合并后的 `name` 当作计价模型。空数组表示未解析到可靠身份，不应回退猜测。
+
+Copilot 和 Devin 的 v8 静态目录也返回 `billing_models`。例如，Copilot 的静态 `id` 为 `claude-fable-5`，对应的计价组合为 `{"provider":"copilot","model":"copilot/claude-fable-5"}`。Devin 的 `swe-2` 对应 `devin/swe-2`。价格编辑器按计价组合合并静态目录和可用路由。旧版 Home 省略该字段时，编辑器可为这两家的静态原生 ID 补上供应商前缀。其他静态模型沿用 `(providers[], id)`。此元数据不会修改已有价格规则或历史账单。
 
 从当前 runtime registry 或静态模型目录返回模型定义。
 
