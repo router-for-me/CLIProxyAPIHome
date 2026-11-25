@@ -23,6 +23,11 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth, cfg *config.Config) (*coreau
 		return nil, nil
 	}
 
+	antigravitySigGrant := ""
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") && !auth.RuntimeProjection {
+		antigravitySigGrant = coreauth.AntigravitySignatureGrantIdentity(auth)
+	}
+
 	out := auth.Clone()
 	out.LastRefreshError = nil
 	delete(out.Attributes, antigravityModelEnumScopeAttribute)
@@ -114,6 +119,17 @@ func SanitizeAuthForDownstream(auth *coreauth.Auth, cfg *config.Config) (*coreau
 
 	if out.Metadata != nil {
 		delete(out.Metadata, "refresh_token")
+		if strings.EqualFold(strings.TrimSpace(out.Provider), "antigravity") {
+			delete(out.Metadata, coreauth.AntigravitySignatureGrantScopeMetadataKey)
+			delete(out.Metadata, coreauth.AntigravitySignatureGrantBindingMetadataKey)
+			delete(out.Metadata, coreauth.AntigravitySignatureGrantHomeBindingMetadataKey)
+			if antigravitySigGrant != "" {
+				if downstreamBinding := coreauth.AntigravitySignatureGrantBinding(out); downstreamBinding != "" {
+					out.Metadata[coreauth.AntigravitySignatureGrantScopeMetadataKey] = antigravitySigGrant
+					out.Metadata[coreauth.AntigravitySignatureGrantBindingMetadataKey] = downstreamBinding
+				}
+			}
+		}
 		if strings.EqualFold(out.Provider, "copilot") {
 			delete(out.Metadata, "copilot_catalog")
 			delete(out.Metadata, "supported_endpoints")

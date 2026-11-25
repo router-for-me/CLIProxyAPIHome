@@ -12,6 +12,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+func init() {
+	coreauth.RegisterAntigravityEnumScopeResolver(antigravityModelEnumScope)
+}
+
 const (
 	antigravityModelEnumScopeAttribute = "antigravity_model_enum_scope"
 	antigravityModelEnumKeyPrefix      = "antigravity:model-enums:v1:"
