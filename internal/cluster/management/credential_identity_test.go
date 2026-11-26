@@ -234,7 +234,7 @@ func TestPatchOpenAICompatibilityRejectsProviderRebind(t *testing.T) {
 	if errAuths != nil {
 		t.Fatal(errAuths)
 	}
-	if len(auths) != 1 || auths[0].ID != id || auths[0].Provider != "original" {
+	if len(auths) != 1 || auths[0].ID != id || auths[0].Provider != "openai-compatible-original" {
 		t.Fatalf("auth after rejected rebind = %#v", auths)
 	}
 }

@@ -123,6 +123,35 @@ func executionLifecycleVersions(t *testing.T, repo *cluster.Repository) map[stri
 	return versions
 }
 
+func TestConfigV8OpenAICompatibleProviderIsolation(t *testing.T) {
+	repo, request := newConfigV8AuthIndexRouter(t)
+	const path = "/v8/management/config/api-keys/openai-compatibility"
+	const keyedID = "11111111-1111-4111-8111-111111111111"
+	const keylessID = "22222222-2222-4222-8222-222222222222"
+	request("PUT", path, `[
+		{"name":"Copilot","base-url":"https://example.test/v1","prefix":"lifecycle-team","models":[{"name":"upstream-chat","alias":"chat"}],"keys":[{"id":"`+keyedID+`","api-key":"test-key"}]},
+		{"name":"Claude","base-url":"https://example.test/v1","id":"`+keylessID+`","models":[{"name":"lifecycle-chat"}],"keys":[]}
+	]`, http.StatusOK)
+	// Replacing a native family must not claim the same-named compatibility group.
+	request("PUT", "/v8/management/config/api-keys/claude", `[]`, http.StatusOK)
+	readback := request("GET", path, "", http.StatusOK)
+	if !strings.Contains(readback, `"Copilot"`) || !strings.Contains(readback, `"Claude"`) {
+		t.Fatal("configured group names were not preserved")
+	}
+	request("PUT", path, readback, http.StatusOK)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(keyedID)
+		registry.GetGlobalRegistry().UnregisterClient(keylessID)
+	})
+	views := executionLifecycleDispatch(t, repo)
+	if got := views[keyedID]; got.Provider != "openai-compatible-copilot" || got.Model != "upstream-chat" {
+		t.Fatalf("prefixed compatibility alias dispatched as provider=%q model=%q", got.Provider, got.Model)
+	}
+	if got := views[keylessID]; got.Provider != "openai-compatible-claude" || got.Model != "lifecycle-chat" {
+		t.Fatalf("keyless compatibility route dispatched as provider=%q model=%q", got.Provider, got.Model)
+	}
+}
+
 func TestConfigV8ExecutionLifecycleAllProviders(t *testing.T) {
 	repo, request := newConfigV8AuthIndexRouter(t)
 	families := []string{"gemini", "interactions", "vertex", "codex", "xai", "meta", "claude", "openai-compatibility"}

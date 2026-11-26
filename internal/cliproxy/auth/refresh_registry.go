@@ -10,6 +10,7 @@ var (
 	antigravityRefreshLead = 30 * time.Minute
 	kimiRefreshLead        = 5 * time.Minute
 	xaiRefreshLead         = 5 * time.Minute
+	copilotRefreshLead     = 5 * time.Minute
 )
 
 // init prepares package-level state.
@@ -21,6 +22,7 @@ func init() {
 	registerRefreshLead("kimi", &kimiRefreshLead)
 	registerRefreshLead("kimi-ai", &kimiRefreshLead)
 	registerRefreshLead("xai", &xaiRefreshLead)
+	registerRefreshLead("copilot", &copilotRefreshLead)
 	registerRefreshLead("meta", nil)
 }
 

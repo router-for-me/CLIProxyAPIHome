@@ -153,6 +153,12 @@ func TestDatabaseSnapshotRegistriesFreezeChangedShapes(t *testing.T) {
 	if authType := databaseSnapshotModelType(t, currentModels, "auth"); authType != reflect.TypeOf(&AuthRecord{}) {
 		t.Fatalf("current auth snapshot type = %v, want AuthRecord", authType)
 	}
+	for _, version := range []int{18, 19} {
+		legacyModels, supported := databaseSnapshotModels(version)
+		if !supported || databaseSnapshotModelType(t, legacyModels, "usage") != reflect.TypeOf(&databaseSnapshotV19UsageRecord{}) {
+			t.Fatalf("snapshot v%d must freeze usage before delivery tracking", version)
+		}
+	}
 	if usageType := databaseSnapshotModelType(t, currentModels, "usage"); usageType != reflect.TypeOf(&UsageRecord{}) {
 		t.Fatalf("current usage snapshot type = %v, want UsageRecord", usageType)
 	}
@@ -377,6 +383,9 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	source := openDatabaseSnapshotSQLiteTestDB(t, filepath.Join(t.TempDir(), "source.db"))
 	want := seedDatabaseSnapshotTestData(t, source)
+	if errComplete := source.Model(&UsageRecord{}).Where("id = ?", want.usageID).Update("plugin_usage_delivered", true).Error; errComplete != nil {
+		t.Fatal(errComplete)
+	}
 	snapshotPath := filepath.Join(t.TempDir(), "home.snapshot.zip")
 
 	manifest, errExport := ExportDatabaseSnapshot(ctx, source, DatabaseSnapshotExportOptions{
@@ -500,6 +509,9 @@ func TestDatabaseSnapshotSQLiteRoundTrip(t *testing.T) {
 	}
 	if usage.ServiceTier != defaultUsageServiceTier {
 		t.Fatalf("imported usage service tier = %q, want %q", usage.ServiceTier, defaultUsageServiceTier)
+	}
+	if !usage.PluginUsageDelivered {
+		t.Fatal("snapshot lost the usage plugin delivery completion marker")
 	}
 	assertDatabaseSnapshotRuntimeTablesEmpty(t, target)
 

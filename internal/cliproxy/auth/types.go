@@ -85,6 +85,8 @@ type Auth struct {
 	Runtime any `json:"-"`
 	// StateVersion is the storage revision of this runtime snapshot when available.
 	StateVersion int64 `json:"-"`
+	// CredentialIdentityVersion fences state across storage identity changes and restorations.
+	CredentialIdentityVersion int64 `json:"-"`
 
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`

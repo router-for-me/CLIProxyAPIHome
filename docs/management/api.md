@@ -232,6 +232,7 @@ The following v8 routes are derived from `internal/managementhttp/routes_v8.go` 
 | `GET` | `/request-events/filter-options` |
 | `GET` | `/request-logs` |
 | `POST` | `/requests/api-call` |
+| `GET` | `/routing/antigravity/tos-pause` |
 | `POST` | `/routing/cooldown/reset` |
 | `GET` | `/routing/model-definitions/:channel` |
 | `GET` | `/server/latest-version` |
@@ -426,7 +427,7 @@ The config endpoints also accept the fields below. All values are database-backe
 
 `tos-pause-window` defaults to `0` (disabled) in Home. Omitted or blank values are explicitly distributed as `"0"` so CPA nodes do not fall back to their own default; explicit non-blank values are preserved. Set a positive duration such as `6h` to enable it; `0`, `off`, `false`, `none`, or `disabled` turns it off. A Google RPC 403 `PERMISSION_DENIED` with `ErrorInfo.reason=TOS_VIOLATION` pauses the whole Antigravity pool for the window. During the pause Home excludes only Antigravity candidates; bindings to other providers stay valid, including under `never`.
 
-`oauth.settings.<provider>[]` overrides `max-context-length` for OAuth models and is applied after exclusions and aliases, before prefixes. An entry matching an `alias` takes precedence over one matching the original `name`. API-key models are not affected.
+`oauth.settings.<provider>[]` overrides `max-context-length` for OAuth models and is applied after exclusions and aliases, before prefixes. For namespaced channels (`copilot`, `devin`), `name` matches either the bare catalog ID or the provider-qualified source ID (for example `gpt-5.3-codex` or `copilot/gpt-5.3-codex`, `swe-2` or `devin/swe-2`). An entry matching an `alias` takes precedence over one matching `name`, and credential-prefixed copies inherit the resolved setting. API-key models are not affected.
 
 `connection-pool` is opt-in: an empty `connection-pool: {}` enables CPA defaults (`idle-conn-timeout: 300s`, `max-idle-conns-per-host: 2`). Fields are `enabled`, `idle-conn-timeout`, and `max-idle-conns-per-host`. Per-key values override the group; omitted or `null` fields inherit, and `enabled: false` opts a key out. The effective options travel with each dispatched credential; Home itself never opens these pools.
 
@@ -1883,7 +1884,9 @@ Charge `price_snapshot` audit data includes `requested_service_tier`, optional `
 
 OpenRouter time-based pricing expressions retain image/audio, reasoning, and cache-write TTL token prices in every branch. Optional token prices use their parent rate when unset and remain free when explicitly zero, including when another branch configures the same dimension.
 
-Creates a server-side, immutable model-price import preview from `source` (`"models.dev"`, `"openrouter"`, `"litellm"`, or `"auto"`). The server fetches and pins the source snapshot (or parses inline `catalog_json` when provided); clients provide `targets` (or `auto_discover: true` to discover models from stored usage and rules), matching policy, aliases, row multipliers, and optional source-match overrides. Invalid request-controlled input returns `422 invalid_import_preview`, a catalog fetch failure returns `502 models_dev_fetch_failed`, and an internal preview persistence failure returns `500 billing_import_preview_failed`. A successful response contains `preview_id`, `preview_revision`, source provenance, `generated_at`, `expires_at`, explicit `atomic: true`, rows, and an exact summary.
+Creates a server-side, immutable model-price import preview from `source` (`"models.dev"`, `"openrouter"`, `"litellm"`, or `"auto"`). The server fetches and pins the source snapshot (or parses inline `catalog_json` when provided); clients provide `targets` (or `auto_discover: true` to combine model IDs from stored usage and price rules with the Copilot and Devin static catalogs and the per-credential billing identities of other available routes, including Devin plugin and legacy routes), matching policy, aliases, row multipliers, and optional source-match overrides. Invalid request-controlled input returns `422 invalid_import_preview`, a catalog fetch failure returns `502 models_dev_fetch_failed`, and an internal preview persistence failure returns `500 billing_import_preview_failed`. A successful response contains `preview_id`, `preview_revision`, source provenance, `generated_at`, `expires_at`, explicit `atomic: true`, rows, and an exact summary.
+
+Auto-discovery accepts up to 10,000 distinct targets across all sources. If the combined set exceeds this limit, Home returns `422 import_target_limit_exceeded` before fetching the pricing catalog and creates no preview. Submit explicit `targets` in smaller batches instead.
 
 Preview targets currently describe only the wildcard base rule (`service_tier: "*"`, `min_input_tokens: 0`); other target scopes are rejected rather than silently rewritten. A matched row includes official prices, final multiplied prices, the exact `write_rule`, optional complete `existing_rule` snapshot with `revision`, and a machine-readable reason. Models.dev context bands create distinct wildcard rows at their inclusive lower bounds. `row_multipliers` apply to the exact returned row key, including a context-band key. Cache-read and cache-write prices are imported from the pinned catalog snapshot. When a cost object has an input price but omits `cache_read` or `cache_write`, Home derives the missing price as `input * 0.1` or `input * 1.25`, respectively; explicit values, including zero, are preserved. Unsupported dimensions, malformed or invalid prices/bands, duplicate bands, or a tier that omits a price dimension configured by its base rule make the whole target non-applicable; the server never imports a potentially undercharged subset.
 
@@ -2018,7 +2021,7 @@ Upstream provider keys are configured through the v8 config tree. They are disti
 | `/config/api-keys/claude` | `claude` |
 | `/config/api-keys/xai` | `xai` |
 | `/config/api-keys/meta` | `meta` |
-| `/config/api-keys/openai-compatibility` | Configured compatibility provider name |
+| `/config/api-keys/openai-compatibility` | `openai-compatible-<lowercase group name>` (e.g. `openai-compatible-copilot`) |
 
 All paths support `GET`, `PUT`, `PATCH`, and `DELETE`. `GET` returns a raw group array. `PUT` and `PATCH` replace the entire array for that family; neither appends nor patches one key by index. `DELETE` removes that family and clears its provider-key records. Send `[]` to replace it with an empty list. Removing one key requires writing the remaining complete family list with retained `id` values. These writes return `{"status":"ok","config-version":8}`.
 
@@ -2105,6 +2108,8 @@ Gemini/Interactions accepts an API key or a non-empty group base URL. Vertex sen
 ### OpenAI-compatible Groups
 
 `api-keys.openai-compatibility[]` preserves the compatibility-provider schema, with `keys` replacing the legacy `api-key-entries`. Group fields include `name`, `base-url`, `priority`, `disabled`, `prefix`, `models`, `headers`, `disable-cooling`, `request-retry`, `request-scoped-errors`, and `support-prompt-cache-key`. Individual keys accept `id`/input-only `uuid`, `api-key`, `proxy-url`, and `weight`; native-provider shared-field overrides are not available on these individual key entries. An empty `keys` list uses the existing keyless fallback-credential behavior, whose identity is the group's `id`.
+
+Keep the configured group name unchanged. Routing, dispatch, and model billing targets use the namespaced provider key; an existing `openai-compatible-` prefix is not repeated. The empty or reserved `openai-compatibility` name uses `openai-compatibility`. Before upgrading a shared database to version 21, stop all older Home nodes so they cannot write back bare keys. The migration preserves credential IDs and model aliases. Review price rules keyed by a bare group name: they are not automatically reassigned to the compatibility group.
 
 Example `PUT /config/api-keys/openai-compatibility` body:
 
@@ -2366,6 +2371,8 @@ Multipart input:
 
 Raw JSON input: the request body is the credential JSON payload. `name` is not required; Home derives or allocates a UUID-backed filename.
 
+GitHub Copilot accepts credential files generated by CPA with `type: copilot`. Home stores the long-lived GitHub credential in `refresh_token` and refreshes the short-lived Copilot token five minutes before it expires. Home discovers each account's models from its trusted Copilot API host and publishes the intersection with the `copilot` section of the general catalog. Models become available after successful discovery. Empty, denied, expired-snapshot, expired-token, or previous-host results yield no published models for that account. Base routes are published as `copilot/<native-model-id>` (matching Devin's `devin/<native-model-id>` convention) and support OAuth aliases, exclusions, OAuth settings, and credential prefixes.
+
 Example responses:
 
 ```json
@@ -2537,6 +2544,7 @@ Creates a provider login URL or device-flow session. Required query `provider` i
 | `xai` | xAI OAuth. |
 | `devin` | Devin PKCE OAuth. |
 | `meta` | Meta device flow. |
+| `copilot` | GitHub Copilot device flow. |
 | Plugin `oauth_provider` | Login handled by a registered Home-loaded plugin. |
 
 Common response:
@@ -2549,7 +2557,7 @@ Common response:
 }
 ```
 
-Kimi, Kimi AI, and Meta return a verification URL and complete in Home's background device-flow worker. Meta also returns `user_code` when supplied by the upstream; if there is no complete verification URL, open `url` and enter that code. Poll `/oauth/status?state=...` to observe completion.
+Kimi, Kimi AI, and Meta return a verification URL and complete in Home's background device-flow worker. Meta also returns `user_code` when supplied by the upstream; if there is no complete verification URL, open `url` and enter that code. For GitHub Copilot, open `url` and enter the returned `user_code`. Poll `/oauth/status?state=...` to observe completion or use `DELETE /oauth/session?state=...` to cancel the session.
 
 Plugin providers must appear in `/plugins` with `supports_oauth: true`, `effective_enabled: true`, and a non-empty `oauth_provider`. Plugin provider keys are lowercase letters, digits, or hyphens; v8 plugins receive `/v8/management/oauth/callback` as their callback route. Missing provider returns `400 {"error":"provider is required"}`; unknown/unavailable providers return `404 {"error":"provider_not_found"}`.
 
@@ -2612,7 +2620,7 @@ This v8 endpoint does not require a management key. It validates the pending DB-
 | `provider` | no | Defaults to the provider stored with the state. Built-in callback aliases include `anthropic`/`claude`, `codex`/`openai`, `antigravity`/`anti-gravity`, `xai`/`x-ai`/`grok`, and `devin`. Plugin sessions use their `oauth_provider`. |
 | `redirect_url` | no; POST only | Full callback URL used to fill missing state, code, or error. |
 
-Kimi, Kimi AI, and Meta use device flow and are not completed by this callback. A provider inconsistent with the state is rejected. Success returns `200 {"status":"ok"}` to acknowledge acceptance; it does not prove token exchange is complete. Built-in code exchange runs in the background. Plugin callbacks save callback metadata, and `/oauth/status` polls the plugin and persists successful credentials.
+Kimi, Kimi AI, Meta, and Copilot use device flow and are not completed by this callback. A provider inconsistent with the state is rejected. Success returns `200 {"status":"ok"}` to acknowledge acceptance; it does not prove token exchange is complete. Built-in code exchange runs in the background. Plugin callbacks save callback metadata, and `/oauth/status` polls the plugin and persists successful credentials.
 
 | Status | Error |
 | --- | --- |
@@ -2649,6 +2657,14 @@ Example response:
 Home stores the resulting credential as DB-backed OAuth auth records and returns the generated `<uuid>.json` name in `auth-file`.
 
 ## Credential Quota and Cooldown Operations
+
+### GET `/routing/antigravity/tos-pause`
+
+Home reads the shared Antigravity pause deadline used during dispatch. A future deadline means the entire pool is paused. When the window is disabled or the deadline is missing or expired, Home returns `"paused": false, "resume_at": null`. `observed_at` is the server observation time and `resume_at` is the scheduled resumption time, both in UTC (RFC 3339). If the runtime or its stored deadline cannot be read, the endpoint returns `503 antigravity_tos_pause_unavailable`. Responses use `Cache-Control: no-store`.
+
+```json
+{ "paused": true, "resume_at": "2026-11-20T04:30:00Z", "observed_at": "2026-11-20T04:25:00Z" }
+```
 
 ### POST `/routing/cooldown/reset`
 
@@ -2929,6 +2945,7 @@ Response fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `capabilities.usage` | boolean | Whether the legacy `GET /observability/usage/api-keys` capability is available. |
+| `capabilities.antigravity_tos_pause_status` | boolean | Whether Home reports the current Antigravity pool pause. |
 | `capabilities.quota_snapshots` | boolean | Whether the DB-backed `GET /quota/credentials` snapshot list is available. |
 | `capabilities.quota_snapshot_details` | boolean | Whether `GET /quota/credentials/:credential_id` is available. |
 | `capabilities.quota_recollect` | boolean | Whether `POST /quota/collect` on-demand collection is available. |
@@ -3194,7 +3211,7 @@ These endpoints read persisted `usage`, `billing_charge`, `api_key`, `user`, and
 
 Canonical token accounting is available only when `capabilities.usage_token_breakdown_v2=true`. Clients must read that declared capability and must not infer support by probing a usage route or rebuilding a breakdown from the legacy token counters. While the capability is `false`, the server may already return `token_breakdown` objects for newly normalized rows, but the selected range can still contain historical rows awaiting backfill. The legacy `input_tokens`, `output_tokens`, `reasoning_tokens`, `cached_tokens`, `cache_read_tokens`, `cache_creation_tokens`, and `total_tokens` fields remain available for diagnostics and backward compatibility; they are not mutually exclusive and must not be stacked into a total.
 
-`input_tokens` and `output_tokens` use one display rule across `/usage/overview` (`totals`, `trend[]`, `model_efficiency[]`, and `top`), `/usage/records`, `/usage/records/:id`, `/usage/export`, `/usage/aggregates`, `/usage/realtime` (`current_usage[]`), `/usage/session-tree`, and the `/request-events` list, detail, and export APIs. The rule matches `/billing/charges` and `/billing/overview`. When a usage row has v2 token accounting with `complete` quality, `input_tokens` includes uncached input, cache reads, and cache writes, and `output_tokens` includes non-reasoning and reasoning output. Pending backfills and `unclassified` or `inconsistent` rows keep the original counters. Aggregates sum this per-row value. `reasoning_tokens`, `cached_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`, `token_breakdown`, and `performance.tps` are unchanged. This read-time conversion does not rewrite stored usage rows.
+`input_tokens` and `output_tokens` use one display rule across `/usage/overview` (`totals`, `trend[]`, `model_efficiency[]`, and `top`), `/usage/records`, `/usage/records/:id`, `/usage/export`, `/usage/aggregates`, `/usage/realtime` (`current_usage[]`), `/usage/session-tree`, and the `/request-events` list, detail, and export APIs. The rule matches `/billing/charges` and `/billing/overview`. When a usage row has v2 token accounting with `complete` quality, `input_tokens` includes uncached input, cache reads, and cache writes, and `output_tokens` includes non-reasoning and reasoning output. Pending backfills and `unclassified` or `inconsistent` rows keep the original counters. Aggregates sum this per-row value. `reasoning_tokens`, `cached_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `total_tokens`, and `token_breakdown` are unchanged. In request and usage records (including exports), `performance.tps` divides the displayed `output_tokens` by the full request latency in seconds, without subtracting TTFT. TPS is null when latency or displayed output is not positive. This read-time conversion does not rewrite stored usage rows.
 
 When enabled, `totals`, every `trend[]` bucket, every usage record, and every aggregate item include this schema:
 
@@ -3644,8 +3661,12 @@ under the same provider. Billing editors must use these pairs instead of the pub
 merged display `name`. Targets are unique and sorted by provider/model; an empty array means no
 billing identity could be resolved and must not be replaced with an alias-based guess.
 
-Static models and older responses omit `billing_models`; clients can retain their existing
-`(providers[], id)` candidates for those responses. Clients must not derive Billing providers from
+The v8 Copilot and Devin static catalogs also include `billing_models`. For example, a Copilot
+entry with catalog `id` `claude-fable-5` has the billing pair
+`{"provider":"copilot","model":"copilot/claude-fable-5"}`. The Devin entry `swe-2` has the billing
+model `devin/swe-2`. Billing editors merge static and available entries by billing pair.
+When an older Home omits this field, editors can qualify the native Copilot and Devin static IDs
+with their provider prefix. Other static models use `(providers[], id)`. Clients must not derive Billing providers from
 `type`, `owned_by`, or a static catalog group name, and must omit records without a safe Billing
 identity. This metadata does not rewrite existing price rules or historical charges.
 
@@ -3713,6 +3734,7 @@ Available model metadata reflects configured `display-name`, positive `max-conte
 
 Returns static model metadata for one channel.
 Returned model entries include the same authoritative `providers` field described above.
+For `copilot` and `devin`, returned model `id` values are namespace-prefixed (`copilot/<id>`, `devin/<id>`) to match OAuth exclusion and alias rules before aliases and credential prefixes.
 
 Supported channels:
 
@@ -3732,6 +3754,7 @@ antigravity
 xai
 x-ai
 grok
+copilot
 devin
 meta
 muse
@@ -4198,6 +4221,8 @@ Upgrade note: earlier Home versions merged these global rules into each OAuth cr
 | `force-mapping` | boolean | Uses the mapped upstream name in response model fields. |
 
 To edit one channel, use `/config/oauth/model-alias/claude` with a raw alias array. To remove it, use `DELETE` on that path. v8 does not use the v0 `items`, `channel`, `provider`, or `aliases` wrappers. Writes return `{"status":"ok","config-version":8}`. As elsewhere in the config tree, `null` is retained rather than interpreted as deletion.
+
+For namespaced channels (`copilot`, `devin`), exclusions and alias `name` match the public provider-qualified source ID (for example `copilot/gpt-5.3-codex` or `devin/swe-2`), and `alias` is published verbatim (Home does not automatically prepend `copilot/` or `devin/`; configure `alias: "copilot/friendly"` explicitly if you want a `copilot/` prefix). Credential prefixes are applied after aliases: when prefixes are optional, an explicit published alias wins over a colliding prefixed copy; when `force-model-prefix` is enabled, only credential-prefixed routes are published. With `force-mapping: true`, responses use the configured `alias` (including any explicit prefix written in `alias`, without the credential prefix).
 
 When a downstream request uses an upstream model ID that is published under an alias, Home may append up to three visible public model IDs to an `auth_not_found` or `model_not_found` error, including a missing-price rejection. Hints cover API-key and OAuth aliases, include required credential prefixes, and respect the client key's credential, model, and model-specific channel scopes. Disabled credentials and unpublished or excluded models are omitted; a policy lookup failure omits the hint. The error code and routing rules remain unchanged.
 

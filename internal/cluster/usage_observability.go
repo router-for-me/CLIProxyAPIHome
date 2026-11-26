@@ -3989,8 +3989,8 @@ func usageObservabilityPerformance(row *usageObservabilityRecordRow) UsageObserv
 		ttft := row.TTFTMS
 		performance.TTFTMS = &ttft
 	}
-	if row.LatencyMS > 0 && row.OutputTokens > 0 {
-		tps := float64(row.OutputTokens) * 1000 / float64(row.LatencyMS)
+	if row.LatencyMS > 0 && row.DisplayOutputTokens > 0 {
+		tps := float64(row.DisplayOutputTokens) * 1000 / float64(row.LatencyMS)
 		performance.TPS = &tps
 	}
 	return performance

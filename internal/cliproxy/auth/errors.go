@@ -23,6 +23,14 @@ const ErrorCodeForceCooldown = "force_cooldown"
 // New failures use the normal transient refresh error and bounded backoff.
 const ErrorCodeRefreshOutcomeUnknown = "refresh_outcome_unknown"
 
+// SchedulerRejectError marks a terminal scheduler response, distinct from an exhausted candidate pool.
+type SchedulerRejectError struct {
+	cause Error
+}
+
+func (e *SchedulerRejectError) Error() string { return e.cause.Error() }
+func (e *SchedulerRejectError) Unwrap() error { return &e.cause }
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.
@@ -37,8 +45,12 @@ type Error struct {
 	HTTPStatus int `json:"http_status,omitempty"`
 	// Upstream preserves the provider response independently from internal
 	// scheduling classification.
-	Upstream *UpstreamResponse `json:"upstream,omitempty"`
+	Upstream          *UpstreamResponse `json:"upstream,omitempty"`
+	boundCredentialID string
 }
+
+// BoundCredentialID identifies the credential fenced by a session affinity error.
+func (e *Error) BoundCredentialID() string { return e.boundCredentialID }
 
 // Error returns the error message.
 func (e *Error) Error() string {

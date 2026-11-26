@@ -3,15 +3,22 @@ package push
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -28,6 +35,15 @@ var (
 	usageLogSanitizedStates = make(map[string]usageLogFileState)
 )
 
+// usageIngestionRuntime is the persistence and plugin boundary used by LPUSH usage.
+type usageIngestionRuntime interface {
+	UsagePluginSink() home.PluginUsageSink
+	DeliverPluginUsage(context.Context, string, home.PluginUsageSink, pluginapi.UsageRecord) error
+	PersistClusterUsagePayload(context.Context, string, time.Time) (bool, bool, error)
+	RecordUsagePayload(context.Context, string) error
+	ApplyUsagePayloadFeedback(context.Context, string) error
+}
+
 // handleUsage handles an usage.
 func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.Reply {
 	if len(args) != 3 {
@@ -39,9 +55,32 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	}
 	receivedAt := time.Now().UTC()
 
-	payload := strings.TrimSpace(args[2])
+	var runtime usageIngestionRuntime
+	if env.Runtime != nil {
+		runtime = env.Runtime
+	}
+	return ingestUsagePayload(ctx, env, runtime, strings.TrimSpace(args[2]), receivedAt)
+}
+
+func ingestUsagePayload(ctx context.Context, env dispatch.Env, runtime usageIngestionRuntime, payload string, receivedAt time.Time) dispatch.Reply {
 	if payload == "" || !gjson.Valid(payload) {
 		return dispatch.Err("invalid usage json")
+	}
+	var sink home.PluginUsageSink
+	var responseHeaders http.Header
+	if runtime != nil {
+		sink = runtime.UsagePluginSink()
+		if sink != nil {
+			// Response headers belong to in-memory plugin feedback only. Database
+			// sanitization below must still remove them from the persisted payload.
+			var snapshot struct {
+				ResponseHeaders http.Header `json:"response_headers"`
+			}
+			if errDecode := json.Unmarshal([]byte(payload), &snapshot); errDecode != nil {
+				return dispatch.Err("invalid plugin usage json")
+			}
+			responseHeaders = snapshot.ResponseHeaders
+		}
 	}
 	sanitizedPayload, errSanitize := cluster.SanitizeUsagePayloadSecrets(payload)
 	if errSanitize != nil {
@@ -54,33 +93,49 @@ func handleUsage(ctx context.Context, env dispatch.Env, args []string) dispatch.
 	}
 	payload = enrichedPayload
 
-	if env.Runtime != nil {
-		persisted, inserted, errPersist := env.Runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
+	if runtime != nil {
+		var pluginUsage pluginapi.UsageRecord
+		if sink != nil {
+			var errDecode error
+			pluginUsage, errDecode = home.DecodePluginUsagePayload(payload)
+			if errDecode != nil {
+				return dispatch.Err("invalid plugin usage json")
+			}
+			pluginUsage.ResponseHeaders = responseHeaders
+		}
+		persisted, inserted, errPersist := runtime.PersistClusterUsagePayload(ctx, payload, receivedAt)
 		if errPersist != nil {
 			// Nothing is acknowledged: CPA redelivers and the dedupe key resolves
 			// whether the usage row already committed.
 			log.Errorf("usage database write error: %v", errPersist)
 			return dispatch.Err("usage database write failed")
 		}
-		if persisted {
-			// A deduplicated delivery still applies feedback: the first attempt may
-			// have committed usage but failed before the scheduler update. Replays
-			// of fully processed events are fenced by event time inside MarkResult.
-			var errFeedback error
-			if inserted {
-				errFeedback = env.Runtime.RecordUsagePayload(ctx, payload)
-			} else {
-				errFeedback = env.Runtime.ApplyUsagePayloadFeedback(ctx, payload)
-			}
-			if errFeedback != nil {
-				log.Errorf("usage feedback error: %v", errFeedback)
-				return dispatch.Err("usage feedback failed")
-			}
-			return dispatch.Integer(1)
+		// Apply scheduler feedback before plugin delivery: a blocked or failed
+		// callback must not delay credential cooldown. Replays are fenced by
+		// execution identity and event time inside MarkResult.
+		var errFeedback error
+		if persisted && !inserted {
+			errFeedback = runtime.ApplyUsagePayloadFeedback(ctx, payload)
+		} else {
+			errFeedback = runtime.RecordUsagePayload(ctx, payload)
 		}
-		if errRecord := env.Runtime.RecordUsagePayload(ctx, payload); errRecord != nil {
-			log.Errorf("usage feedback error: %v", errRecord)
+		if errFeedback != nil {
+			log.Errorf("usage feedback error: %v", errFeedback)
 			return dispatch.Err("usage feedback failed")
+		}
+		// Insertion deduplication does not prove delivery: another request may
+		// still be blocked in the plugin, or the commit result may have been lost.
+		if errDeliver := runtime.DeliverPluginUsage(ctx, payload, sink, pluginUsage); errDeliver != nil {
+			if errors.Is(errDeliver, homeerrors.ErrUsagePluginDeliveryPending) || errors.Is(errDeliver, pluginhost.ErrUsageDeliveryPending) {
+				return dispatch.Err("usage plugin delivery pending")
+			}
+			// Plugin errors may contain plugin-owned payloads; do not echo them
+			// into Home logs or the RESP response. The event remains retryable.
+			log.Error("usage plugin delivery failed")
+			return dispatch.Err("usage plugin delivery failed")
+		}
+		if persisted {
+			return dispatch.Integer(1)
 		}
 	}
 
