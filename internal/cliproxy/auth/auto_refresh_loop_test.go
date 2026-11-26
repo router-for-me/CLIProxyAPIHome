@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
 
 type autoRefreshTestResolver struct {
@@ -518,5 +520,38 @@ func TestAutoRefreshResolverErrorKeepsPendingBackoff(t *testing.T) {
 	}
 	if due := loop.popDue(start.Add(time.Second)); len(due) != 0 {
 		t.Fatalf("due auths during pending backoff = %v, want none", due)
+	}
+}
+
+func TestManagerStartAutoRefreshUsesConfiguredWorkerCount(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	t.Cleanup(manager.Shutdown)
+
+	manager.SetConfig(&internalconfig.Config{AuthAutoRefreshWorkers: 5})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	manager.StartAutoRefresh(ctx, time.Minute)
+	manager.mu.RLock()
+	initialLoop := manager.refreshLoop
+	manager.mu.RUnlock()
+	if initialLoop == nil || initialLoop.concurrency != 5 {
+		t.Fatalf("initial refreshLoop concurrency = %+v, want 5", initialLoop)
+	}
+
+	manager.SetConfig(&internalconfig.Config{AuthAutoRefreshWorkers: 7})
+	manager.mu.RLock()
+	reloadedLoop := manager.refreshLoop
+	manager.mu.RUnlock()
+	if reloadedLoop == nil || reloadedLoop.concurrency != 7 {
+		t.Fatalf("reloaded refreshLoop concurrency = %+v, want 7", reloadedLoop)
+	}
+
+	manager.SetConfig(&internalconfig.Config{AuthAutoRefreshWorkers: 0})
+	manager.mu.RLock()
+	defaultLoop := manager.refreshLoop
+	manager.mu.RUnlock()
+	if defaultLoop == nil || defaultLoop.concurrency != refreshMaxConcurrency {
+		t.Fatalf("default refreshLoop concurrency = %+v, want %d", defaultLoop, refreshMaxConcurrency)
 	}
 }

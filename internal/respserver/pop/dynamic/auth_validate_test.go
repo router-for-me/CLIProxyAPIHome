@@ -169,6 +169,11 @@ func newAuthValidateRuntime(t *testing.T, ctx context.Context, validKey string, 
 	}
 
 	repo := cluster.NewRepository(db)
+	// Dispatch fixtures use unpriced models; billing gates are covered in cluster tests.
+	allowUnpriced := true
+	if _, errSettings := repo.UpdateBillingSettings(ctx, cluster.BillingSettingsPatch{AllowUnpricedModels: &allowUnpriced}); errSettings != nil {
+		t.Fatalf("UpdateBillingSettings() error = %v", errSettings)
+	}
 	username := "auth-validate-user"
 	creditsUnlimited := true
 	user, errCreateUser := repo.CreateUser(ctx, cluster.UserUpdate{Username: &username, CreditsUnlimited: &creditsUnlimited})

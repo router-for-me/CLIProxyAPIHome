@@ -29,7 +29,7 @@ func TestQuotaAutoMigrateCreatesSnapshotTables(t *testing.T) {
 			t.Fatalf("table %s was not migrated", table)
 		}
 	}
-	for _, column := range []string{"reset_credits", "last_active_probe_at", "probe_activity_at"} {
+	for _, column := range []string{"reset_credits", "last_active_probe_at", "probe_activity_at", "plan_expires_at"} {
 		if !db.Migrator().HasColumn(&QuotaSnapshotRecord{}, column) {
 			t.Fatalf("quota_snapshot.%s was not migrated", column)
 		}

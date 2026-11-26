@@ -58,14 +58,16 @@ func (c *Collector) probeClaude(ctx context.Context, auth *coreauth.Auth) (probe
 	return result, nil
 }
 
-func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *probeError) {
+var antigravityCodeAssistRequestBody = []byte(`{"metadata":{"ideType":"ANTIGRAVITY"}}`)
+
+func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
 	projectID := quotaMetadataString(auth.Metadata, "project_id", "projectId", "project")
 	if projectID == "" {
-		return nil, &probeError{code: "PROJECT_ID_UNAVAILABLE", message: "Credential project ID is unavailable.", retryable: false}
+		return probeResult{}, &probeError{code: "PROJECT_ID_UNAVAILABLE", message: "Credential project ID is unavailable.", retryable: false}
 	}
 	body, errMarshal := json.Marshal(map[string]string{"project": projectID})
 	if errMarshal != nil {
-		return nil, &probeError{code: "PROBE_REQUEST_INVALID", message: "Antigravity quota request could not be created.", retryable: false}
+		return probeResult{}, &probeError{code: "PROBE_REQUEST_INVALID", message: "Antigravity quota request could not be created.", retryable: false}
 	}
 	// Match the CPA inference User-Agent; outdated clients receive responses without the Gemini quota group.
 	configuredUserAgent := ""
@@ -78,6 +80,7 @@ func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (
 	headers := http.Header{"Content-Type": []string{"application/json"}, "User-Agent": []string{cpasdkauth.AntigravityRequestUserAgent(configuredUserAgent)}}
 	probeCtx, cancelProbe := context.WithTimeout(ctx, c.options.ProbeTimeout)
 	defer cancelProbe()
+	var windows []cluster.QuotaWindow
 	var lastError *probeError
 	for _, targetURL := range c.options.AntigravityURLs {
 		payload, _, errRequest := c.probeRequest(probeCtx, auth, http.MethodPost, targetURL, body, headers)
@@ -91,16 +94,38 @@ func (c *Collector) probeAntigravity(ctx context.Context, auth *coreauth.Auth) (
 			}
 			continue
 		}
-		windows, errParse := parseAntigravityWindows(payload, c.options.Now().UTC())
-		if errParse == nil && antigravityQuotaGroupsComplete(windows) {
-			return windows, nil
+		parsedWindows, errParse := parseAntigravityWindows(payload, c.options.Now().UTC())
+		if errParse == nil && antigravityQuotaGroupsComplete(parsedWindows) {
+			windows = parsedWindows
+			break
 		}
 		lastError = &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Antigravity quota response did not contain both usable weekly quota buckets.", retryable: true}
 	}
-	if lastError == nil {
-		lastError = &probeError{code: "PROVIDER_UNAVAILABLE", message: "Antigravity quota collector has no configured endpoint.", retryable: false}
+	if len(windows) == 0 {
+		if lastError == nil {
+			lastError = &probeError{code: "PROVIDER_UNAVAILABLE", message: "Antigravity quota collector has no configured endpoint.", retryable: false}
+		}
+		return probeResult{}, lastError
 	}
-	return nil, lastError
+
+	result := probeResult{windows: windows, replaceWindows: true, replacePlan: true}
+	if codeAssistURL := strings.TrimSpace(c.options.AntigravityCodeAssistURL); codeAssistURL != "" {
+		codeAssistPayload, _, errCodeAssist := c.probeRequest(ctx, auth, http.MethodPost, codeAssistURL, antigravityCodeAssistRequestBody, headers)
+		if errCodeAssist != nil {
+			result.partial = true
+			result.collectionError = probeCollectionError(errCodeAssist, c.options.Now().UTC())
+			result.replacePlan = false
+		} else if plan, errPlan := parseAntigravitySubscriptionPlan(codeAssistPayload); errPlan != nil {
+			planError := &probeError{code: "SUBSCRIPTION_RESPONSE_INVALID", message: "Antigravity subscription response could not be parsed.", retryable: true}
+			result.partial = true
+			result.collectionError = probeCollectionError(planError, c.options.Now().UTC())
+			result.replacePlan = false
+		} else {
+			result.plan = plan
+			result.replacePlan = true
+		}
+	}
+	return result, nil
 }
 
 func (c *Collector) probeKimi(ctx context.Context, auth *coreauth.Auth) ([]cluster.QuotaWindow, *probeError) {
@@ -113,57 +138,6 @@ func (c *Collector) probeKimi(ctx context.Context, auth *coreauth.Auth) ([]clust
 		return nil, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "Kimi quota response did not contain usable windows.", retryable: true}
 	}
 	return windows, nil
-}
-
-func (c *Collector) probeXAI(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
-	headers := http.Header{
-		"Accept":               []string{"*/*"},
-		"User-Agent":           []string{xaiGrokUserAgent},
-		xaiTokenAuthHeader:     []string{xaiTokenAuthValue},
-		xaiClientVersionHeader: []string{xaiClientVersionValue},
-	}
-	if userID := quotaMetadataString(auth.Metadata, "sub", "subject", "user_id", "userId"); userID != "" {
-		headers.Set("x-userid", userID)
-	}
-	now := c.options.Now().UTC()
-	var windows []cluster.QuotaWindow
-	var plan *cluster.QuotaPlan
-	monthlyPayload, _, errMonthly := c.probeRequest(ctx, auth, http.MethodGet, c.options.XAIBillingURL, nil, headers)
-	if errMonthly == nil {
-		monthlyWindows, monthlyPlan, errParse := parseXAIUsageWindows(monthlyPayload, now)
-		if errParse != nil {
-			return probeResult{}, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI billing response did not contain usable quota.", retryable: true}
-		}
-		windows, plan = monthlyWindows, monthlyPlan
-	}
-	// The weekly credits quota lives behind the format=credits billing variant
-	// and is the primary limit for subscription accounts; a weekly probe failure
-	// is non-fatal while the monthly response still yields usable windows.
-	weeklyPayload, _, errWeekly := c.probeRequest(ctx, auth, http.MethodGet, xaiWeeklyBillingURL(c.options.XAIBillingURL), nil, headers)
-	if errWeekly == nil {
-		if weeklyWindow, ok := parseXAIWeeklyWindow(weeklyPayload, now); ok {
-			windows = append([]cluster.QuotaWindow{weeklyWindow}, windows...)
-		}
-	}
-	if len(windows) == 0 {
-		if errMonthly != nil {
-			return probeResult{}, errMonthly
-		}
-		if errWeekly != nil {
-			return probeResult{}, errWeekly
-		}
-		return probeResult{}, &probeError{code: "UPSTREAM_RESPONSE_INVALID", message: "xAI billing response did not contain usable quota.", retryable: true}
-	}
-	result := probeResult{windows: windows, plan: plan, replaceWindows: true, replacePlan: true}
-	if errMonthly != nil {
-		// The weekly window alone cannot re-derive the subscription plan, so a
-		// monthly outage downgrades the collection to partial and keeps the
-		// previously stored plan instead of clearing it.
-		result.partial = true
-		result.collectionError = probeCollectionError(errMonthly, now)
-		result.replacePlan = false
-	}
-	return result, nil
 }
 
 func (c *Collector) probeMeta(ctx context.Context, auth *coreauth.Auth) (probeResult, *probeError) {
@@ -523,6 +497,81 @@ func antigravityQuotaBucketSpec(bucketID string) (antigravityBucketSpec, bool) {
 	}
 }
 
+type antigravitySubscriptionTier struct {
+	id   string
+	name string
+}
+
+func normalizeAntigravitySubscriptionTier(value any) *antigravitySubscriptionTier {
+	raw, ok := value.(map[string]any)
+	if !ok || raw == nil {
+		return nil
+	}
+	tier := &antigravitySubscriptionTier{
+		id:   quotaMetadataString(raw, "id"),
+		name: quotaMetadataString(raw, "name"),
+	}
+	if tier.id == "" && tier.name == "" {
+		return nil
+	}
+	return tier
+}
+
+func parseAntigravitySubscriptionPlan(body []byte) (*cluster.QuotaPlan, error) {
+	var decoded any
+	if errDecode := json.Unmarshal(body, &decoded); errDecode != nil {
+		return nil, fmt.Errorf("decode antigravity subscription response: %w", errDecode)
+	}
+	root, ok := decoded.(map[string]any)
+	if !ok || root == nil {
+		return nil, fmt.Errorf("antigravity subscription response is not a JSON object")
+	}
+	if _, hasModels := root["models"]; !hasModels {
+		if nested, okNested := root["body"].(map[string]any); okNested && nested != nil {
+			root = nested
+		} else if nestedText, okText := root["body"].(string); okText && strings.TrimSpace(nestedText) != "" {
+			var nestedParsed map[string]any
+			if json.Unmarshal([]byte(nestedText), &nestedParsed) == nil && nestedParsed != nil {
+				root = nestedParsed
+			}
+		}
+	}
+	if root["error"] != nil {
+		return nil, fmt.Errorf("antigravity subscription response contains an error")
+	}
+	currentTier := normalizeAntigravitySubscriptionTier(root["currentTier"])
+	if currentTier == nil {
+		currentTier = normalizeAntigravitySubscriptionTier(root["current_tier"])
+	}
+	paidTier := normalizeAntigravitySubscriptionTier(root["paidTier"])
+	if paidTier == nil {
+		paidTier = normalizeAntigravitySubscriptionTier(root["paid_tier"])
+	}
+	effectiveTier := currentTier
+	if paidTier != nil && paidTier.id != "" {
+		effectiveTier = paidTier
+	}
+	if effectiveTier == nil {
+		return nil, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(effectiveTier.id)) {
+	case "g1-ultra-tier":
+		return &cluster.QuotaPlan{Name: "Ultra", Premium: true}, nil
+	case "g1-ultra-lite-tier":
+		return &cluster.QuotaPlan{Name: "Ultra Lite", Premium: true}, nil
+	case "g1-pro-tier":
+		return &cluster.QuotaPlan{Name: "Pro", Premium: false}, nil
+	case "free-tier":
+		return &cluster.QuotaPlan{Name: "Free", Premium: false}, nil
+	default:
+		name := firstNonEmptyString(effectiveTier.name, effectiveTier.id)
+		if name == "" {
+			return nil, nil
+		}
+		return &cluster.QuotaPlan{Name: name, Premium: false}, nil
+	}
+}
+
 func antigravityQuotaGroupsComplete(windows []cluster.QuotaWindow) bool {
 	var geminiWeekly, thirdPartyWeekly bool
 	for _, window := range windows {
@@ -827,20 +876,28 @@ type xaiBillingPeriod struct {
 	End   string `json:"end"`
 }
 
+type xaiBillingProductUsage struct {
+	Product           string        `json:"product"`
+	UsagePercent      xaiPercentage `json:"usagePercent"`
+	UsagePercentSnake xaiPercentage `json:"usage_percent"`
+}
+
 type xaiBillingConfig struct {
-	MonthlyLimit            flexFloat         `json:"monthlyLimit"`
-	MonthlyLimitSnake       flexFloat         `json:"monthly_limit"`
-	Used                    flexFloat         `json:"used"`
-	OnDemandCap             flexFloat         `json:"onDemandCap"`
-	OnDemandCapSnake        flexFloat         `json:"on_demand_cap"`
-	OnDemandUsed            flexFloat         `json:"onDemandUsed"`
-	OnDemandUsedSnake       flexFloat         `json:"on_demand_used"`
-	BillingPeriodEnd        string            `json:"billingPeriodEnd"`
-	BillingEndSnake         string            `json:"billing_period_end"`
-	CreditUsagePercent      flexFloat         `json:"creditUsagePercent"`
-	CreditUsagePercentSnake flexFloat         `json:"credit_usage_percent"`
-	CurrentPeriod           *xaiBillingPeriod `json:"currentPeriod"`
-	CurrentPeriodSnake      *xaiBillingPeriod `json:"current_period"`
+	MonthlyLimit            flexFloat                `json:"monthlyLimit"`
+	MonthlyLimitSnake       flexFloat                `json:"monthly_limit"`
+	Used                    flexFloat                `json:"used"`
+	OnDemandCap             flexFloat                `json:"onDemandCap"`
+	OnDemandCapSnake        flexFloat                `json:"on_demand_cap"`
+	OnDemandUsed            flexFloat                `json:"onDemandUsed"`
+	OnDemandUsedSnake       flexFloat                `json:"on_demand_used"`
+	BillingPeriodEnd        string                   `json:"billingPeriodEnd"`
+	BillingEndSnake         string                   `json:"billing_period_end"`
+	CreditUsagePercent      xaiPercentage            `json:"creditUsagePercent"`
+	CreditUsagePercentSnake xaiPercentage            `json:"credit_usage_percent"`
+	CurrentPeriod           *xaiBillingPeriod        `json:"currentPeriod"`
+	CurrentPeriodSnake      *xaiBillingPeriod        `json:"current_period"`
+	ProductUsage            []xaiBillingProductUsage `json:"productUsage"`
+	ProductUsageSnake       []xaiBillingProductUsage `json:"product_usage"`
 }
 
 const (
@@ -868,7 +925,7 @@ func parseXAIUsageWindows(body []byte, observedAt time.Time) ([]cluster.QuotaWin
 		return nil, nil, fmt.Errorf("decode xai billing response: %w", errDecode)
 	}
 	if payload.Config == nil {
-		return nil, nil, nil
+		return nil, nil, fmt.Errorf("xai billing response is missing config")
 	}
 	config := payload.Config
 	monthlyLimitCents := firstFloat(flexFloatValue(config.MonthlyLimit), flexFloatValue(config.MonthlyLimitSnake))
@@ -941,20 +998,23 @@ func parseXAIWeeklyWindow(body []byte, observedAt time.Time) (cluster.QuotaWindo
 	if config == nil {
 		return cluster.QuotaWindow{}, false
 	}
-	usedPercent := firstFloat(flexFloatValue(config.CreditUsagePercent), flexFloatValue(config.CreditUsagePercentSnake))
-	period := config.CurrentPeriod
-	if period == nil {
-		period = config.CurrentPeriodSnake
+	return xaiWeeklyWindow(config, observedAt, xaiEntitlementUnknown)
+}
+
+func xaiWeeklyWindow(config *xaiBillingConfig, observedAt time.Time, entitlement xaiWeeklyEntitlement) (cluster.QuotaWindow, bool) {
+	usedPercent := xaiPercentageValue(config.CreditUsagePercent, config.CreditUsagePercentSnake)
+	period := xaiCurrentWeeklyPeriod(config)
+	if entitlement == xaiEntitlementFree || !xaiWeeklyPeriodIsCurrent(config, observedAt) {
+		return cluster.QuotaWindow{}, false
 	}
 	if usedPercent == nil {
-		return cluster.QuotaWindow{}, false
+		if entitlement == xaiEntitlementPaid && xaiCanInferZeroUsage(config, observedAt) {
+			usedPercent = quotaFloatPtr(0)
+		} else if entitlement != xaiEntitlementPaid || period == nil || !strings.Contains(strings.ToLower(period.Type), "weekly") {
+			return cluster.QuotaWindow{}, false
+		}
 	}
-	if period != nil && strings.Contains(strings.ToLower(period.Type), "monthly") {
-		return cluster.QuotaWindow{}, false
-	}
-	used := math.Max(0, math.Min(100, *usedPercent))
-	limit := 100.0
-	window := cluster.QuotaWindow{ID: "xai-weekly-usage", Label: quotaStringPtr("Weekly Limit"), Scope: "account", Mode: "fixed", Status: "unknown", Unit: "percentage", Used: &used, Limit: &limit, PeriodUnit: "week", PeriodValue: quotaFloatPtr(1), Source: "active_probe", ObservedAt: observedAt, Priority: -10}
+	window := cluster.QuotaWindow{ID: "xai-weekly-usage", Label: quotaStringPtr("Weekly Limit"), Scope: "account", Mode: "fixed", Status: "unknown", Unit: "percentage", Used: usedPercent, Limit: quotaFloatPtr(100), PeriodUnit: "week", PeriodValue: quotaFloatPtr(1), Source: "active_probe", ObservedAt: observedAt, Priority: -10}
 	if period != nil {
 		window.ResetAt = parseProviderTime(period.End)
 	}
@@ -963,6 +1023,89 @@ func parseXAIWeeklyWindow(body []byte, observedAt time.Time) (cluster.QuotaWindo
 	}
 	normalizeWindowValues(&window)
 	return window, true
+}
+
+func parseXAIWeeklyWindows(body []byte, observedAt time.Time) []cluster.QuotaWindow {
+	var payload xaiBillingPayload
+	if errDecode := json.Unmarshal(body, &payload); errDecode != nil || payload.Config == nil {
+		return nil
+	}
+	return xaiWeeklyWindows(payload.Config, observedAt, xaiEntitlementUnknown)
+}
+
+func xaiWeeklyWindows(config *xaiBillingConfig, observedAt time.Time, entitlement xaiWeeklyEntitlement) []cluster.QuotaWindow {
+	if entitlement == xaiEntitlementFree || !xaiWeeklyPeriodIsCurrent(config, observedAt) {
+		return nil
+	}
+	var windows []cluster.QuotaWindow
+	var resetAt *time.Time
+	if weeklyWindow, ok := xaiWeeklyWindow(config, observedAt, entitlement); ok {
+		resetAt = weeklyWindow.ResetAt
+		windows = append(windows, weeklyWindow)
+	}
+	period := xaiCurrentWeeklyPeriod(config)
+	if period != nil && strings.Contains(strings.ToLower(period.Type), "monthly") {
+		return windows
+	}
+	if resetAt == nil && period != nil {
+		resetAt = parseProviderTime(period.End)
+	}
+	if resetAt == nil {
+		resetAt = parseProviderTime(firstNonEmptyString(config.BillingPeriodEnd, config.BillingEndSnake))
+	}
+	rawProducts := config.ProductUsage
+	if len(rawProducts) == 0 {
+		rawProducts = config.ProductUsageSnake
+	}
+	seen := make(map[string]int, len(rawProducts))
+	productWindows := make([]cluster.QuotaWindow, 0, len(rawProducts))
+	for index, item := range rawProducts {
+		product := strings.TrimSpace(item.Product)
+		if product == "" {
+			product = fmt.Sprintf("Product %d", index+1)
+		}
+		usedPercent := xaiPercentageValue(item.UsagePercent, item.UsagePercentSnake)
+		var usedPtr *float64
+		var limitPtr *float64
+		if usedPercent != nil && !math.IsNaN(*usedPercent) && !math.IsInf(*usedPercent, 0) {
+			used := math.Max(0, math.Min(100, *usedPercent))
+			limit := 100.0
+			usedPtr = &used
+			limitPtr = &limit
+		}
+		slug := quotaIDSlug(product)
+		if slug == "" {
+			slug = fmt.Sprintf("%d", index+1)
+		}
+		window := cluster.QuotaWindow{
+			ID:          "xai-product-" + slug,
+			Label:       quotaStringPtr(product),
+			Scope:       "account",
+			ScopeID:     quotaStringPtr("xai-product-usage"),
+			Mode:        "fixed",
+			Status:      "unknown",
+			Unit:        "percentage",
+			Used:        usedPtr,
+			Limit:       limitPtr,
+			ResetAt:     resetAt,
+			PeriodUnit:  "week",
+			PeriodValue: quotaFloatPtr(1),
+			Source:      "active_probe",
+			ObservedAt:  observedAt,
+			Priority:    20 + index,
+		}
+		if usedPtr != nil {
+			normalizeWindowValues(&window)
+		}
+		key := strings.ToLower(product)
+		if existingIdx, exists := seen[key]; exists {
+			productWindows[existingIdx] = window
+			continue
+		}
+		seen[key] = len(productWindows)
+		productWindows = append(productWindows, window)
+	}
+	return append(windows, productWindows...)
 }
 
 func normalizedProviderRatio(value float64) float64 {

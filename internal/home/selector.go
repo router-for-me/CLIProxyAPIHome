@@ -38,8 +38,10 @@ func selectorFromConfig(cfg *config.Config, store coreauth.SessionAffinityStore)
 	}
 
 	return coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-		Fallback: selector,
-		TTL:      ttl,
-		Store:    store,
+		Fallback:         selector,
+		TTL:              ttl,
+		Store:            store,
+		SubagentAffinity: cfg.Routing.SessionAffinitySubagents,
+		RebindOn:         cfg.Routing.SessionAffinityRebindOn,
 	})
 }

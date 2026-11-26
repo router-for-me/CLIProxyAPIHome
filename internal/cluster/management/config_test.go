@@ -328,7 +328,7 @@ func TestPayloadAdvancedMatchersRoundTrip(t *testing.T) {
 	engine := gin.New()
 	engine.PUT("/payload", handler.PutConfigRoot("/payload"))
 	engine.GET("/payload", handler.GetConfigRoot("/payload"))
-	engine.GET("/config", handler.GetConfig)
+	engine.GET("/config.yaml", handler.GetConfigYAML)
 	engine.PATCH("/payload", handler.PatchConfigRoot("/payload"))
 
 	payload := `{
@@ -389,13 +389,15 @@ func TestPayloadAdvancedMatchersRoundTrip(t *testing.T) {
 	}
 	assertAdvancedPayloadMatcher(t, getResp.Body.Bytes())
 
-	configResp := httptest.NewRecorder()
-	configReq := httptest.NewRequest(http.MethodGet, "/config", nil)
-	engine.ServeHTTP(configResp, configReq)
-	if configResp.Code != http.StatusOK {
-		t.Fatalf("config status = %d, body = %s", configResp.Code, configResp.Body.String())
+	yamlResp := httptest.NewRecorder()
+	yamlReq := httptest.NewRequest(http.MethodGet, "/config.yaml", nil)
+	engine.ServeHTTP(yamlResp, yamlReq)
+	if yamlResp.Code != http.StatusOK {
+		t.Fatalf("config.yaml status = %d, body = %s", yamlResp.Code, yamlResp.Body.String())
 	}
-	assertAdvancedPayloadMatcher(t, configResp.Body.Bytes())
+	if !strings.Contains(yamlResp.Body.String(), "from-protocol: responses") || !strings.Contains(yamlResp.Body.String(), "X-Client-Tier: tenant-*") {
+		t.Fatalf("config.yaml missing advanced payload matchers:\n%s", yamlResp.Body.String())
+	}
 
 	patchResp := httptest.NewRecorder()
 	patchReq := httptest.NewRequest(http.MethodPatch, "/payload", strings.NewReader(`{
@@ -629,9 +631,6 @@ plugins:
 	if cfg["disable-cooling"] != true {
 		t.Fatalf("disable-cooling = %v, want Home global setting preserved", cfg["disable-cooling"])
 	}
-	if cfg["ws-auth"] != false {
-		t.Fatalf("ws-auth = %v, want false", cfg["ws-auth"])
-	}
 	plugins, ok := cfg["plugins"].(map[string]any)
 	if !ok {
 		t.Fatalf("plugins = %#v, want object", cfg["plugins"])
@@ -826,16 +825,6 @@ func TestAntigravityConfigRoutes(t *testing.T) {
 	}
 	if !strings.Contains(getResp2.Body.String(), `"API"`) || !strings.Contains(getResp2.Body.String(), `"proxy"`) {
 		t.Fatalf("GET /antigravity body = %s, want API and proxy", getResp2.Body.String())
-	}
-
-	// GET /config
-	configResp := httptest.NewRecorder()
-	engine.ServeHTTP(configResp, httptest.NewRequest(http.MethodGet, "/config", nil))
-	if configResp.Code != http.StatusOK {
-		t.Fatalf("GET /config status = %d", configResp.Code)
-	}
-	if !strings.Contains(configResp.Body.String(), `"antigravity"`) || !strings.Contains(configResp.Body.String(), `"sensitive-words"`) {
-		t.Fatalf("GET /config body = %s, want antigravity object", configResp.Body.String())
 	}
 
 	// GET /config.yaml

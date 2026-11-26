@@ -21,8 +21,25 @@ func TestSessionAffinityDatabaseConditionalWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "home.db")
 	nodeA := openRefreshTestRepositoryAt(t, path, true)
 	nodeB := openRefreshTestRepositoryAt(t, path, false)
+	testSessionAffinityDatabaseConditionalWrites(t, nodeA, nodeB, false)
+}
+
+func TestPostgresSessionAffinityDatabaseConditionalWrites(t *testing.T) {
+	for _, history := range []bool{false, true} {
+		t.Run(fmt.Sprintf("history=%t", history), func(t *testing.T) {
+			repo := newPostgresQuiescenceRepository(t)
+			testSessionAffinityDatabaseConditionalWrites(t, repo, NewRepository(repo.db), history)
+		})
+	}
+}
+
+func testSessionAffinityDatabaseConditionalWrites(t *testing.T, nodeA, nodeB *Repository, history bool) {
+	t.Helper()
 	key := strings.Repeat("a", 64)
 	commit := coreauth.SessionAffinityCommit{Key: key, AuthID: "cred-a", TTL: time.Hour}
+	if history {
+		commit.SessionKey, commit.Provider = strings.Repeat("f", 64), "codex"
+	}
 	if swapped, errSwap := nodeA.CompareAndSwapSessionBinding(t.Context(), commit); errSwap != nil || !swapped {
 		t.Fatalf("create=%t err=%v", swapped, errSwap)
 	}
@@ -304,7 +321,7 @@ func TestSessionAffinityRuntimeAcrossNodesAndReload(t *testing.T) {
 		t.Fatalf("dispatch preparation error=%v", errDispatch)
 	}
 	var count int64
-	if errCount := repoA.db.Model(&SessionAffinityRecord{}).Count(&count).Error; errCount != nil || count != 3 {
+	if errCount := repoA.db.Model(&SessionAffinityRecord{}).Where("credential_id <> ''").Count(&count).Error; errCount != nil || count != 3 {
 		t.Fatalf("bindings=%d err=%v, want only warmup, shared and child", count, errCount)
 	}
 

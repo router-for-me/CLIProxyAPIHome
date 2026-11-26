@@ -22,6 +22,7 @@ var quotaRecollectProviders = map[string]struct{}{
 	"claude":      {},
 	"antigravity": {},
 	"codex":       {},
+	"devin":       {},
 	"kimi":        {},
 	"xai":         {},
 	"meta":        {},

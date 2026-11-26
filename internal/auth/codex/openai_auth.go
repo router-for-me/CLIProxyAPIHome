@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/oautherror"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // OAuth configuration constants for OpenAI Codex refresh.
@@ -31,6 +33,8 @@ const (
 type CodexAuth struct {
 	httpClient *http.Client
 }
+
+var codexRefreshGroup singleflight.Group
 
 type codexRefreshResponseError struct {
 	statusCode   int
@@ -79,7 +83,46 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
+	var ownsRefresh atomic.Bool
+	resultCh := codexRefreshGroup.DoChan(refreshToken, func() (any, error) {
+		ownsRefresh.Store(true)
+		return o.refreshTokens(ctx, refreshToken)
+	})
+	var result singleflight.Result
+	select {
+	case <-ctx.Done():
+		if !ownsRefresh.Load() {
+			return nil, ctx.Err()
+		}
+		// Keep the owner's exchange outcome, especially a known token rotation.
+		// Only waiters may leave without waiting for that exchange to finish.
+		result = <-resultCh
+	case result = <-resultCh:
+	}
+	// Cancellation wins for waiters even when both channels were ready.
+	if errContext := ctx.Err(); errContext != nil && !ownsRefresh.Load() {
+		return nil, errContext
+	}
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	tokens, ok := result.Val.(*CodexTokenData)
+	if !ok || tokens == nil {
+		return nil, fmt.Errorf("token refresh failed: invalid single-flight result")
+	}
+	return tokens, nil
+}
 
+func (o *CodexAuth) refreshTokens(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
+	if errContext := ctx.Err(); errContext != nil {
+		return nil, errContext
+	}
 	data := url.Values{
 		"client_id":     {ClientID},
 		"grant_type":    {"refresh_token"},
@@ -95,7 +138,7 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := o.httpClient.Do(req)
+	resp, err := doRefreshRequest(o.httpClient, req)
 	if err != nil {
 		return nil, fmt.Errorf("token refresh request failed: %w", err)
 	}
@@ -125,6 +168,9 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
 	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" || tokenResp.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("token refresh response is missing a usable access token or expiry")
+	}
 
 	// Extract account ID from ID token
 	claims, err := ParseJWTToken(tokenResp.IDToken)
@@ -149,10 +195,15 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}, nil
 }
 
-// RefreshTokensWithRetry refreshes tokens with a built-in retry mechanism.
-// It attempts to refresh the tokens up to a specified maximum number of retries,
-// with an exponential backoff strategy to handle transient network errors.
+// RefreshTokensWithRetry applies bounded retries to transient refresh failures.
+// Explicit grant rejection and caller cancellation stop the retry loop.
 func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*CodexTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -169,13 +220,13 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 		if err == nil {
 			return tokenData, nil
 		}
-		if isNonRetryableRefreshErr(err) {
-			log.Warnf("Token refresh attempt %d failed with a non-retryable provider response", attempt+1)
+		if isNonRetryableRefreshErr(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Warnf("Token refresh attempt %d stopped", attempt+1)
 			return nil, err
 		}
 
 		lastErr = err
-		log.Warnf("Token refresh attempt %d failed with a retryable provider response", attempt+1)
+		log.Warnf("Token refresh attempt %d failed; retrying within the configured limit", attempt+1)
 	}
 
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
@@ -228,3 +279,14 @@ func isNonRetryableRefreshErr(err error) bool {
 	return strings.Contains(raw, "invalid_grant") || strings.Contains(raw, "refresh_token_expired") ||
 		strings.Contains(raw, "refresh_token_revoked") || strings.Contains(raw, "refresh_token_reused")
 }
+
+// doRefreshRequest keeps OAuth refresh credentials on the configured endpoint.
+func doRefreshRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	refreshClient := *client
+	refreshClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return refreshClient.Do(req)
+}
+
+// RefreshOutcomeMetadataKey identifies legacy diagnostics retained by old data.
+// These diagnostics no longer control refresh eligibility.
+const RefreshOutcomeMetadataKey = "codex_refresh_outcomes"

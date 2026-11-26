@@ -105,6 +105,7 @@ func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess) (string, er
 		b.byID[idKey] = model
 	}
 
+	env.Runtime.PruneCopilotModels()
 	reg := registry.GetGlobalRegistry()
 	auths := manager.List()
 	for _, auth := range auths {

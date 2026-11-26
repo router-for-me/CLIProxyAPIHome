@@ -37,7 +37,7 @@ func (r *Runtime) ReadConfigYAMLContext(ctx context.Context) ([]byte, error) {
 		if len(data) == 0 {
 			return nil, fmt.Errorf("home runtime: config is empty")
 		}
-		filtered, errFilter := sanitizeConfigYAMLForDownstream(data)
+		filtered, errFilter := sanitizeConfigYAMLForDownstream(data, r.pluginHost != nil && r.pluginHost.HasSchedulerContinuity())
 		if errFilter != nil {
 			return nil, errFilter
 		}
@@ -54,7 +54,7 @@ func (r *Runtime) ReadConfigYAMLContext(ctx context.Context) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("home runtime: config is empty")
 	}
-	filtered, errFilter := sanitizeConfigYAMLForDownstream(data)
+	filtered, errFilter := sanitizeConfigYAMLForDownstream(data, r.pluginHost != nil && r.pluginHost.HasSchedulerContinuity())
 	if errFilter != nil {
 		return nil, errFilter
 	}
@@ -94,7 +94,7 @@ func (r *Runtime) PublishConfigYAML(payload []byte) {
 		return
 	}
 
-	filtered, errFilter := sanitizeConfigYAMLForDownstream(payload)
+	filtered, errFilter := sanitizeConfigYAMLForDownstream(payload, r.pluginHost != nil && r.pluginHost.HasSchedulerContinuity())
 	if errFilter != nil || len(filtered) == 0 {
 		return
 	}
@@ -118,8 +118,26 @@ func (r *Runtime) PublishConfigYAML(payload []byte) {
 	}
 }
 
+var downstreamExcludedConfigKeys = []string{
+	"remote-management",
+	"user-email",
+	"api-keys",
+	"auth-dir",
+	"allow-host",
+	"tls",
+	"gemini-api-key",
+	"interactions-api-key",
+	"codex-api-key",
+	"xai-api-key",
+	"meta-api-key",
+	"claude-api-key",
+	"openai-compatibility",
+	"vertex-api-key",
+	"oauth-model-alias",
+}
+
 // sanitizeConfigYAMLForDownstream sanitizes a config yaml for downstream.
-func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
+func sanitizeConfigYAMLForDownstream(payload []byte, continuity ...bool) ([]byte, error) {
 	// Normalize source data before building the derived payload.
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("home runtime: config is empty")
@@ -133,67 +151,52 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	if errNormalize != nil {
 		return nil, fmt.Errorf("home runtime: normalize config: %w", errNormalize)
 	}
-	var errMarshal error
-	payload, errMarshal = yaml.Marshal(normalized)
+	// Older CPA executors default an omitted or blank TOS pause window to 6h.
+	// Project Home's disabled default explicitly without changing stored config.
+	antigravity, ok := normalized["antigravity"].(map[string]any)
+	if !ok {
+		if normalized["antigravity"] != nil {
+			return nil, fmt.Errorf("home runtime: antigravity must be a mapping")
+		}
+		antigravity = make(map[string]any)
+		normalized["antigravity"] = antigravity
+	}
+	window := antigravity["tos-pause-window"]
+	if raw, isString := window.(string); window == nil || (isString && strings.TrimSpace(raw) == "") {
+		antigravity["tos-pause-window"] = "0"
+		// NormalizeConfigRoot has already validated these optional containers.
+		if oauth, okOAuth := normalized["oauth"].(map[string]any); okOAuth {
+			if providers, okProviders := oauth["providers"].(map[string]any); okProviders {
+				if scoped, okScoped := providers["antigravity"].(map[string]any); okScoped {
+					scoped["tos-pause-window"] = "0"
+				}
+			}
+		}
+	}
+	for _, key := range downstreamExcludedConfigKeys {
+		delete(normalized, key)
+	}
+	// CPA needs Antigravity exclusions for variants selected after Home dispatch.
+	// Keep the other providers' rules Home-only and preserve each pattern intact.
+	const exclusionsKey = "oauth-excluded-models"
+	exclusions, _ := normalized[exclusionsKey].(map[string]any)
+	for provider := range exclusions {
+		if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+			delete(exclusions, provider)
+		}
+	}
+	if len(exclusions) == 0 {
+		delete(normalized, exclusionsKey)
+	}
+	// Advertise the optional read-only scheduler RPC separately from user config.
+	normalized["home-scheduler-protocol"] = 0
+	if len(continuity) > 0 && continuity[0] {
+		normalized["home-scheduler-protocol"] = 1
+	}
+	appconfig.ApplyDownstreamHomeModeScalars(normalized)
+	forced, errMarshal := yaml.Marshal(normalized)
 	if errMarshal != nil {
-		return nil, fmt.Errorf("home runtime: marshal config: %w", errMarshal)
-	}
-
-	var yamlRoot yaml.Node
-	if errUnmarshal := yaml.Unmarshal(payload, &yamlRoot); errUnmarshal != nil {
-		return nil, fmt.Errorf("home runtime: unmarshal config: %w", errUnmarshal)
-	}
-	if yamlRoot.Kind != yaml.DocumentNode || len(yamlRoot.Content) == 0 || yamlRoot.Content[0] == nil {
-		return nil, fmt.Errorf("home runtime: invalid config yaml document")
-	}
-
-	doc := yamlRoot.Content[0]
-	removeConfigKeysForDownstream(doc, []string{
-		"remote-management",
-		"user-email",
-		"api-keys",
-		"auth-dir",
-		"tls",
-		"gemini-api-key",
-		"interactions-api-key",
-		"codex-api-key",
-		"xai-api-key",
-		"meta-api-key",
-		"claude-api-key",
-		"openai-compatibility",
-		"vertex-api-key",
-		"oauth-model-alias",
-		"oauth-excluded-models",
-	})
-	stripYAMLComments(&yamlRoot)
-
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if errEncode := enc.Encode(&yamlRoot); errEncode != nil {
-		_ = enc.Close()
-		return nil, fmt.Errorf("home runtime: marshal config: %w", errEncode)
-	}
-	if errClose := enc.Close(); errClose != nil {
-		return nil, fmt.Errorf("home runtime: marshal config: %w", errClose)
-	}
-	out := bytes.TrimSpace(buf.Bytes())
-	if len(out) == 0 {
-		return nil, fmt.Errorf("home runtime: config is empty")
-	}
-	out = append(out, '\n')
-
-	var root map[string]any
-	if errUnmarshalRoot := yaml.Unmarshal(out, &root); errUnmarshalRoot != nil {
-		return nil, fmt.Errorf("home runtime: unmarshal downstream config root: %w", errUnmarshalRoot)
-	}
-	if root == nil {
-		root = make(map[string]any)
-	}
-	appconfig.ApplyDownstreamHomeModeScalars(root)
-	forced, errMarshalRoot := yaml.Marshal(root)
-	if errMarshalRoot != nil {
-		return nil, fmt.Errorf("home runtime: marshal downstream config root: %w", errMarshalRoot)
+		return nil, fmt.Errorf("home runtime: marshal downstream config root: %w", errMarshal)
 	}
 	forced = bytes.TrimSpace(forced)
 	if len(forced) == 0 {
@@ -201,56 +204,4 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	}
 	forced = append(forced, '\n')
 	return forced, nil
-}
-
-// removeConfigKeysForDownstream removes a config keys for downstream.
-func removeConfigKeysForDownstream(node *yaml.Node, keys []string) {
-	// Normalize source data before building the derived payload.
-	if node == nil || node.Kind != yaml.MappingNode || len(keys) == 0 {
-		return
-	}
-
-	keySet := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		k := strings.TrimSpace(key)
-		if k == "" {
-			continue
-		}
-		keySet[k] = struct{}{}
-	}
-	if len(keySet) == 0 {
-		return
-	}
-
-	next := make([]*yaml.Node, 0, len(node.Content))
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		k := node.Content[i]
-		v := node.Content[i+1]
-		if k == nil || strings.TrimSpace(k.Value) == "" {
-			next = append(next, k, v)
-			continue
-		}
-		if _, ok := keySet[k.Value]; ok {
-			continue
-		}
-		next = append(next, k, v)
-	}
-	node.Content = next
-}
-
-// stripYAMLComments handles a strip yaml comments.
-func stripYAMLComments(node *yaml.Node) {
-	if node == nil {
-		return
-	}
-	node.HeadComment = ""
-	node.LineComment = ""
-	node.FootComment = ""
-
-	for _, child := range node.Content {
-		stripYAMLComments(child)
-	}
-	if node.Alias != nil {
-		stripYAMLComments(node.Alias)
-	}
 }

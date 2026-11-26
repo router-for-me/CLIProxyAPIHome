@@ -32,7 +32,7 @@ func (postgresTransactionTracer) TraceConnectEnd(context.Context, pgx.TraceConne
 
 func (postgresTransactionTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
 	startup, ok := ctx.Value(postgresTransactionStartupKey{}).(*postgresTransactionStartup)
-	if !ok || (data.SQL != "begin" && !strings.HasPrefix(data.SQL, "begin ")) {
+	if !ok || (data.SQL != "begin" && !strings.HasPrefix(data.SQL, "begin ") && !strings.HasPrefix(data.SQL, "begin;")) {
 		return ctx
 	}
 	return context.WithValue(ctx, postgresTransactionBeginKey{}, startup.nowFunc())

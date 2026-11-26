@@ -68,9 +68,12 @@ func (m *Manager) mutateCooldownState(ctx context.Context, credentialID string, 
 		return result, ErrCooldownMutationUnsupported
 	}
 
-	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) bool {
+	persisted, errMutate := mutator.MutateAuthState(ctx, credentialID, func(auth *Auth) StateMutation {
 		result.changed = mutate(auth)
-		return result.changed || persistUnchanged
+		if result.changed || persistUnchanged {
+			return StateMutationChanged
+		}
+		return StateMutationUnchanged
 	})
 	if errMutate != nil {
 		return result, errMutate
@@ -117,9 +120,12 @@ func (m *Manager) ClearQuotaCooldown(ctx context.Context, credentialID, model st
 			}
 			result.Model = resolvedModel
 			modelKeys = append(modelKeys, resolvedModel)
-			if requestedModel != resolvedModel {
+			if native, ok := publishedNativeSourceModelKey(auth, resolvedModel); ok {
+				modelKeys = append(modelKeys, native)
+			}
+			if requestedModel != resolvedModel && !isPublishedSourceModelKey(auth, resolvedModel) {
 				// Clear the pre-upstream-key route state too so rolling upgrades do
-				// not leave the scheduler blocked by its compatibility fallback.
+				// not leave non-published routes blocked by their compatibility fallback.
 				modelKeys = append(modelKeys, requestedModel)
 			}
 		}
@@ -309,8 +315,15 @@ func hasDisabledCooldownState(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
+	hasForceQuotaModel := false
 	for _, state := range auth.ModelStates {
 		if state == nil {
+			continue
+		}
+		if isForceCooldownResultError(state.LastError) {
+			if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
+				hasForceQuotaModel = true
+			}
 			continue
 		}
 		if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
@@ -326,7 +339,10 @@ func hasDisabledCooldownState(auth *Auth) bool {
 			return true
 		}
 	}
-	if auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() {
+	if isForceCooldownResultError(auth.LastError) {
+		return false
+	}
+	if (auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero()) && (!hasForceQuotaModel || hasLegacyCredentialQuota(auth)) {
 		return true
 	}
 	if auth.Disabled || auth.Status == StatusDisabled || len(auth.ModelStates) > 0 {
@@ -352,7 +368,32 @@ func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
 	refreshUnavailable := auth.Unavailable
 	refreshNextRetryAfter := auth.NextRetryAfter
 	refreshRuntimeBlocked := auth.RuntimeRefreshBlocked
-	quotaTransition := clearQuotaCooldownState(auth, nil, now, true)
+	var nonForceQuotaModels []string
+	hasNonForceQuotaModel := false
+	hasForceCooldownQuotaModel := false
+	for modelID, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if isForceCooldownResultError(state.LastError) {
+			if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
+				hasForceCooldownQuotaModel = true
+			}
+			continue
+		}
+		nonForceQuotaModels = append(nonForceQuotaModels, modelID)
+		if state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() {
+			hasNonForceQuotaModel = true
+		}
+	}
+	var quotaTransition cooldownClearTransition
+	if hasForceCooldownQuotaModel {
+		if hasNonForceQuotaModel {
+			quotaTransition = clearQuotaCooldownState(auth, nonForceQuotaModels, now, false)
+		}
+	} else if !isForceCooldownResultError(auth.LastError) {
+		quotaTransition = clearQuotaCooldownState(auth, nil, now, true)
+	}
 
 	wasDisabled := auth.Disabled || auth.Status == StatusDisabled
 	disabledStatus := auth.Status
@@ -370,7 +411,7 @@ func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
 	changed := quotaTransition.changed()
 
 	for _, state := range auth.ModelStates {
-		if state == nil || state.Status == StatusDisabled {
+		if state == nil || state.Status == StatusDisabled || isForceCooldownResultError(state.LastError) {
 			continue
 		}
 		status := statusCodeFromResult(state.LastError)
@@ -393,7 +434,7 @@ func clearDisabledCooldownState(auth *Auth, now time.Time) bool {
 
 	legacyAuthRequestError := authStatus == 0 && !auth.Quota.Exceeded
 	quotaOwnsAuthRetry := auth.Quota.Exceeded && auth.NextRetryAfter.Equal(auth.Quota.NextRecoverAt)
-	clearAuthRetry := !wasDisabled && !preserveRefreshAcquisition && len(auth.ModelStates) == 0 && !auth.NextRetryAfter.IsZero() &&
+	clearAuthRetry := !wasDisabled && !preserveRefreshAcquisition && !isForceCooldownResultError(auth.LastError) && len(auth.ModelStates) == 0 && !auth.NextRetryAfter.IsZero() &&
 		!quotaOwnsAuthRetry && (legacyAuthRequestError || isRequestErrorCooldownStatus(authStatus))
 	if clearAuthRetry {
 		if auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now) {

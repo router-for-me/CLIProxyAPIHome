@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const modelsRefreshInterval = 3 * time.Hour
+// ModelsRefreshInterval is the shared cadence for model catalogs and account entitlements.
+const ModelsRefreshInterval = 3 * time.Hour
+
+const modelsRefreshInterval = ModelsRefreshInterval
 
 var modelsFetchTimeout = 30 * time.Second
 
@@ -93,6 +96,7 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"xai", oldData.XAI, newData.XAI},
 		{"devin", oldData.Devin, newData.Devin},
 		{"meta", oldData.Meta, newData.Meta},
+		{"copilot", oldData.Copilot, newData.Copilot},
 	}
 
 	seen := make(map[string]bool, len(sections))
@@ -232,6 +236,7 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 	}{
 		{name: "devin", models: data.Devin},
 		{name: "meta", models: data.Meta},
+		{name: "copilot", models: data.Copilot},
 	} {
 		if len(section.models) == 0 {
 			continue

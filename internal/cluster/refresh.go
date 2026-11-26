@@ -156,7 +156,7 @@ func (c *RefreshController) RefreshNowObserved(ctx context.Context, authIndex, o
 				if errSync := c.syncForwardedAuth(refreshCtx, forwardAuthUUID); errSync != nil {
 					log.Warnf("cluster refresh forwarded auth sync failed | auth=%s err=%v", forwardAuthUUID, errSync)
 					switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
-					case "authentication_error", "refresh_temporarily_unavailable", "refresh_unsupported":
+					case "authentication_error", "refresh_temporarily_unavailable", "refresh_unsupported", coreauth.ErrorCodeRefreshOutcomeUnknown:
 						if errFailClosed := c.applyForwardedRefreshFailureInMemory(refreshCtx, forwardAuthUUID, authErr); errFailClosed != nil {
 							log.Warnf("cluster refresh forwarded auth fail-closed update failed | auth=%s err=%v", forwardAuthUUID, errFailClosed)
 						}
@@ -241,7 +241,7 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 		auth.Quota = coreauth.QuotaState{}
 		auth.UpdatedAt = now
 		auth.LastError = lastError
-	case "refresh_temporarily_unavailable":
+	case "refresh_temporarily_unavailable", coreauth.ErrorCodeRefreshOutcomeUnknown:
 		if strings.TrimSpace(lastError.Message) == "" {
 			lastError.Message = "credential refresh temporarily unavailable"
 		}
@@ -249,6 +249,10 @@ func (c *RefreshController) applyForwardedRefreshFailureInMemory(ctx context.Con
 			lastError.HTTPStatus = http.StatusServiceUnavailable
 		}
 		lastError.Retryable = true
+		if lastError.Code == coreauth.ErrorCodeRefreshOutcomeUnknown {
+			lastError.Code = "refresh_temporarily_unavailable"
+			lastError.Message = "credential refresh temporarily unavailable"
+		}
 		coreauth.ApplyRefreshFailureState(auth, lastError, now)
 	case "refresh_unsupported":
 		if strings.TrimSpace(lastError.Message) == "" {
@@ -338,7 +342,7 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 				}
 				if refreshError != nil {
 					switch strings.ToLower(strings.TrimSpace(refreshError.Code)) {
-					case "refresh_temporarily_unavailable", "refresh_unsupported":
+					case "refresh_temporarily_unavailable", "refresh_unsupported", coreauth.ErrorCodeRefreshOutcomeUnknown:
 						refreshErr = refreshError
 					}
 				}
@@ -419,20 +423,20 @@ func (c *RefreshController) refreshLocalWithLock(ctx context.Context, authIndex,
 	}
 	if refreshErr != nil {
 		if coreauth.AuthIsNewerThanObserved(updated, observedAccessTokenSHA256) {
-			return home.BuildRefreshPayload(updated)
+			return home.BuildRefreshPayload(updated, c.runtime.Config())
 		}
 		if coreauth.CanUseObservedTokenAfterRefreshFailure(updated, observedAccessTokenSHA256, refreshErr, time.Now().UTC()) {
-			return home.BuildRefreshPayload(updated)
+			return home.BuildRefreshPayload(updated, c.runtime.Config())
 		}
 		return nil, refreshErr
 	}
 	if targetIndex != requestedIndex {
 		if requested, ok := core.GetByIndex(requestedIndex); ok && requested != nil {
-			return home.BuildRefreshPayload(requested)
+			return home.BuildRefreshPayload(requested, c.runtime.Config())
 		}
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	return home.BuildRefreshPayload(updated)
+	return home.BuildRefreshPayload(updated, c.runtime.Config())
 }
 
 func (c *RefreshController) retryRefreshFinalize(ctx context.Context, targetUUID, leaseID string, leased, beforeClaim, refreshed *coreauth.Auth, errRefresh error) (*coreauth.Auth, bool, bool, bool, error) {
@@ -461,7 +465,7 @@ func (c *RefreshController) finalizeRefreshLease(ctx context.Context, targetUUID
 			disabledTarget = true
 			return true
 		}
-		if coreauth.AuthIsNewerThanObserved(current, coreauth.AccessTokenSHA256(leased)) {
+		if coreauth.AuthIsNewerThanObserved(current, coreauth.AccessTokenSHA256(leased)) || codexRefreshGrantReplaced(current, leased) {
 			clearRefreshLease(current)
 			if beforeClaim != nil && current.NextRefreshAfter.Equal(leased.NextRefreshAfter) {
 				current.NextRefreshAfter = beforeClaim.NextRefreshAfter
@@ -534,6 +538,18 @@ func clearRefreshLease(auth *coreauth.Auth) {
 	}
 }
 
+func codexRefreshGrantReplaced(current, before *coreauth.Auth) bool {
+	if current == nil || before == nil || !strings.EqualFold(strings.TrimSpace(before.Provider), "codex") {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(current.Provider), "codex") {
+		return true
+	}
+	currentToken, _ := current.Metadata["refresh_token"].(string)
+	beforeToken, _ := before.Metadata["refresh_token"].(string)
+	return strings.TrimSpace(currentToken) != strings.TrimSpace(beforeToken)
+}
+
 func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefresh error, now time.Time) *coreauth.Auth {
 	if current == nil {
 		return refreshed
@@ -543,6 +559,9 @@ func mergeClusterRefreshOutcome(current, base, refreshed *coreauth.Auth, errRefr
 		return merged
 	}
 	refreshed = refreshed.Clone()
+	if codexRefreshGrantReplaced(current, base) {
+		return merged
+	}
 	if errRefresh == nil {
 		if base == nil {
 			base = &coreauth.Auth{}

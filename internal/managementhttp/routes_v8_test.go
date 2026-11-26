@@ -17,10 +17,10 @@ import (
 func TestManagementV8Routes(t *testing.T) {
 	sdk := cpasdkapi.NewHandlerWithoutConfigFilePath(&cpaconfig.Config{}, nil)
 	home := clustermanagement.NewHandler(nil, nil, "", 0)
-	legacy := defaultRoutes(sdk)
-	registerClusterManagementRoutes(legacy, home)
+	routes := defaultRoutes(sdk)
+	registerClusterManagementRoutes(routes, home)
 	engine := gin.New()
-	managementV8Routes(legacy, sdk, home).Register(engine.Group("/v8/management"))
+	managementV8Routes(routes, sdk, home).Register(engine.Group("/v8/management"))
 	registered := make(map[string]bool)
 	for _, route := range engine.Routes() {
 		registered[route.Method+" "+route.Path] = true
@@ -34,6 +34,7 @@ func TestManagementV8Routes(t *testing.T) {
 		"GET /credentials/model-states", "GET /credentials/:credential_id/model-states",
 		"GET /oauth/auth-url", "POST /oauth/import", "GET /oauth/status", "DELETE /oauth/session",
 		"GET /server/latest-version", "POST /requests/api-call", "POST /routing/cooldown/reset",
+		"GET /routing/antigravity/tos-pause",
 		"GET /observability/logs", "GET /observability/usage/api-keys", "GET /plugins/store", "DELETE /plugins/:id",
 		"GET /credentials/quota/providers", "POST /credentials/quota/fetch", "POST /credentials/quota/reset",
 		"GET /plugins/:id/quota", "POST /plugins/:id/quota", "DELETE /plugins/:id/quota",
@@ -61,14 +62,14 @@ func TestManagementV8QuotaRoutesRemainAvailable(t *testing.T) {
 	for _, database := range []bool{false, true} {
 		t.Run(map[bool]string{false: "SDK", true: "database"}[database], func(t *testing.T) {
 			sdk := cpasdkapi.NewHandlerWithoutConfigFilePath(&cpaconfig.Config{}, nil)
-			legacy := defaultRoutes(sdk)
+			routes := defaultRoutes(sdk)
 			var home *clustermanagement.Handler
 			if database {
 				home = clustermanagement.NewHandler(nil, nil, "", 0)
-				registerClusterManagementRoutes(legacy, home)
+				registerClusterManagementRoutes(routes, home)
 			}
 			engine := gin.New()
-			managementV8Routes(legacy, sdk, home).Register(engine.Group("/v8/management"))
+			managementV8Routes(routes, sdk, home).Register(engine.Group("/v8/management"))
 			registered := make(map[string]bool)
 			for _, route := range engine.Routes() {
 				registered[route.Method+" "+route.Path] = true
@@ -118,7 +119,7 @@ func TestManagementV8AccessControlAndOAuthCallbacks(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, authorized := range []bool{true, false} {
-				for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v8/management/config/server/port"} {
+				for _, route := range []string{"/v8/management/config", "/v8/management/config/server/port"} {
 					req := httptest.NewRequest("GET", route, nil)
 					req.RemoteAddr = "127.0.0.1:1234"
 					if authorized {

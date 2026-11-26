@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -30,6 +33,13 @@ type UsageRecord struct {
 	TTFTMS    int64     `gorm:"column:ttft_ms;not null;default:0"`
 	Source    string    `gorm:"column:source;index:idx_usage_source;index:idx_usage_source_time,priority:1"`
 	AuthIndex string    `gorm:"column:auth_index;index:idx_usage_auth_index;index:idx_usage_auth_time,priority:1"`
+	// DedupeKey identifies one CPA execution so redelivered payloads collapse onto
+	// the first committed row. Rows written before the column existed keep an
+	// empty key and stay outside the partial unique index.
+	DedupeKey string `gorm:"column:dedupe_key;not null;default:'';size:80;index:idx_usage_dedupe_key,unique,where:dedupe_key <> ''"`
+	// PluginUsageDelivered is independent of insertion: an uncertain commit may
+	// leave a stored event whose plugin delivery has never started.
+	PluginUsageDelivered bool `gorm:"column:plugin_usage_delivered;not null;default:false"`
 	// Quota identity fields fence activity from concurrent credential replacement;
 	// the key also protects rolling upgrades where an older Home cannot advance the generation.
 	QuotaCredentialID    string `gorm:"column:quota_credential_id;not null;default:''"`
@@ -216,7 +226,7 @@ func UsageRecordFromPayloadWithRuntime(payload string, metadata UsageRuntimeMeta
 		Alias:                      strings.TrimSpace(gjson.Get(payload, "alias").String()),
 		Effort:                     strings.TrimSpace(gjson.Get(payload, "reasoning_effort").String()),
 		ServiceTier:                usageServiceTierFromPayload(payload),
-		ResponseServiceTier:        strings.TrimSpace(gjson.Get(payload, "response_service_tier").String()),
+		ResponseServiceTier:        usagePayloadString(payload, "response_service_tier", "upstream_service_tier"),
 		Endpoint:                   strings.TrimSpace(gjson.Get(payload, "endpoint").String()),
 		AuthType:                   strings.TrimSpace(gjson.Get(payload, "auth_type").String()),
 		APIKey:                     strings.TrimSpace(gjson.Get(payload, "api_key").String()),
@@ -331,14 +341,28 @@ func (r *Repository) AppendUsage(ctx context.Context, payload string, homeIP str
 
 // AppendUsageWithRuntime appends usage with trusted Home/CPA runtime metadata.
 func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string, metadata UsageRuntimeMetadata) (*UsageRecord, error) {
+	record, _, errAppend := r.AppendUsageWithRuntimeOutcome(ctx, payload, metadata)
+	return record, errAppend
+}
+
+// AppendUsageWithRuntimeOutcome appends usage with trusted Home/CPA runtime metadata
+// and reports whether this call committed a new usage row (false when deduplicated).
+// Deduplication relies on the unique dedupe_key index, so concurrent and
+// cross-node redeliveries are resolved by the database without extra locking.
+func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload string, metadata UsageRuntimeMetadata) (*UsageRecord, bool, error) {
 	record, errRecord := UsageRecordFromPayloadWithRuntime(payload, metadata)
 	if errRecord != nil {
-		return nil, errRecord
+		return nil, false, errRecord
 	}
+	dedupeKey, errDedupeKey := usagePayloadDedupeKey(payload)
+	if errDedupeKey != nil {
+		return nil, false, errDedupeKey
+	}
+	record.DedupeKey = dedupeKey
 
 	db, errDB := r.database()
 	if errDB != nil {
-		return nil, errDB
+		return nil, false, errDB
 	}
 
 	ctx = contextOrBackground(ctx)
@@ -357,22 +381,90 @@ func (r *Repository) AppendUsageWithRuntime(ctx context.Context, payload string,
 		record.QuotaIdentityVersion = quotaCredentialIdentityVersion(resolved)
 		record.QuotaIdentityKey = identityKey
 	}
+	inserted := false
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if errCreate := tx.WithContext(ctx).Create(record).Error; errCreate != nil {
-			return errCreate
+		insert := tx.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns:     []clause.Column{{Name: "dedupe_key"}},
+			TargetWhere: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "dedupe_key <> ''"}}},
+			DoNothing:   true,
+		}).Create(record)
+		if insert.Error != nil {
+			return insert.Error
 		}
-		if errBilling := r.createBillingChargeForUsageTx(ctx, tx, record, payload); errBilling != nil {
-			return errBilling
+		if insert.RowsAffected == 0 {
+			existing := &UsageRecord{}
+			// Keep the partial-index predicate explicit for indexed lookups.
+			if errExisting := tx.WithContext(ctx).Where("dedupe_key <> '' AND dedupe_key = ?", dedupeKey).First(existing).Error; errExisting != nil {
+				return errExisting
+			}
+			record = existing
+			return nil
 		}
-		return nil
+		inserted = true
+		return r.createBillingChargeForUsageTx(ctx, tx, record, payload)
 	})
 	if errTransaction != nil {
-		return nil, errTransaction
+		return nil, false, errTransaction
 	}
-	if errQuota := upsertQuotaFromUsageRecord(ctx, db, record, metadata); errQuota != nil {
-		log.WithError(errQuota).Warn("usage quota observation ignored")
+	if inserted {
+		if errQuota := upsertQuotaFromUsageRecord(ctx, db, record, metadata); errQuota != nil {
+			log.WithError(errQuota).Warn("usage quota observation ignored")
+		}
 	}
-	return record, nil
+	return record, inserted, nil
+}
+
+// usagePayloadDedupeKey identifies one CPA execution. Modern payloads carry an
+// execution_id; legacy payloads fall back to a canonical hash of the payload
+// with secrets and Home-added runtime metadata removed, so the same event
+// redelivered to another Home node still yields the same key. The caller has
+// already validated the payload JSON.
+func usagePayloadDedupeKey(payload string) (string, error) {
+	if executionID := strings.TrimSpace(gjson.Get(payload, "execution_id").String()); executionID != "" {
+		sum := sha256.Sum256([]byte(executionID))
+		return "exec:" + hex.EncodeToString(sum[:]), nil
+	}
+	sanitized, errSanitize := SanitizeUsagePayloadSecrets(payload)
+	if errSanitize != nil {
+		return "", errSanitize
+	}
+	canonical := canonicalizeUsageDedupeJSON(stripUsageRuntimeMetadataFields(sanitized))
+	sum := sha256.Sum256([]byte(canonical))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func canonicalizeUsageDedupeJSON(payload string) string {
+	decoder := json.NewDecoder(strings.NewReader(payload))
+	decoder.UseNumber()
+	var parsed any
+	if errDecode := decoder.Decode(&parsed); errDecode != nil {
+		return strings.TrimSpace(payload)
+	}
+	normalized, errMarshal := json.Marshal(parsed)
+	if errMarshal != nil {
+		return strings.TrimSpace(payload)
+	}
+	return string(normalized)
+}
+
+func stripUsageRuntimeMetadataFields(payload string) string {
+	out := payload
+	for _, field := range []string{"home_ip", "home.ip", "home_port", "home.port", "cpa_node_id", "cpa.node_id", "node_id", "cpa_ip", "cpa.ip", "cpa_port", "cpa.port", "cpa_label", "cpa.label"} {
+		if gjson.Get(out, field).Exists() {
+			if next, errDelete := sjson.Delete(out, field); errDelete == nil {
+				out = next
+			}
+		}
+	}
+	for _, parent := range []string{"home", "cpa"} {
+		node := gjson.Get(out, parent)
+		if node.Exists() && node.IsObject() && len(node.Map()) == 0 {
+			if next, errDelete := sjson.Delete(out, parent); errDelete == nil {
+				out = next
+			}
+		}
+	}
+	return out
 }
 
 func (r *Repository) getCachedRootSessionID(sessionID string) (string, bool) {

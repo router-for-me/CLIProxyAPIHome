@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	cpaauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/modelconfig"
@@ -18,6 +20,11 @@ const (
 )
 
 type ModelInfo = registry.ModelInfo
+
+type modelPluginSource interface {
+	ModelsForAuth(context.Context, *cpaauth.Auth) sdkpluginhost.AuthModelResult
+	ModelsForProvider(string) []sdkpluginhost.ModelInfo
+}
 
 // modelInfosFromAuthMetadata derives model infos from auth metadata.
 func modelInfosFromAuthMetadata(a *coreauth.Auth, key string) []*ModelInfo {
@@ -103,21 +110,31 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 			if providerKey == "" {
 				providerKey = compatName
 			}
-			return strings.ToLower(providerKey), compatName, true
+			return config.OpenAICompatibleProviderKey(providerKey), compatName, true
 		}
 	}
 	if strings.EqualFold(strings.TrimSpace(a.Provider), "openai-compatibility") {
-		return "openai-compatibility", strings.TrimSpace(a.Label), true
+		compatName = strings.TrimSpace(a.Label)
+		return config.OpenAICompatibleProviderKey(compatName), compatName, true
 	}
 	return "", "", false
 }
 
 // registerResolvedModelsForAuth returns a register resolved models for auth.
 func (r *Runtime) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models, candidates []*ModelInfo) {
-	if a == nil || a.ID == "" {
+	if r == nil || a == nil || a.ID == "" {
 		return
 	}
 	registry.GetGlobalRegistry().RegisterClientWithCandidates(a.ID, providerKey, models, candidates)
+	if r.coreManager != nil {
+		modelIDs := make([]string, 0, len(models))
+		for _, model := range models {
+			if model != nil {
+				modelIDs = append(modelIDs, model.ID)
+			}
+		}
+		r.coreManager.SetModelAliasHints(a, modelIDs)
+	}
 }
 
 func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *DispatchModelInfo {
@@ -130,7 +147,31 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 	}
 	seen := make(map[string]struct{}, len(candidates))
 	var selected *ModelInfo
+	// OAuth aliases can override capabilities independently of their upstream.
+	// API-key pools retain the upstream-first lookup below.
+	upstreamCanonical := coreauth.CanonicalModelID(upstreamModel)
+	baseID := coreauth.CanonicalModelID(routeModel)
+	base := modelRegistry.GetModelInfoForClient(authID, baseID)
+	route := base
+	// Namespaced sources follow the base route selected by the scheduler.
+	// Other OAuth providers can configure a literal suffixed alias independently.
+	if exact := strings.TrimSpace(routeModel); exact != baseID && (base == nil || base.SourceModelID == "") {
+		route = modelRegistry.GetModelInfoForClient(authID, exact)
+	}
+	for _, info := range []*ModelInfo{route, base} {
+		if info == nil {
+			continue
+		}
+		if (info.SourceModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.SourceModelID), upstreamCanonical)) ||
+			(info.MetadataModelID != "" && strings.EqualFold(coreauth.CanonicalModelID(info.MetadataModelID), upstreamCanonical)) {
+			selected = info
+			break
+		}
+	}
 	for _, candidate := range candidates {
+		if selected != nil {
+			break
+		}
 		key := strings.ToLower(strings.TrimSpace(candidate))
 		if key == "" {
 			continue
@@ -151,6 +192,10 @@ func dispatchModelInfoForAuth(authID, upstreamModel, routeModel string) *Dispatc
 	if modelID == "" {
 		modelID = coreauth.CanonicalModelID(selected.ID)
 	}
+	return newDispatchModelInfo(modelID, selected)
+}
+
+func newDispatchModelInfo(modelID string, selected *ModelInfo) *DispatchModelInfo {
 	return &DispatchModelInfo{
 		ID:                         modelID,
 		Type:                       selected.Type,
@@ -170,48 +215,52 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if r == nil || a == nil || a.ID == "" {
 		return
 	}
-	if a.Disabled || a.Status == coreauth.StatusDisabled {
-		registry.GetGlobalRegistry().UnregisterClient(a.ID)
-		return
-	}
+	r.cancelStaleAntigravityProbes(a.ID)
+	r.publishModelsForAuth(a, r.pluginHost)
+}
 
-	r.cfgMu.RLock()
-	cfg := r.cfg
-	r.cfgMu.RUnlock()
-
-	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
-	if authKind == "" {
-		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
-			authKind = "apikey"
-		}
+// pruneStaleAuthModels releases obsolete model state and returns the credential that still owns the ID.
+func (r *Runtime) pruneStaleAuthModels(authID string) *coreauth.Auth {
+	r.copilotMu.Lock()
+	defer r.copilotMu.Unlock()
+	current, _ := r.coreManager.GetByID(authID)
+	if !activeCopilotAccount(current) {
+		delete(r.copilotAccounts, authID)
 	}
-	// Unregister legacy client ID (if present) to avoid double counting
-	if a.Runtime != nil {
-		if idGetter, ok := a.Runtime.(interface{ GetClientID() string }); ok {
-			if rid := idGetter.GetClientID(); rid != "" && rid != a.ID {
-				registry.GetGlobalRegistry().UnregisterClient(rid)
-			}
-		}
+	if current == nil {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
 	}
+	return current
+}
 
+// publishModelsForAuth resolves plugin models and applies the current account model policy.
+func (r *Runtime) publishModelsForAuth(a *coreauth.Auth, plugins modelPluginSource) {
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
 	compatProviderKey, compatDisplayName, compatDetected := openAICompatInfoFromAuth(a)
 	if compatDetected {
 		provider = "openai-compatibility"
 	}
 
-	excluded := r.oauthExcludedModels(cfg, provider, authKind)
-	// The "excluded_models" attribute holds only the credential's own exclusions.
-	// When present it takes priority over the global oauth-excluded-models config;
-	// otherwise the current global config applies, so global changes take effect without rewriting credentials.
-	if a.Attributes != nil {
-		if val, ok := a.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
-			excluded = strings.Split(val, ",")
-		}
-	}
-	configModels := modelInfosFromAuthMetadata(a, homeConfigModelsMetadataKey)
-	if r.tryRegisterPluginModelsForAuth(context.Background(), a, provider, authKind, excluded) {
+	if provider == "copilot" {
+		r.registerCopilotModelsForAuth(a)
 		return
+	}
+	if r.coreManager != nil {
+		r.coreManager.SetModelAliasHints(a, nil)
+	}
+	if a.Disabled || a.Status == coreauth.StatusDisabled {
+		registry.GetGlobalRegistry().UnregisterClient(a.ID)
+		return
+	}
+	cfg := r.Config()
+	unregisterLegacyModelClient(a)
+	authKind, excluded := r.modelRegistrationAuthSettings(cfg, provider, a)
+	configModels := modelInfosFromAuthMetadata(a, homeConfigModelsMetadataKey)
+	if plugins != nil {
+		result := plugins.ModelsForAuth(context.Background(), homeAuthToPluginAuth(a))
+		if r.tryRegisterPluginModelsForAuth(a, provider, excluded, result) {
+			return
+		}
 	}
 
 	var models []*ModelInfo
@@ -253,7 +302,14 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	case "antigravity":
-		models = registry.GetAntigravityModels()
+		expectedKey := r.antigravityCapabilityKey(a)
+		hints := r.cachedAntigravityHints(a)
+		if hints.ModelIDs != nil {
+			r.applyAntigravityModelHints(context.Background(), a, provider, hints, expectedKey)
+			r.asyncProbeAntigravityCapabilities(context.Background(), a, provider)
+			return
+		}
+		models = applyAntigravityFetchedModelCapabilities(registry.GetAntigravityModels(), hints)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if len(configModels) > 0 {
@@ -317,6 +373,11 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		}
 	case "devin":
 		models = registry.GetDevinModels()
+		for _, model := range models {
+			if model != nil {
+				applyModelNamespace(model, provider, model.ID, model.ID)
+			}
+		}
 	case "meta":
 		models = registry.GetMetaModels()
 		if len(configModels) > 0 {
@@ -333,12 +394,7 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 		if len(configModels) > 0 {
 			providerKey := provider
 			if compatDetected {
-				if compatProviderKey != "" {
-					providerKey = compatProviderKey
-				}
-				if strings.EqualFold(providerKey, "openai-compatibility") && compatDisplayName != "" {
-					providerKey = strings.ToLower(compatDisplayName)
-				}
+				providerKey = compatProviderKey
 			}
 			if providerKey == "" {
 				providerKey = "openai-compatibility"
@@ -352,38 +408,11 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 			compatName := strings.TrimSpace(a.Provider)
 			isCompatAuth := false
 			if compatDetected {
-				if compatProviderKey != "" {
-					providerKey = compatProviderKey
-				}
-				if compatDisplayName != "" {
-					compatName = compatDisplayName
-				}
+				providerKey, compatName = compatProviderKey, compatDisplayName
 				isCompatAuth = true
-			}
-
-			if strings.EqualFold(providerKey, "openai-compatibility") {
+			} else if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
+				providerKey = strings.ToLower(v)
 				isCompatAuth = true
-				if a.Attributes != nil {
-					if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
-						compatName = v
-					}
-					if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
-						providerKey = strings.ToLower(v)
-						isCompatAuth = true
-					}
-				}
-				if providerKey == "openai-compatibility" && compatName != "" {
-					providerKey = strings.ToLower(compatName)
-				}
-			} else if a.Attributes != nil {
-				if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
-					compatName = v
-					isCompatAuth = true
-				}
-				if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
-					providerKey = strings.ToLower(v)
-					isCompatAuth = true
-				}
 			}
 
 			for i := range cfg.OpenAICompatibility {
@@ -451,12 +480,44 @@ func (r *Runtime) registerModelsForAuth(a *coreauth.Auth) {
 	if key == "" {
 		key = strings.ToLower(strings.TrimSpace(a.Provider))
 	}
-	models = r.appendPluginModels(key, models)
-	candidates := append([]*ModelInfo{}, models...)
-	models = applyExcludedModels(models, excluded)
-	models = applyOAuthModelAlias(cfg, provider, authKind, models)
+	if plugins != nil {
+		models = appendDistinctModels(models, pluginModelsToHomeModels(plugins.ModelsForProvider(key)))
+	}
+	models, candidates := applyOAuthModelConfig(cfg, provider, authKind, models, excluded)
 	forcePrefix := cfg != nil && cfg.ForceModelPrefix
 	r.registerResolvedModelsForAuth(a, key, applyModelPrefixes(models, a.Prefix, forcePrefix), candidates)
+	if provider == "antigravity" {
+		r.asyncProbeAntigravityCapabilities(context.Background(), a, key)
+	}
+}
+
+// unregisterLegacyModelClient prevents an older client ID from double counting models.
+func unregisterLegacyModelClient(a *coreauth.Auth) {
+	if idGetter, ok := a.Runtime.(interface{ GetClientID() string }); ok {
+		if id := idGetter.GetClientID(); id != "" && id != a.ID {
+			registry.GetGlobalRegistry().UnregisterClient(id)
+		}
+	}
+}
+
+// modelRegistrationAuthSettings resolves the credential kind and effective exclusions.
+func (r *Runtime) modelRegistrationAuthSettings(cfg *config.Config, provider string, a *coreauth.Auth) (string, []string) {
+	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
+	if authKind == "" {
+		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
+			authKind = "apikey"
+		}
+	}
+	excluded := r.oauthExcludedModels(cfg, provider, authKind)
+	// The "excluded_models" attribute holds only the credential's own exclusions.
+	// When present it takes priority over the global oauth-excluded-models config;
+	// otherwise the current global config applies, so global changes take effect without rewriting credentials.
+	if a.Attributes != nil {
+		if val, ok := a.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
+			excluded = strings.Split(val, ",")
+		}
+	}
+	return authKind, excluded
 }
 
 // oauthExcludedModels handles an oauth excluded models.
@@ -656,9 +717,32 @@ func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey) 
 	return nil
 }
 
-// applyExcludedModels applies an excluded models.
+// applyModelNamespace qualifies a provider catalog entry for public routing while
+// keeping its canonical source and bare metadata key separate.
+func applyModelNamespace(model *ModelInfo, provider, nativeID, routeID string) {
+	if model == nil {
+		return
+	}
+	prefix := provider + "/"
+	model.ID = prefix + routeID
+	model.SourceModelID = prefix + nativeID
+	model.MetadataModelID = nativeID
+}
+
+func setCopilotModelDisplayName(model *ModelInfo, nativeID string) {
+	if model == nil {
+		return
+	}
+	displayName := strings.TrimSpace(model.DisplayName)
+	if displayName == "" {
+		displayName = nativeID
+	}
+	const suffix = " (Copilot)"
+	model.DisplayName = strings.TrimSuffix(displayName, suffix) + suffix
+}
+
+// applyExcludedModels filters models matching any exclusion pattern.
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
-	// Normalize source data before building the derived payload.
 	if len(models) == 0 || len(excluded) == 0 {
 		return models
 	}
@@ -679,9 +763,10 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 			continue
 		}
 		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		sourceID := strings.ToLower(strings.TrimSpace(model.SourceModelID))
 		blocked := false
 		for _, pattern := range patterns {
-			if matchWildcard(pattern, modelID) {
+			if matchWildcard(pattern, modelID) || (sourceID != "" && sourceID != modelID && matchWildcard(pattern, sourceID)) {
 				blocked = true
 				break
 			}
@@ -693,12 +778,24 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	return filtered
 }
 
-// applyModelPrefixes applies a model prefixes.
+// applyModelPrefixes applies credential prefixes to published models.
+// When prefixes are optional, explicit published names take precedence over
+// prefixed copies that would collide with them.
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
-	// Normalize source data before building the derived payload.
 	trimmedPrefix := strings.TrimSpace(prefix)
 	if trimmedPrefix == "" || len(models) == 0 {
 		return models
+	}
+
+	// A published name can already contain the credential prefix. Preserve
+	// that route when an optional prefixed copy would have the same name.
+	explicitNames := make(map[string]struct{})
+	if !forceModelPrefix {
+		for _, model := range models {
+			if model != nil && model.SourceModelID != "" {
+				explicitNames[strings.TrimSpace(model.ID)] = struct{}{}
+			}
+		}
 	}
 
 	out := make([]*ModelInfo, 0, len(models)*2)
@@ -730,8 +827,18 @@ func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix boo
 		if !forceModelPrefix || trimmedPrefix == baseID {
 			addModel(model)
 		}
+		prefixedID := trimmedPrefix + "/" + baseID
+		if _, exists := explicitNames[prefixedID]; exists {
+			continue
+		}
 		clone := *model
-		clone.ID = trimmedPrefix + "/" + baseID
+		clone.ID = prefixedID
+		if clone.MetadataModelID == "" {
+			clone.MetadataModelID = baseID
+		}
+		if clone.Name != "" {
+			clone.Name = rewriteModelInfoName(clone.Name, baseID, clone.ID)
+		}
 		addModel(&clone)
 	}
 	return out
@@ -957,28 +1064,18 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 		return models
 	}
 
-	type aliasEntry struct {
-		alias       string
-		displayName string
-		fork        bool
-	}
-
-	forward := make(map[string][]aliasEntry, len(aliases))
-	for i := range aliases {
-		name := strings.TrimSpace(aliases[i].Name)
-		alias := strings.TrimSpace(aliases[i].Alias)
-		if name == "" || alias == "" {
+	forward := make(map[string][]config.OAuthModelAlias, len(aliases))
+	for _, configured := range aliases {
+		name := strings.TrimSpace(configured.Name)
+		alias := strings.TrimSpace(configured.Alias)
+		if name == "" || alias == "" || strings.EqualFold(name, alias) {
 			continue
 		}
-		if strings.EqualFold(name, alias) {
-			continue
-		}
+		entry := configured
+		entry.Name = name
+		entry.Alias = alias
 		key := strings.ToLower(name)
-		forward[key] = append(forward[key], aliasEntry{
-			alias:       alias,
-			displayName: strings.TrimSpace(aliases[i].DisplayName),
-			fork:        aliases[i].Fork,
-		})
+		forward[key] = append(forward[key], entry)
 	}
 	if len(forward) == 0 {
 		return models
@@ -1007,7 +1104,7 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 
 		keepOriginal := false
 		for _, entry := range entries {
-			if entry.fork {
+			if entry.Fork {
 				keepOriginal = true
 				break
 			}
@@ -1021,10 +1118,7 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 
 		addedAlias := false
 		for _, entry := range entries {
-			mappedID := strings.TrimSpace(entry.alias)
-			if mappedID == "" {
-				continue
-			}
+			mappedID := entry.Alias
 			if strings.EqualFold(mappedID, id) {
 				continue
 			}
@@ -1035,8 +1129,14 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			seen[aliasKey] = struct{}{}
 			clone := *model
 			clone.ID = mappedID
-			if entry.displayName != "" {
-				clone.DisplayName = entry.displayName
+			if clone.SourceModelID != "" && entry.ForceMapping {
+				clone.ResponseModelAlias = mappedID
+			}
+			if clone.MetadataModelID == "" {
+				clone.MetadataModelID = id
+			}
+			if displayName := strings.TrimSpace(entry.DisplayName); displayName != "" {
+				clone.DisplayName = displayName
 			}
 			if clone.Name != "" {
 				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)

@@ -81,11 +81,47 @@ const (
 // registration shape, so credentials, auth identifiers and per-client counts
 // stay out of reach.
 func (h *Handler) ListModels(c *gin.Context) {
+	ctx, cancel := requestContext(c)
+	defer cancel()
+
 	models := availableUserModels()
+	settings, errSettings := h.repo.GetBillingSettings(ctx)
+	if errSettings != nil {
+		respondError(c, http.StatusInternalServerError, "billing_settings_load_failed", errSettings)
+		return
+	}
+
+	if !settings.PublicModelPricing {
+		items := make([]gin.H, 0, len(models))
+		for _, model := range models {
+			items = append(items, userModelResponse(model, nil))
+		}
+		c.JSON(http.StatusOK, gin.H{"models": items, "total": len(items)})
+		return
+	}
+
+	modelIDs := make([]string, 0, len(models))
+	for _, model := range models {
+		modelIDs = append(modelIDs, model.ID)
+	}
+
+	prices, errPrices := h.modelPriceIndex(ctx, modelIDs)
+	if errPrices != nil {
+		respondError(c, http.StatusInternalServerError, "model_price_load_failed", errPrices)
+		return
+	}
+
+	availability, bounds, errAvailability := h.modelAvailabilityIndex(ctx, modelIDs)
+	if errAvailability != nil {
+		respondError(c, http.StatusInternalServerError, "model_availability_load_failed", errAvailability)
+		return
+	}
 
 	items := make([]gin.H, 0, len(models))
 	for _, model := range models {
-		items = append(items, userModelResponse(model, nil))
+		item := userModelResponse(model, prices)
+		item["availability"] = availabilityFor(availability, model.ID, bounds)
+		items = append(items, item)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"models": items, "total": len(items)})

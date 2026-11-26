@@ -126,6 +126,13 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		}
 	}
 	label := provider
+	if provider == "copilot" {
+		delete(metadata, "copilot_catalog")
+		delete(metadata, "supported_endpoints")
+		if username, _ := metadata["username"].(string); username != "" {
+			label = username
+		}
+	}
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email
 	}
@@ -199,6 +206,17 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		if note, isStr := rawNote.(string); isStr {
 			if trimmed := strings.TrimSpace(note); trimmed != "" {
 				a.Attributes["note"] = trimmed
+			}
+		}
+	}
+	// Read using_api from auth file.
+	if rawUsingAPI, ok := metadata["using_api"]; ok {
+		switch v := rawUsingAPI.(type) {
+		case bool:
+			a.Attributes["using_api"] = strconv.FormatBool(v)
+		case string:
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil {
+				a.Attributes["using_api"] = strconv.FormatBool(parsed)
 			}
 		}
 	}

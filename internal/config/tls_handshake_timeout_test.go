@@ -20,8 +20,12 @@ func TestValidateV8ConfigAcceptsRequestsTLSHandshakeTimeout(t *testing.T) {
 	if errDecode := yaml.Unmarshal(source, &cfg); errDecode != nil {
 		t.Fatalf("yaml.Unmarshal() error = %v", errDecode)
 	}
-	if cfg.TLSHandshakeTimeoutSeconds != 12 {
-		t.Fatalf("tls-handshake-timeout-seconds = %d, want 12", cfg.TLSHandshakeTimeoutSeconds)
+	normalizedCfg, errNormalizeCfg := NormalizeConfigRoot(cfg.RawConfig)
+	if errNormalizeCfg != nil {
+		t.Fatalf("NormalizeConfigRoot(cfg) error = %v", errNormalizeCfg)
+	}
+	if normalizedCfg["tls-handshake-timeout-seconds"] != 12 {
+		t.Fatalf("tls-handshake-timeout-seconds = %#v, want 12", normalizedCfg["tls-handshake-timeout-seconds"])
 	}
 	remigrated, _, errMigrate := NormalizeConfigLayout(source, true)
 	if errMigrate != nil {
@@ -34,8 +38,12 @@ func TestValidateV8ConfigAcceptsRequestsTLSHandshakeTimeout(t *testing.T) {
 	if errDecode := yaml.Unmarshal(remigrated, &restored); errDecode != nil {
 		t.Fatalf("yaml.Unmarshal(remigrated) error = %v", errDecode)
 	}
-	if restored.TLSHandshakeTimeoutSeconds != 12 {
-		t.Fatalf("remigrated tls-handshake-timeout-seconds = %d, want 12", restored.TLSHandshakeTimeoutSeconds)
+	normalizedRestored, errNormalizeRestored := NormalizeConfigRoot(restored.RawConfig)
+	if errNormalizeRestored != nil {
+		t.Fatalf("NormalizeConfigRoot(restored) error = %v", errNormalizeRestored)
+	}
+	if normalizedRestored["tls-handshake-timeout-seconds"] != 12 {
+		t.Fatalf("remigrated tls-handshake-timeout-seconds = %#v, want 12", normalizedRestored["tls-handshake-timeout-seconds"])
 	}
 	var root map[string]any
 	if errDecode := yaml.Unmarshal(source, &root); errDecode != nil {
@@ -83,8 +91,12 @@ func TestRequestsTLSHandshakeTimeoutCanonicalPrecedence(t *testing.T) {
 			if errDecode := yaml.Unmarshal([]byte(tt.source), &cfg); errDecode != nil {
 				t.Fatalf("yaml.Unmarshal() error = %v", errDecode)
 			}
-			if cfg.TLSHandshakeTimeoutSeconds != tt.want {
-				t.Fatalf("tls-handshake-timeout-seconds = %d, want %d", cfg.TLSHandshakeTimeoutSeconds, tt.want)
+			normalized, errNormalize := NormalizeConfigRoot(cfg.RawConfig)
+			if errNormalize != nil {
+				t.Fatalf("NormalizeConfigRoot() error = %v", errNormalize)
+			}
+			if normalized["tls-handshake-timeout-seconds"] != tt.want {
+				t.Fatalf("tls-handshake-timeout-seconds = %#v, want %d", normalized["tls-handshake-timeout-seconds"], tt.want)
 			}
 		})
 	}

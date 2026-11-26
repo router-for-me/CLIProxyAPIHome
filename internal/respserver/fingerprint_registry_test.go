@@ -126,7 +126,7 @@ func TestSubscriptionStopsPongWhenSharedLivenessFails(t *testing.T) {
 	server := New("", nil)
 	server.fingerprints = registry
 	server.SetClusterHandler(cluster.NewRESPHandler(coordinator, nil, repo))
-	cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connection))
+	cancel := server.startSubscriptionUpdates(tracked.Context(), tracked, newSafeWriter(connection), newSubscriptionLiveness(0))
 	defer cancel()
 	time.Sleep(subscriptionHeartbeatInterval + 50*time.Millisecond)
 	if output := connection.Output(); strings.Contains(output, "pong") {

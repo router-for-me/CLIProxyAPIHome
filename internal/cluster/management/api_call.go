@@ -78,7 +78,8 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
-	if apiCallHeadersNeedToken(reqHeaders) {
+	requiresToken := apiCallHeadersNeedToken(reqHeaders) || strings.Contains(body.Data, "$TOKEN$")
+	if requiresToken {
 		if authIndex == "" || auth == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "auth not found"})
 			return
@@ -95,6 +96,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		for key, value := range reqHeaders {
 			reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
 		}
+		body.Data = apiCallBodyWithToken(body.Data, token)
 	}
 
 	var requestBody io.Reader
@@ -123,6 +125,9 @@ func (h *Handler) APICall(c *gin.Context) {
 	httpClient := &http.Client{
 		Timeout:   defaultAPICallTimeout,
 		Transport: h.apiCallTransport(auth),
+	}
+	if requiresToken {
+		httpClient.CheckRedirect = proxyutil.SameOriginRedirectPolicy(nil)
 	}
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
@@ -289,6 +294,19 @@ func apiCallHeadersNeedToken(headers map[string]string) bool {
 		}
 	}
 	return false
+}
+
+func apiCallBodyWithToken(data, token string) string {
+	if !strings.Contains(data, "$TOKEN$") {
+		return data
+	}
+	replacement := token
+	if json.Valid([]byte(data)) {
+		if encoded, errMarshal := json.Marshal(token); errMarshal == nil && len(encoded) >= 2 {
+			replacement = string(encoded[1 : len(encoded)-1])
+		}
+	}
+	return strings.ReplaceAll(data, "$TOKEN$", replacement)
 }
 
 // apiCallFirstNonEmptyString handles an api call first non empty string.

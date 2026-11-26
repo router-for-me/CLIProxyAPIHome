@@ -1,12 +1,12 @@
 package management
 
 import (
+	"iter"
 	"net/http"
 	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -54,6 +54,9 @@ func (h *Handler) getCredentialModels(c *gin.Context, includeCandidates bool) {
 		authID = name
 	}
 
+	if includeCandidates {
+		h.runtime.PruneCopilotModels()
+	}
 	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
 	response := gin.H{"models": credentialModelEntries(models)}
 	if includeCandidates {
@@ -92,7 +95,7 @@ func (h *Handler) GetModels(c *gin.Context) {
 	h.getModels(c, false)
 }
 
-// GetModelsV8 includes the execution identities used by billing for public aliases.
+// GetModelsV8 includes billing identities for available routes and namespaced static models.
 func (h *Handler) GetModelsV8(c *gin.Context) {
 	h.getModels(c, true)
 }
@@ -106,6 +109,7 @@ func (h *Handler) getModels(c *gin.Context, includeBillingModels bool) {
 	switch scope {
 	case "available", "active", "current":
 		if includeBillingModels {
+			h.runtime.PruneCopilotModels()
 			c.JSON(http.StatusOK, gin.H{"scope": "available", "models": h.availableBillingModelDefinitions()})
 			return
 		}
@@ -116,9 +120,14 @@ func (h *Handler) getModels(c *gin.Context, includeBillingModels bool) {
 	case "static", "all-static", "definitions":
 		channel := strings.TrimSpace(firstNonEmptyQuery(c, "channel", "provider"))
 		if channel == "" {
+			groups := registry.GetAllStaticModelDefinitions()
+			models := make(gin.H, len(groups))
+			for name, definitions := range groups {
+				models[name] = staticModelResponse(name, definitions, includeBillingModels)
+			}
 			c.JSON(http.StatusOK, gin.H{
 				"scope":  "static",
-				"models": registry.GetAllStaticModelDefinitions(),
+				"models": models,
 			})
 			return
 		}
@@ -127,10 +136,11 @@ func (h *Handler) getModels(c *gin.Context, includeBillingModels bool) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown channel", "channel": channel})
 			return
 		}
+		channel = strings.ToLower(channel)
 		c.JSON(http.StatusOK, gin.H{
 			"scope":   "static",
-			"channel": strings.ToLower(strings.TrimSpace(channel)),
-			"models":  models,
+			"channel": channel,
+			"models":  staticModelResponse(channel, models, includeBillingModels),
 		})
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope", "scope": scope})
@@ -148,16 +158,33 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 		return
 	}
 
-	models := registry.GetStaticModelDefinitionsByChannel(channel)
+	normalizedChannel := strings.ToLower(channel)
+	models := registry.GetStaticModelDefinitionsByChannel(normalizedChannel)
 	if models == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown channel", "channel": channel})
 		return
 	}
+	for _, model := range models {
+		if model != nil {
+			model.ID = catalogRouteModelID(normalizedChannel, model.ID)
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"channel": strings.ToLower(strings.TrimSpace(channel)),
+		"channel": normalizedChannel,
 		"models":  models,
 	})
+}
+
+func catalogRouteModelID(channel, id string) string {
+	if channel != "copilot" && channel != "devin" {
+		return id
+	}
+	id = strings.TrimSpace(id)
+	if id == "" || strings.HasPrefix(id, channel+"/") {
+		return id
+	}
+	return channel + "/" + id
 }
 
 // Billing identities are resolved per credential, because one public alias may
@@ -172,14 +199,40 @@ type billingModelDefinition struct {
 	BillingModels []billingModelTarget `json:"billing_models"`
 }
 
-func (h *Handler) availableBillingModelDefinitions() []billingModelDefinition {
-	modelRegistry := registry.GetGlobalRegistry()
-	models := modelRegistry.GetAvailableModelDefinitions()
-	targets := make(map[string]map[billingModelTarget]struct{}, len(models))
-	for _, model := range models {
-		targets[model.ID] = make(map[billingModelTarget]struct{})
+func staticModelResponse(channel string, models []*registry.ModelInfo, includeBillingModels bool) any {
+	if !includeBillingModels || (channel != "copilot" && channel != "devin") || len(models) == 0 {
+		return models
 	}
-	if h != nil && h.runtime != nil && h.runtime.CoreManager() != nil {
+	definitions := make([]billingModelDefinition, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		id := catalogRouteModelID(channel, model.ID)
+		definitions = append(definitions, billingModelDefinition{
+			ModelInfo:     model,
+			BillingModels: []billingModelTarget{{Provider: channel, Model: id}},
+		})
+	}
+	return definitions
+}
+
+type billingModelRoute struct {
+	ID              string
+	Target          billingModelTarget
+	PublishedSource bool
+}
+
+func (h *Handler) availableBillingRoutes(models []*registry.ModelInfo) iter.Seq[billingModelRoute] {
+	return func(yield func(billingModelRoute) bool) {
+		if h == nil || h.runtime == nil || h.runtime.CoreManager() == nil || len(models) == 0 {
+			return
+		}
+		available := make(map[string]struct{}, len(models))
+		for _, model := range models {
+			available[model.ID] = struct{}{}
+		}
+		modelRegistry := registry.GetGlobalRegistry()
 		manager := h.runtime.CoreManager()
 		for _, auth := range manager.List() {
 			if auth == nil || auth.Disabled {
@@ -190,16 +243,33 @@ func (h *Handler) availableBillingModelDefinitions() []billingModelDefinition {
 				continue
 			}
 			for _, route := range routes {
-				set, exists := targets[route]
-				if !exists {
+				if _, ok := available[route]; !ok {
 					continue
 				}
-				model := coreauth.CanonicalModelID(manager.ResolveExecutionModel(auth, route))
-				if model != "" {
-					set[billingModelTarget{Provider: provider, Model: model}] = struct{}{}
+				model, publishedSource := manager.ResolveBillingModel(auth, route)
+				if model == "" {
+					continue
+				}
+				if !yield(billingModelRoute{
+					ID:              route,
+					Target:          billingModelTarget{Provider: provider, Model: model},
+					PublishedSource: publishedSource,
+				}) {
+					return
 				}
 			}
 		}
+	}
+}
+
+func (h *Handler) availableBillingModelDefinitions() []billingModelDefinition {
+	models := registry.GetGlobalRegistry().GetAvailableModelDefinitions()
+	targets := make(map[string]map[billingModelTarget]struct{}, len(models))
+	for route := range h.availableBillingRoutes(models) {
+		if targets[route.ID] == nil {
+			targets[route.ID] = make(map[billingModelTarget]struct{})
+		}
+		targets[route.ID][route.Target] = struct{}{}
 	}
 	out := make([]billingModelDefinition, 0, len(models))
 	for _, model := range models {

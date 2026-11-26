@@ -40,10 +40,27 @@ func TestPublicModelCatalogWithholdsPriceAndAvailability(t *testing.T) {
 	}
 	for _, model := range payload.Models {
 		if model.Pricing != nil {
-			t.Errorf("model %s exposes pricing to an anonymous visitor", model.ID)
+			t.Errorf("model %s exposes pricing to an anonymous visitor when public_model_pricing is false", model.ID)
 		}
 		if model.Availability != nil {
-			t.Errorf("model %s exposes availability to an anonymous visitor", model.ID)
+			t.Errorf("model %s exposes availability to an anonymous visitor when public_model_pricing is false", model.ID)
+		}
+	}
+
+	publicPricing := true
+	if _, errPatch := handler.repo.UpdateBillingSettings(context.Background(), cluster.BillingSettingsPatch{
+		PublicModelPricing: &publicPricing,
+	}); errPatch != nil {
+		t.Fatalf("UpdateBillingSettings(public_model_pricing=true) error = %v", errPatch)
+	}
+
+	publicPayload := getUserModels(t, handler.ListModels, "/models", "")
+	for _, model := range publicPayload.Models {
+		if model.Pricing == nil {
+			t.Errorf("model %s missing public pricing when public_model_pricing is true", model.ID)
+		}
+		if model.Availability == nil {
+			t.Errorf("model %s missing public availability when public_model_pricing is true", model.ID)
 		}
 	}
 }
@@ -272,6 +289,38 @@ func TestAccessibleModelsReturnPriceLadderWithoutOperatorBookkeeping(t *testing.
 	if foreign.Pricing == nil || foreign.Pricing.Status != pricingStatusUnpublished {
 		t.Errorf("foreign-provider pricing = %+v, want unpublished", foreign.Pricing)
 	}
+
+	// Wildcard rules (provider="*" and trailing model pattern "mystery-*") must
+	// publish pricing for servable models using the same specificity as billing.
+	ctx := context.Background()
+	if _, errWildProv := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
+		Provider:              "*",
+		Model:                 "text-only-model",
+		ServiceTier:           "*",
+		InputPricePerMillion:  1.25,
+		OutputPricePerMillion: 5.0,
+		Enabled:               true,
+	}); errWildProv != nil {
+		t.Fatalf("CreateBillingModelPrice(provider=*) error = %v", errWildProv)
+	}
+	if _, errWildModel := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
+		Provider:              "openai",
+		Model:                 "mystery-*",
+		ServiceTier:           "*",
+		InputPricePerMillion:  0.75,
+		OutputPricePerMillion: 3.0,
+		Enabled:               true,
+	}); errWildModel != nil {
+		t.Fatalf("CreateBillingModelPrice(model=mystery-*) error = %v", errWildModel)
+	}
+	wildcardPayload := getUserModels(t, handler.ListAccessibleModels, "/models/accessible", createUserBillingBearerToken(t, handler, user.ID))
+	wildcardModels := indexUserModelsByID(wildcardPayload.Models)
+	if got := wildcardModels["text-only-model"].Pricing; got == nil || got.Status != pricingStatusPublished || len(got.Providers) != 1 || got.Providers[0].Provider != "openai" || got.Providers[0].Tiers[0].Rungs[0].InputPricePerMillion != 1.25 {
+		t.Fatalf("provider=* catalog pricing = %+v, want published openai @ 1.25", got)
+	}
+	if got := wildcardModels["mystery-model"].Pricing; got == nil || got.Status != pricingStatusPublished || len(got.Providers) != 1 || got.Providers[0].Provider != "openai" || got.Providers[0].Tiers[0].Rungs[0].InputPricePerMillion != 0.75 {
+		t.Fatalf("model=mystery-* catalog pricing = %+v, want published openai @ 0.75", got)
+	}
 }
 
 func TestAccessibleModelsReportInsufficientAvailabilityData(t *testing.T) {
@@ -283,7 +332,11 @@ func TestAccessibleModelsReportInsufficientAvailabilityData(t *testing.T) {
 	user := createUserModelTestUser(t, handler, "availability-user")
 	createUserModelAPIKey(t, handler, user.ID, "availability-client-key", nil)
 	// Twelve observations, two of them failures: enough to publish a rate.
-	seedUserModelUsage(t, handler, "gpt-4.1-mini", "availability-client-key", 10, 2)
+	seedUserModelUsage(t, handler, "gpt-4.1-mini", "availability-client-key", 9, 2)
+	if _, errAppend := handler.repo.AppendUsage(context.Background(),
+		fmt.Sprintf(`{"timestamp":%q,"provider":"antigravity","model":"gpt-4.1-mini","request_id":"req-split-output","latency_ms":13790,"tokens":{"input_tokens":296790,"output_tokens":78,"reasoning_tokens":1460,"total_tokens":298328}}`, time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)), "192.0.2.10"); errAppend != nil {
+		t.Fatalf("AppendUsage(split output) error = %v", errAppend)
+	}
 	// Three observations: a sample, but not a measurement.
 	seedUserModelUsage(t, handler, "text-only-model", "availability-client-key", 3, 0)
 
@@ -309,8 +362,12 @@ func TestAccessibleModelsReportInsufficientAvailabilityData(t *testing.T) {
 	if observed.AvgTTFTMS == nil || *observed.AvgTTFTMS <= 0 {
 		t.Errorf("observed avg_ttft_ms = %v, want a positive mean", observed.AvgTTFTMS)
 	}
-	if observed.OutputTokensPerSecond == nil || *observed.OutputTokensPerSecond <= 0 {
-		t.Errorf("observed output_tokens_per_second = %v, want a positive rate", observed.OutputTokensPerSecond)
+	// The split-output sample contributes all 1538 output tokens, not just its 78 non-reasoning tokens.
+	const wantTPS = 187.81 // (9*500 + 1538) / (18.36 + 13.79)
+	if observed.OutputTokensPerSecond == nil {
+		t.Error("observed output_tokens_per_second missing")
+	} else if got := *observed.OutputTokensPerSecond; got != wantTPS {
+		t.Errorf("observed output_tokens_per_second = %v, want %v", got, wantTPS)
 	}
 	if observed.Window.Hours != int(modelAvailabilityWindow/time.Hour) {
 		t.Errorf("observed window hours = %d, want %d", observed.Window.Hours, int(modelAvailabilityWindow/time.Hour))

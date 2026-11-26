@@ -21,10 +21,13 @@ import (
 )
 
 type Repository struct {
-	db                 *gorm.DB
-	cpaSnapshotMu      sync.Mutex
-	sessionRootCacheMu sync.RWMutex
-	sessionRootCache   map[string]string
+	db                       *gorm.DB
+	cpaSnapshotMu            sync.Mutex
+	sessionRootCacheMu       sync.RWMutex
+	sessionRootCache         map[string]string
+	usagePluginPending       sync.Map
+	usagePluginAdmissionOnce sync.Once
+	usagePluginAdmission     chan struct{}
 }
 
 type UpsertResult string
@@ -152,6 +155,7 @@ func RecordToAuth(record *AuthRecord) (*coreauth.Auth, error) {
 	}
 	auth.Index = record.Index
 	auth.StateVersion = record.Version
+	auth.CredentialIdentityVersion = quotaCredentialIdentityVersion(*record)
 
 	return auth, nil
 }
@@ -224,10 +228,24 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 				if errCurrent != nil {
 					return errCurrent
 				}
+				next := auth.Clone()
 				if !existing.DeletedAt.Valid {
 					currentConfig, nextConfig := make(map[string]any), make(map[string]any)
-					ApplyCredentialConfigToRoot(currentConfig, []*coreauth.Auth{current})
-					ApplyCredentialConfigToRoot(nextConfig, []*coreauth.Auth{auth})
+					if _, errApplyCurrent := ApplyCredentialConfigToRoot(currentConfig, []*coreauth.Auth{current}); errApplyCurrent != nil {
+						return errApplyCurrent
+					}
+					if _, errApplyNext := ApplyCredentialConfigToRoot(nextConfig, []*coreauth.Auth{auth}); errApplyNext != nil {
+						return errApplyNext
+					}
+					// Compare the actual configuration trees, not lossy Go/JSON projections.
+					currentConfig, errCurrentTree := appconfig.NormalizeConfigRoot(currentConfig)
+					if errCurrentTree != nil {
+						return errCurrentTree
+					}
+					nextConfig, errNextTree := appconfig.NormalizeConfigRoot(nextConfig)
+					if errNextTree != nil {
+						return errNextTree
+					}
 					currentJSON, errCurrentJSON := json.Marshal(currentConfig)
 					if errCurrentJSON != nil {
 						return errCurrentJSON
@@ -240,14 +258,20 @@ func (r *Repository) upsertAuthWithResult(ctx context.Context, auth *coreauth.Au
 					if errCompare != nil {
 						return errCompare
 					}
-					// Re-synthesis changes timestamps and omits runtime state. An unchanged
-					// provider credential must keep its entire persisted row and version.
+					// A scope-only edit retains live cooldowns and timestamps. The normal
+					// JSON comparison below also preserves the revision on a true no-op.
 					if len(currentConfig) > 0 && sameConfig {
-						out = &existing
-						return nil
+						next = current
+						if scope := auth.Metadata[appconfig.HomeCredentialGroupMetadataKey]; scope != nil {
+							if next.Metadata == nil {
+								next.Metadata = make(map[string]any)
+							}
+							next.Metadata[appconfig.HomeCredentialGroupMetadataKey] = scope
+						} else {
+							delete(next.Metadata, appconfig.HomeCredentialGroupMetadataKey)
+						}
 					}
 				}
-				next := auth.Clone()
 				next.Disabled = current.Disabled
 				next.Status = current.Status
 				next.StatusMessage = current.StatusMessage
@@ -379,6 +403,22 @@ func (r *Repository) WithAuthRefreshLock(ctx context.Context, uuid string, fn fu
 // backoff escalation atomic across the cluster. The returned auth and record
 // reflect the post-transaction row state.
 func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mutate func(auth *coreauth.Auth) bool) (*coreauth.Auth, *AuthRecord, bool, error) {
+	if mutate == nil {
+		return nil, nil, false, fmt.Errorf("cluster auth mutate callback is nil")
+	}
+	// Existing callers always publish changed credentials, including explicit
+	// revision fences for resets and refresh operations.
+	return r.mutateAuthState(ctx, uuid, op, func(auth *coreauth.Auth) coreauth.StateMutation {
+		if mutate(auth) {
+			return coreauth.StateMutationChanged
+		}
+		return coreauth.StateMutationUnchanged
+	})
+}
+
+// mutateAuthState persists observation fences without issuing a reload event.
+// Both kinds of writes advance the revision under the same auth row lock.
+func (r *Repository) mutateAuthState(ctx context.Context, uuid string, op string, mutate func(auth *coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, *AuthRecord, bool, error) {
 	// Keep validation before state changes so failures leave existing data intact.
 	db, errDB := r.database()
 	if errDB != nil {
@@ -413,7 +453,14 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		auth.ID = uuid
 		auth.Index = uuid
 
-		changed = mutate(auth)
+		mutation := mutate(auth)
+		switch mutation {
+		case coreauth.StateMutationUnchanged:
+		case coreauth.StateMutationChanged, coreauth.StateMutationObservation:
+			changed = true
+		default:
+			return fmt.Errorf("invalid auth state mutation: %d", mutation)
+		}
 		if !changed {
 			outAuth = auth
 			outRecord = existing
@@ -445,6 +492,9 @@ func (r *Repository) MutateAuth(ctx context.Context, uuid string, op string, mut
 		}
 		outAuth = auth
 		outRecord = record
+		if mutation == coreauth.StateMutationObservation {
+			return nil
+		}
 		return appendEvent(txDB, "auth", op, uuid, record.Version)
 	})
 	if errTransaction != nil {
@@ -496,6 +546,7 @@ func (r *Repository) ListAuthIndex(ctx context.Context) ([]AuthIndex, error) {
 			Quota:          auth.Quota,
 			ModelStates:    auth.ModelStates,
 			BaseURL:        record.BaseURL,
+			ProxyURL:       strings.TrimSpace(auth.ProxyURL),
 			ModelsHash:     record.ModelsHash,
 			Attributes:     auth.Attributes,
 			ModelMetadata:  modelMetadataFromAuth(auth),
@@ -1203,6 +1254,7 @@ func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfig(ctx context.Contex
 }
 
 func (r *Repository) replaceConfigSnapshotWithLockedActivationGateTx(ctx context.Context, tx *gorm.DB, nodeHeartbeatTimeout time.Duration, gate *ConcurrencyActivationGateRecord, values map[string]any) error {
+	submitted := values
 	values, errNormalize := appconfig.NormalizeConfigRoot(values)
 	if errNormalize != nil {
 		return errNormalize
@@ -1224,7 +1276,7 @@ func (r *Repository) replaceConfigSnapshotWithLockedActivationGateTx(ctx context
 	} else if _, errEnsure := ensureLifecycleConfigTx(tx, nodeHeartbeatTimeout); errEnsure != nil {
 		return errEnsure
 	}
-	if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values); errReconcile != nil {
+	if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values, submitted); errReconcile != nil {
 		return mapCredentialConcurrencyOrphan(errReconcile)
 	}
 	if errImportPolicies := r.importCredentialConcurrencyPoliciesWithLockedActivationGateTx(ctx, tx, gate, values); errImportPolicies != nil {

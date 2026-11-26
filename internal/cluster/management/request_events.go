@@ -183,6 +183,7 @@ func requestEventResponse(record *cluster.UsageObservabilityRecord) gin.H {
 		"original_model":       record.OriginalModel,
 		"model_alias":          requestEventModelAlias(record),
 		"endpoint":             record.Endpoint,
+		"stream":               record.Stream,
 		"source":               emptyStringAsNil(record.Source),
 		"executor_type":        record.ExecutorType,
 		"service_tier":         emptyStringAsNil(record.ServiceTier),
@@ -193,6 +194,7 @@ func requestEventResponse(record *cluster.UsageObservabilityRecord) gin.H {
 		"error":                requestEventErrorResponse(record),
 		"tokens":               requestEventTokensResponse(record),
 		"token_breakdown":      usageTokenBreakdownResponse(record.Tokens.TokenBreakdown),
+		"tool_usage":           requestEventToolUsageResponse(record.ToolUsage),
 		"performance":          requestEventPerformanceResponse(record),
 		"billing":              requestEventBillingResponse(record),
 		"related":              requestEventRelatedResponse(record),
@@ -293,6 +295,7 @@ func requestEventClientResponse(record *cluster.UsageObservabilityRecord) gin.H 
 		"client_key_label":  record.Client.APIKeyLabel,
 		"client_key_masked": record.Client.APIKeyMasked,
 		"client_ip":         emptyStringAsNil(record.Client.ClientIP),
+		"user_agent":        emptyStringAsNil(record.Client.UserAgent),
 	}
 }
 
@@ -334,6 +337,26 @@ func requestEventTokensResponse(record *cluster.UsageObservabilityRecord) gin.H 
 	}
 }
 
+func requestEventToolUsageResponse(usage *cluster.UsageObservabilityToolUsage) any {
+	if usage == nil {
+		return nil
+	}
+	return gin.H{
+		"web_search_calls":           usage.WebSearchCalls,
+		"web_search_queries":         usage.WebSearchQueries,
+		"web_fetch_calls":            usage.WebFetchCalls,
+		"x_search_calls":             usage.XSearchCalls,
+		"code_execution_calls":       usage.CodeExecutionCalls,
+		"file_search_calls":          usage.FileSearchCalls,
+		"document_search_calls":      usage.DocumentSearchCalls,
+		"mcp_calls":                  usage.MCPCalls,
+		"google_maps_chunks":         usage.GoogleMapsChunks,
+		"num_sources_used":           usage.NumSourcesUsed,
+		"num_server_side_tools_used": usage.NumServerSideToolsUsed,
+		"image_generation_calls":     usage.ImageGenerationCalls,
+	}
+}
+
 func requestEventPerformanceResponse(record *cluster.UsageObservabilityRecord) gin.H {
 	return gin.H{
 		"latency_ms": record.Performance.LatencyMS,
@@ -343,11 +366,18 @@ func requestEventPerformanceResponse(record *cluster.UsageObservabilityRecord) g
 }
 
 func requestEventBillingResponse(record *cluster.UsageObservabilityRecord) gin.H {
+	var costBreakdown any
+	if len(record.Billing.CostBreakdown) > 0 {
+		costBreakdown = record.Billing.CostBreakdown
+	}
 	return gin.H{
 		"amount":             optionalFloat64Value(record.Billing.Amount),
+		"base_amount":        optionalFloat64Value(record.Billing.BaseAmount),
+		"billing_multiplier": optionalFloat64Value(record.Billing.BillingMultiplier),
 		"currency":           emptyStringAsNil(record.Billing.Currency),
 		"charge_id":          emptyStringAsNil(record.Billing.ChargeID),
 		"matched_price_rule": emptyStringAsNil(record.Billing.MatchedPriceRule),
+		"cost_breakdown":     costBreakdown,
 	}
 }
 
@@ -418,7 +448,7 @@ func requestEventFlattenedValue(item gin.H, key string) any {
 			credentialKey = key
 		}
 		return nestedMapValue(item, "credential", credentialKey)
-	case "user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip":
+	case "user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip", "user_agent":
 		return nestedMapValue(item, "client", key)
 	case "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens":
 		return nestedMapValue(item, "tokens", key)
@@ -467,7 +497,7 @@ func requestEventExportCSVHeader() []string {
 		"provider", "model", "original_model", "model_alias", "endpoint", "source", "executor_type", "service_tier", "reasoning_effort",
 		"home_ip", "home_port", "home_id", "cpa_node_id", "cpa_ip", "cpa_port", "cpa_label",
 		"credential_type", "credential_id", "auth_index", "credential_provider", "credential_label", "credential_source", "credential_api_key_preview",
-		"user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip",
+		"user_id", "username", "client_key_id", "client_key_label", "client_key_masked", "client_ip", "user_agent",
 		"input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens",
 		"latency_ms", "ttft_ms", "tps", "amount", "currency", "charge_id", "matched_price_rule",
 		"error_status_code", "error_upstream_status_code", "error_reason", "error_message", "error_body_preview",

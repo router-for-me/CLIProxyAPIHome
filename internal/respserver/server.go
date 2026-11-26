@@ -176,7 +176,7 @@ func (s *Server) syncClusterClientCount(ctx context.Context) {
 	}
 }
 
-func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedConnection, writer *safeWriter) context.CancelFunc {
+func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedConnection, writer *safeWriter, liveness *subscriptionLiveness) context.CancelFunc {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -195,7 +195,13 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedC
 				return
 			case <-heartbeatTicker.C:
 				lifetime := tracked.Lifetime()
-				if errLiveness := s.refreshSubscriptionLiveness(runCtx, lifetime); errLiveness != nil {
+				if errLiveness := s.refreshSubscriptionLiveness(runCtx, lifetime, liveness); errLiveness != nil {
+					if cluster.IsLifecycleTimeout(errLiveness) {
+						// Tolerate transient waits only until the independent persistence deadline.
+						// Ordinary messages and telemetry never renew that deadline.
+						log.Warnf("subscription liveness refresh timed out; skipping heartbeat: %v", errLiveness)
+						continue
+					}
 					log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
 					if s.fingerprints != nil {
 						if errFence := s.fingerprints.Fence(context.WithoutCancel(runCtx), lifetime, s.fingerprints.LatestFenceRevision(lifetime)); errFence != nil {
@@ -244,11 +250,20 @@ func (s *Server) startSubscriptionUpdates(ctx context.Context, tracked *TrackedC
 	return cancel
 }
 
-func (s *Server) refreshSubscriptionLiveness(ctx context.Context, lifetime cluster.ConnectionLifetime) error {
+func (s *Server) refreshSubscriptionLiveness(ctx context.Context, lifetime cluster.ConnectionLifetime, liveness *subscriptionLiveness) error {
 	if s == nil || s.cluster == nil {
 		return fmt.Errorf("cluster lifecycle unavailable")
 	}
-	return s.cluster.RefreshCPALiveness(ctx, lifetime)
+	deadline := liveness.currentDeadline()
+	if !time.Now().Before(deadline) {
+		return errSubscriptionHeartbeatExpired
+	}
+	refreshCtx, cancelRefresh := context.WithDeadline(ctx, deadline)
+	defer cancelRefresh()
+	if errRefresh := s.cluster.RefreshCPALiveness(refreshCtx, lifetime); errRefresh != nil {
+		return errRefresh
+	}
+	return liveness.persisted()
 }
 
 func buildOrWriteDispatchReply(writer *safeWriter, reply dispatch.Reply) error {
@@ -417,6 +432,7 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 	addedNode := false
 	var unsubscribeConfig func()
 	var cancelSubscriptionUpdates context.CancelFunc
+	var liveness *subscriptionLiveness
 	var pendingConfigSubscriptionReady chan struct{}
 	var pendingConfigSubscriptionAborted chan struct{}
 	defer func() {
@@ -478,6 +494,13 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			if unsubscribeConfig != nil {
 				return 1, nil
 			}
+			if liveness == nil {
+				var errWatch error
+				liveness, errWatch = s.fingerprints.watchSubscriptionLiveness(tracked.Lifetime())
+				if errWatch != nil {
+					return 0, errWatch
+				}
+			}
 			if !addedNode {
 				if clientCertificateFingerprint != "" {
 					node.GlobalRegistry().UpdateFingerprintSubscription(clientCertificateFingerprint, clientNodeID, clientIP, 1)
@@ -522,7 +545,16 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 	}
 	if s.cluster != nil && clientCertificateFingerprint != "" {
 		connEnv.SubscribeMembership = func(subscriptionCtx context.Context, protocolVersion int, lifecycleConfigRevision int64, takeover bool, instanceID string) (cluster.ConnectionLifetime, error) {
-			return s.cluster.SubscribeMembership(subscriptionCtx, clientCertificateFingerprint, clientNodeID, protocolVersion, lifecycleConfigRevision, takeover, instanceID)
+			lifetime, errSubscribe := s.cluster.SubscribeMembership(subscriptionCtx, clientCertificateFingerprint, clientNodeID, protocolVersion, lifecycleConfigRevision, takeover, instanceID)
+			if errSubscribe != nil {
+				return cluster.ConnectionLifetime{}, errSubscribe
+			}
+			var errWatch error
+			liveness, errWatch = s.fingerprints.watchSubscriptionLiveness(lifetime)
+			if errWatch != nil {
+				return cluster.ConnectionLifetime{}, errWatch
+			}
+			return lifetime, nil
 		}
 	}
 
@@ -629,7 +661,12 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 				latencyPing := len(args) == 2 && strings.HasPrefix(args[1], "home-rtt/")
 				if unsubscribeConfig != nil && !latencyPing {
 					lifetime := tracked.Lifetime()
-					if errLiveness := s.refreshSubscriptionLiveness(connectionCtx, lifetime); errLiveness != nil {
+					if errLiveness := s.refreshSubscriptionLiveness(connectionCtx, lifetime, liveness); errLiveness != nil {
+						if cluster.IsLifecycleTimeout(errLiveness) {
+							// The independent watchdog still fences at the last persisted heartbeat's deadline.
+							log.Warnf("subscription liveness refresh timed out; skipping PING reply: %v", errLiveness)
+							return
+						}
 						log.Warnf("failed to refresh subscription liveness: %v", errLiveness)
 						livenessFailure = &lifetime
 						closeConnection = true
@@ -728,7 +765,7 @@ func (s *Server) HandleConn(ctx context.Context, conn net.Conn) {
 			close(pendingConfigSubscriptionReady)
 			pendingConfigSubscriptionReady = nil
 			pendingConfigSubscriptionAborted = nil
-			cancelSubscriptionUpdates = s.startSubscriptionUpdates(connectionCtx, tracked, writer)
+			cancelSubscriptionUpdates = s.startSubscriptionUpdates(connectionCtx, tracked, writer, liveness)
 		}
 	}
 }

@@ -142,6 +142,9 @@ func TestRESPHandlerKeepsMembershipInstanceIDRuntimeOnly(t *testing.T) {
 	if errSubscribe != nil {
 		t.Fatal(errSubscribe)
 	}
+	if lifetime.HeartbeatTimeout != config.DefaultCredentialConcurrencyConfig().CPAHeartbeatTimeout {
+		t.Fatalf("subscription heartbeat timeout = %v", lifetime.HeartbeatTimeout)
+	}
 	if lifetime.InstanceID != testMembershipInstanceID {
 		t.Fatalf("runtime instance ID = %q, want %q", lifetime.InstanceID, testMembershipInstanceID)
 	}

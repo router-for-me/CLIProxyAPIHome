@@ -9,13 +9,13 @@ func TestGetDevinAndMetaModels(t *testing.T) {
 	}
 	foundSwe2 := false
 	for _, model := range devinModels {
-		if model != nil && model.ID == "devin/swe-2" {
+		if model != nil && model.ID == "swe-2" {
 			foundSwe2 = true
 			break
 		}
 	}
 	if !foundSwe2 {
-		t.Fatal("expected devin/swe-2 in GetDevinModels()")
+		t.Fatal("expected swe-2 in GetDevinModels()")
 	}
 
 	metaModels := GetMetaModels()
