@@ -9,6 +9,10 @@ import (
 // complete credentials in any full-record persistence path.
 var ErrRuntimeProjectionPersist = errors.New("auth: cannot persist an incomplete runtime projection")
 
+// ErrAuthNotFound reports an authoritative credential lookup or mutation whose
+// target no longer exists. It is distinct from an unloaded local credential.
+var ErrAuthNotFound = errors.New("auth: credential not found")
+
 // Store abstracts persistence of Auth state across restarts.
 type Store interface {
 	// List returns all auth records stored in the backend.
@@ -25,13 +29,21 @@ type StateVersionSaver interface {
 	SaveWithStateVersion(ctx context.Context, auth *Auth) (id string, stateVersion int64, err error)
 }
 
-// StateMutator is an optional Store capability. Implementations load the
-// authoritative persisted copy of the auth (typically under a database row
-// lock), apply mutate to it, and persist the result atomically when mutate
-// reports a change. The returned auth reflects the post-mutation persisted
-// state whether or not anything changed. Backends that implement this
-// interface let availability transitions such as quota backoff escalation
-// stay atomic across multiple Home nodes sharing one database.
+// StateMutation distinguishes shared state changes from observation-only writes.
+type StateMutation uint8
+
+const (
+	StateMutationUnchanged StateMutation = iota
+	// StateMutationChanged persists the auth and notifies peers to reload it.
+	StateMutationChanged
+	// StateMutationObservation persists a replay fence without notifying peers.
+	// The storage revision must still advance to reject older snapshot saves.
+	StateMutationObservation
+)
+
+// StateMutator applies mutate to the authoritative auth under a row lock.
+// Changed and observation-only mutations are persisted atomically; only changed
+// mutations publish an auth event. The returned auth includes the storage revision.
 type StateMutator interface {
-	MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error)
+	MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) StateMutation) (*Auth, error)
 }

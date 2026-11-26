@@ -6,6 +6,7 @@ type DispatchDecision struct {
 	Provider      string
 	UpstreamModel string
 	RequestRetry  int
+	SelectionID   string
 	PooledModels  bool
 	ForceMapping  bool
 	OriginalAlias string

@@ -45,8 +45,13 @@ func (r *Repository) BeginFingerprintCancellation(ctx context.Context, fingerpri
 		return 0, fmt.Errorf("CPA certificate fingerprint is required")
 	}
 
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
 	var revision int64
-	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		var errBegin error
 		revision, errBegin = beginFingerprintCancellationTx(ctx, tx, fingerprint, time.Time{})
 		return errBegin
@@ -66,8 +71,13 @@ func (r *Repository) BeginFingerprintCancellationForLifetime(ctx context.Context
 		return 0, ErrMembershipNotActive
 	}
 
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
 	var revision int64
-	errTransaction := db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		membership := CPANodeMembershipRecord{}
 		errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", lifetime.Fingerprint).First(&membership).Error
 		if errors.Is(errLock, gorm.ErrRecordNotFound) {
@@ -149,23 +159,32 @@ func (r *Repository) CleanupStaleMemberships(ctx context.Context) error {
 	if errDB != nil {
 		return errDB
 	}
-	now, errNow := DatabaseNow(ctx, db)
+	ctx = contextOrBackground(ctx)
+	scanCtx, cancelScan := context.WithTimeout(ctx, lifecycleTransactionBudget)
+	now, errNow := DatabaseNow(scanCtx, db)
 	if errNow != nil {
+		cancelScan()
 		return errNow
 	}
 	var active []CPANodeMembershipRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).Where("state = ?", MembershipStateActive).Order("certificate_fingerprint").Find(&active).Error; errFind != nil {
+	errFind := db.WithContext(scanCtx).Where("state = ?", MembershipStateActive).Order("certificate_fingerprint").Find(&active).Error
+	cancelScan()
+	if errFind != nil {
 		return errFind
 	}
+	var cleanupErrors []error
 	for _, membership := range active {
+		if errContext := ctx.Err(); errContext != nil {
+			return errors.Join(append(cleanupErrors, errContext)...)
+		}
 		if membership.CPAHeartbeatTimeout <= 0 || !membership.LastSeenAt.Before(now.Add(-membership.CPAHeartbeatTimeout)) {
 			continue
 		}
 		if errCleanup := r.cleanupStaleMembership(ctx, membership.CertificateFingerprint, membership.CPAHeartbeatTimeout); errCleanup != nil {
-			return errCleanup
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup stale membership %s: %w", membership.CertificateFingerprint, errCleanup))
 		}
 	}
-	return nil
+	return errors.Join(cleanupErrors...)
 }
 
 func (r *Repository) cleanupStaleMembership(ctx context.Context, fingerprint string, heartbeatTimeout time.Duration) error {
@@ -173,7 +192,12 @@ func (r *Repository) cleanupStaleMembership(ctx context.Context, fingerprint str
 	if errDB != nil {
 		return errDB
 	}
-	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		now, errNow := DatabaseNow(ctx, tx)
 		if errNow != nil {
 			return errNow
@@ -204,7 +228,12 @@ func (r *Repository) AcknowledgeQuiescence(ctx context.Context, fingerprint stri
 	if fingerprint == "" || connectedAt.IsZero() || revision <= 0 || strings.TrimSpace(home.IP) == "" || home.Port <= 0 || home.StartedAt.IsZero() {
 		return ErrQuiescenceRevisionMismatch
 	}
-	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		membership := CPANodeMembershipRecord{}
 		if errLock := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("certificate_fingerprint = ?", fingerprint).First(&membership).Error; errLock != nil {
 			if errors.Is(errLock, gorm.ErrRecordNotFound) {
@@ -244,11 +273,17 @@ func (r *Repository) CompleteFingerprintCancellation(ctx context.Context, finger
 	if fingerprint == "" || connectedAt.IsZero() || revision <= 0 {
 		return ErrQuiescenceRevisionMismatch
 	}
+	callerCtx := ctx
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
 	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		return completeFingerprintCancellationTx(ctx, tx, fingerprint, revision, connectedAt)
 	})
 	if errTransaction == nil {
-		r.cleanupClosedInFlightLifetime(ctx, fingerprint, connectedAt)
+		r.cleanupClosedInFlightLifetime(callerCtx, fingerprint, connectedAt)
 	}
 	return errTransaction
 }
@@ -259,16 +294,24 @@ func (r *Repository) RecoverStaleQuiescence(ctx context.Context) error {
 	if errDB != nil {
 		return errDB
 	}
+	ctx = contextOrBackground(ctx)
+	scanCtx, cancelScan := context.WithTimeout(ctx, lifecycleTransactionBudget)
 	var canceling []CPANodeMembershipRecord
-	if errFind := db.WithContext(contextOrBackground(ctx)).Where("state = ?", MembershipStateCanceling).Order("certificate_fingerprint").Find(&canceling).Error; errFind != nil {
+	errFind := db.WithContext(scanCtx).Where("state = ?", MembershipStateCanceling).Order("certificate_fingerprint").Find(&canceling).Error
+	cancelScan()
+	if errFind != nil {
 		return errFind
 	}
+	var recoveryErrors []error
 	for _, membership := range canceling {
+		if errContext := ctx.Err(); errContext != nil {
+			return errors.Join(append(recoveryErrors, errContext)...)
+		}
 		if errRecover := r.recoverStaleMembershipQuiescence(ctx, membership.CertificateFingerprint, membership.ConnectedAt, membership.CancelRevision); errRecover != nil {
-			return errRecover
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("recover stale membership %s: %w", membership.CertificateFingerprint, errRecover))
 		}
 	}
-	return nil
+	return errors.Join(recoveryErrors...)
 }
 
 func (r *Repository) recoverStaleMembershipQuiescence(ctx context.Context, fingerprint string, connectedAt time.Time, revision int64) error {
@@ -276,8 +319,14 @@ func (r *Repository) recoverStaleMembershipQuiescence(ctx context.Context, finge
 	if errDB != nil {
 		return errDB
 	}
+	callerCtx := ctx
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
 	completed := false
 	errTransaction := withConcurrencyTransaction(ctx, db, func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		lifecycle, errLifecycle := lifecycleConfigForQuiescence(tx)
 		if errLifecycle != nil {
 			return errLifecycle
@@ -313,7 +362,7 @@ func (r *Repository) recoverStaleMembershipQuiescence(ctx context.Context, finge
 		return nil
 	})
 	if errTransaction == nil && completed {
-		r.cleanupClosedInFlightLifetime(ctx, fingerprint, connectedAt)
+		r.cleanupClosedInFlightLifetime(callerCtx, fingerprint, connectedAt)
 	}
 	return errTransaction
 }
@@ -328,7 +377,11 @@ func recoverPendingQuiescenceRowsTx(ctx context.Context, tx *gorm.DB, rows []CPA
 }
 
 func (r *Repository) cleanupClosedInFlightLifetime(ctx context.Context, fingerprint string, connectedAt time.Time) {
-	if errCleanup := r.CleanupInFlightLifetime(ctx, fingerprint, connectedAt); errCleanup != nil {
+	// The closed state is already committed, so cleanup gets its own budget instead of
+	// whatever the lifecycle transaction left over.
+	cleanupCtx, cancel := context.WithTimeout(contextOrBackground(ctx), lifecycleTransactionBudget)
+	defer cancel()
+	if errCleanup := r.CleanupInFlightLifetime(cleanupCtx, fingerprint, connectedAt); errCleanup != nil {
 		log.WithError(errCleanup).Warn("failed to clean in-flight observation lifetime")
 	}
 }
@@ -379,7 +432,12 @@ func (r *Repository) RefreshCPALiveness(ctx context.Context, lifetime Connection
 	if fingerprint == "" || lifetime.ConnectedAt.IsZero() {
 		return ErrMembershipNotActive
 	}
-	return db.WithContext(contextOrBackground(ctx)).Transaction(func(tx *gorm.DB) error {
+	ctx, cancel := lifecycleTransactionContext(ctx)
+	defer cancel()
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if errConfigure := configureLifecycleTransaction(tx); errConfigure != nil {
+			return errConfigure
+		}
 		membership := CPANodeMembershipRecord{}
 		// Serialize liveness writers before evaluating the heartbeat timestamp, without blocking KEY SHARE readers.
 		errMember := tx.Clauses(clause.Locking{Strength: "NO KEY UPDATE"}).Where("certificate_fingerprint = ?", fingerprint).First(&membership).Error

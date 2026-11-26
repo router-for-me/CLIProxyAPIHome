@@ -118,7 +118,7 @@ plugins:
 	assertContains("port: 8317")
 	assertContains("usage-statistics-enabled: true")
 	assertContains("disable-cooling: true")
-	assertContains("ws-auth: false")
+	assertNotContains("ws-auth:")
 	assertContains("plugins:")
 	assertContains("sample:")
 	assertContains("mode: fast")
@@ -154,7 +154,6 @@ func TestSanitizeConfigYAMLForDownstreamNullDocumentAppliesHomeModeScalars(t *te
 	for _, expected := range []string{
 		"usage-statistics-enabled: true",
 		"disable-cooling: true",
-		"ws-auth: false",
 	} {
 		if !strings.Contains(string(out), expected) {
 			t.Fatalf("downstream config = %q, want %q", out, expected)
@@ -175,5 +174,85 @@ func TestSanitizeConfigYAMLForDownstreamForwardsClaudeToolSearch(t *testing.T) {
 	}
 	if strings.Contains(string(out), "upstream:") {
 		t.Fatalf("downstream config kept a v8 upstream block: %q", out)
+	}
+}
+
+func TestSanitizeConfigYAMLForDownstreamForwardsSensitiveWordsReplace(t *testing.T) {
+	input := `config-version: 8
+oauth:
+  providers:
+    antigravity:
+      sensitive-words-replace:
+        "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+        "RemoveOnly": ""
+    devin:
+      sensitive-words-replace:
+        "Claude Code": "Devin"
+`
+	out, errSanitize := sanitizeConfigYAMLForDownstream([]byte(input))
+	if errSanitize != nil {
+		t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+	}
+	var decoded struct {
+		Antigravity struct {
+			SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace"`
+		} `yaml:"antigravity"`
+		Devin struct {
+			SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace"`
+		} `yaml:"devin"`
+	}
+	if errUnmarshal := yaml.Unmarshal(out, &decoded); errUnmarshal != nil {
+		t.Fatalf("yaml.Unmarshal(out) error = %v", errUnmarshal)
+	}
+	if decoded.Antigravity.SensitiveWordsReplace["You are Codex, an agent based on GPT-5."] != "You are a helpful coding assistant." {
+		t.Fatalf("downstream antigravity replacements = %#v", decoded.Antigravity.SensitiveWordsReplace)
+	}
+	if val, ok := decoded.Antigravity.SensitiveWordsReplace["RemoveOnly"]; !ok || val != "" {
+		t.Fatalf("downstream empty deletion lost: %#v", decoded.Antigravity.SensitiveWordsReplace)
+	}
+	if decoded.Devin.SensitiveWordsReplace["Claude Code"] != "Devin" {
+		t.Fatalf("downstream devin replacements = %#v", decoded.Devin.SensitiveWordsReplace)
+	}
+}
+
+func TestSanitizeConfigYAMLForDownstreamForwardsSensitivePatternsReplace(t *testing.T) {
+	input := `config-version: 8
+oauth:
+  providers:
+    antigravity:
+      sensitive-patterns-replace:
+        - pattern: '(?m)^RFC 2119[^\n]*\n?'
+          replacement: ""
+    devin:
+      sensitive-patterns-replace:
+        - pattern: '(?m)^You are omp[^\n]*\n?'
+          replacement: ""
+`
+	out, errSanitize := sanitizeConfigYAMLForDownstream([]byte(input))
+	if errSanitize != nil {
+		t.Fatalf("sanitizeConfigYAMLForDownstream() error = %v", errSanitize)
+	}
+	var decoded struct {
+		Antigravity struct {
+			SensitivePatternsReplace []struct {
+				Pattern     string `yaml:"pattern"`
+				Replacement string `yaml:"replacement"`
+			} `yaml:"sensitive-patterns-replace"`
+		} `yaml:"antigravity"`
+		Devin struct {
+			SensitivePatternsReplace []struct {
+				Pattern     string `yaml:"pattern"`
+				Replacement string `yaml:"replacement"`
+			} `yaml:"sensitive-patterns-replace"`
+		} `yaml:"devin"`
+	}
+	if errUnmarshal := yaml.Unmarshal(out, &decoded); errUnmarshal != nil {
+		t.Fatalf("yaml.Unmarshal(out) error = %v", errUnmarshal)
+	}
+	if len(decoded.Antigravity.SensitivePatternsReplace) != 1 || decoded.Antigravity.SensitivePatternsReplace[0].Pattern != `(?m)^RFC 2119[^\n]*\n?` || decoded.Antigravity.SensitivePatternsReplace[0].Replacement != "" {
+		t.Fatalf("downstream antigravity pattern replacements = %#v", decoded.Antigravity.SensitivePatternsReplace)
+	}
+	if len(decoded.Devin.SensitivePatternsReplace) != 1 || decoded.Devin.SensitivePatternsReplace[0].Pattern != `(?m)^You are omp[^\n]*\n?` {
+		t.Fatalf("downstream devin pattern replacements = %#v", decoded.Devin.SensitivePatternsReplace)
 	}
 }

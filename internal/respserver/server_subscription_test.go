@@ -65,6 +65,9 @@ func TestProtocolOneSubscribeCreatesMembershipWithCurrentHome(t *testing.T) {
 	for time.Now().Before(deadline) {
 		lifetime, errClassify := repo.ClassifyConnection(context.Background(), fingerprint, commandHome)
 		if errClassify == nil && lifetime.Controlled {
+			if lifetime.HeartbeatTimeout != lifecycle.CPAHeartbeatTimeout {
+				t.Fatalf("membership heartbeat timeout = %v, want %v", lifetime.HeartbeatTimeout, lifecycle.CPAHeartbeatTimeout)
+			}
 			return
 		}
 		goruntime.Gosched()

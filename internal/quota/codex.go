@@ -358,24 +358,7 @@ func quotaProbeStatus(remaining float64) string {
 }
 
 func quotaWindowAggregateStatus(windows []cluster.QuotaWindow) string {
-	status := "unknown"
-	for _, window := range windows {
-		switch window.Status {
-		case "exhausted":
-			return "exhausted"
-		case "low":
-			status = "low"
-		case "error":
-			if status != "low" {
-				status = "error"
-			}
-		case "healthy":
-			if status == "unknown" {
-				status = "healthy"
-			}
-		}
-	}
-	return status
+	return cluster.AggregateQuotaWindowStatus(windows)
 }
 
 func quotaIDSlug(value string) string {

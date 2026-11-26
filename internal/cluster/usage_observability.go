@@ -264,10 +264,12 @@ type UsageObservabilityRecord struct {
 	Model              string
 	OriginalModel      string
 	Endpoint           string
+	Stream             *bool
 	ServiceTier        string
 	ReasoningEffort    string
 	ExecutorType       string
 	Tokens             UsageObservabilityTokens
+	ToolUsage          *UsageObservabilityToolUsage
 	Performance        UsageObservabilityPerformance
 	Client             UsageObservabilityClient
 	Credential         UsageObservabilityCredential
@@ -287,6 +289,21 @@ type UsageObservabilityTokens struct {
 	TokenBreakdown      UsageTokenBreakdown
 }
 
+type UsageObservabilityToolUsage struct {
+	WebSearchCalls         int64
+	WebSearchQueries       int64
+	WebFetchCalls          int64
+	XSearchCalls           int64
+	CodeExecutionCalls     int64
+	FileSearchCalls        int64
+	DocumentSearchCalls    int64
+	MCPCalls               int64
+	GoogleMapsChunks       int64
+	NumSourcesUsed         int64
+	NumServerSideToolsUsed int64
+	ImageGenerationCalls   int64
+}
+
 type UsageObservabilityPerformance struct {
 	LatencyMS int64
 	TTFTMS    *int64
@@ -300,6 +317,7 @@ type UsageObservabilityClient struct {
 	UserID       *uint
 	Username     string
 	ClientIP     string
+	UserAgent    string
 }
 
 type UsageObservabilityCredential struct {
@@ -315,13 +333,16 @@ type UsageObservabilityCredential struct {
 }
 
 type UsageObservabilityBilling struct {
-	ChargeID         string
-	Amount           *float64
-	Currency         string
-	BillingBasis     string
-	MatchedPriceRule string
-	BalanceBefore    *float64
-	BalanceAfter     *float64
+	ChargeID          string
+	Amount            *float64
+	BaseAmount        *float64
+	BillingMultiplier *float64
+	Currency          string
+	BillingBasis      string
+	MatchedPriceRule  string
+	BalanceBefore     *float64
+	BalanceAfter      *float64
+	CostBreakdown     JSONB
 }
 
 type UsageObservabilityRuntime struct {
@@ -410,9 +431,12 @@ type usageObservabilityRecordRow struct {
 	Username                   string          `gorm:"column:username"`
 	ChargeID                   string          `gorm:"column:charge_id"`
 	Amount                     sql.NullFloat64 `gorm:"column:amount"`
+	BaseAmount                 sql.NullFloat64 `gorm:"column:base_amount"`
+	BillingMultiplier          sql.NullFloat64 `gorm:"column:billing_multiplier"`
 	MatchedPriceRule           string          `gorm:"column:matched_price_rule"`
 	BalanceBefore              sql.NullFloat64 `gorm:"column:balance_before"`
 	BalanceAfter               sql.NullFloat64 `gorm:"column:balance_after"`
+	CostBreakdown              JSONB           `gorm:"column:cost_breakdown"`
 	UsageAuthIndex             string          `gorm:"column:usage_auth_index"`
 	AuthUUID                   string          `gorm:"column:auth_uuid"`
 	AuthJSON                   JSONB           `gorm:"column:auth_json"`
@@ -2416,9 +2440,12 @@ func usageObservabilityRecordSelect() string {
 		"user"."username" AS username,
 		"billing_charge"."id" AS charge_id,
 		"billing_charge"."amount" AS amount,
+		"billing_charge"."base_amount" AS base_amount,
+		"billing_charge"."billing_multiplier" AS billing_multiplier,
 		"billing_charge"."matched_price_rule" AS matched_price_rule,
 		"billing_charge"."balance_before" AS balance_before,
 		"billing_charge"."balance_after" AS balance_after,
+		"billing_charge"."cost_breakdown" AS cost_breakdown,
 		COALESCE("auth_uuid"."uuid", "auth_by_index"."uuid", "auth_by_id"."uuid") AS auth_uuid,
 		COALESCE("auth_uuid"."auth_json", "auth_by_index"."auth_json", "auth_by_id"."auth_json") AS auth_json,
 		COALESCE("auth_uuid"."id", "auth_by_index"."id", "auth_by_id"."id") AS auth_id,
@@ -2867,6 +2894,57 @@ func usageObservabilityEventType(row *usageObservabilityRecordRow, payload map[s
 	return "completion"
 }
 
+func usageObservabilityToolUsageFromPayload(rawPayload string) *UsageObservabilityToolUsage {
+	payload := strings.TrimSpace(rawPayload)
+	if payload == "" {
+		return nil
+	}
+	first := func(paths ...string) int64 {
+		for _, path := range paths {
+			if v := gjson.Get(payload, path); v.Exists() && v.Int() > 0 {
+				return v.Int()
+			}
+			if v := gjson.Get(payload, "tokens."+path); v.Exists() && v.Int() > 0 {
+				return v.Int()
+			}
+		}
+		return 0
+	}
+	out := &UsageObservabilityToolUsage{
+		WebSearchCalls: first(
+			"web_search_requests",
+			"tool_usage_details.web_search_calls",
+			"server_tool_use.web_search_requests",
+		),
+		WebSearchQueries:       first("tool_usage_details.web_search_queries"),
+		WebFetchCalls:          first("tool_usage_details.web_fetch_calls", "server_tool_use.web_fetch_requests"),
+		XSearchCalls:           first("tool_usage_details.x_search_calls"),
+		CodeExecutionCalls:     first("tool_usage_details.code_execution_calls", "server_tool_use.code_execution_requests"),
+		FileSearchCalls:        first("tool_usage_details.file_search_calls", "server_tool_use.file_search_requests"),
+		DocumentSearchCalls:    first("tool_usage_details.document_search_calls"),
+		MCPCalls:               first("tool_usage_details.mcp_calls", "server_tool_use.mcp_requests"),
+		GoogleMapsChunks:       first("tool_usage_details.extra.google_maps_chunks", "google_maps_chunks"),
+		NumSourcesUsed:         first("tool_usage_details.num_sources_used", "num_sources_used"),
+		NumServerSideToolsUsed: first("tool_usage_details.num_server_side_tools_used", "num_server_side_tools_used"),
+		ImageGenerationCalls:   first("tool_usage_details.image_generation_calls", "server_side_tool_usage_details.image_generation_calls"),
+	}
+	if out.WebSearchCalls <= 0 &&
+		out.WebSearchQueries <= 0 &&
+		out.WebFetchCalls <= 0 &&
+		out.XSearchCalls <= 0 &&
+		out.CodeExecutionCalls <= 0 &&
+		out.FileSearchCalls <= 0 &&
+		out.DocumentSearchCalls <= 0 &&
+		out.MCPCalls <= 0 &&
+		out.GoogleMapsChunks <= 0 &&
+		out.NumSourcesUsed <= 0 &&
+		out.NumServerSideToolsUsed <= 0 &&
+		out.ImageGenerationCalls <= 0 {
+		return nil
+	}
+	return out
+}
+
 func firstNonZeroInt(values ...int) int {
 	for _, value := range values {
 		if value != 0 {
@@ -2977,6 +3055,7 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 		Model:              strings.TrimSpace(row.Model),
 		OriginalModel:      firstNonEmptyUsageObservabilityString(row.Alias, row.Model),
 		Endpoint:           strings.TrimSpace(row.Endpoint),
+		Stream:             optionalBoolFromPayload(payload, "stream"),
 		ServiceTier:        strings.TrimSpace(row.ServiceTier),
 		ReasoningEffort:    strings.TrimSpace(row.ReasoningEffort),
 		ExecutorType:       strings.TrimSpace(row.ExecutorType),
@@ -3001,6 +3080,7 @@ func usageObservabilityRecordFromRow(row *usageObservabilityRecordRow) UsageObse
 				row.UnclassifiedTokens,
 			),
 		},
+		ToolUsage:   usageObservabilityToolUsageFromPayload(string(row.PayloadJSON)),
 		Performance: usageObservabilityPerformance(row),
 		Client:      usageObservabilityClient(row, payload),
 		Credential:  usageObservabilityCredential(row),
@@ -3909,8 +3989,8 @@ func usageObservabilityPerformance(row *usageObservabilityRecordRow) UsageObserv
 		ttft := row.TTFTMS
 		performance.TTFTMS = &ttft
 	}
-	if row.LatencyMS > 0 && row.OutputTokens > 0 {
-		tps := float64(row.OutputTokens) * 1000 / float64(row.LatencyMS)
+	if row.LatencyMS > 0 && row.DisplayOutputTokens > 0 {
+		tps := float64(row.DisplayOutputTokens) * 1000 / float64(row.LatencyMS)
 		performance.TPS = &tps
 	}
 	return performance
@@ -3932,6 +4012,7 @@ func usageObservabilityClient(row *usageObservabilityRecordRow, payload map[stri
 		UserID:       normalizeOptionalUint(row.ClientUserID),
 		Username:     strings.TrimSpace(row.Username),
 		ClientIP:     firstStringFromPayload(payload, "client_ip", "client.ip", "remote_addr"),
+		UserAgent:    firstStringFromPayload(payload, "user_agent", "client.user_agent", "userAgent"),
 	}
 }
 
@@ -4034,9 +4115,20 @@ func usageObservabilityBilling(row *usageObservabilityRecordRow) UsageObservabil
 		balanceBefore := row.BalanceBefore.Float64
 		billing.BalanceBefore = &balanceBefore
 	}
+	if row.BaseAmount.Valid {
+		baseAmount := row.BaseAmount.Float64
+		billing.BaseAmount = &baseAmount
+	}
+	if row.BillingMultiplier.Valid {
+		billingMultiplier := row.BillingMultiplier.Float64
+		billing.BillingMultiplier = &billingMultiplier
+	}
 	if row.BalanceAfter.Valid {
 		balanceAfter := row.BalanceAfter.Float64
 		billing.BalanceAfter = &balanceAfter
+	}
+	if len(row.CostBreakdown) > 0 {
+		billing.CostBreakdown = row.CostBreakdown
 	}
 	return billing
 }
@@ -4237,6 +4329,13 @@ func firstBoolFromPayload(payload map[string]any, paths ...string) (bool, bool) 
 		}
 	}
 	return false, false
+}
+
+func optionalBoolFromPayload(payload map[string]any, paths ...string) *bool {
+	if value, ok := firstBoolFromPayload(payload, paths...); ok {
+		return &value
+	}
+	return nil
 }
 
 func firstArrayLengthFromPayload(payload map[string]any, paths ...string) *int {

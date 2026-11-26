@@ -12,6 +12,12 @@ const RequestedModelMetadataKey = "requested_model"
 // AllowedAuthIDsMetadataKey stores the dispatch allowlist in Options.Metadata.
 const AllowedAuthIDsMetadataKey = "allowed_auth_ids"
 
+// PinnedAuthIDMetadataKey stores an explicit pinned credential ID in Options.Metadata.
+const PinnedAuthIDMetadataKey = "pinned_auth_id"
+
+// PinnedAuthMetadataKey aliases PinnedAuthIDMetadataKey for CPA metadata parity.
+const PinnedAuthMetadataKey = PinnedAuthIDMetadataKey
+
 // AllowedModelIDsMetadataKey stores the model allowlist in Options.Metadata.
 const AllowedModelIDsMetadataKey = "allowed_model_ids"
 
@@ -40,11 +46,19 @@ type ExcludedConcurrencyCandidate struct {
 // This is a deliberately small subset of CPA's execution options: CLIProxyAPIHome only needs
 // headers / query / raw request bytes for selector decisions, and a generic metadata bag.
 type Options struct {
+	Stream          bool
 	Headers         http.Header
 	Query           url.Values
 	OriginalRequest []byte
 	Metadata        map[string]any
 	SessionAffinity *SessionAffinitySelection
+	// SessionAffinityScope overrides the binding namespace, not candidate filtering
+	// or weighted accounting. Empty uses the provider passed to the selector.
+	SessionAffinityScope string
+	// ExcludedProviders fences unavailable pools without changing session-binding namespaces.
+	ExcludedProviders []string
+	// positiveWeightOnly classifies an exhausted weighted fallback, not the plugin's candidate pool.
+	positiveWeightOnly bool
 }
 
 func requestRetryRoundFromOptions(opts Options) int {

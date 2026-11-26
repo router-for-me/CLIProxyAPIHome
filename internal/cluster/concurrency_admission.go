@@ -92,6 +92,16 @@ func (e *ConcurrencyAdmissionError) ConcurrencyType() string {
 	return e.Type
 }
 
+// RetryAfter exposes a bounded capacity retry hint without a dependency on cluster types.
+func (e *ConcurrencyAdmissionError) RetryAfter() *time.Duration {
+	if e == nil || (e.Type != "credential_concurrency_exceeded" && e.Type != "credential_model_concurrency_exceeded") ||
+		e.RetryAfterMS <= 0 || e.RetryAfterMS > math.MaxInt64/int64(time.Millisecond) {
+		return nil
+	}
+	delay := time.Duration(e.RetryAfterMS) * time.Millisecond
+	return &delay
+}
+
 func (e *ConcurrencyAdmissionError) Unwrap() error {
 	if e == nil {
 		return nil

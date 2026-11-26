@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"gorm.io/gorm"
 )
 
@@ -106,11 +107,15 @@ func TestOAuthConfigUpsertAndSnapshotMutationSerializePostgres(t *testing.T) {
 					t.Fatal("concurrent config mutations did not complete")
 				}
 			}
-			cfg, _, errConfig := repo.LoadConfigAsRuntimeConfig(ctx)
+			cfg, wire, errConfig := repo.LoadConfigAsRuntimeConfig(ctx)
 			if errConfig != nil {
 				t.Fatal(errConfig)
 			}
-			if cfg.CodexHeaderDefaults.UserAgent != "new-agent" || !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"] || !reflect.DeepEqual(cfg.Antigravity.SensitiveWords, []string{"new"}) {
+			cpa, errCPA := cpaconfig.ParseConfigBytes(wire)
+			if errCPA != nil {
+				t.Fatal(errCPA)
+			}
+			if cpa.CodexHeaderDefaults.UserAgent != "new-agent" || !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"] || !reflect.DeepEqual(cpa.Antigravity.SensitiveWords, []string{"new"}) {
 				t.Fatal("a committed config mutation was overwritten by a stale OAuth scope")
 			}
 		})

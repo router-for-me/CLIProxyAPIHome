@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"gorm.io/gorm"
 )
 
@@ -249,12 +250,16 @@ func TestOAuthConfigUpsertsPreserveConcurrentScopes(t *testing.T) {
 			t.Error(errUpdate)
 		}
 	}
-	cfg, _, errConfig := repo.LoadConfigAsRuntimeConfig(ctx)
+	_, wire, errConfig := repo.LoadConfigAsRuntimeConfig(ctx)
 	if errConfig != nil {
 		t.Fatal(errConfig)
 	}
-	if !cfg.Codex.DisableCodexCloaking || !cfg.XAI.InjectXSearch ||
-		!reflect.DeepEqual(cfg.Antigravity.SensitiveWords, []string{"new"}) || !reflect.DeepEqual(cfg.Devin.SensitiveWords, []string{"new"}) {
+	cpa, errCPA := cpaconfig.ParseConfigBytes(wire)
+	if errCPA != nil {
+		t.Fatal(errCPA)
+	}
+	if !cpa.Codex.DisableCodexCloaking || !cpa.XAI.InjectXSearch ||
+		!reflect.DeepEqual(cpa.Antigravity.SensitiveWords, []string{"new"}) || !reflect.DeepEqual(cpa.Devin.SensitiveWords, []string{"new"}) {
 		t.Fatal("a concurrent edit replaced another provider's OAuth settings")
 	}
 }

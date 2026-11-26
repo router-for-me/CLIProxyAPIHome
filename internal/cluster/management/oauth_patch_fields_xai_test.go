@@ -33,3 +33,35 @@ func TestApplyOAuthFieldPatchXaiWebsockets(t *testing.T) {
 		t.Fatalf("attributes.websockets = %q, want true", got)
 	}
 }
+
+func TestApplyOAuthFieldPatchXaiUsingAPI(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "xai-auth",
+		Provider: "xai",
+		Metadata: map[string]any{
+			"type": "xai",
+		},
+	}
+	entry := authFileEntry(auth)
+	if got := entry["using_api"]; got != false {
+		t.Fatalf("default using_api = %#v, want false", got)
+	}
+
+	changed, errPatch := applyOAuthFieldPatch(auth, mustRawFields(t, `{"using_api":true}`))
+	if errPatch != nil {
+		t.Fatalf("applyOAuthFieldPatch returned error: %v", errPatch)
+	}
+	if !changed {
+		t.Fatalf("applyOAuthFieldPatch changed = false, want true")
+	}
+	if got, ok := auth.Metadata["using_api"].(bool); !ok || !got {
+		t.Fatalf("metadata.using_api = %#v, want true", auth.Metadata["using_api"])
+	}
+	if got := auth.Attributes["using_api"]; got != "true" {
+		t.Fatalf("attributes.using_api = %q, want true", got)
+	}
+	entry = authFileEntry(auth)
+	if got := entry["using_api"]; got != true {
+		t.Fatalf("patched using_api = %#v, want true", got)
+	}
+}

@@ -16,24 +16,77 @@ const (
 	pricingStatusUnpublished = "unpublished"
 )
 
-// modelPriceIndex groups enabled price rules by lower-cased model identifier so
-// a catalog of any size costs one query rather than one query per model.
-type modelPriceIndex map[string][]cluster.BillingModelPriceRecord
+// modelPriceIndex holds enabled price rules so a catalog of any size costs one
+// query rather than one query per model, while supporting provider="*" and
+// trailing model wildcards with the same specificity order as billing.
+type modelPriceIndex []cluster.BillingModelPriceRecord
 
-// newModelPriceIndex buckets price records by model.
+// newModelPriceIndex stores enabled price records for catalog lookup.
 func newModelPriceIndex(records []cluster.BillingModelPriceRecord) modelPriceIndex {
 	if len(records) == 0 {
 		return modelPriceIndex{}
 	}
-	index := make(modelPriceIndex, len(records))
+	out := make(modelPriceIndex, 0, len(records))
 	for i := range records {
-		key := strings.ToLower(strings.TrimSpace(records[i].Model))
-		if key == "" {
+		if strings.TrimSpace(records[i].Model) == "" {
 			continue
 		}
-		index[key] = append(index[key], records[i])
+		out = append(out, records[i])
 	}
-	return index
+	return out
+}
+
+// selectProviderPriceRecords picks the most specific enabled rule group for one
+// servable (provider, modelID) pair, matching billingFindPrice specificity:
+// 1. exact provider + exact model
+// 2. exact provider + longest model pattern
+// 3. wildcard provider ("*") + exact model
+// 4. wildcard provider ("*") + longest model pattern
+func (index modelPriceIndex) selectProviderPriceRecords(provider, modelID string) []cluster.BillingModelPriceRecord {
+	candidates := []string{modelID}
+	if bare := cluster.BillingStripChannelPrefix(modelID); bare != "" && !strings.EqualFold(bare, modelID) {
+		candidates = append(candidates, bare)
+	}
+	levels := []struct {
+		ruleProvider string
+		pattern      bool
+	}{
+		{ruleProvider: provider, pattern: false},
+		{ruleProvider: provider, pattern: true},
+		{ruleProvider: cluster.BillingServiceTierWildcard, pattern: false},
+		{ruleProvider: cluster.BillingServiceTierWildcard, pattern: true},
+	}
+	for _, level := range levels {
+		for _, candidate := range candidates {
+			bestKey := ""
+			for i := range index {
+				rec := index[i]
+				if !strings.EqualFold(strings.TrimSpace(rec.Provider), level.ruleProvider) {
+					continue
+				}
+				if !cluster.BillingModelMatches(rec.Model, candidate, level.pattern) {
+					continue
+				}
+				key := strings.ToLower(strings.TrimSpace(rec.Model))
+				if bestKey == "" || len(key) > len(bestKey) {
+					bestKey = key
+				}
+			}
+			if bestKey == "" {
+				continue
+			}
+			var matched []cluster.BillingModelPriceRecord
+			for i := range index {
+				rec := index[i]
+				if strings.EqualFold(strings.TrimSpace(rec.Provider), level.ruleProvider) &&
+					strings.EqualFold(strings.TrimSpace(rec.Model), bestKey) {
+					matched = append(matched, rec)
+				}
+			}
+			return matched
+		}
+	}
+	return nil
 }
 
 // pricingFor builds the price ladder a buyer sees for one model.
@@ -44,18 +97,23 @@ func newModelPriceIndex(records []cluster.BillingModelPriceRecord) modelPriceInd
 // cannot take. A model whose serving channels are unknown is therefore reported
 // as unpublished, not as priced by everything.
 func (index modelPriceIndex) pricingFor(modelID string, providers []string) gin.H {
-	records := index[strings.ToLower(strings.TrimSpace(modelID))]
-	if len(records) == 0 {
+	modelID = strings.TrimSpace(modelID)
+	if len(index) == 0 || modelID == "" {
 		return gin.H{"status": pricingStatusUnpublished}
 	}
 
-	servable := make(map[string]struct{}, len(providers))
+	servable := make([]string, 0, len(providers))
+	seenProviders := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
 		normalized := strings.ToLower(strings.TrimSpace(provider))
 		if normalized == "" {
 			continue
 		}
-		servable[normalized] = struct{}{}
+		if _, ok := seenProviders[normalized]; ok {
+			continue
+		}
+		seenProviders[normalized] = struct{}{}
+		servable = append(servable, normalized)
 	}
 	if len(servable) == 0 {
 		// Knowing of no channel that can serve the model is not the same as
@@ -71,39 +129,35 @@ func (index modelPriceIndex) pricingFor(modelID string, providers []string) gin.
 		tier  string
 		rungs []cluster.BillingModelPriceRecord
 	}
-	providerOrder := make([]string, 0, len(records))
-	tiersByProvider := make(map[string][]*tierLadder, len(records))
+	providerOrder := make([]string, 0, len(servable))
+	tiersByProvider := make(map[string][]*tierLadder, len(servable))
 
-	for i := range records {
-		provider := strings.ToLower(strings.TrimSpace(records[i].Provider))
-		if provider == "" {
+	for _, provider := range servable {
+		records := index.selectProviderPriceRecords(provider, modelID)
+		if len(records) == 0 {
 			continue
 		}
-		if _, ok := servable[provider]; !ok {
-			continue
-		}
-		tier := strings.TrimSpace(records[i].ServiceTier)
-		if tier == "" {
-			tier = cluster.BillingServiceTierWildcard
-		}
-
-		ladders, known := tiersByProvider[provider]
-		if !known {
-			providerOrder = append(providerOrder, provider)
-		}
-		var target *tierLadder
-		for _, ladder := range ladders {
-			if ladder.tier == tier {
-				target = ladder
-				break
+		providerOrder = append(providerOrder, provider)
+		var ladders []*tierLadder
+		for i := range records {
+			tier := strings.TrimSpace(records[i].ServiceTier)
+			if tier == "" {
+				tier = cluster.BillingServiceTierWildcard
 			}
+			var target *tierLadder
+			for _, ladder := range ladders {
+				if ladder.tier == tier {
+					target = ladder
+					break
+				}
+			}
+			if target == nil {
+				target = &tierLadder{tier: tier}
+				ladders = append(ladders, target)
+			}
+			target.rungs = append(target.rungs, records[i])
 		}
-		if target == nil {
-			target = &tierLadder{tier: tier}
-			ladders = append(ladders, target)
-			tiersByProvider[provider] = ladders
-		}
-		target.rungs = append(target.rungs, records[i])
+		tiersByProvider[provider] = ladders
 	}
 
 	if len(providerOrder) == 0 {
@@ -160,7 +214,7 @@ func (index modelPriceIndex) pricingFor(modelID string, providers []string) gin.
 // bookkeeping about how a price came to exist, not part of the quote, and the
 // user contract puts them out of bounds.
 func modelPriceRungResponse(record cluster.BillingModelPriceRecord) gin.H {
-	return gin.H{
+	rung := gin.H{
 		"min_input_tokens":              record.MinInputTokens,
 		"input_price_per_million":       record.InputPricePerMillion,
 		"output_price_per_million":      record.OutputPricePerMillion,
@@ -168,4 +222,16 @@ func modelPriceRungResponse(record cluster.BillingModelPriceRecord) gin.H {
 		"cache_write_price_per_million": record.CacheWritePricePerMillion,
 		"request_price":                 record.RequestPrice,
 	}
+	// Optional dimensions are quoted only when configured; an unset one bills at
+	// its parent price, which the rung already shows.
+	for name, value := range record.Values() {
+		if value != nil {
+			rung[name] = *value
+		}
+	}
+	// A pricing expression replaces the column prices for this rung.
+	if expression := strings.TrimSpace(record.PricingExpr); expression != "" {
+		rung["pricing_expr"] = expression
+	}
+	return rung
 }

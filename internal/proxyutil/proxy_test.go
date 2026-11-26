@@ -3,6 +3,7 @@ package proxyutil
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -31,21 +32,43 @@ func TestSOCKSTransportDialContextHonorsCancellation(t *testing.T) {
 	if errTransport != nil {
 		t.Fatalf("BuildHTTPTransport() error = %v", errTransport)
 	}
-	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancelDeadline()
-	startedAt := time.Now()
-	_, errDial := transport.DialContext(deadlineCtx, "tcp", "example.com:443")
-	if errDial == nil || !errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("DialContext() error/context = %v/%v, want cancellation at deadline", errDial, deadlineCtx.Err())
-	}
-	if elapsed := time.Since(startedAt); elapsed > time.Second {
-		t.Fatalf("SOCKS cancellation took %v, want under 1s", elapsed)
-	}
+	dialCtx, cancelDial := context.WithCancel(context.Background())
+	defer cancelDial()
+	dialResult := make(chan error, 1)
+	go func() {
+		conn, errDial := transport.DialContext(dialCtx, "tcp", "example.com:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		dialResult <- errDial
+	}()
 
+	var conn net.Conn
 	select {
-	case conn := <-accepted:
-		_ = conn.Close()
-	case <-time.After(time.Second):
+	case conn = <-accepted:
+	case <-time.After(5 * time.Second):
 		t.Fatal("SOCKS proxy did not accept the test connection")
+	}
+	defer func() {
+		if errClose := conn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			t.Errorf("proxy connection close error = %v", errClose)
+		}
+	}()
+	if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+		t.Fatalf("SetReadDeadline() error = %v", errDeadline)
+	}
+	// Observe the SOCKS greeting before cancellation, then leave the handshake
+	// unanswered so only the context can interrupt the client's blocked read.
+	if _, errRead := io.ReadFull(conn, make([]byte, 3)); errRead != nil {
+		t.Fatalf("read SOCKS greeting error = %v", errRead)
+	}
+	cancelDial()
+	select {
+	case errDial := <-dialResult:
+		if errDial == nil || !errors.Is(dialCtx.Err(), context.Canceled) {
+			t.Fatalf("DialContext() error/context = %v/%v, want context cancellation", errDial, dialCtx.Err())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SOCKS dial did not return after context cancellation")
 	}
 }

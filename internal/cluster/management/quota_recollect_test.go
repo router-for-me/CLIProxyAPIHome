@@ -37,7 +37,7 @@ func TestCollectQuotaAcceptedWithFilters(t *testing.T) {
 	engine.POST("/quota/collect", handler.CollectQuota)
 
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/quota/collect", strings.NewReader(`{"credential_ids":["auth-a"," auth-b "],"providers":["xai"]}`))
+	request := httptest.NewRequest(http.MethodPost, "/quota/collect", strings.NewReader(`{"credential_ids":["auth-a"," auth-b "],"providers":["devin"]}`))
 	request.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(response, request)
 
@@ -59,6 +59,9 @@ func TestCollectQuotaAcceptedWithFilters(t *testing.T) {
 	}
 	if _, ok := trigger.credentialIDs["auth-b"]; !ok {
 		t.Fatalf("credential id whitespace was not trimmed: %v", trigger.credentialIDs)
+	}
+	if _, ok := trigger.providers["devin"]; !ok {
+		t.Fatal("Devin provider filter was not passed to the collector")
 	}
 }
 

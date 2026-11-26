@@ -279,6 +279,45 @@ func TestCollectorCodexResetDetailsFailureClearsUnreliableLastKnownData(t *testi
 	}
 }
 
+func TestCodexPlanFromAuthFallsBackToIDTokenClaims(t *testing.T) {
+	// Header: {"alg":"none"}, Payload: {"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}
+	jwtToken := "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8ifX0."
+	repo := newCollectorTestRepository(t)
+	now := time.Date(2026, 7, 22, 5, 0, 0, 0, time.UTC)
+	seedCollectorAuth(t, repo, "codex-jwt-plan", map[string]any{
+		"type":         "codex",
+		"access_token": "probe-secret",
+		"id_token":     jwtToken,
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/usage":
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":15,"limit_window_seconds":604800,"reset_at":1785296520}}}`))
+		case "/resets":
+			_, _ = w.Write([]byte(`{"available_count":0,"credits":[]}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	collector := NewCollector(repo, Options{
+		Owner:                "home-a",
+		CodexUsageURL:        server.URL + "/usage",
+		CodexResetCreditsURL: server.URL + "/resets",
+		Now:                  func() time.Time { return now },
+	})
+	collector.collect(context.Background())
+
+	item, errGet := repo.GetQuotaCredential(context.Background(), "codex-jwt-plan", now.Add(time.Minute))
+	if errGet != nil {
+		t.Fatalf("GetQuotaCredential() error = %v", errGet)
+	}
+	if item.Plan == nil || item.Plan.Name != "Pro 20x" || !item.Plan.Premium {
+		t.Fatalf("codex id_token fallback plan = %+v, want Pro 20x premium", item.Plan)
+	}
+}
+
 func quotaIntPtr(value int) *int {
 	return &value
 }

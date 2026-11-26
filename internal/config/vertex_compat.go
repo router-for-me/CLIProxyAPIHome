@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
+	"gopkg.in/yaml.v3"
 )
 
 // VertexCompatKey represents the configuration for Vertex AI-compatible API keys.
@@ -13,6 +15,7 @@ import (
 //
 // Example services: zenmux.ai and similar Vertex-compatible providers.
 type VertexCompatKey struct {
+	CredentialConfig `yaml:",inline" json:"-"`
 	// ID is the immutable credential identity.
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// UUID is accepted for backward-compatible input and normalized to ID.
@@ -70,8 +73,7 @@ func (k VertexCompatKey) GetPrefix() string { return k.Prefix }
 // GetProxyURL returns a proxy url.
 func (k VertexCompatKey) GetProxyURL() string { return k.ProxyURL }
 
-// VertexCompatModel represents a model configuration for Vertex compatibility,
-// including the actual model name and its alias for API routing.
+// VertexCompatModel defines the complete Vertex-compatible model configuration shared with CPA.
 type VertexCompatModel struct {
 	// Name is the actual model name used by the external provider.
 	Name string `yaml:"name" json:"name"`
@@ -82,6 +84,7 @@ type VertexCompatModel struct {
 	// Settings shared with CPA V8.
 	DisplayName  string                    `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	ForceMapping bool                      `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
+	OpenAPI      *bool                     `yaml:"openapi,omitempty" json:"openapi,omitempty"`
 	Thinking     *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
@@ -131,8 +134,14 @@ func (cfg *Config) SanitizeVertexCompatKeys() {
 		}
 		entry.Models = sanitizedModels
 
-		// Use API key + base URL as uniqueness key
-		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		// Retain distinct model and execution options even for the same endpoint.
+		raw, _ := yaml.Marshal(entry)
+		var options map[string]any
+		_ = yaml.Unmarshal(raw, &options)
+		delete(options, "id")
+		delete(options, "uuid")
+		encoded, _ := json.Marshal(options)
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL + "\x00" + string(encoded)
 		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}

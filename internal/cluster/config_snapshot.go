@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -58,7 +59,7 @@ func (r *Repository) LoadConfigAsRuntimeConfig(ctx context.Context) (*appconfig.
 	return cfg, payload, nil
 }
 
-func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context, tx *gorm.DB, values map[string]any) error {
+func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context, tx *gorm.DB, values, submitted map[string]any) error {
 	if tx == nil {
 		return fmt.Errorf("database connection is nil")
 	}
@@ -69,7 +70,7 @@ func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context,
 	if len(explicitKeys) == 0 {
 		return nil
 	}
-	cfg, _, errConfig := RuntimeConfigFromRoot(values)
+	cfg, _, errConfig := RuntimeConfigFromRoot(submitted)
 	if errConfig != nil {
 		return errConfig
 	}
@@ -88,7 +89,9 @@ func (r *Repository) reconcileConfigSnapshotProviderAuthsTx(ctx context.Context,
 	}
 	ReuseGeneratedProviderCredentialIDs(existing, auths)
 	exported := make(map[string]any, len(explicitKeys))
-	ApplyCredentialConfigToRoot(exported, auths)
+	if _, errApply := ApplyCredentialConfigToRoot(exported, auths); errApply != nil {
+		return errApply
+	}
 	for key := range explicitKeys {
 		if value, exists := exported[key]; exists {
 			values[key] = value
@@ -142,6 +145,7 @@ func ConfigRootFromSnapshot(snapshot map[string]json.RawMessage) (map[string]any
 // RuntimeConfigFromRoot derives runtime config from root.
 func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, error) {
 	// Normalize before inspecting roots, including v8 imports and snapshots.
+	groups, _ := root["api-keys"].(map[string]any)
 	var errNormalize error
 	root, errNormalize = appconfig.NormalizeConfigRoot(root)
 	if errNormalize != nil {
@@ -165,11 +169,19 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg := &appconfig.Config{Port: appconfig.DefaultCPAPort}
 	cfg.CredentialConcurrency = appconfig.DefaultCredentialConcurrencyConfig()
 	cfg.CredentialInFlight = appconfig.DefaultCredentialInFlightConfig()
-	cfg.Pprof.Addr = appconfig.DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = appconfig.DefaultPanelGitHubRepository
-	cfg.ErrorLogsMaxFiles = 10
-	cfg.RedisUsageQueueRetentionSeconds = 60
-	if errUnmarshal := yaml.Unmarshal(data, cfg); errUnmarshal != nil {
+	source := data
+	if len(groups) > 0 {
+		// Keep the flat runtime payload, but decode credential ownership from the V8 input.
+		scoped := maps.Clone(root)
+		appconfig.SetV8CredentialGroups(scoped, groups)
+		var errScope error
+		source, errScope = yaml.Marshal(scoped)
+		if errScope != nil {
+			return nil, nil, errScope
+		}
+	}
+	if errUnmarshal := yaml.Unmarshal(source, cfg); errUnmarshal != nil {
 		return nil, nil, errUnmarshal
 	}
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
@@ -196,16 +208,9 @@ func RuntimeConfigFromRoot(root map[string]any) (*appconfig.Config, []byte, erro
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
 	cfg.SanitizeMetaKeys()
-	cfg.SanitizeCodexHeaderDefaults()
-	cfg.SanitizeClaudeHeaderDefaults()
 	cfg.SanitizeClaudeKeys()
 	cfg.SanitizeOpenAICompatibility()
 	cfg.SanitizeOAuthModelAlias()
-	cfg.SanitizePayloadRules()
-	cfg.SanitizeAntigravity()
-	if cfg.Pprof.Addr == "" {
-		cfg.Pprof.Addr = appconfig.DefaultPprofAddr
-	}
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = appconfig.DefaultPanelGitHubRepository
 	}
@@ -339,7 +344,9 @@ func (r *Repository) MutateConfigSnapshot(ctx context.Context, nodeHeartbeatTime
 		if errAuths != nil {
 			return errAuths
 		}
-		ApplyCredentialConfigToRoot(root, auths)
+		if errApply := ApplyV8CredentialConfigToRoot(root, auths); errApply != nil {
+			return errApply
+		}
 		values, errMutate := mutate(root)
 		if errMutate != nil {
 			return errMutate

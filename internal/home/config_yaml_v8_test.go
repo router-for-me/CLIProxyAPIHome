@@ -43,7 +43,7 @@ observability:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cpa.Port != 8427 || !cpa.DisableCooling || !cpa.UsageStatisticsEnabled || cpa.WebsocketAuth {
+	if cpa.Port != 8427 || !cpa.DisableCooling || !cpa.UsageStatisticsEnabled {
 		t.Fatal("Home invariants lost")
 	}
 	// The bundled CPA release predates this field, so verify the emitted
@@ -52,6 +52,9 @@ observability:
 	var downstream map[string]any
 	if errDecode := yaml.Unmarshal(data, &downstream); errDecode != nil {
 		t.Fatalf("decode downstream config: %v", errDecode)
+	}
+	if strings.Contains(string(data), "ws-auth:") {
+		t.Fatalf("Home-only WebSocket auth switch reached CPA: %s", data)
 	}
 	if downstream["tls-handshake-timeout-seconds"] != 12 {
 		t.Fatalf("downstream tls-handshake-timeout-seconds = %#v, want 12", downstream["tls-handshake-timeout-seconds"])

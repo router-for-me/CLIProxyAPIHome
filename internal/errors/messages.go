@@ -2,6 +2,7 @@ package errors
 
 const (
 	TypeError                   = "error"
+	TypeAuthNotFound            = "auth_not_found"
 	TypeModelNotFound           = "model_not_found"
 	TypeRequestRetryExceeded    = "request_retry_exceeded"
 	TypeUserCreditsInsufficient = "user_credits_insufficient"
@@ -26,5 +27,6 @@ const (
 	MessageUserCreditsInsufficient          = "insufficient user credits"
 	MessageUserPeriodLimitExceeded          = "period limit exceeded"
 
-	MessageModelDoesNotExistFmt = "model %s does not exist"
+	MessageModelDoesNotExistFmt       = "model %s does not exist"
+	MessageModelPriceNotConfiguredFmt = "model %s has no configured price"
 )

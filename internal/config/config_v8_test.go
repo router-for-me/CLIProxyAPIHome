@@ -89,6 +89,13 @@ func TestV8ConfigRejectsInvalidLayouts(t *testing.T) {
 		"config-version: 9", "server: false", "routing: {retry: {typo: 1}}",
 		"home: {enabled: true}", "unknown-root: true", "server: {unknown-field: true}",
 		"debug: true", "api-keys: {unknown: []}", "api-keys: {codex: [{keys: [{api-key: key, base-url: x}]}]}",
+		"api-keys: {codex: [{disable-codex-cloaking: true, keys: [{api-key: key}]}]}",
+		"api-keys: {codex: [{support-prompt-cache-key: true, keys: [{api-key: key}]}]}",
+		"api-keys: {claude: [{cloak: {mode: always}, keys: [{api-key: key}]}]}",
+		"api-keys: {claude: [{native-tool-search: true, keys: [{api-key: key}]}]}",
+		"api-keys: {claude: [{fingerprint-profile: claude-code-cli, keys: [{api-key: key}]}]}",
+		"api-keys: {claude: [{rebuild-mid-system-message: true, keys: [{api-key: key}]}]}",
+		"api-keys: {claude: [{experimental-cch-signing: true, keys: [{api-key: key}]}]}",
 		"api-keys: {codex: [{keys: [{api-key: key, weight: 1.5}]}]}", "server: {port: 1, port: 2}",
 	} {
 		t.Run(source, func(t *testing.T) {
@@ -126,7 +133,7 @@ func TestV8ConfigExample(t *testing.T) {
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
-	if active.Port != 8317 || active.RequestRetry != 3 || !active.QuotaExceeded.AntigravityCredits || active.QuotaExceeded.SwitchProject || active.QuotaExceeded.SwitchPreviewModel || !active.UsageStatisticsEnabled || active.WebsocketAuth {
+	if active.Port != 8317 || active.RequestRetry != 3 || !active.QuotaExceeded.AntigravityCredits || active.QuotaExceeded.SwitchProject || active.QuotaExceeded.SwitchPreviewModel || !active.UsageStatisticsEnabled {
 		t.Fatal("template defaults do not match the Home configuration contract")
 	}
 	for _, count := range []int{len(active.GeminiKey), len(active.InteractionsKey), len(active.VertexCompatAPIKey), len(active.CodexKey), len(active.ClaudeKey), len(active.XAIKey), len(active.MetaKey), len(active.OpenAICompatibility)} {
@@ -267,7 +274,15 @@ func TestV8MigrationRemovesRetiredFieldsAndPreservesSessionAffinity(t *testing.T
 			if errDecode := yaml.Unmarshal(source, &cfg); errDecode != nil {
 				t.Fatal(errDecode)
 			}
-			if cfg.Routing.SessionAffinity != test.want || !cfg.Codex.DisableCodexCloaking {
+			wire, errMarshalSource := yaml.Marshal(cfg)
+			if errMarshalSource != nil {
+				t.Fatal(errMarshalSource)
+			}
+			cpaSource, errParseSource := cpaconfig.ParseConfigBytes(wire)
+			if errParseSource != nil {
+				t.Fatal(errParseSource)
+			}
+			if cfg.Routing.SessionAffinity != test.want || !cpaSource.Codex.DisableCodexCloaking {
 				t.Fatal("legacy config load changed effective settings")
 			}
 			unchanged, changed, errNormalize := NormalizeConfigLayout(source, false)

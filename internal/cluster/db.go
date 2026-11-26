@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,7 +65,8 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 			return nil
 		}))
 	}
-	sqlDB := stdlib.OpenDB(*pgConfig, options...)
+	connector := &lifecyclePostgresConnector{Connector: stdlib.GetConnector(*pgConfig, options...)}
+	sqlDB := sql.OpenDB(connector)
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	if cfg.MaxIdleConns != nil {
 		sqlDB.SetMaxIdleConns(*cfg.MaxIdleConns)
@@ -83,7 +85,29 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 		return nil, errPing
 	}
 
-	return db, nil
+	// Delivery transactions must not reserve connections from the pool used by
+	// plugin callbacks. Keep their separate capacity bounded and lazy, even when
+	// the ordinary pool is unlimited. Both pools share connection configuration.
+	deliveryPool := sql.OpenDB(lifecyclePostgresConnector{Connector: connector.Connector})
+	deliveryLimit := maxUsageDeliveryConnections
+	if cfg.MaxOpenConns > 0 && cfg.MaxOpenConns < deliveryLimit {
+		deliveryLimit = cfg.MaxOpenConns
+	}
+	deliveryPool.SetMaxOpenConns(deliveryLimit)
+	deliveryPool.SetMaxIdleConns(1)
+	connector.usageDeliveryPool = deliveryPool
+	deliveryConfig := databaseGORMConfig(cfg.SlowQueryThreshold)
+	deliveryConfig.DisableAutomaticPing = true
+	deliveryDB, errDelivery := gorm.Open(postgres.New(postgres.Config{DSN: dsn, Conn: deliveryPool}), deliveryConfig)
+	if errDelivery != nil {
+		if errClose := sqlDB.Close(); errClose != nil {
+			return nil, fmt.Errorf("open usage delivery database: %w; close sql db: %v", errDelivery, errClose)
+		}
+		return nil, errDelivery
+	}
+	return db.Set(usageDeliveryStoreKey, &postgresUsageDeliveryStore{
+		db: deliveryDB, admission: make(chan struct{}, deliveryLimit),
+	}).Session(&gorm.Session{}), nil
 }
 
 // OpenSQLite opens a SQLite database.
@@ -239,6 +263,11 @@ func autoMigrate(db *gorm.DB) error {
 func autoMigrateSchema(db *gorm.DB) error {
 	startedAt := time.Now()
 	isPostgres := db.Dialector.Name() == "postgres"
+	if db.Migrator().HasTable(&BillingChargeRecord{}) && !db.Migrator().HasColumn(&BillingChargeRecord{}, "billing_multiplier") {
+		if errAdd := db.Exec(`ALTER TABLE "billing_charge" ADD COLUMN "billing_multiplier" numeric NOT NULL DEFAULT 1`).Error; errAdd != nil {
+			return fmt.Errorf("add billing_charge.billing_multiplier column: %w", errAdd)
+		}
+	}
 	if errMigrate := db.AutoMigrate(databaseMigrationModels()...); errMigrate != nil {
 		log.WithFields(log.Fields{
 			"database_backend":            db.Dialector.Name(),
@@ -279,10 +308,12 @@ func runCustomMigrations(db *gorm.DB) error {
 		{name: "migrate_user_unique_email", run: migrateUserUniqueEmail},
 		{name: "migrate_auth_next_retry_after", run: migrateAuthNextRetryAfter},
 		{name: "migrate_usage_observability_indexes", run: migrateUsageObservabilityIndexes},
+		{name: "migrate_usage_dedupe_keys", run: migrateUsageDedupeKeys},
 		{name: "migrate_usage_provider_api_key_sources", run: migrateUsageProviderAPIKeySources},
 		{name: "migrate_usage_service_tiers", run: migrateUsageServiceTiers},
 		{name: "migrate_legacy_api_keys", run: migrateLegacyAPIKeys},
 		{name: "migrate_deleted_access_group_bindings", run: migrateDeletedAccessGroupBindings},
+		{name: "migrate_openai_compatible_providers", run: migrateOpenAICompatibleProviders},
 		{name: "migrate_oauth_excluded_models_attributes", run: migrateOAuthExcludedModelsAttributes},
 	}
 	for _, migration := range migrations {

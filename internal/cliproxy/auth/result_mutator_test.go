@@ -40,7 +40,7 @@ func (s *fakeMutatorStore) Save(_ context.Context, auth *Auth) (string, error) {
 
 func (s *fakeMutatorStore) Delete(context.Context, string) error { return nil }
 
-func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
+func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate func(auth *Auth) StateMutation) (*Auth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attempts++
@@ -51,7 +51,7 @@ func (s *fakeMutatorStore) MutateAuthState(_ context.Context, id string, mutate 
 		return nil, fmt.Errorf("auth %s not found", id)
 	}
 	working := s.persisted.Clone()
-	if mutate(working) {
+	if mutate(working) != StateMutationUnchanged {
 		s.mutations++
 		s.persisted = working
 	}
@@ -492,50 +492,92 @@ func TestMarkResultCodexRetryDelayCrossManagerExtension(t *testing.T) {
 }
 
 func TestMarkResultDisabledQuotaSkipsRepeatedPersistence(t *testing.T) {
-	const authID = "auth-disabled-quota-local-repeat"
-	const model = "gpt-5"
-	ctx := context.Background()
-	seed := &Auth{
-		ID:       authID,
-		Index:    authID,
-		Provider: "codex",
-		Status:   StatusActive,
-		Metadata: map[string]any{"access_token": "preserved"},
-	}
-	store := &fakeMutatorStore{persisted: seed.Clone()}
-	manager := NewManager(store, nil, nil)
-	manager.SetConfig(&config.Config{DisableCooling: true})
-	if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
+	for _, test := range []struct {
+		name              string
+		timed             bool
+		globalDisable     bool
+		credentialDisable bool
+	}{
+		{name: "untimed global", globalDisable: true},
+		{name: "timed global", timed: true, globalDisable: true},
+		{name: "timed credential override", timed: true, credentialDisable: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const authID, model = "auth-disabled-quota-local-repeat", "gpt-5"
+			ctx := context.Background()
+			seed := &Auth{
+				ID: authID, Index: authID, Provider: "codex", Status: StatusActive,
+				Metadata: map[string]any{"access_token": "preserved"},
+			}
+			if test.credentialDisable {
+				seed.Metadata["disable_cooling"] = true
+			}
+			store := &fakeMutatorStore{persisted: seed.Clone()}
+			manager := NewManager(store, nil, nil)
+			t.Cleanup(manager.Shutdown)
+			manager.SetConfig(&config.Config{DisableCooling: test.globalDisable})
+			if _, errRegister := manager.Register(WithSkipPersist(ctx), seed.Clone()); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
 
-	manager.MarkResult(ctx, quotaResult(authID, model))
-	if attempts := store.mutationAttemptCount(); attempts != 1 {
-		t.Fatalf("mutation attempts after first 429 = %d, want 1", attempts)
-	}
-	if mutations := store.mutationCount(); mutations != 1 {
-		t.Fatalf("changed mutations after first 429 = %d, want 1", mutations)
-	}
+			first := quotaResult(authID, model)
+			if test.timed {
+				first.ObservedAt = time.Now().UTC().Add(-5 * time.Minute)
+			}
+			if errMark := manager.MarkResult(ctx, first); errMark != nil {
+				t.Fatal(errMark)
+			}
+			if mutations := store.mutationCount(); mutations != 1 {
+				t.Fatalf("changed mutations after first 429 = %d, want 1", mutations)
+			}
 
-	manager.MarkResult(ctx, quotaResult(authID, model))
-	manager.flushResultPersistQueue()
-	if attempts := store.mutationAttemptCount(); attempts != 1 {
-		t.Fatalf("mutation attempts after repeated 429 = %d, want 1", attempts)
-	}
-	if saves := store.saveCount(); saves != 0 {
-		t.Fatalf("Save() calls after repeated 429 = %d, want 0", saves)
-	}
+			const repeats = 100
+			repeated := first
+			for i := 1; i <= repeats; i++ {
+				repeated = quotaResult(authID, model)
+				repeated.Error.Message = fmt.Sprintf("quota delivery %d", i)
+				if test.timed {
+					repeated.ObservedAt = first.ObservedAt.Add(time.Duration(i) * time.Second)
+				}
+				if errMark := manager.MarkResult(ctx, repeated); errMark != nil {
+					t.Fatal(errMark)
+				}
+			}
+			repeated.SkipRequestStats = true
+			if errReplay := manager.MarkResult(ctx, repeated); errReplay != nil {
+				t.Fatal(errReplay)
+			}
 
-	local, ok := manager.GetByID(authID)
-	if !ok || local == nil || local.ModelStates[model] == nil {
-		t.Fatalf("GetByID() missing disabled quota state: %#v", local)
-	}
-	state := local.ModelStates[model]
-	if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
-		t.Fatalf("repeated disabled quota state = %#v, want dispatchable", state)
-	}
-	if got := store.persistedSnapshot().Metadata["access_token"]; got != "preserved" {
-		t.Fatalf("persisted access_token = %v, want preserved", got)
+			// Check pending and in-flight work before completed saves so this also
+			// catches an erroneously queued save before the worker reaches Store.Save.
+			manager.resultPersistMu.Lock()
+			pending := len(manager.resultPersistPending)
+			active := len(manager.resultPersistActive)
+			queued := len(manager.resultPersistQueue)
+			manager.resultPersistMu.Unlock()
+			if saves := store.saveCount(); pending != 0 || active != 0 || queued != 0 || saves != 0 {
+				t.Fatalf("repeated 429 persisted: pending=%d active=%d queued=%d saves=%d", pending, active, queued, saves)
+			}
+			if attempts := store.mutationAttemptCount(); attempts != 1 {
+				t.Fatalf("mutation attempts after repeated 429 = %d, want 1", attempts)
+			}
+
+			local, ok := manager.GetByID(authID)
+			if !ok || local == nil || local.ModelStates[model] == nil {
+				t.Fatalf("GetByID() missing disabled quota state: %#v", local)
+			}
+			state := local.ModelStates[model]
+			if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() || !state.Quota.NextRecoverAt.IsZero() {
+				t.Fatalf("repeated disabled quota state = %#v, want dispatchable", state)
+			}
+			if !state.LastObservedAt.Equal(repeated.ObservedAt) || state.StatusMessage != repeated.Error.Message || local.Failed != repeats+1 {
+				t.Fatalf("local diagnostics or stats were lost: state=%+v failed=%d", state, local.Failed)
+			}
+			persisted := store.persistedSnapshot()
+			if !persisted.ModelStates[model].LastObservedAt.Equal(first.ObservedAt) || persisted.Metadata["access_token"] != "preserved" {
+				t.Fatal("repeated 429 changed persisted state or credential metadata")
+			}
+		})
 	}
 }
 
@@ -1026,7 +1068,7 @@ type blockingMutatorStore struct {
 	once    sync.Once
 }
 
-func (s *blockingMutatorStore) MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
+func (s *blockingMutatorStore) MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) StateMutation) (*Auth, error) {
 	s.once.Do(func() { close(s.started) })
 	select {
 	case <-s.release:
@@ -1052,7 +1094,7 @@ func (s *committedMutatorStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *committedMutatorStore) MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) bool) (*Auth, error) {
+func (s *committedMutatorStore) MutateAuthState(ctx context.Context, id string, mutate func(auth *Auth) StateMutation) (*Auth, error) {
 	persisted, errMutate := s.fakeMutatorStore.MutateAuthState(ctx, id, mutate)
 	s.once.Do(func() { close(s.committed) })
 	select {
@@ -1220,5 +1262,69 @@ func TestMarkResultReconcilesCoolingDisabledDuringQuotaMutation(t *testing.T) {
 	}
 	if attempts := store.mutationAttemptCount(); attempts != 2 {
 		t.Fatalf("mutation attempts = %d, want quota transition plus compensating clear", attempts)
+	}
+}
+
+func TestMarkResultOtherModelSuccessClearsCredentialErrorAfterCooldown(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusServiceUnavailable} {
+		for _, cooling := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/cooling=%v", status, cooling), func(t *testing.T) {
+				ctx := context.Background()
+				const authID = "auth-expired-model-error"
+				now := time.Now().UTC()
+				retryAt := now.Add(-10 * time.Minute)
+				if cooling {
+					retryAt = now.Add(10 * time.Minute)
+				}
+				modelErr := &Error{Message: "model failure", HTTPStatus: status}
+				state := &ModelState{
+					Status: StatusError, StatusMessage: modelErr.Message, Unavailable: true, NextRetryAfter: retryAt,
+					LastError: cloneError(modelErr), UpdatedAt: now.Add(-20 * time.Minute),
+				}
+				if status == http.StatusTooManyRequests {
+					state.Quota = QuotaState{Exceeded: true, Scope: quotaScopeModel, Reason: "quota", NextRecoverAt: retryAt, BackoffLevel: 1}
+				}
+				seed := &Auth{
+					ID: authID, Index: authID, Provider: "codex", StateVersion: 1,
+					Status: StatusError, StatusMessage: modelErr.Message, LastError: cloneError(modelErr),
+					Metadata:    map[string]any{"access_token": "token"},
+					ModelStates: map[string]*ModelState{"gpt-5": state},
+				}
+				store := &fakeMutatorStore{persisted: seed.Clone()}
+				manager := NewManager(store, nil, nil)
+				// Home nodes hold a runtime projection without credential secrets or messages.
+				projection := seed.Clone()
+				projection.Metadata, projection.StatusMessage, projection.LastError = nil, "", nil
+				projection.RuntimeProjection = true
+				if _, errRegister := manager.Register(WithSkipPersist(ctx), projection); errRegister != nil {
+					t.Fatal(errRegister)
+				}
+
+				for i := 0; i < 2; i++ {
+					success := Result{AuthID: authID, Provider: "codex", Model: "gpt-5-mini", Success: true, ObservedAt: now.Add(time.Duration(i) * time.Second), AccessTokenSHA256: AccessTokenSHA256(seed)}
+					if errMark := manager.MarkResult(ctx, success); errMark != nil {
+						t.Fatal(errMark)
+					}
+				}
+
+				persisted := store.persistedSnapshot()
+				local, _ := manager.GetByID(authID)
+				if cooling {
+					if persisted.Status != StatusError || local.Status != StatusError || store.mutationAttemptCount() != 0 {
+						t.Fatalf("cooling: persisted=%s local=%s attempts=%d, want error without transactions", persisted.Status, local.Status, store.mutationAttemptCount())
+					}
+					return
+				}
+				if persisted.Status != StatusActive || persisted.StatusMessage != "" || persisted.LastError != nil || local.Status != StatusActive {
+					t.Fatalf("expired: persisted=%s %q %v local=%s, want active", persisted.Status, persisted.StatusMessage, persisted.LastError, local.Status)
+				}
+				if persisted.ModelStates["gpt-5"].LastError == nil {
+					t.Fatal("expired model error history was dropped")
+				}
+				if attempts := store.mutationAttemptCount(); attempts != 1 {
+					t.Fatalf("mutation attempts = %d, want one clearing transition", attempts)
+				}
+			})
+		}
 	}
 }

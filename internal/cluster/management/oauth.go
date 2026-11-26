@@ -587,6 +587,9 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 	if priority := priorityFromAuth(auth); priority != nil {
 		entry["priority"] = *priority
 	}
+	if weight := weightFromAuth(auth); weight != nil {
+		entry["weight"] = *weight
+	}
 	if note := noteFromAuth(auth); note != "" {
 		entry["note"] = note
 	}
@@ -604,6 +607,9 @@ func authFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		entry["request-retry"] = requestRetry
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") || hasUsingAPIInAuth(auth) {
+		entry["using_api"] = usingAPIFromAuth(auth)
 	}
 	return entry
 }
@@ -751,6 +757,14 @@ func applyOAuthFieldPatch(auth *coreauth.Auth, fields map[string]json.RawMessage
 				continue
 			}
 		}
+		if metadataPath == "weight" {
+			if value == nil {
+				delete(auth.Metadata, "weight")
+				touchedRoots["weight"] = struct{}{}
+				changed = true
+				continue
+			}
+		}
 		if metadataPath == "headers" {
 			applyOAuthHeadersPatch(auth, value)
 		} else if errSet := setOAuthMetadataValue(auth.Metadata, metadataPath, value); errSet != nil {
@@ -831,6 +845,8 @@ func canonicalOAuthMetadataKey(key string) string {
 		return "request_scoped_errors"
 	case "tool-prefix-disabled":
 		return "tool_prefix_disabled"
+	case "using-api":
+		return "using_api"
 	default:
 		return key
 	}
@@ -858,6 +874,8 @@ func legacyOAuthMetadataKey(canonicalKey string) string {
 		return "request-scoped-errors"
 	case "tool_prefix_disabled":
 		return "tool-prefix-disabled"
+	case "using_api":
+		return "using-api"
 	default:
 		return ""
 	}
@@ -974,11 +992,17 @@ func syncOAuthMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct
 	if _, ok := touchedRoots["priority"]; ok {
 		syncOAuthPriorityAttribute(auth)
 	}
+	if _, ok := touchedRoots["weight"]; ok {
+		syncOAuthWeightAttribute(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncOAuthNoteAttribute(auth)
 	}
 	if _, ok := touchedRoots["websockets"]; ok {
 		syncOAuthWebsocketsAttribute(auth)
+	}
+	if _, ok := touchedRoots["using_api"]; ok {
+		syncOAuthUsingAPIAttribute(auth)
 	}
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncOAuthDisabledState(auth)
@@ -1021,6 +1045,21 @@ func syncOAuthPriorityAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+func syncOAuthWeightAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	weight, ok := oauthIntValue(auth.Metadata["weight"])
+	if !ok || weight < 0 {
+		delete(auth.Attributes, "weight")
+		return
+	}
+	auth.Attributes["weight"] = strconv.Itoa(weight)
 }
 
 func oauthIntValue(value any) (int, bool) {
@@ -1076,6 +1115,21 @@ func syncOAuthWebsocketsAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["websockets"] = strconv.FormatBool(websockets)
+}
+
+func syncOAuthUsingAPIAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	usingAPI, ok := oauthBoolValue(auth.Metadata["using_api"])
+	if !ok {
+		delete(auth.Attributes, "using_api")
+		return
+	}
+	auth.Attributes["using_api"] = strconv.FormatBool(usingAPI)
 }
 
 func oauthBoolValue(value any) (bool, bool) {
@@ -1165,6 +1219,26 @@ func priorityFromAuth(auth *coreauth.Auth) *int {
 	return nil
 }
 
+// weightFromAuth derives an explicit non-negative routing weight from auth.
+func weightFromAuth(auth *coreauth.Auth) *int {
+	if auth == nil {
+		return nil
+	}
+	if auth.Attributes != nil {
+		if weightRaw := strings.TrimSpace(auth.Attributes["weight"]); weightRaw != "" {
+			if weight, errAtoi := strconv.Atoi(weightRaw); errAtoi == nil && weight >= 0 {
+				return &weight
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		if weight, ok := oauthIntValue(auth.Metadata["weight"]); ok && weight >= 0 {
+			return &weight
+		}
+	}
+	return nil
+}
+
 func prefixFromAuth(auth *coreauth.Auth) string {
 	if auth == nil {
 		return ""
@@ -1206,6 +1280,52 @@ func websocketsFromAuth(auth *coreauth.Auth) bool {
 	if auth.Metadata != nil {
 		if websockets, ok := oauthBoolValue(auth.Metadata["websockets"]); ok {
 			return websockets
+		}
+	}
+	return false
+}
+
+func hasUsingAPIInAuth(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if _, ok := oauthBoolValue(auth.Attributes["using_api"]); ok {
+			return true
+		}
+		if _, ok := oauthBoolValue(auth.Attributes["using-api"]); ok {
+			return true
+		}
+	}
+	if auth.Metadata != nil {
+		if _, ok := oauthBoolValue(auth.Metadata["using_api"]); ok {
+			return true
+		}
+		if _, ok := oauthBoolValue(auth.Metadata["using-api"]); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func usingAPIFromAuth(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if usingAPI, ok := oauthBoolValue(auth.Attributes["using_api"]); ok {
+			return usingAPI
+		}
+		if usingAPI, ok := oauthBoolValue(auth.Attributes["using-api"]); ok {
+			return usingAPI
+		}
+	}
+	if auth.Metadata != nil {
+		if usingAPI, ok := oauthBoolValue(auth.Metadata["using_api"]); ok {
+			return usingAPI
+		}
+		if usingAPI, ok := oauthBoolValue(auth.Metadata["using-api"]); ok {
+			return usingAPI
 		}
 	}
 	return false

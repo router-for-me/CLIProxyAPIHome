@@ -26,6 +26,12 @@ type NativeCapabilities struct {
 type ModelInfo struct {
 	// ID is the unique identifier for the model
 	ID string `json:"id"`
+	// SourceModelID identifies the provider model behind this published route.
+	SourceModelID string `json:"-" yaml:"-"`
+	// MetadataModelID identifies the catalog key used to resolve client metadata.
+	MetadataModelID string `json:"-" yaml:"-"`
+	// ResponseModelAlias is the forced response name on a published route, before credential prefixing.
+	ResponseModelAlias string `json:"-" yaml:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
 	// Created timestamp when the model was created
@@ -153,7 +159,9 @@ func GetGlobalRegistry() *ModelRegistry {
 	return globalRegistry
 }
 
-// LookupModelInfo searches dynamic registry (provider-specific > global) then static definitions.
+// LookupModelInfo looks up ModelInfo by checking dynamic registrations first
+// (strictly scoped to provider when non-empty, or global when empty) and then
+// falling back to channel-specific or shared static definitions.
 func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
@@ -168,7 +176,10 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	if info := GetGlobalRegistry().GetModelInfo(modelID, p); info != nil {
 		return cloneModelInfo(info)
 	}
-	return cloneModelInfo(LookupStaticModelInfo(modelID))
+	if p != "" {
+		return LookupStaticModelInfoByChannel(modelID, p)
+	}
+	return lookupStaticModelInfo(modelID, nil)
 }
 
 const modelQuotaExceededWindow = 5 * time.Minute
@@ -321,9 +332,13 @@ func (r *ModelRegistry) registerClient(clientID, clientProvider string, models, 
 
 	// Apply removals first to keep counters accurate.
 	for _, id := range removed {
+		if reg := r.models[id]; reg != nil {
+			delete(reg.QuotaExceededClients, clientID)
+			delete(reg.SuspendedClients, clientID)
+		}
 		oldCount := oldCounts[id]
 		for i := 0; i < oldCount; i++ {
-			r.removeModelRegistration(clientID, id, oldProvider, now)
+			r.removeModelRegistration(id, oldProvider, now)
 		}
 	}
 
@@ -334,7 +349,7 @@ func (r *ModelRegistry) registerClient(clientID, clientProvider string, models, 
 		}
 		overage := oldCount - newCount
 		for i := 0; i < overage; i++ {
-			r.removeModelRegistration(clientID, id, oldProvider, now)
+			r.removeModelRegistration(id, oldProvider, now)
 		}
 	}
 
@@ -367,13 +382,10 @@ func (r *ModelRegistry) registerClient(clientID, clientProvider string, models, 
 				reg.InfoByProvider[provider] = cloneModelInfo(model)
 			}
 			reg.LastUpdated = now
-			// Re-registering an existing client/model binding starts a fresh registry
-			// snapshot for that binding. Cooldown and suspension are transient
-			// scheduling state and must not survive this reconciliation step.
-			if reg.QuotaExceededClients != nil {
+			// Preserve scheduling state for unchanged bindings. The auth manager
+			// reconciles actual cooldown and suspension transitions separately.
+			if providerChanged {
 				delete(reg.QuotaExceededClients, clientID)
-			}
-			if reg.SuspendedClients != nil {
 				delete(reg.SuspendedClients, clientID)
 			}
 			if providerChanged && provider != "" {
@@ -464,7 +476,7 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
 }
 
 // removeModelRegistration removes a model registration.
-func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider string, now time.Time) {
+func (r *ModelRegistry) removeModelRegistration(modelID, provider string, now time.Time) {
 	// Normalize source data before building the derived payload.
 	registration, exists := r.models[modelID]
 	if !exists {
@@ -472,12 +484,6 @@ func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider stri
 	}
 	registration.Count--
 	registration.LastUpdated = now
-	if registration.QuotaExceededClients != nil {
-		delete(registration.QuotaExceededClients, clientID)
-	}
-	if registration.SuspendedClients != nil {
-		delete(registration.SuspendedClients, clientID)
-	}
 	if registration.Count < 0 {
 		registration.Count = 0
 	}
@@ -640,9 +646,13 @@ func (r *ModelRegistry) SetModelQuotaExceeded(clientID, modelID string) {
 		return
 	}
 	if registration, exists := r.models[modelID]; exists {
+		_, already := registration.QuotaExceededClients[clientID]
 		now := time.Now()
+		// Keep refreshing the quota window even when the marker already exists.
 		registration.QuotaExceededClients[clientID] = &now
-		log.Debugf("Marked model %s as quota exceeded for client %s", modelID, clientID)
+		if !already {
+			log.Debugf("Marked model %s as quota exceeded for client %s", modelID, clientID)
+		}
 	}
 }
 
@@ -685,12 +695,15 @@ func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
 	if registration.SuspendedClients == nil {
 		registration.SuspendedClients = make(map[string]string)
 	}
-	if _, already := registration.SuspendedClients[clientID]; already {
+	previousReason, already := registration.SuspendedClients[clientID]
+	if already && previousReason == reason {
 		return
 	}
 	registration.SuspendedClients[clientID] = reason
 	registration.LastUpdated = time.Now()
-	if reason != "" {
+	if already {
+		log.Debugf("Updated suspension reason for client %s for model %s: %s -> %s", clientID, modelID, previousReason, reason)
+	} else if reason != "" {
 		log.Debugf("Suspended client %s for model %s: %s", clientID, modelID, reason)
 	} else {
 		log.Debugf("Suspended client %s for model %s", clientID, modelID)
@@ -854,20 +867,20 @@ func modelInfoSortKey(model *ModelInfo) string {
 	return strings.ToLower(strings.TrimSpace(model.ID))
 }
 
-// GetModelInfo returns ModelInfo, prioritizing provider-specific definition if available.
+// GetModelInfo returns ModelInfo, strictly scoped to provider when non-empty.
 func (r *ModelRegistry) GetModelInfo(modelID, provider string) *ModelInfo {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 	if reg, ok := r.models[modelID]; ok && reg != nil {
-		// Try provider specific definition first
-		if provider != "" && reg.InfoByProvider != nil {
-			if reg.Providers != nil {
+		if provider != "" {
+			if reg.InfoByProvider != nil && reg.Providers != nil {
 				if count, ok := reg.Providers[provider]; ok && count > 0 {
 					if info, ok := reg.InfoByProvider[provider]; ok && info != nil {
 						return cloneModelInfo(info)
 					}
 				}
 			}
+			return nil
 		}
 		// Fallback to global info (last registered)
 		return cloneModelInfo(reg.Info)

@@ -6,9 +6,35 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 )
+
+func TestCopilotProjectionPreservesTokenExpiry(t *testing.T) {
+	ctx := t.Context()
+	repo := newQuotaTestRepository(t)
+	expiry := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	auth := &coreauth.Auth{ID: t.Name(), Index: t.Name(), Provider: "copilot", Status: coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "fixture-access", "refresh_token": "fixture-refresh",
+			"base_url": "https://api.individual.githubcopilot.com", "account_id": "account", "expired": expiry}}
+	if _, errUpsert := repo.UpsertAuth(ctx, auth, "register"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+	adapter := NewRuntimeAdapter(repo, "127.0.0.1")
+	if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	minimal := adapter.ListMinimalAuths()[0]
+	got, ok := minimal.ExpirationTime()
+	if !minimal.RuntimeProjection || !ok || got.UTC().Format(time.RFC3339Nano) != expiry ||
+		minimal.Metadata["base_url"] != auth.Metadata["base_url"] || minimal.Metadata["account_id"] != "account" {
+		t.Fatal("database projection lost the Copilot identity or expiry")
+	}
+	if minimal.Metadata["access_token"] != nil || minimal.Metadata["refresh_token"] != nil {
+		t.Fatal("database projection retained a token")
+	}
+}
 
 func TestProjectionPreservesCredentialAndExistingSharedTransitions(t *testing.T) {
 	for _, tc := range []struct {
@@ -90,5 +116,54 @@ func TestProjectionPreservesCredentialAndExistingSharedTransitions(t *testing.T)
 				t.Fatal("complete credential save/cache behavior regressed")
 			}
 		})
+	}
+}
+
+func TestProjectionPreservesAntigravityCapabilityHintsAndRouteMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := newQuotaTestRepository(t)
+	hints := map[string]any{
+		"endpoint":             "https://daily-cloudcode-pa.googleapis.com",
+		"project_id":           "proj-123",
+		"model_ids":            []any{"claude-sonnet-4-6", "gemini-3-flash"},
+		"web_search_model_ids": []any{"gemini-3-flash"},
+	}
+	seed := &coreauth.Auth{
+		ID:       "antigravity-proj",
+		Index:    "antigravity-proj",
+		Provider: "antigravity",
+		ProxyURL: "http://proxy.example.test:8080",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":                         "antigravity",
+			"access_token":                 "secret-access",
+			"refresh_token":                "secret-refresh",
+			"project_id":                   "proj-123",
+			"base_url":                     "https://daily-cloudcode-pa.googleapis.com",
+			"user_agent":                   "antigravity/1.104.0 darwin/arm64",
+			"antigravity_capability_hints": hints,
+		},
+	}
+	if _, errUpsert := repo.UpsertAuth(ctx, seed, "register"); errUpsert != nil {
+		t.Fatal(errUpsert)
+	}
+	adapter := NewRuntimeAdapter(repo, "127.0.0.1")
+	if errLoad := adapter.LoadIndex(ctx); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	minimal := adapter.ListMinimalAuths()[0]
+	if !minimal.RuntimeProjection || minimal.Metadata["access_token"] != nil || minimal.Metadata["refresh_token"] != nil {
+		t.Fatalf("minimal projection leaked secrets: %#v", minimal.Metadata)
+	}
+	if minimal.ProxyURL != "http://proxy.example.test:8080" {
+		t.Fatalf("ProxyURL = %q, want http://proxy.example.test:8080", minimal.ProxyURL)
+	}
+	if minimal.Metadata["project_id"] != "proj-123" ||
+		minimal.Metadata["base_url"] != "https://daily-cloudcode-pa.googleapis.com" ||
+		minimal.Metadata["user_agent"] != "antigravity/1.104.0 darwin/arm64" {
+		t.Fatalf("minimal projection lost Antigravity route metadata: %#v", minimal.Metadata)
+	}
+	if !reflect.DeepEqual(minimal.Metadata["antigravity_capability_hints"], hints) {
+		t.Fatalf("minimal projection hints = %#v, want %#v", minimal.Metadata["antigravity_capability_hints"], hints)
 	}
 }

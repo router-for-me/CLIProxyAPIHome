@@ -52,8 +52,10 @@ type UserUpdate struct {
 	Email            *string
 	Credits          *float64
 	CreditsUnlimited *bool
-	MFA              *JSONB
-	Passkey          *JSONB
+	// BillingMultiplier sets or clears the per-user charge multiplier.
+	BillingMultiplier OptionalFloatUpdate
+	MFA               *JSONB
+	Passkey           *JSONB
 
 	Timezone        *string
 	Limit5hCredits  OptionalFloatUpdate
@@ -339,6 +341,9 @@ func NormalizeJSONB(raw json.RawMessage) (*JSONB, error) {
 func applyUserPeriodLimitUpdate(record *UserRecord, update UserUpdate) error {
 	if record == nil {
 		return fmt.Errorf("user record is nil")
+	}
+	if errMultiplier := applyOptionalFloat(update.BillingMultiplier, &record.BillingMultiplier); errMultiplier != nil {
+		return periodLimitFieldError("billing_multiplier", PeriodLimitErrInvalidLimit, "billing_multiplier must be a non-negative number")
 	}
 	defaultUserPeriodLimitFields(record)
 	if update.Timezone != nil {

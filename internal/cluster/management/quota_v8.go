@@ -232,7 +232,7 @@ func (h *Handler) ResetCredentialQuota(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// GetPluginQuota handles GET /v0/management/plugins/:id/quota?auth_index=...
+// GetPluginQuota handles GET /v8/management/plugins/:id/quota?auth_index=...
 func (h *Handler) GetPluginQuota(c *gin.Context) {
 	pluginID := strings.TrimSpace(c.Param("id"))
 	authIndex := strings.TrimSpace(c.Query("auth_index"))
@@ -246,7 +246,7 @@ func (h *Handler) GetPluginQuota(c *gin.Context) {
 	h.fetchQuotaForPlugin(c, pluginID, authIndex)
 }
 
-// FetchPluginQuota handles POST /v0/management/plugins/:id/quota
+// FetchPluginQuota handles POST /v8/management/plugins/:id/quota
 func (h *Handler) FetchPluginQuota(c *gin.Context) {
 	pluginID := strings.TrimSpace(c.Param("id"))
 	var body credentialQuotaRequest
@@ -298,7 +298,7 @@ func (h *Handler) fetchQuotaForPlugin(c *gin.Context, pluginID, authIndex string
 	c.JSON(http.StatusOK, quotaResp)
 }
 
-// ResetPluginQuota handles DELETE /v0/management/plugins/:id/quota and POST /v0/management/plugins/:id/quota/reset
+// ResetPluginQuota handles DELETE /v8/management/plugins/:id/quota and POST /v8/management/plugins/:id/quota/reset
 func (h *Handler) ResetPluginQuota(c *gin.Context) {
 	pluginID := strings.TrimSpace(c.Param("id"))
 	authIndex := strings.TrimSpace(c.Query("auth_index"))

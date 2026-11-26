@@ -17,7 +17,7 @@ func TestApplyCredentialConfigToRootPreservesDistinctOpenAICompatibilityCredenti
 	idOne := "77777777-7777-4777-8777-777777777777"
 	idTwo := "88888888-8888-4888-8888-888888888888"
 	root := map[string]any{}
-	ApplyCredentialConfigToRoot(root, []*coreauth.Auth{
+	if _, errApply := ApplyCredentialConfigToRoot(root, []*coreauth.Auth{
 		{
 			ID:       idOne,
 			Index:    idOne,
@@ -40,7 +40,9 @@ func TestApplyCredentialConfigToRootPreservesDistinctOpenAICompatibilityCredenti
 				"base_url":    "https://example.test",
 			},
 		},
-	})
+	}); errApply != nil {
+		t.Fatal(errApply)
+	}
 	entries, okEntries := root["openai-compatibility"].([]appconfig.OpenAICompatibility)
 	if !okEntries || len(entries) != 1 {
 		t.Fatalf("openai-compatibility = %#v", root["openai-compatibility"])
@@ -81,7 +83,9 @@ func TestApplyCredentialConfigToRootRoundTripsDistinctOpenAICompatibilityFallbac
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			root := map[string]any{}
-			ApplyCredentialConfigToRoot(root, tc.auths)
+			if _, errApply := ApplyCredentialConfigToRoot(root, tc.auths); errApply != nil {
+				t.Fatal(errApply)
+			}
 			entries, okEntries := root["openai-compatibility"].([]appconfig.OpenAICompatibility)
 			if !okEntries || len(entries) != 2 {
 				t.Fatalf("openai-compatibility = %#v, want two separately representable entries", root["openai-compatibility"])

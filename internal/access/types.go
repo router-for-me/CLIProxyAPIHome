@@ -23,11 +23,3 @@ type AccessProvider struct {
 	// Config passes provider-specific options to the implementation.
 	Config map[string]any `yaml:"config,omitempty" json:"config,omitempty"`
 }
-
-const (
-	// AccessProviderTypeConfigAPIKey is the built-in provider validating inline API keys.
-	AccessProviderTypeConfigAPIKey = "config-api-key"
-
-	// DefaultAccessProviderName is applied when no provider name is supplied.
-	DefaultAccessProviderName = "config-inline"
-)

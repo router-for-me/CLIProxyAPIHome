@@ -5,184 +5,154 @@ import (
 	"errors"
 	"testing"
 
-	homeauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	cpaauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
-type discoveryAuthAdapter struct {
+type discoveryTestAdapter struct {
 	ClusterAdapter
-	full  *homeauth.Auth
-	err   error
-	calls int
+	full       *coreauth.Auth
+	errFull    error
+	fullCalls  int
+	saved      *coreauth.Auth
+	saveResult int64
+	projection *coreauth.Auth
 }
 
-func (a *discoveryAuthAdapter) ObservedAuthState(string) (int64, bool) {
+func (a *discoveryTestAdapter) Enabled() bool { return true }
+
+func (a *discoveryTestAdapter) GetFullAuth(context.Context, string) (*coreauth.Auth, error) {
+	a.fullCalls++
 	if a.full == nil {
-		return 0, false
+		return nil, a.errFull
 	}
-	return a.full.StateVersion, true
-}
-func (a *discoveryAuthAdapter) Enabled() bool { return true }
-func (a *discoveryAuthAdapter) GetFullAuth(_ context.Context, id string) (*homeauth.Auth, error) {
-	a.calls++
-	return a.full, a.err
+	return a.full.Clone(), a.errFull
 }
 
-func TestPluginDiscoveryUsesFullCredentialWithoutChangingSchedulingProjection(t *testing.T) {
-	projection := &homeauth.Auth{ID: "credential-id", Index: "credential-id", Provider: "fixture", RuntimeProjection: true}
-	adapter := &discoveryAuthAdapter{full: &homeauth.Auth{ID: projection.ID, Provider: "fixture", Metadata: map[string]any{"token": "synthetic-first"}}}
-	runtime := &Runtime{clusterAdapter: adapter}
-	first, errResolve := runtime.pluginDiscoveryAuth(context.Background(), projection)
-	if errResolve != nil || first == nil || first.Metadata["token"] != "synthetic-first" {
-		t.Fatal("discovery did not receive the full provider credential")
+func (a *discoveryTestAdapter) SaveWithStateVersion(_ context.Context, auth *coreauth.Auth) (string, int64, error) {
+	a.saved = auth.Clone()
+	return auth.ID, a.saveResult, nil
+}
+
+func (a *discoveryTestAdapter) ListMinimalAuths() []*coreauth.Auth {
+	if a.projection == nil {
+		return nil
 	}
-	first.Metadata["token"] = "mutated-copy"
-	if projection.Metadata != nil || adapter.full.Metadata["token"] != "synthetic-first" {
-		t.Fatal("discovery changed the scheduler projection or authoritative credential")
+	return []*coreauth.Auth{a.projection.Clone()}
+}
+
+type discoveryTestPlugin struct {
+	registered []sdkpluginhost.RegisteredPluginInfo
+	result     sdkpluginhost.AuthModelResult
+	seen       *cpaauth.Auth
+}
+
+func (p *discoveryTestPlugin) ModelsForAuth(_ context.Context, auth *cpaauth.Auth) sdkpluginhost.AuthModelResult {
+	p.seen = auth
+	if auth.Metadata["token"] != "synthetic-token" {
+		return sdkpluginhost.AuthModelResult{Handled: true, Err: errors.New("missing token")}
 	}
-	// Reconnect updates the same identity. The next callback resolves it again.
-	adapter.full.Metadata["token"] = "synthetic-reconnected"
-	second, errReconnect := runtime.pluginDiscoveryAuth(context.Background(), projection)
-	if errReconnect != nil || second.Metadata["token"] != "synthetic-reconnected" || second.ID != projection.ID || adapter.calls != 2 {
-		t.Fatal("reconnect did not use the current credential with the same identity")
+	return p.result
+}
+
+func (p *discoveryTestPlugin) ModelsForProvider(string) []sdkpluginhost.ModelInfo { return nil }
+
+func (p *discoveryTestPlugin) RegisteredPlugins() []sdkpluginhost.RegisteredPluginInfo {
+	return p.registered
+}
+
+func newDiscoveryTestRuntime(t *testing.T, adapter *discoveryTestAdapter) (*Runtime, *coreauth.Auth) {
+	t.Helper()
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	rt := &Runtime{cfg: &config.Config{}, coreManager: manager, clusterAdapter: adapter}
+	projection := &coreauth.Auth{ID: t.Name(), Index: t.Name(), Provider: "fixture", StateVersion: 3,
+		Status: coreauth.StatusActive, RuntimeProjection: true, Attributes: map[string]string{"auth_kind": "oauth"}}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(t.Context()), projection); errRegister != nil {
+		t.Fatal(errRegister)
 	}
-	saved := adapter.full.Clone()
-	for _, state := range []string{"deleted", "disabled", "refresh-blocked", "provider-changed", "resolver-failed"} {
-		t.Run(state, func(t *testing.T) {
-			full := saved.Clone()
-			adapter.err = nil
-			switch state {
-			case "deleted":
-				full = nil
+	adapter.full = &coreauth.Auth{ID: projection.ID, Provider: "fixture", StateVersion: 3, Status: coreauth.StatusActive,
+		Attributes: map[string]string{"auth_kind": "oauth"}, Metadata: map[string]any{"token": "synthetic-token"}}
+	reg := registry.GetGlobalRegistry()
+	t.Cleanup(func() { reg.UnregisterClient(projection.ID) })
+	return rt, projection
+}
+
+func TestPluginDiscoveryUsesFullCredentialForProjection(t *testing.T) {
+	adapter := &discoveryTestAdapter{}
+	rt, projection := newDiscoveryTestRuntime(t, adapter)
+	plugin := &discoveryTestPlugin{
+		registered: []sdkpluginhost.RegisteredPluginInfo{{}},
+		result:     sdkpluginhost.AuthModelResult{Handled: true, Models: []sdkpluginhost.ModelInfo{{ID: "fixture-model"}}},
+	}
+	rt.publishModelsForAuth(projection, plugin)
+	if plugin.seen == nil || plugin.seen.Metadata["token"] != "synthetic-token" || plugin.seen.ID != projection.ID {
+		t.Fatal("plugin discovery did not receive the full credential")
+	}
+	if !registry.GetGlobalRegistry().ClientSupportsModel(projection.ID, "fixture-model") {
+		t.Fatal("discovered model was not registered")
+	}
+	if current, _ := rt.coreManager.GetByID(projection.ID); current == nil || !current.RuntimeProjection || current.Metadata["token"] != nil {
+		t.Fatal("scheduler record stopped being a secret-free projection")
+	}
+}
+
+func TestPluginDiscoveryKeepsProjectionWhenFullAuthIsUnavailable(t *testing.T) {
+	for _, tc := range []string{"no-plugins", "resolver-error", "disabled", "provider-changed"} {
+		t.Run(tc, func(t *testing.T) {
+			adapter := &discoveryTestAdapter{}
+			rt, projection := newDiscoveryTestRuntime(t, adapter)
+			plugin := &discoveryTestPlugin{registered: []sdkpluginhost.RegisteredPluginInfo{{}}}
+			switch tc {
+			case "no-plugins":
+				plugin.registered = nil
+			case "resolver-error":
+				adapter.errFull = errors.New("resolver failed")
 			case "disabled":
-				full.Disabled = true
-			case "refresh-blocked":
-				full.RuntimeRefreshBlocked = true
+				adapter.full.Disabled = true
 			case "provider-changed":
-				full.Provider = "other"
-			case "resolver-failed":
-				adapter.err = errors.New("private resolver detail")
+				adapter.full.Provider = "other"
 			}
-			adapter.full = full
-			resolved, errUnavailable := runtime.pluginDiscoveryAuth(context.Background(), projection)
-			if resolved != nil || errUnavailable == nil || errUnavailable.Error() == "private resolver detail" {
-				t.Fatal("unavailable credential reached discovery or leaked a resolver error")
+			if got := rt.pluginDiscoveryAuth(t.Context(), plugin, projection); got != projection {
+				t.Fatal("unusable full credential replaced the projection")
+			}
+			if tc == "no-plugins" && adapter.fullCalls != 0 {
+				t.Fatal("full credential was loaded without registered plugins")
 			}
 		})
 	}
 }
 
-func TestPluginDiscoveryNonClusterAuthIsCopied(t *testing.T) {
-	auth := &homeauth.Auth{ID: "local", Provider: "fixture", Metadata: map[string]any{"token": "synthetic-local"}}
-	resolved, errResolve := (&Runtime{}).pluginDiscoveryAuth(context.Background(), auth)
-	if errResolve != nil || resolved.Metadata["token"] != "synthetic-local" {
-		t.Fatal("non-cluster discovery lost its credential")
-	}
-	resolved.Metadata["token"] = "changed"
-	if auth.Metadata["token"] != "synthetic-local" {
-		t.Fatal("discovery mutated local auth")
-	}
-}
-
-func TestPluginDiscoveryDiscardsResultsAfterRevocationOrReconnect(t *testing.T) {
-	projection := &homeauth.Auth{ID: "credential-id", Provider: "fixture", RuntimeProjection: true}
-	adapter := &discoveryAuthAdapter{full: &homeauth.Auth{ID: projection.ID, Provider: "fixture", StateVersion: 1, Metadata: map[string]any{"token": "synthetic-first"}}}
-	runtime := &Runtime{clusterAdapter: adapter}
-	discovered, errResolve := runtime.pluginDiscoveryAuth(context.Background(), projection)
-	if errResolve != nil || !runtime.pluginDiscoveryStillCurrent(projection, discovered) {
-		t.Fatal("current discovery was rejected")
-	}
-	adapter.full.StateVersion = 2
-	if runtime.pluginDiscoveryStillCurrent(projection, discovered) {
-		t.Fatal("reconnected credential accepted stale discovery")
-	}
-	adapter.full = nil
-	if runtime.pluginDiscoveryStillCurrent(projection, discovered) {
-		t.Fatal("revoked credential accepted stale discovery")
-	}
-}
-
-type discoveryUpdateAdapter struct {
-	discoveryAuthAdapter
-}
-
-func (a *discoveryUpdateAdapter) SaveWithStateVersion(_ context.Context, auth *homeauth.Auth) (string, int64, error) {
-	if a.full == nil || auth.StateVersion != a.full.StateVersion {
-		return auth.ID, 0, nil
-	}
-	a.full = auth.Clone()
-	a.full.StateVersion++
-	return auth.ID, a.full.StateVersion, nil
-}
-
-func (a *discoveryUpdateAdapter) ListMinimalAuths() []*homeauth.Auth {
-	if a.full == nil {
-		return nil
-	}
-	return []*homeauth.Auth{{ID: a.full.ID, Provider: a.full.Provider, Label: a.full.Label,
-		StateVersion: a.full.StateVersion, RuntimeProjection: true}}
-}
-
-func TestPluginDiscoveryAuthUpdatePersistsFullRecordButKeepsSchedulerMinimal(t *testing.T) {
-	ctx := context.Background()
-	adapter := &discoveryUpdateAdapter{discoveryAuthAdapter: discoveryAuthAdapter{full: &homeauth.Auth{
-		ID: "discovery-update", Provider: "fixture", StateVersion: 1,
-		Metadata: map[string]any{"token": "synthetic-token"},
-	}}}
-	manager := homeauth.NewManager(nil, nil, nil)
-	projection := adapter.ListMinimalAuths()[0]
-	if _, errRegister := manager.Register(homeauth.WithSkipPersist(ctx), projection); errRegister != nil {
-		t.Fatal(errRegister)
-	}
-	runtime := &Runtime{clusterAdapter: adapter, coreManager: manager}
-	discovered := adapter.full.Clone()
-	// The SDK merges a partial label update with the callback's full credential.
-	update := pluginAuthToHomeAuth(homeAuthToPluginAuth(discovered))
-	update.Label = "discovered label"
-	applied, errUpdate := runtime.applyPluginDiscoveryAuthUpdate(ctx, update, discovered)
-	if errUpdate != nil || applied == nil || applied.Label != update.Label || applied.StateVersion != 2 {
-		t.Fatalf("discovery update was not applied: %v", errUpdate)
-	}
-	current, exists := manager.GetByID(projection.ID)
-	if !exists || !current.RuntimeProjection || current.Metadata != nil || current.Storage != nil {
-		t.Fatal("full discovery credential entered scheduler state")
-	}
-	if adapter.full.Metadata["token"] != "synthetic-token" || adapter.full.Label != update.Label {
-		t.Fatal("partial plugin update damaged the authoritative credential")
-	}
-	if _, errStale := runtime.applyPluginDiscoveryAuthUpdate(ctx, update, discovered); errStale == nil {
-		t.Fatal("stale discovery overwrote a newer credential")
-	}
-	adapter.full = nil
-	if _, errRevoked := runtime.applyPluginDiscoveryAuthUpdate(ctx, update, applied); errRevoked == nil {
-		t.Fatal("discovery update restored a revoked credential")
-	}
-}
-
-func TestPluginDiscoveryPublicationPreservesNewerModelsAndCannotRestoreRevokedModels(t *testing.T) {
-	const id = "discovery-publication"
-	modelRegistry := registry.GetGlobalRegistry()
-	t.Cleanup(func() { modelRegistry.UnregisterClient(id) })
-	adapter := &discoveryAuthAdapter{full: &homeauth.Auth{ID: id, Provider: "fixture", StateVersion: 1}}
-	runtime := &Runtime{clusterAdapter: adapter, coreManager: homeauth.NewManager(nil, nil, nil)}
-	discovered := adapter.full.Clone()
-	register := func(model string) {
-		runtime.registerResolvedModelsForAuth(discovered, "fixture", []*ModelInfo{{ID: model}}, nil)
-	}
-	runtime.publishPluginDiscoveryModels(discovered, discovered, func() { register("old-model") })
-	if modelRegistry.GetModelInfoForClient(id, "old-model") == nil {
-		t.Fatal("current discovery did not publish its models")
-	}
-	adapter.full.StateVersion++
-	register("new-model")
-	runtime.publishPluginDiscoveryModels(discovered, discovered, func() { register("stale-model") })
-	if modelRegistry.GetModelInfoForClient(id, "new-model") == nil || modelRegistry.GetModelInfoForClient(id, "stale-model") != nil {
-		t.Fatal("stale discovery replaced or removed reconnected models")
-	}
-	adapter.full = nil
-	runtime.applyCoreAuthRemove(homeauth.WithSkipPersist(context.Background()), id)
-	runtime.publishPluginDiscoveryModels(discovered, discovered, func() { register("revoked-model") })
-	if modelRegistry.GetModelInfoForClient(id, "revoked-model") != nil {
-		t.Fatal("discovery restored models after revocation")
+func TestPluginDiscoveryAuthUpdateKeepsSchedulerProjection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		accepted int64
+	}{{"accepted", 4}, {"stale", 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &discoveryTestAdapter{saveResult: tc.accepted}
+			rt, projection := newDiscoveryTestRuntime(t, adapter)
+			adapter.projection = projection.Clone()
+			adapter.projection.StateVersion = 4
+			adapter.projection.Prefix = "team"
+			update := &cpaauth.Auth{ID: projection.ID, Prefix: "team", Status: cpaauth.StatusActive,
+				Metadata: map[string]any{"token": "synthetic-token", "account_id": "updated"}}
+			plugin := &discoveryTestPlugin{
+				registered: []sdkpluginhost.RegisteredPluginInfo{{}},
+				result:     sdkpluginhost.AuthModelResult{Handled: true, Auth: update, Models: []sdkpluginhost.ModelInfo{{ID: "fixture-model"}}},
+			}
+			rt.publishModelsForAuth(projection, plugin)
+			if adapter.saved == nil || adapter.saved.StateVersion != 3 || adapter.saved.Metadata["account_id"] != "updated" {
+				t.Fatal("plugin update was not persisted at the revision discovery read")
+			}
+			current, _ := rt.coreManager.GetByID(projection.ID)
+			if current == nil || !current.RuntimeProjection || current.Metadata["token"] != nil {
+				t.Fatal("full credential replaced the scheduler projection")
+			}
+			if wantVersion := map[int64]int64{4: 4, 0: 3}[tc.accepted]; current.StateVersion != wantVersion {
+				t.Fatalf("scheduler revision = %d, want %d", current.StateVersion, wantVersion)
+			}
+		})
 	}
 }

@@ -75,7 +75,7 @@ func (s *failingCooldownMutationStore) Delete(context.Context, string) error {
 	return nil
 }
 
-func (s *failingCooldownMutationStore) MutateAuthState(context.Context, string, func(*coreauth.Auth) bool) (*coreauth.Auth, error) {
+func (s *failingCooldownMutationStore) MutateAuthState(context.Context, string, func(*coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, error) {
 	s.attempts++
 	return nil, s.err
 }
@@ -287,26 +287,36 @@ func TestApplyCoreAuthAddOrUpdateRegistersModelsFromAcceptedSnapshot(t *testing.
 func TestSanitizeAuthForDownstreamRemovesRefreshDiagnostic(t *testing.T) {
 	t.Parallel()
 
-	auth := &coreauth.Auth{
-		ID:       "refresh-diagnostic-auth",
-		Provider: "antigravity",
-		LastError: &coreauth.Error{
-			Code:       "refresh_temporarily_unavailable",
-			Diagnostic: "safe refresh diagnostic",
-			Upstream:   &coreauth.UpstreamResponse{Status: http.StatusBadGateway, Body: []byte(`{"error":"proxy detail"}`)},
-		},
-		LastRefreshError: &coreauth.Error{Code: "refresh_temporarily_unavailable", Diagnostic: "safe refresh diagnostic"},
-	}
-	sanitized := SanitizeAuthForDownstream(auth)
-	if sanitized == nil || sanitized.LastRefreshError != nil || sanitized.LastError != nil {
-		t.Fatalf("SanitizeAuthForDownstream() = %#v, want refresh diagnostic removed", sanitized)
-	}
-	if auth.LastRefreshError == nil || auth.LastError == nil || auth.LastError.Upstream == nil {
-		t.Fatal("SanitizeAuthForDownstream() mutated the source auth")
+	for _, code := range []string{"refresh_temporarily_unavailable", "refresh_unsupported", coreauth.ErrorCodeRefreshOutcomeUnknown} {
+		t.Run(code, func(t *testing.T) {
+			auth := &coreauth.Auth{
+				ID:       "refresh-diagnostic-auth",
+				Provider: "codex",
+				LastError: &coreauth.Error{
+					Code:       code,
+					Diagnostic: "safe refresh diagnostic",
+					Upstream:   &coreauth.UpstreamResponse{Status: http.StatusBadGateway, Body: []byte(`{"error":"proxy detail"}`)},
+				},
+				LastRefreshError: &coreauth.Error{Code: code, Diagnostic: "safe refresh diagnostic"},
+			}
+			sanitized, errSanitize := SanitizeAuthForDownstream(auth, nil)
+			if errSanitize != nil {
+				t.Fatal(errSanitize)
+			}
+			if sanitized == nil || sanitized.LastRefreshError != nil || sanitized.LastError != nil {
+				t.Fatalf("SanitizeAuthForDownstream() = %#v, want refresh diagnostic removed", sanitized)
+			}
+			if auth.LastRefreshError == nil || auth.LastError == nil || auth.LastError.Upstream == nil {
+				t.Fatal("SanitizeAuthForDownstream() mutated the source auth")
+			}
+		})
 	}
 
 	executionErr := &coreauth.Error{Code: "model_failed", Diagnostic: "execution diagnostic", HTTPStatus: http.StatusBadGateway}
-	sanitizedExecution := SanitizeAuthForDownstream(&coreauth.Auth{ID: "execution-error-auth", LastError: executionErr})
+	sanitizedExecution, errSanitize := SanitizeAuthForDownstream(&coreauth.Auth{ID: "execution-error-auth", LastError: executionErr}, nil)
+	if errSanitize != nil {
+		t.Fatal(errSanitize)
+	}
 	if sanitizedExecution == nil || sanitizedExecution.LastError == nil || sanitizedExecution.LastError.Code != executionErr.Code {
 		t.Fatalf("SanitizeAuthForDownstream() removed ordinary execution error: %#v", sanitizedExecution)
 	}
