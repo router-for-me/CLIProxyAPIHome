@@ -126,7 +126,7 @@ func TestParseAntigravityWindowsAcceptsFlexibleFractionsAndSkipsMalformedBuckets
 	}
 }
 
-func TestCollectorAntigravityPrimaryWindowsStayDistinctWhenFiveHourBucketsDiffer(t *testing.T) {
+func TestCollectorAntigravityPrimaryWindowsKeepEveryWindowWhenFiveHourBucketMissing(t *testing.T) {
 	repo := newCollectorTestRepository(t)
 	now := time.Date(2026, 7, 22, 4, 0, 0, 0, time.UTC)
 	seedCollectorProviderAuth(t, repo, "antigravity-asymmetric", "antigravity", map[string]any{
@@ -157,11 +157,11 @@ func TestCollectorAntigravityPrimaryWindowsStayDistinctWhenFiveHourBucketsDiffer
 	if errGet != nil {
 		t.Fatalf("GetQuotaCredential() error = %v", errGet)
 	}
-	if item.CollectionStatus != "success" || len(item.Windows) != 3 || len(item.PrimaryWindows) != 2 {
+	if item.CollectionStatus != "success" || len(item.Windows) != 3 || item.WindowCount != 3 || len(item.PrimaryWindows) != 3 {
 		t.Fatalf("unexpected asymmetric quota snapshot: %+v", item)
 	}
-	if item.PrimaryWindows[0].ID != "antigravity-gemini-5h" || item.PrimaryWindows[1].ID != "antigravity-3p-weekly" {
-		t.Fatalf("primary windows did not retain both groups: %+v", item.PrimaryWindows)
+	if item.PrimaryWindows[0].ID != "antigravity-gemini-5h" || item.PrimaryWindows[1].ID != "antigravity-gemini-weekly" || item.PrimaryWindows[2].ID != "antigravity-3p-weekly" {
+		t.Fatalf("primary windows did not keep every current window: %+v", item.PrimaryWindows)
 	}
 }
 
