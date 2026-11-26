@@ -2,12 +2,12 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"gorm.io/gorm"
 )
@@ -16,6 +16,11 @@ const (
 	OAuthSessionTTL          = 20 * time.Minute
 	oauthCompletedSessionTTL = time.Minute
 )
+
+// OAuthSessionResult is the public result kept on a completed OAuth session.
+type OAuthSessionResult struct {
+	AuthIDs []string `json:"auth_ids"`
+}
 
 // ErrOAuthSessionNotPending reports that session data can no longer be changed.
 var ErrOAuthSessionNotPending = errors.New("oauth session is not pending")
@@ -227,15 +232,28 @@ func (r *Repository) CompleteOAuthSessionWithAuths(ctx context.Context, state st
 			return errComplete
 		}
 		txRepo := NewRepository(tx)
+		authIDs := make([]string, 0, len(auths))
+		seen := make(map[string]bool, len(auths))
 		for _, auth := range auths {
 			if auth == nil {
 				return fmt.Errorf("oauth credential is nil")
 			}
-			if _, errUpsert := txRepo.UpsertAuth(ctx, auth, "upsert"); errUpsert != nil {
+			record, errUpsert := txRepo.UpsertAuth(ctx, auth, "upsert")
+			if errUpsert != nil {
 				return errUpsert
 			}
+			if !seen[record.UUID] {
+				authIDs = append(authIDs, record.UUID)
+				seen[record.UUID] = true
+			}
 		}
-		return nil
+		// Keep only the public result after clearing the pending session's secrets.
+		result, errMarshal := json.Marshal(OAuthSessionResult{AuthIDs: authIDs})
+		if errMarshal != nil {
+			return errMarshal
+		}
+		return tx.Model(&OAuthSessionRecord{}).Where("state = ?", strings.TrimSpace(state)).
+			Update("data", JSONB(result)).Error
 	})
 }
 
