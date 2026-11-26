@@ -257,8 +257,9 @@ func (r *Runtime) publishModelsForAuth(a *coreauth.Auth, plugins modelPluginSour
 	authKind, excluded := r.modelRegistrationAuthSettings(cfg, provider, a)
 	configModels := modelInfosFromAuthMetadata(a, homeConfigModelsMetadataKey)
 	if plugins != nil {
-		result := plugins.ModelsForAuth(context.Background(), homeAuthToPluginAuth(a))
-		if r.tryRegisterPluginModelsForAuth(a, provider, excluded, result) {
+		discovery := r.pluginDiscoveryAuth(context.Background(), plugins, a)
+		result := plugins.ModelsForAuth(context.Background(), homeAuthToPluginAuth(discovery))
+		if r.tryRegisterPluginModelsForAuth(a, discovery, provider, excluded, result) {
 			return
 		}
 	}

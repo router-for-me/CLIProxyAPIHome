@@ -167,7 +167,7 @@ func (r *Runtime) pluginLoginPollAuths(resp pluginapi.AuthLoginPollResponse) ([]
 	return auths, nil
 }
 
-func (r *Runtime) tryRegisterPluginModelsForAuth(auth *homeauth.Auth, provider string, excluded []string, result sdkpluginhost.AuthModelResult) bool {
+func (r *Runtime) tryRegisterPluginModelsForAuth(auth, discovery *homeauth.Auth, provider string, excluded []string, result sdkpluginhost.AuthModelResult) bool {
 	if !result.Handled {
 		return false
 	}
@@ -178,7 +178,7 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(auth *homeauth.Auth, provider s
 
 	activeAuth := auth
 	if result.Auth != nil && r.coreManager != nil {
-		activeAuth = r.applyPluginModelAuthUpdate(auth, pluginAuthToHomeAuth(result.Auth))
+		activeAuth = r.applyPluginModelAuthUpdate(auth, discovery, pluginAuthToHomeAuth(result.Auth))
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(result.Provider))
 	if activeProvider := strings.ToLower(strings.TrimSpace(activeAuth.Provider)); activeProvider != "" {
@@ -199,21 +199,24 @@ func (r *Runtime) tryRegisterPluginModelsForAuth(auth *homeauth.Auth, provider s
 	return true
 }
 
-func (r *Runtime) applyPluginModelAuthUpdate(auth, update *homeauth.Auth) *homeauth.Auth {
+func (r *Runtime) applyPluginModelAuthUpdate(auth, discovery, update *homeauth.Auth) *homeauth.Auth {
 	update.ID = auth.ID
 	if update.Provider == "" {
-		update.Provider = auth.Provider
+		update.Provider = discovery.Provider
 	}
 	if update.FileName == "" {
-		update.FileName = auth.FileName
+		update.FileName = discovery.FileName
 	}
 	if update.Attributes == nil {
 		update.Attributes = make(map[string]string)
 	}
-	for key, value := range auth.Attributes {
+	for key, value := range discovery.Attributes {
 		if _, exists := update.Attributes[key]; !exists {
 			update.Attributes[key] = value
 		}
+	}
+	if discovery != auth {
+		return r.applyProjectedPluginAuthUpdate(context.Background(), auth, discovery, update)
 	}
 	updated, errUpdate := r.coreManager.Update(context.Background(), update)
 	if errUpdate != nil || updated == nil {
