@@ -325,7 +325,28 @@ func run() int {
 		log.Errorf("failed to resolve database node ip: %v", errClusterClientAddr)
 		return 1
 	}
-	tlsConfig, errCertificates := repo.EnsureClusterCertificates(runCtx, clusterClientAddr)
+	coordinationRepo := repo
+	if dbBackend == cluster.DatabaseBackendPostgres && clusterCfg != nil {
+		coordinationDB, errCoordinationOpen := cluster.OpenCoordination(runCtx, clusterCfg.PGSQL)
+		if errCoordinationOpen != nil {
+			log.Errorf("failed to open coordination database pool: %v", errCoordinationOpen)
+			return 1
+		}
+		if coordinationDB != nil {
+			coordinationSQLDB, errCoordinationSQLDB := coordinationDB.DB()
+			if errCoordinationSQLDB != nil {
+				log.Errorf("failed to get coordination sql db: %v", errCoordinationSQLDB)
+				return 1
+			}
+			defer func() {
+				if errCloseSQL := coordinationSQLDB.Close(); errCloseSQL != nil {
+					log.Warnf("failed to close coordination sql db: %v", errCloseSQL)
+				}
+			}()
+			coordinationRepo = cluster.NewRepository(coordinationDB)
+		}
+	}
+	tlsConfig, errCertificates := coordinationRepo.EnsureClusterCertificates(runCtx, clusterClientAddr)
 	if errCertificates != nil {
 		log.Errorf("failed to init runtime certificates: %v", errCertificates)
 		return 1
@@ -408,6 +429,7 @@ func run() int {
 			StartupRecovery: func(recoveryCtx context.Context, incarnation cluster.HomeIncarnationID) error {
 				return recoverCPAFences(recoveryCtx, clusterRepo, incarnation, respSrv)
 			},
+			CoordinationRepository: coordinationRepo,
 		})
 		refreshController := cluster.NewRefreshController(coordinator, rt, clusterRepo, clusterTLSConfig)
 		coordinator.SetOnMasterChanged(refreshController.OnMasterChanged)

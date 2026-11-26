@@ -74,7 +74,7 @@ func (h *RESPHandler) ClassifyConnection(ctx context.Context, fingerprint string
 	if !initialized {
 		return ConnectionLifetime{}, fmt.Errorf("cluster resp: Home incarnation is not initialized")
 	}
-	return h.repo.ClassifyConnection(ctx, fingerprint, home)
+	return h.liveness().ClassifyConnection(ctx, fingerprint, home)
 }
 
 // SubscribeMembership creates a membership owned by this Home incarnation.
@@ -90,7 +90,7 @@ func (h *RESPHandler) RefreshCPALiveness(ctx context.Context, lifetime Connectio
 	if lifetime.Home != home {
 		return ErrHomeIncarnationFenced
 	}
-	return h.repo.RefreshCPALiveness(ctx, lifetime)
+	return h.liveness().RefreshCPALiveness(ctx, lifetime)
 }
 
 // SubscribeMembership creates a membership owned by this Home incarnation.
@@ -102,7 +102,7 @@ func (h *RESPHandler) SubscribeMembership(ctx context.Context, fingerprint strin
 	if !initialized {
 		return ConnectionLifetime{}, fmt.Errorf("cluster resp: Home incarnation is not initialized")
 	}
-	member, errSubscribe := h.repo.SubscribeMembership(ctx, SubscribeMembershipRequest{
+	member, errSubscribe := h.liveness().SubscribeMembership(ctx, SubscribeMembershipRequest{
 		Fingerprint:             fingerprint,
 		NodeID:                  nodeID,
 		Home:                    home,
@@ -203,7 +203,7 @@ func (h *RESPHandler) nodesPayload(ctx context.Context) ([]byte, error) {
 		return nil, errNow
 	}
 	cutoff := now.Add(-timeout)
-	nodes, errNodes := h.repo.ListLiveClusterNodes(ctx, cutoff)
+	nodes, errNodes := h.liveness().ListLiveClusterNodes(ctx, cutoff)
 	if errNodes != nil {
 		return nil, errNodes
 	}
@@ -276,7 +276,7 @@ func (h *RESPHandler) authorizeNode(ctx context.Context, remoteIP string, secret
 		return nil, errNow
 	}
 	cutoff := now.Add(-timeout)
-	node, errNode := h.repo.LiveClusterNodeByIPAndSecret(ctx, remoteIP, secret, cutoff)
+	node, errNode := h.liveness().LiveClusterNodeByIPAndSecret(ctx, remoteIP, secret, cutoff)
 	if errNode != nil {
 		return nil, errNode
 	}
@@ -290,7 +290,7 @@ func (h *RESPHandler) databaseNow(ctx context.Context) (time.Time, error) {
 	if h == nil || h.repo == nil {
 		return time.Time{}, fmt.Errorf("cluster resp: repository is nil")
 	}
-	db, errDB := h.repo.database()
+	db, errDB := h.liveness().database()
 	if errDB != nil {
 		return time.Time{}, errDB
 	}
@@ -593,4 +593,14 @@ func parseClusterRESPError(line string) error {
 		Message:    errorMessage,
 		HTTPStatus: statusCode,
 	}
+}
+
+// liveness returns the repository for CPA liveness, membership and node lookups: the
+// coordinator's coordination pool when one is configured, otherwise the handler's own.
+// Rebalance commands, fingerprint cancellation and certificate signing stay on h.repo.
+func (h *RESPHandler) liveness() *Repository {
+	if h.coordinator != nil && h.coordinator.coordination != nil {
+		return h.coordinator.coordination
+	}
+	return h.repo
 }

@@ -33,6 +33,9 @@ type PGSQLConfig struct {
 	MaxOpenConns       int           `yaml:"max-open-conns"`
 	MaxIdleConns       *int          `yaml:"max-idle-conns"`
 	SlowQueryThreshold time.Duration `yaml:"slow-query-threshold"`
+
+	// CoordinationMaxOpenConns gives heartbeats, election and node liveness their own pool.
+	CoordinationMaxOpenConns int `yaml:"coordination-max-open-conns"`
 }
 
 type SQLiteConfig struct {
@@ -231,6 +234,9 @@ func (c PGSQLConfig) Configured() bool {
 func (c PGSQLConfig) Validate() error {
 	if c.MaxOpenConns < 0 {
 		return fmt.Errorf("pgsql.max-open-conns must not be negative")
+	}
+	if c.CoordinationMaxOpenConns < 0 {
+		return fmt.Errorf("pgsql.coordination-max-open-conns must not be negative")
 	}
 	if c.MaxIdleConns != nil {
 		if *c.MaxIdleConns < 0 {

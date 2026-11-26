@@ -110,6 +110,21 @@ func Open(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
 	}).Session(&gorm.Session{}), nil
 }
 
+// OpenCoordination opens the pool used only by cluster coordination: heartbeats, election,
+// master lookup and node liveness. It returns nil when pgsql.coordination-max-open-conns is 0,
+// and coordination then shares the main pool. With a capped main pool, request work can hold
+// every connection for seconds; a separate pool keeps heartbeats inside their timeout.
+func OpenCoordination(ctx context.Context, cfg PGSQLConfig) (*gorm.DB, error) {
+	if cfg.CoordinationMaxOpenConns <= 0 {
+		return nil, nil
+	}
+	coordination := cfg
+	coordination.MaxOpenConns = cfg.CoordinationMaxOpenConns
+	idle := cfg.CoordinationMaxOpenConns
+	coordination.MaxIdleConns = &idle
+	return Open(ctx, coordination)
+}
+
 // OpenSQLite opens a SQLite database.
 func OpenSQLite(ctx context.Context, path string, configuredSlowQueryThreshold ...time.Duration) (*gorm.DB, error) {
 	if ctx == nil {
