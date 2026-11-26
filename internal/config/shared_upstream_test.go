@@ -27,7 +27,7 @@ oauth: {auth-dir: upstream-auth, auth-auto-refresh-workers: 3, providers: {codex
 	if errDecode := yaml.Unmarshal(source, &cfg); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if !cfg.Codex.OptimizeMultiAgentV2 || cfg.OAuthOnlyFields["codex.disable-codex-cloaking"] || !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"] {
+	if cfg.OAuthOnlyFields["codex.disable-codex-cloaking"] || !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"] {
 		t.Fatal("client or shared provider fields acquired OAuth scope")
 	}
 	var root map[string]any
@@ -76,7 +76,15 @@ oauth: {auth-dir: upstream-auth, auth-auto-refresh-workers: 3, providers: {codex
 	if errDecode := yaml.Unmarshal(remigrated, &restored); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if !reflect.DeepEqual(restored.Codex, cfg.Codex) || !reflect.DeepEqual(restored.ClaudeHeaderDefaults, cfg.ClaudeHeaderDefaults) || !reflect.DeepEqual(restored.OAuthOnlyFields, cfg.OAuthOnlyFields) || restored.AuthDir != cfg.AuthDir {
+	restoredWire, errRestoredMarshal := yaml.Marshal(restored)
+	if errRestoredMarshal != nil {
+		t.Fatal(errRestoredMarshal)
+	}
+	restoredCPA, errRestoredParse := cpaconfig.ParseConfigBytes(restoredWire)
+	if errRestoredParse != nil {
+		t.Fatal(errRestoredParse)
+	}
+	if !reflect.DeepEqual(restoredCPA.Codex, cpa.Codex) || !reflect.DeepEqual(restoredCPA.ClaudeHeaderDefaults, cpa.ClaudeHeaderDefaults) || !reflect.DeepEqual(restored.OAuthOnlyFields, cfg.OAuthOnlyFields) || restored.AuthDir != cfg.AuthDir {
 		t.Fatal("database projection round trip changed runtime provider settings")
 	}
 }
@@ -100,7 +108,11 @@ func TestSharedUpstreamHistoricalPrecedence(t *testing.T) {
 				if errDecode := yaml.Unmarshal(data, &cfg); errDecode != nil {
 					t.Fatal(errDecode)
 				}
-				if cfg.Codex.ResponseSteering != tc.want || cfg.OAuthOnlyFields["codex.response-steering"] {
+				cpaView, errParse := cpaconfig.ParseConfigBytes(data)
+				if errParse != nil {
+					t.Fatal(errParse)
+				}
+				if cpaView.Codex.ResponseSteering != tc.want || cfg.OAuthOnlyFields["codex.response-steering"] {
 					t.Fatal("shared upstream precedence or scope changed")
 				}
 				if migrate {

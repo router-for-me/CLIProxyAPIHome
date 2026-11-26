@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/auth/antigravity"
 	claudeauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/claude"
 	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
@@ -20,22 +24,9 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	log "github.com/sirupsen/logrus"
 )
-
-func (m *Manager) withCodexRefreshJournal(ctx context.Context) context.Context {
-	m.mu.RLock()
-	store := m.store
-	m.mu.RUnlock()
-	if provider, ok := store.(interface {
-		CodexRefreshJournal() codexauth.RefreshJournal
-	}); ok {
-		if journal := provider.CodexRefreshJournal(); journal != nil {
-			return codexauth.WithRefreshJournal(ctx, journal)
-		}
-	}
-	return ctx
-}
 
 // refreshCredential refreshes auth metadata when a refresh token or Meta DCA token is present.
 // It is best-effort: providers that do not support refresh are treated as no-op.
@@ -62,6 +53,8 @@ func refreshCredential(ctx context.Context, cfg *config.Config, auth *Auth, rt h
 		return refreshXAI(ctx, cfg, auth)
 	case "meta":
 		return refreshMeta(ctx, cfg, auth)
+	case "copilot":
+		return refreshCopilot(ctx, cfg, auth, rt)
 	default:
 		return auth, nil
 	}
@@ -74,11 +67,7 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 	if refreshToken == "" {
 		return auth, nil
 	}
-	if errOutcome := codexauth.RefreshOutcomeUnknown(auth.Metadata, false); errOutcome != nil {
-		if errPreserve := codexauth.PreserveRefreshOutcome(ctx, refreshToken, errOutcome); errPreserve != nil {
-			return nil, builtInRefreshError("codex", "provider_refresh", errPreserve)
-		}
-	}
+
 	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
@@ -96,6 +85,7 @@ func refreshCodex(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, e
 			auth.Attributes["plan_type"] = planType
 		}
 	}
+	delete(auth.Metadata, codexauth.RefreshOutcomeMetadataKey)
 	auth.Metadata["id_token"] = td.IDToken
 	auth.Metadata["access_token"] = td.AccessToken
 	if td.RefreshToken != "" {
@@ -356,9 +346,28 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
+	grantIdentity := AntigravitySignatureGrantIdentity(auth)
+	if !antigravityHasValidSignatureGrant(auth) {
+		delete(auth.Metadata, AntigravitySignatureGrantScopeMetadataKey)
+		delete(auth.Metadata, AntigravitySignatureGrantHomeBindingMetadataKey)
+	} else if grantIdentity != "" {
+		auth.Metadata[AntigravitySignatureGrantScopeMetadataKey] = grantIdentity
+	}
 	auth.Metadata["access_token"] = tokenResp.AccessToken
 	if tokenResp.RefreshToken != "" {
 		auth.Metadata["refresh_token"] = tokenResp.RefreshToken
+	}
+	updatedBinding := AntigravitySignatureGrantBinding(auth)
+	if retained := strings.TrimSpace(metaStringValue(auth.Metadata, AntigravitySignatureGrantScopeMetadataKey)); retained != "" {
+		auth.Metadata[AntigravitySignatureGrantBindingMetadataKey] = updatedBinding
+	} else if grantIdentity != "" {
+		auth.Metadata[AntigravitySignatureGrantScopeMetadataKey] = grantIdentity
+		auth.Metadata[AntigravitySignatureGrantBindingMetadataKey] = updatedBinding
+	}
+	if homeBinding := AntigravitySignatureGrantHomeBinding(antigravityResolvedEnumScope(auth)); homeBinding != "" && strings.TrimSpace(metaStringValue(auth.Metadata, AntigravitySignatureGrantScopeMetadataKey)) != "" {
+		auth.Metadata[AntigravitySignatureGrantHomeBindingMetadataKey] = homeBinding
+	} else {
+		delete(auth.Metadata, AntigravitySignatureGrantHomeBindingMetadataKey)
 	}
 	now := time.Now()
 	auth.Metadata["expires_in"] = tokenResp.ExpiresIn
@@ -367,6 +376,119 @@ func refreshAntigravity(ctx context.Context, cfg *config.Config, auth *Auth, rt 
 	auth.Metadata["type"] = "antigravity"
 	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
 	return auth, nil
+}
+
+const (
+	// AntigravitySignatureGrantScopeMetadataKey stores the retained Antigravity signature cache grant identity.
+	AntigravitySignatureGrantScopeMetadataKey = "cpa_signature_cache_grant"
+	// AntigravitySignatureGrantBindingMetadataKey binds the retained signature grant to the current token pair.
+	AntigravitySignatureGrantBindingMetadataKey = "cpa_signature_cache_grant_binding"
+	// AntigravitySignatureGrantHomeBindingMetadataKey binds the retained signature grant to the current Home enum scope.
+	AntigravitySignatureGrantHomeBindingMetadataKey = "cpa_signature_cache_grant_home_binding"
+)
+
+var antigravityEnumScopeResolver atomic.Pointer[func(*Auth) string]
+
+// RegisterAntigravityEnumScopeResolver registers the Home enum scope resolver
+// used to align Antigravity signature cache grants with Home's enum scope.
+func RegisterAntigravityEnumScopeResolver(fn func(*Auth) string) {
+	if fn == nil {
+		antigravityEnumScopeResolver.Store(nil)
+		return
+	}
+	antigravityEnumScopeResolver.Store(&fn)
+}
+
+// AntigravitySignatureGrantFromEnumScope derives the canonical Home signature
+// cache grant identity from an Antigravity model enum scope.
+func AntigravitySignatureGrantFromEnumScope(enumScope string) string {
+	enumScope = strings.TrimSpace(enumScope)
+	if enumScope == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(enumScope))
+	return "home-grant:" + hex.EncodeToString(digest[:8])
+}
+
+// AntigravitySignatureGrantHomeBinding binds a retained signature grant to the
+// current Antigravity model enum scope so older Home nodes that forward DB
+// metadata after stripping refresh_token stay aligned across refresh_token rotations.
+func AntigravitySignatureGrantHomeBinding(enumScope string) string {
+	enumScope = strings.TrimSpace(enumScope)
+	if enumScope == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(enumScope))
+	return "home-bind:" + hex.EncodeToString(digest[:8])
+}
+
+func antigravityResolvedEnumScope(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if resolverPtr := antigravityEnumScopeResolver.Load(); resolverPtr != nil && *resolverPtr != nil {
+		return strings.TrimSpace((*resolverPtr)(auth))
+	}
+	return ""
+}
+
+// AntigravitySignatureGrantBinding computes the token-pair binding hash for an Antigravity credential.
+func AntigravitySignatureGrantBinding(auth *Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	refresh := strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token"))
+	access := strings.TrimSpace(metaStringValue(auth.Metadata, "access_token"))
+	if refresh == "" && access == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(refresh + "\x00" + access))
+	return "grant:" + hex.EncodeToString(digest[:8])
+}
+
+func antigravityHasValidSignatureGrant(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	retained := strings.TrimSpace(metaStringValue(auth.Metadata, AntigravitySignatureGrantScopeMetadataKey))
+	if retained == "" {
+		return false
+	}
+	tokenBinding := AntigravitySignatureGrantBinding(auth)
+	if tokenBinding == "" {
+		return false
+	}
+	binding := strings.TrimSpace(metaStringValue(auth.Metadata, AntigravitySignatureGrantBindingMetadataKey))
+	if binding != "" && binding == tokenBinding {
+		return true
+	}
+	homeBinding := strings.TrimSpace(metaStringValue(auth.Metadata, AntigravitySignatureGrantHomeBindingMetadataKey))
+	if homeBinding != "" {
+		if expected := AntigravitySignatureGrantHomeBinding(antigravityResolvedEnumScope(auth)); expected != "" && homeBinding == expected {
+			return true
+		}
+	}
+	return false
+}
+
+// AntigravitySignatureGrantIdentity returns the bound signature grant identity,
+// otherwise derives it from Home's Antigravity model enum scope when available,
+// and finally falls back to the current token binding.
+func AntigravitySignatureGrantIdentity(auth *Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	binding := AntigravitySignatureGrantBinding(auth)
+	if binding == "" {
+		return ""
+	}
+	if antigravityHasValidSignatureGrant(auth) {
+		return strings.TrimSpace(metaStringValue(auth.Metadata, AntigravitySignatureGrantScopeMetadataKey))
+	}
+	if homeGrant := AntigravitySignatureGrantFromEnumScope(antigravityResolvedEnumScope(auth)); homeGrant != "" {
+		return homeGrant
+	}
+	return binding
 }
 
 // refreshXAI refreshes an xAI OAuth credential.
@@ -421,6 +543,35 @@ func refreshXAI(ctx context.Context, cfg *config.Config, auth *Auth) (*Auth, err
 	auth.Metadata["type"] = "xai"
 	auth.Metadata["auth_kind"] = "oauth"
 	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	return auth, nil
+}
+
+// refreshCopilot exchanges the GitHub credential for a short-lived Copilot token.
+func refreshCopilot(ctx context.Context, cfg *config.Config, auth *Auth, rt http.RoundTripper) (*Auth, error) {
+	client := &http.Client{Transport: rt, Timeout: 30 * time.Second}
+	if rt == nil && cfg != nil {
+		sdkCfg := cfg.SDKConfig
+		sdkCfg.ProxyURL = cfg.ProxyURL
+		client = util.SetProxy(&sdkCfg, client)
+	}
+	token, errExchange := copilotauth.Exchange(ctx, client, metaStringValue(auth.Metadata, "refresh_token"))
+	if errExchange != nil {
+		var status copilotauth.HTTPError
+		if errors.As(errExchange, &status) && status.Code == http.StatusUnauthorized {
+			errExchange = fmt.Errorf("%w: %w", newUnauthorizedRefreshError(), errExchange)
+		}
+		return nil, builtInRefreshError(copilotauth.Provider, "token_exchange", errExchange)
+	}
+	base, errBase := token.API()
+	if errBase != nil {
+		return nil, builtInRefreshError(copilotauth.Provider, "token_endpoint", errBase)
+	}
+	auth.Metadata["access_token"] = token.Value
+	auth.Metadata["base_url"] = base
+	auth.Metadata["expired"] = time.Unix(token.ExpiresAt, 0).UTC().Format(time.RFC3339)
+	if _, exists := auth.Attributes["base_url"]; exists {
+		auth.Attributes["base_url"] = base
+	}
 	return auth, nil
 }
 

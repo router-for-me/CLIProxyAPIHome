@@ -2,13 +2,18 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"encoding/json"
+	"regexp"
+
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -32,7 +37,20 @@ type Result struct {
 	RetryAfter        *time.Duration
 	ResetAt           *time.Time
 	AccessTokenSHA256 string
+	// ObservedAt is the event time of the usage result. Non-zero values fence
+	// replayed or out-of-order deliveries against the model state.
+	ObservedAt time.Time
+	// RequestStatsEventID identifies a completed execution independently of usage
+	// persistence. Identified replays count only if this manager has not counted it.
+	RequestStatsEventID string
+	// SkipRequestStats suppresses statistics for legacy replays without an event ID.
+	SkipRequestStats bool
 }
+
+// ErrAuthNotLoaded reports a result for a credential this manager has not
+// loaded. Callers that can resolve the authoritative credential should load it
+// and retry instead of dropping the result.
+var ErrAuthNotLoaded = errors.New("auth manager: credential is not loaded")
 
 // markResultTransition captures the registry side effects derived from a result transition.
 type markResultTransition struct {
@@ -44,10 +62,10 @@ type markResultTransition struct {
 }
 
 // MarkResult records a downstream execution result and updates auth cooldown state.
-func (m *Manager) MarkResult(ctx context.Context, result Result) {
+func (m *Manager) MarkResult(ctx context.Context, result Result) error {
 	// Keep validation before state changes so failures leave existing data intact.
 	if m == nil || (strings.TrimSpace(result.AuthID) == "" && strings.TrimSpace(result.AuthIndex) == "") {
-		return
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -62,11 +80,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	disableCooling := false
 	resultModel := canonicalModelKey(result.Model)
 	if resultModel == "" {
-		return
+		return nil
 	}
 	resultAuthID := m.resultAuthID(result)
 	if resultAuthID == "" {
-		return
+		return ErrAuthNotLoaded
 	}
 	now := time.Now()
 
@@ -76,24 +94,41 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if auth == nil || auth.ID != resultAuthID {
 		m.mu.Unlock()
 		unlockUpdate()
-		return
+		return ErrAuthNotLoaded
 	}
+	reg := registry.GetGlobalRegistry()
+	resultModel = publishedResultModelKey(reg, auth, resultModel)
 	var mutator StateMutator
 	stateMutatorAvailable := false
-	disableCooling = m.quotaCooldownDisabledForAuth(auth)
-	auth.recordRecentRequest(now, result.Success)
-	if result.Success {
-		auth.Success++
-	} else {
-		auth.Failed++
+	cfg, _ := m.runtimeConfig.Load().(*config.Config)
+	evaluateResultErrorCode := func(target *Auth) {
+		if !result.Success && result.Error != nil && strings.TrimSpace(result.Error.Code) == "" {
+			if action, matched := matchRequestScopedErrorActionForResult(target, result.Error, cfg); matched {
+				switch action {
+				case "stop", "continue":
+					result.Error.Code = ErrorCodeRequestScoped
+				case "stop-and-cooldown", "continue-and-cooldown":
+					result.Error.Code = ErrorCodeForceCooldown
+				}
+			}
+		}
 	}
-	if !result.Success && result.Error != nil && result.Error.Code == ErrorCodeRequestScoped {
+	evaluateResultErrorCode(auth)
+	disableCooling = m.quotaCooldownDisabledForAuth(auth)
+	if isForceCooldownResultError(result.Error) {
+		disableCooling = false
+	}
+	m.recordResultRequestStatsLocked(auth, result, now)
+	if result.RequestScoped() || resultObservationStale(auth, result, publishedModelStateKey(auth, resultModel)) {
 		// Count the request failure without publishing a stale credential snapshot
 		// or adopting shared availability state through the status-based paths.
+		// The local model state never runs ahead of the persisted one, so a
+		// locally fenced result is also fenced in the database.
 		m.mu.Unlock()
 		unlockUpdate()
-		return
+		return nil
 	}
+	migratedModelState := migratePublishedModelState(auth, resultModel)
 	localOnlyDisabledQuota = statusCodeFromResult(result.Error) == http.StatusTooManyRequests &&
 		!isModelSupportResultError(result.Error) &&
 		disableCooling &&
@@ -103,7 +138,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if stateMutator, ok := m.store.(StateMutator); ok {
 		stateMutatorAvailable = true
-		if m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
+		if migratedModelState || m.resultNeedsGlobalTransition(auth, result, resultModel, now, disableCooling) {
 			mutator = stateMutator
 		}
 	}
@@ -113,7 +148,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if mutator == nil && !(stateMutatorAvailable && isTokenVersionedSuccessResult(result)) {
 		transition = m.applyResultTransition(auth, result, resultModel, now, disableCooling)
 		if localOnlyDisabledQuota {
-			skipResultPersist = availabilityFingerprint(auth, resultModel) == localAvailabilityBefore
+			localAvailabilityAfter := availabilityFingerprint(auth, resultModel)
+			// With cooling disabled, advancing a local observation alone must not
+			// enqueue a full auth save or publish a reload event.
+			localAvailabilityBefore.modelObservedAt, localAvailabilityAfter.modelObservedAt = time.Time{}, time.Time{}
+			skipResultPersist = localAvailabilityAfter == localAvailabilityBefore
 		}
 		authSnapshot = auth.Clone()
 	}
@@ -123,32 +162,48 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if mutator != nil {
 		// Apply the transition against the persisted auth so concurrent quota
 		// results reported to other Home nodes cannot clobber the shared state.
-		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) bool {
-			before := availabilityFingerprint(persisted, resultModel)
+		effectiveResultModel := resultModel
+		persisted, errMutate := mutator.MutateAuthState(ctx, resultAuthID, func(persisted *Auth) StateMutation {
+			evaluateResultErrorCode(persisted)
+			effectiveDisableCooling := disableCooling
+			if isForceCooldownResultError(result.Error) {
+				effectiveDisableCooling = false
+			}
+			effectiveResultModel = publishedResultModelKey(reg, persisted, resultModel)
+			migratedPersistedModelState := migratePublishedModelState(persisted, effectiveResultModel)
+			before := availabilityFingerprint(persisted, effectiveResultModel)
 			baseVersion := persisted.StateVersion
-			transition = m.applyResultTransition(persisted, result, resultModel, now, disableCooling)
-			changed := availabilityFingerprint(persisted, resultModel) != before
+			transition = m.applyResultTransition(persisted, result, effectiveResultModel, now, effectiveDisableCooling)
+			after := availabilityFingerprint(persisted, effectiveResultModel)
+			changed := migratedPersistedModelState || after != before
 			if baseVersion > 0 {
 				transitionVersion = baseVersion
 				if changed {
 					transitionVersion++
 				}
 			}
-			return changed
+			if !changed {
+				return StateMutationUnchanged
+			}
+			// Peers read the authoritative fence before applying timestamped results.
+			// Advancing it alone must not trigger a full credential reload per request.
+			before.modelObservedAt, after.modelObservedAt = time.Time{}, time.Time{}
+			if !migratedPersistedModelState && before == after {
+				return StateMutationObservation
+			}
+			return StateMutationChanged
 		})
 		if errMutate != nil {
-			log.Warnf("auth manager: persisted result transition failed for %s: %v", resultAuthID, errMutate)
-			return
+			return fmt.Errorf("auth manager: persist result transition for %s: %w", resultAuthID, errMutate)
 		}
 		if persisted == nil {
-			log.Warnf("auth manager: persisted result transition returned no auth for %s", resultAuthID)
-			return
+			return fmt.Errorf("auth manager: persisted result transition returned no auth for %s", resultAuthID)
 		}
 		if transitionVersion > 0 && persisted.StateVersion > transitionVersion {
 			transition = markResultTransition{}
 		}
 		var adopted bool
-		authSnapshot, adopted = m.adoptPersistedResultState(result, resultModel, persisted, now)
+		authSnapshot, adopted = m.adoptPersistedResultState(result, effectiveResultModel, persisted, now)
 		if !adopted {
 			transition = markResultTransition{}
 		}
@@ -164,13 +219,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.queueRefreshReschedule(authSnapshot.ID)
 	}
 	resultStatus := statusCodeFromResult(result.Error)
-	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) {
+	if resultStatus == http.StatusTooManyRequests || isRequestErrorCooldownStatus(resultStatus) || isForceCooldownResultError(result.Error) {
 		m.reconcileCoveredCooldownAfterResult(ctx, resultAuthID)
-		return
+		return nil
 	}
 	if transition.clearModelQuota || transition.setModelQuota || transition.shouldResumeModel || transition.shouldSuspendModel {
 		m.ReconcileRegistryModelStates(ctx, resultAuthID)
 	}
+	return nil
 }
 
 // applyResultTransition applies the result state machine to the provided auth
@@ -185,6 +241,9 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if isTokenVersionFencedResult(result) && AuthIsNewerThanObserved(auth, result.AccessTokenSHA256) {
 		return transition
 	}
+	if result.RequestScoped() || resultObservationStale(auth, result, resultModel) {
+		return transition
+	}
 	preserveRefreshAcquisition := RefreshBlocksDispatch(auth)
 	refreshStatus := auth.Status
 	refreshStatusMessage := auth.StatusMessage
@@ -195,6 +254,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	if result.Success {
 		state := ensureModelState(auth, resultModel)
 		resetModelState(state, now)
+		markModelObserved(state, result)
 		updateAggregatedAvailability(auth, now)
 		if preserveRefreshAcquisition {
 			auth.Status = refreshStatus
@@ -214,13 +274,11 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 
-	if (result.Error != nil && result.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(result.Error) {
-		return transition
-	}
 	if isStreamTruncatedResultError(result.Error) {
 		// A truncated accepted stream already submitted its generation
 		// upstream; record the failure without cooling the credential/model.
 		state := ensureModelState(auth, resultModel)
+		markModelObserved(state, result)
 		state.Status = StatusError
 		state.UpdatedAt = now
 		if result.Error != nil {
@@ -233,6 +291,7 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 		return transition
 	}
 	state := ensureModelState(auth, resultModel)
+	markModelObserved(state, result)
 	state.Unavailable = true
 	state.Status = StatusError
 	state.UpdatedAt = now
@@ -305,6 +364,14 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 			state.NextRetryAfter = time.Time{}
 		}
 	}
+	if isForceCooldownResultError(result.Error) && state.NextRetryAfter.IsZero() {
+		state.NextRetryAfter = now.Add(time.Minute)
+		state.Unavailable = true
+		transition.shouldSuspendModel = true
+		if transition.suspendReason == "" {
+			transition.suspendReason = "force_cooldown"
+		}
+	}
 	auth.Status = StatusError
 	auth.UpdatedAt = now
 	updateAggregatedAvailability(auth, now)
@@ -319,11 +386,42 @@ func (m *Manager) applyResultTransition(auth *Auth, result Result, resultModel s
 	return transition
 }
 
+// RequestScoped reports failures which must not participate in credential feedback.
+func (r Result) RequestScoped() bool {
+	if r.Success || isForceCooldownResultError(r.Error) {
+		return false
+	}
+	return (r.Error != nil && r.Error.Code == ErrorCodeRequestScoped) || isRequestScopedNotFoundResultError(r.Error)
+}
+
+// resultObservationStale reports whether a timestamped result is older than, or
+// a replay of, the newest result already applied to the model. Results without
+// an event time are never fenced.
+func resultObservationStale(auth *Auth, result Result, resultModel string) bool {
+	if auth == nil || result.ObservedAt.IsZero() {
+		return false
+	}
+	state := auth.ModelStates[resultModel]
+	return state != nil && !state.LastObservedAt.IsZero() && !result.ObservedAt.After(state.LastObservedAt)
+}
+
+// markModelObserved advances the model's observation fence to the result event time.
+func markModelObserved(state *ModelState, result Result) {
+	if state == nil || result.ObservedAt.IsZero() {
+		return
+	}
+	if result.ObservedAt.After(state.LastObservedAt) {
+		state.LastObservedAt = result.ObservedAt.UTC()
+	}
+}
+
 // resultNeedsGlobalTransition reports whether the result must be applied to
 // the persisted auth through the store's StateMutator so the transition stays
 // atomic across Home nodes. Unauthorized transitions must preserve credentials
 // that may be refreshed concurrently, while quota (429) and clearing successes
 // need shared availability state. Other failures stay on the local path.
+// Clean successes stay database-free; in-window quota failures persist only
+// their observation fence so a redelivery cannot reopen an expired window.
 func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultModel string, now time.Time, disableCooling bool) bool {
 	if auth == nil {
 		return false
@@ -333,6 +431,9 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	}
 	statusCode := statusCodeFromResult(result.Error)
 	if statusCode == http.StatusUnauthorized {
+		return true
+	}
+	if isForceCooldownResultError(result.Error) && statusCode != http.StatusTooManyRequests {
 		return true
 	}
 	if statusCode != http.StatusTooManyRequests {
@@ -359,7 +460,8 @@ func (m *Manager) resultNeedsGlobalTransition(auth *Auth, result Result, resultM
 	return state == nil ||
 		!state.NextRetryAfter.Equal(next) ||
 		!state.Quota.NextRecoverAt.Equal(next) ||
-		state.Quota.BackoffLevel != nextBackoffLevel
+		state.Quota.BackoffLevel != nextBackoffLevel ||
+		result.ObservedAt.After(state.LastObservedAt)
 }
 
 // disabledQuotaStateAlreadyApplied reports whether a disabled-cooling 429 can
@@ -441,20 +543,21 @@ type quotaFingerprint struct {
 // availabilityFingerprintValue condenses the fields of an auth (and one model
 // state) that determine scheduling availability, so state mutations can
 // cheaply detect whether a transition changed anything worth persisting.
-// Volatile fields such as LastError, StatusMessage, and UpdatedAt are
-// intentionally excluded to keep in-window failures write-free.
+// Observation fences are included because they must survive cross-node replays.
+// Volatile diagnostics such as LastError, StatusMessage, and UpdatedAt are excluded.
 type availabilityFingerprintValue struct {
-	status         Status
-	disabled       bool
-	unavailable    bool
-	nextRetryUnix  int64
-	quota          quotaFingerprint
-	modelPresent   bool
-	modelStatus    Status
-	modelUnavail   bool
-	modelRetryUnix int64
-	modelResetUnix int64
-	modelQuota     quotaFingerprint
+	status          Status
+	disabled        bool
+	unavailable     bool
+	nextRetryUnix   int64
+	quota           quotaFingerprint
+	modelPresent    bool
+	modelStatus     Status
+	modelUnavail    bool
+	modelRetryUnix  int64
+	modelResetUnix  int64
+	modelObservedAt time.Time
+	modelQuota      quotaFingerprint
 }
 
 // fingerprintUnix normalizes a time for fingerprint comparison.
@@ -494,6 +597,7 @@ func availabilityFingerprint(auth *Auth, resultModel string) availabilityFingerp
 			fp.modelUnavail = state.Unavailable
 			fp.modelRetryUnix = fingerprintUnix(state.NextRetryAfter)
 			fp.modelResetUnix = fingerprintUnix(state.QuotaResetAt)
+			fp.modelObservedAt = state.LastObservedAt
 			fp.modelQuota = fingerprintQuota(state.Quota)
 		}
 	}
@@ -558,6 +662,8 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	if persisted == nil {
 		return nil, false
 	}
+	resultModel = publishedResultModelKey(registry.GetGlobalRegistry(), persisted, resultModel)
+	migratePublishedModelState(persisted, resultModel)
 	unlockUpdate := m.updateLocks.lock(persisted.ID)
 	defer unlockUpdate()
 	m.mu.Lock()
@@ -589,6 +695,7 @@ func (m *Manager) adoptPersistedResultState(result Result, resultModel string, p
 	local.StateVersion = persisted.StateVersion
 	local.LastRefreshError = cloneError(persisted.LastRefreshError)
 	local.NextRefreshAfter = persisted.NextRefreshAfter
+	migratePublishedModelState(local, resultModel)
 	if state := persisted.ModelStates[resultModel]; state != nil {
 		if local.ModelStates == nil {
 			local.ModelStates = make(map[string]*ModelState)
@@ -820,22 +927,16 @@ func clearAggregatedAvailability(auth *Auth) {
 	auth.Quota = QuotaState{}
 }
 
-// hasModelError reports whether model error is present.
+// hasModelError reports whether a model error still keeps the credential in
+// error. Only errors inside their cooldown count; once the model can be
+// requested again, its LastError remains model diagnostic history only.
 func hasModelError(auth *Auth, now time.Time) bool {
-	if auth == nil || len(auth.ModelStates) == 0 {
+	if auth == nil {
 		return false
 	}
 	for _, state := range auth.ModelStates {
-		if state == nil {
-			continue
-		}
-		if state.LastError != nil {
+		if state != nil && state.Status == StatusError && state.NextRetryAfter.After(now) {
 			return true
-		}
-		if state.Status == StatusError {
-			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {
-				return true
-			}
 		}
 	}
 	return false
@@ -1002,25 +1103,31 @@ func quotaCooldownAfterFailure(quota QuotaState, now time.Time, result Result) (
 		nextLevel = level
 	}
 
-	provider := strings.ToLower(strings.TrimSpace(result.Provider))
-	if provider != "antigravity" && provider != "codex" {
-		return deadline, nextLevel
+	// Anchor relative provider hints to the event time so a redelivered 429
+	// does not restart the provider reset window.
+	hintAnchor := now
+	if !result.ObservedAt.IsZero() && result.ObservedAt.Before(now) {
+		hintAnchor = result.ObservedAt
 	}
-	if result.ResetAt != nil && result.ResetAt.After(now) {
-		resetAt := result.ResetAt.UTC()
-		if resetAt.Sub(now) <= providerQuotaHintMaxHorizon {
-			if resetAt.After(deadline) {
-				deadline = resetAt
-			}
-			return deadline, nextLevel
-		}
-	}
-	if result.RetryAfter != nil && *result.RetryAfter > 0 && *result.RetryAfter <= providerQuotaHintMaxHorizon {
-		if retryAt := now.Add(*result.RetryAfter); retryAt.After(deadline) {
-			deadline = retryAt
-		}
+	if resetAt := result.quotaResetTime(hintAnchor); resetAt.After(deadline) {
+		deadline = resetAt
 	}
 	return deadline, nextLevel
+}
+
+// quotaResetTime normalizes a supported provider hint to a bounded absolute deadline.
+func (r Result) quotaResetTime(now time.Time) time.Time {
+	provider := strings.ToLower(strings.TrimSpace(r.Provider))
+	if provider != "antigravity" && provider != "codex" {
+		return time.Time{}
+	}
+	if r.ResetAt != nil && r.ResetAt.After(now) && r.ResetAt.Sub(now) <= providerQuotaHintMaxHorizon {
+		return r.ResetAt.UTC()
+	}
+	if r.RetryAfter != nil && *r.RetryAfter > 0 && *r.RetryAfter <= providerQuotaHintMaxHorizon {
+		return now.Add(*r.RetryAfter).UTC()
+	}
+	return time.Time{}
 }
 
 // NewUsageResult creates a new usage result.
@@ -1078,6 +1185,93 @@ func newUsageResultWithCode(authIndex, provider, model string, statusCode int, b
 // failures that must not mark the credential/model unavailable.
 func isStreamTruncatedResultError(err *Error) bool {
 	return err != nil && err.Code == ErrorCodeStreamTruncated
+}
+
+func isForceCooldownResultError(err *Error) bool {
+	return err != nil && err.Code == ErrorCodeForceCooldown
+}
+
+func extractRequestScopedErrorRulesForAuth(auth *Auth, cfg *config.Config) []config.RequestScopedErrorRule {
+	if auth != nil && auth.Metadata != nil {
+		raw, ok := auth.Metadata["request_scoped_errors"]
+		if !ok {
+			raw, ok = auth.Metadata["request-scoped-errors"]
+		}
+		if ok && raw != nil {
+			switch typed := raw.(type) {
+			case []config.RequestScopedErrorRule:
+				if len(typed) > 0 {
+					return typed
+				}
+			case []any:
+				var rules []config.RequestScopedErrorRule
+				if data, errMarshal := json.Marshal(typed); errMarshal == nil {
+					if errUnmarshal := json.Unmarshal(data, &rules); errUnmarshal == nil && len(rules) > 0 {
+						return rules
+					}
+				}
+			}
+		}
+	}
+	if cfg == nil || auth == nil {
+		return nil
+	}
+	if auth.AuthKind() == AuthKindOAuth {
+		if len(cfg.OAuthRequestScopedErrors) > 0 {
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if rules, ok := cfg.OAuthRequestScopedErrors[provider]; ok && len(rules) > 0 {
+				return rules
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func matchRequestScopedErrorActionForResult(auth *Auth, err *Error, cfg *config.Config) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	rules := extractRequestScopedErrorRulesForAuth(auth, cfg)
+	if len(rules) == 0 {
+		return "", false
+	}
+	statusCode := statusCodeFromResult(err)
+	body := err.Message
+	for _, rule := range rules {
+		if rule.Status <= 0 || rule.Status != statusCode {
+			continue
+		}
+		if len(rule.Match) == 0 && len(rule.MatchRegexr) == 0 {
+			continue
+		}
+		matched := false
+		for _, substr := range rule.Match {
+			if substr != "" && strings.Contains(body, substr) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			for _, pattern := range rule.MatchRegexr {
+				if pattern != "" {
+					if re, errCompile := regexp.Compile(pattern); errCompile == nil && re.MatchString(body) {
+						matched = true
+						break
+					}
+				}
+			}
+		}
+		if !matched {
+			continue
+		}
+		action := strings.ToLower(strings.TrimSpace(rule.Action))
+		switch action {
+		case "stop", "stop-and-cooldown", "continue", "continue-and-cooldown":
+			return action, true
+		}
+	}
+	return "", false
 }
 
 func parseUsageRetryHints(provider, body string, statusCode int) (*time.Duration, *time.Time) {

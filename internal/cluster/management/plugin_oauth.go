@@ -148,20 +148,13 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 	if h == nil || h.runtime == nil || c == nil || c.Request == nil || c.Request.URL == nil {
 		return false
 	}
-	provider, okProvider := pluginAuthProviderFromManagementPath(c.Request.URL.Path)
-	callbackPath := "/v0/management/oauth-callback"
-	if c.Request.URL.Path == "/v8/management/oauth/auth-url" {
-		var errProvider error
-		provider, errProvider = normalizePluginOAuthProvider(c.Query("provider"))
-		okProvider = errProvider == nil
-		callbackPath = "/v8/management/oauth/callback"
-	}
-	if !okProvider || !h.runtime.HasPluginAuthProvider(provider) {
+	provider, errProvider := normalizePluginOAuthProvider(c.Query("provider"))
+	if errProvider != nil || !h.runtime.HasPluginAuthProvider(provider) {
 		return false
 	}
 
 	ctx := pluginAuthRequestContext(requestContextOrBackground(c), c)
-	baseURL, errBaseURL := h.pluginManagementCallbackURL(c, callbackPath)
+	baseURL, errBaseURL := h.pluginManagementCallbackURL(c)
 	if errBaseURL != nil {
 		log.WithError(errBaseURL).WithField("provider", provider).Error("cluster plugin oauth: callback URL failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
@@ -308,25 +301,7 @@ func normalizePluginOAuthProvider(provider string) (string, error) {
 	return provider, nil
 }
 
-func pluginAuthProviderFromManagementPath(path string) (string, bool) {
-	path = strings.TrimSpace(path)
-	const prefix = "/v0/management/"
-	const suffix = "-auth-url"
-	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
-		return "", false
-	}
-	provider, errProvider := normalizePluginOAuthProvider(strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix))
-	return provider, errProvider == nil
-}
-
-func (h *Handler) pluginManagementCallbackURL(c *gin.Context, callbackPath string) (string, error) {
-	callbackPath = strings.TrimSpace(callbackPath)
-	if callbackPath == "" {
-		callbackPath = "/v0/management/oauth-callback"
-	}
-	if !strings.HasPrefix(callbackPath, "/") {
-		callbackPath = "/" + callbackPath
-	}
+func (h *Handler) pluginManagementCallbackURL(c *gin.Context) (string, error) {
 	scheme := managementRequestScheme(c)
 	host := managementRequestHost(c)
 	if host == "" && h != nil && h.nodeIP != "" && h.nodePort > 0 {
@@ -335,7 +310,7 @@ func (h *Handler) pluginManagementCallbackURL(c *gin.Context, callbackPath strin
 	if host == "" {
 		return "", fmt.Errorf("management request host is empty")
 	}
-	return (&url.URL{Scheme: scheme, Host: host, Path: callbackPath}).String(), nil
+	return (&url.URL{Scheme: scheme, Host: host, Path: "/v8/management/oauth/callback"}).String(), nil
 }
 
 func managementRequestScheme(c *gin.Context) string {

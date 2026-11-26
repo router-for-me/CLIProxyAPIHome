@@ -75,7 +75,7 @@ func (s *failingCooldownMutationStore) Delete(context.Context, string) error {
 	return nil
 }
 
-func (s *failingCooldownMutationStore) MutateAuthState(context.Context, string, func(*coreauth.Auth) bool) (*coreauth.Auth, error) {
+func (s *failingCooldownMutationStore) MutateAuthState(context.Context, string, func(*coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, error) {
 	s.attempts++
 	return nil, s.err
 }
@@ -299,7 +299,10 @@ func TestSanitizeAuthForDownstreamRemovesRefreshDiagnostic(t *testing.T) {
 				},
 				LastRefreshError: &coreauth.Error{Code: code, Diagnostic: "safe refresh diagnostic"},
 			}
-			sanitized := SanitizeAuthForDownstream(auth)
+			sanitized, errSanitize := SanitizeAuthForDownstream(auth, nil)
+			if errSanitize != nil {
+				t.Fatal(errSanitize)
+			}
 			if sanitized == nil || sanitized.LastRefreshError != nil || sanitized.LastError != nil {
 				t.Fatalf("SanitizeAuthForDownstream() = %#v, want refresh diagnostic removed", sanitized)
 			}
@@ -310,7 +313,10 @@ func TestSanitizeAuthForDownstreamRemovesRefreshDiagnostic(t *testing.T) {
 	}
 
 	executionErr := &coreauth.Error{Code: "model_failed", Diagnostic: "execution diagnostic", HTTPStatus: http.StatusBadGateway}
-	sanitizedExecution := SanitizeAuthForDownstream(&coreauth.Auth{ID: "execution-error-auth", LastError: executionErr})
+	sanitizedExecution, errSanitize := SanitizeAuthForDownstream(&coreauth.Auth{ID: "execution-error-auth", LastError: executionErr}, nil)
+	if errSanitize != nil {
+		t.Fatal(errSanitize)
+	}
 	if sanitizedExecution == nil || sanitizedExecution.LastError == nil || sanitizedExecution.LastError.Code != executionErr.Code {
 		t.Fatalf("SanitizeAuthForDownstream() removed ordinary execution error: %#v", sanitizedExecution)
 	}

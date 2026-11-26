@@ -81,7 +81,7 @@ func (r *Repository) ReplaceConfigSnapshotWithLifecycleConfigAndCreatePluginTask
 		} else if _, errEnsure := ensureLifecycleConfigTx(tx, nodeHeartbeatTimeout); errEnsure != nil {
 			return errEnsure
 		}
-		if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values); errReconcile != nil {
+		if errReconcile := r.reconcileConfigSnapshotProviderAuthsTx(ctx, tx, values, values); errReconcile != nil {
 			return mapCredentialConcurrencyOrphan(errReconcile)
 		}
 		if errImportPolicies := r.importCredentialConcurrencyPoliciesWithLockedActivationGateTx(ctx, tx, gate, values); errImportPolicies != nil {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
@@ -50,14 +51,18 @@ func TestConfigV8HistoricalProviderSubtrees(t *testing.T) {
 				t.Fatalf("historical view omitted shared/client/OAuth values: %s", view)
 			}
 			request(tc.method, "config/oauth/providers/codex", tc.body)
-			cfg, _, err := repo.LoadConfigAsRuntimeConfig(context.Background())
+			cfg, wire, err := repo.LoadConfigAsRuntimeConfig(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if cfg.Codex.ResponseSteering != tc.steering || cfg.Codex.StreamBootstrapBuffering != tc.buffering || cfg.Codex.OptimizeMultiAgentV2 != tc.optimize || cfg.CodexHeaderDefaults.UserAgent != tc.agent {
+			cpa, errCPA := cpaconfig.ParseConfigBytes(wire)
+			if errCPA != nil {
+				t.Fatal(errCPA)
+			}
+			if cpa.Codex.ResponseSteering != tc.steering || cpa.Codex.StreamBootstrapBuffering != tc.buffering || cpa.Client.Codex.OptimizeMultiAgentV2 != tc.optimize || cpa.CodexHeaderDefaults.UserAgent != tc.agent {
 				t.Fatal("historical provider update lost replacement/merge semantics")
 			}
-			if !cfg.XAI.InjectXSearch || cfg.AuthAutoRefreshWorkers != 3 || (tc.agent != "" && !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"]) {
+			if !cpa.XAI.InjectXSearch || cfg.AuthAutoRefreshWorkers != 3 || (tc.agent != "" && !cfg.OAuthOnlyFields["codex-header-defaults.user-agent"]) {
 				t.Fatal("historical provider update changed unrelated values or OAuth scope")
 			}
 			if err = config.ValidateV8Config([]byte(request(http.MethodGet, "config.yaml", ""))); err != nil {

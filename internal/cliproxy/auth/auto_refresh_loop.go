@@ -11,14 +11,16 @@ import (
 )
 
 type authAutoRefreshLoop struct {
-	manager     *Manager
-	interval    time.Duration
-	concurrency int
+	manager  *Manager
+	interval time.Duration
 
-	mu    sync.Mutex
-	queue refreshMinHeap
-	index map[string]*refreshHeapItem
-	dirty map[string]struct{}
+	mu          sync.Mutex
+	concurrency int
+	workerCtx   context.Context
+	workerStops []chan struct{}
+	queue       refreshMinHeap
+	index       map[string]*refreshHeapItem
+	dirty       map[string]struct{}
 
 	wakeCh chan struct{}
 	jobs   chan string
@@ -67,24 +69,57 @@ func (l *authAutoRefreshLoop) run(ctx context.Context) {
 		return
 	}
 
-	workers := l.concurrency
-	if workers <= 0 {
-		workers = refreshMaxConcurrency
-	}
-	for i := 0; i < workers; i++ {
-		go l.worker(ctx)
-	}
+	l.mu.Lock()
+	l.workerCtx = ctx
+	l.resizeWorkersLocked()
+	l.mu.Unlock()
 
 	l.loop(ctx)
 }
 
-// worker processes queued auto-refresh work.
-func (l *authAutoRefreshLoop) worker(ctx context.Context) {
+// resizeWorkers preserves the scheduler, queued jobs, and in-flight requests.
+func (l *authAutoRefreshLoop) resizeWorkers(concurrency int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.concurrency = concurrency
+	l.resizeWorkersLocked()
+}
+
+func (l *authAutoRefreshLoop) resizeWorkersLocked() {
+	if l.workerCtx == nil || l.workerCtx.Err() != nil {
+		return
+	}
+	for len(l.workerStops) > l.concurrency {
+		last := len(l.workerStops) - 1
+		close(l.workerStops[last])
+		l.workerStops = l.workerStops[:last]
+	}
+	for len(l.workerStops) < l.concurrency {
+		stop := make(chan struct{})
+		l.workerStops = append(l.workerStops, stop)
+		go l.worker(l.workerCtx, stop)
+	}
+}
+
+// worker retires between jobs; only stopping the loop cancels an active request.
+func (l *authAutoRefreshLoop) worker(ctx context.Context, stop <-chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-stop:
+			return
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
 		case authID := <-l.jobs:
+			if ctx.Err() != nil {
+				return
+			}
 			if authID == "" {
 				continue
 			}

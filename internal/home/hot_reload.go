@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 
-	configaccess "github.com/router-for-me/CLIProxyAPIHome/internal/access/config_access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/managementasset"
@@ -152,7 +151,6 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 	logConfigChanges(oldCfg, cfg)
 
 	r.deleteRemovedPluginArtifacts(ctx, oldCfg, cfg)
-	configaccess.Register(&cfg.SDKConfig)
 	r.refreshAccessProviders()
 	managementasset.SetCurrentConfig(cfg)
 	registry.UpdateModelCatalogSources(cfg.Models)

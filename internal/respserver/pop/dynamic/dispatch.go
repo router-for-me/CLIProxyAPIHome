@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
@@ -33,6 +34,7 @@ func Register(reg *dispatch.Registry) {
 	}
 	_ = reg.RegisterDynamic("RPOP", typeAuth, handleAuth)
 	_ = reg.RegisterDynamic("RPOP", typeAuthValidate, handleAuthValidate)
+	_ = reg.RegisterDynamic("RPOP", "scheduler-continuity", handleSchedulerContinuity)
 	_ = reg.SetDynamicDefault("RPOP", handleAuth)
 }
 
@@ -125,11 +127,14 @@ func handleAuth(ctx context.Context, env dispatch.Env, args []string) dispatch.R
 	return reply
 }
 
-func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]byte, []byte, error) {
+func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string, cfg *config.Config) ([]byte, []byte, error) {
 	if result == nil || result.Auth == nil {
 		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
 	}
-	auth := home.SanitizeAuthForDownstream(result.Auth)
+	auth, errSanitize := home.SanitizeAuthForDownstream(result.Auth, cfg)
+	if errSanitize != nil {
+		return nil, nil, errSanitize
+	}
 	if auth == nil {
 		return nil, nil, errors.New(homeerrors.MessageNoAuthAvailable)
 	}
@@ -156,6 +161,11 @@ func prepareDispatchResponse(result *home.DispatchResult, userAPIKey string) ([]
 		}
 		if errSet := set("request_retry", result.RequestRetry); errSet != nil {
 			return nil, errSet
+		}
+		if result.SelectionID != "" {
+			if errSet := set("selection_id", result.SelectionID); errSet != nil {
+				return nil, errSet
+			}
 		}
 		if result.ForceMapping && strings.TrimSpace(result.OriginalAlias) != "" {
 			if errSet := set("force_mapping", true); errSet != nil {
@@ -249,6 +259,23 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		return nil, "", &reply
 	}
 
+	var schedulerContext struct {
+		Stream             bool   `json:"stream"`
+		RequestID          string `json:"request_id"`
+		TraceID            string `json:"trace_id"`
+		ExecutionSessionID string `json:"execution_session_id"`
+		RequestedModel     string `json:"requested_model"`
+	}
+	if field := gjson.Get(jsonArg, "scheduler_context"); field.Exists() {
+		if !field.IsObject() {
+			reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
+			return nil, "", &reply
+		}
+		if errUnmarshal := json.Unmarshal([]byte(field.Raw), &schedulerContext); errUnmarshal != nil {
+			reply := dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageInvalidRequestJSON)))
+			return nil, "", &reply
+		}
+	}
 	headers := parseHeaders(jsonArg)
 	sessionID := coreauth.NormalizeExplicitID(gjson.Get(jsonArg, "session_id").String())
 	if sessionID != "" && strings.TrimSpace(headers.Get("X-Session-ID")) == "" {
@@ -257,6 +284,11 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 	parentSessionID := coreauth.NormalizeExplicitID(gjson.Get(jsonArg, "parent_session_id").String())
 	if parentSessionID != "" && strings.TrimSpace(headers.Get("X-Parent-Session-ID")) == "" {
 		headers.Set("X-Parent-Session-ID", parentSessionID)
+	}
+	// CPA already sends node_kind separately from headers. Preserve it for
+	// distinguishing conversational forks from subagent inheritance.
+	if nodeKind := strings.TrimSpace(gjson.Get(jsonArg, "node_kind").String()); nodeKind != "" && strings.TrimSpace(headers.Get("X-Node-Kind")) == "" {
+		headers.Set("X-Node-Kind", nodeKind)
 	}
 	ctx = cluster.WithAPIKeyRequestCache(ctx)
 	authRes, authErr := env.Runtime.Authenticate(ctx, headers)
@@ -279,6 +311,9 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 
 	concurrencyReq := dispatchConcurrencyRequest{Protocol: int(gjson.Get(jsonArg, "concurrency_protocol").Int())}
 	result, errDispatch := env.Runtime.DispatchForAPIKeyWithConcurrency(ctx, model, headers, userAPIKey, credentialPolicy, excludedAuthIDs, pinnedAuthID, home.DispatchConcurrencyContext{
+		Stream: schedulerContext.Stream, RequestID: schedulerContext.RequestID,
+		TraceID: schedulerContext.TraceID, ExecutionSessionID: schedulerContext.ExecutionSessionID,
+		RequestedModel:    schedulerContext.RequestedModel,
 		Fingerprint:       env.ConnectionLifetime.Fingerprint,
 		ConnectedAt:       env.ConnectionLifetime.ConnectedAt,
 		Controlled:        env.ConnectionLifetime.Controlled,
@@ -286,7 +321,7 @@ func dispatchRequest(ctx context.Context, env dispatch.Env, args []string) (*hom
 		RetryRound:        retryRound,
 		RetryRoundPresent: retryRoundPresent,
 		PrepareResponse: func(result *home.DispatchResult) ([]byte, []byte, error) {
-			unaccounted, accounted, errPrepare := prepareDispatchResponse(result, userAPIKey)
+			unaccounted, accounted, errPrepare := prepareDispatchResponse(result, userAPIKey, env.Runtime.Config())
 			if errPrepare != nil {
 				return nil, nil, errPrepare
 			}
@@ -537,6 +572,17 @@ func buildErrorJSON(message string) string {
 // preserving the structured access error code (e.g. no_credentials, invalid_credential) so the
 // downstream proxy can map it to the correct HTTP status.
 func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
+	var rejection *coreauth.SchedulerRejectError
+	if errors.As(errDispatch, &rejection) {
+		var cause *coreauth.Error
+		if errors.As(rejection, &cause) {
+			// Older CPA prefers type to code and must not mistake a rejection for pool exhaustion.
+			out, _ := sjson.Set("{}", "error.type", "scheduler_rejected")
+			out, _ = sjson.Set(out, "error.code", cause.Code)
+			out, _ = sjson.Set(out, "error.message", cause.Message)
+			return out
+		}
+	}
 	var admissionErr *cluster.ConcurrencyAdmissionError
 	if errors.As(errDispatch, &admissionErr) {
 		out := "{}"
@@ -544,7 +590,14 @@ func buildDispatchErrorJSON(runtime *home.Runtime, errDispatch error) string {
 		out, _ = sjson.Set(out, "error.message", concurrencyErrorMessage(admissionErr.Type))
 		if cluster.IsConcurrencySaturated(admissionErr) {
 			out, _ = sjson.Set(out, "error.retryable", true)
-			out, _ = sjson.Set(out, "error.retry_after_ms", concurrencyRetryAfterMS(runtime, admissionErr.RetryAfterMS))
+			retryAfterMS := admissionErr.RetryAfterMS
+			var timed interface{ RetryAfter() *time.Duration }
+			if errors.As(errDispatch, &timed) {
+				if delay := timed.RetryAfter(); delay != nil && *delay > 0 {
+					retryAfterMS = delay.Milliseconds()
+				}
+			}
+			out, _ = sjson.Set(out, "error.retry_after_ms", runtime.ConcurrencyRetryAfterMS(retryAfterMS))
 		}
 		return out
 	}
@@ -583,39 +636,6 @@ func concurrencyErrorMessage(errorType string) string {
 		return "credential model concurrency limit exceeded"
 	}
 	return "credential concurrency limit reached"
-}
-
-func wholePositiveMilliseconds(value string) (int64, bool) {
-	duration, errDuration := time.ParseDuration(value)
-	if errDuration != nil || duration <= 0 || duration%time.Millisecond != 0 {
-		return 0, false
-	}
-	return duration.Milliseconds(), true
-}
-
-func concurrencyRetryAfterMS(runtime *home.Runtime, retryAfterMS int64) int64 {
-	if retryAfterMS > 0 {
-		return retryAfterMS
-	}
-	min, max := int64(250), int64(1000)
-	if runtime != nil {
-		if runtimeConfig := runtime.Config(); runtimeConfig != nil {
-			cfg := runtimeConfig.CredentialConcurrency
-			if parsedMin, okMin := wholePositiveMilliseconds(cfg.BusyRetryMin); okMin {
-				min = parsedMin
-			}
-			if parsedMax, okMax := wholePositiveMilliseconds(cfg.BusyRetryMax); okMax {
-				max = parsedMax
-			}
-		}
-	}
-	if min < 1 {
-		min = 1
-	}
-	if max < min {
-		max = min
-	}
-	return min + time.Now().UnixNano()%(max-min+1)
 }
 
 func buildAuthErrorJSON(authErr *access.AuthError) string {

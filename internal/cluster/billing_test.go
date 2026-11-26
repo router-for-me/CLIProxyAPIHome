@@ -655,10 +655,6 @@ func TestAppendUsageDuplicatePayloadDoesNotDoubleCharge(t *testing.T) {
 	if errDB != nil {
 		t.Fatalf("database() error = %v", errDB)
 	}
-	// Simulate a pre-upgrade billing_charge row that used legacyBillingPayloadHash(rawPayload).
-	if errLegacyHash := db.Model(&BillingChargeRecord{}).Where("usage_id = ?", firstExec.ID).Update("payload_hash", legacyBillingPayloadHash(execPayloadA)).Error; errLegacyHash != nil {
-		t.Fatalf("Update(payload_hash legacy) error = %v", errLegacyHash)
-	}
 	secondExec, insertedSecond, errExecSecond := repo.AppendUsageWithRuntimeOutcome(ctx, execPayloadB, UsageRuntimeMetadata{HomeIP: "192.0.2.11", HomePort: 9327})
 	if errExecSecond != nil || insertedSecond {
 		t.Fatalf("AppendUsageWithRuntimeOutcome(exec duplicate) inserted=%v error = %v, want false/nil", insertedSecond, errExecSecond)

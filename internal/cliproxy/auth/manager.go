@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	codexauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/logging"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
@@ -113,6 +112,7 @@ type Manager struct {
 	indexAuth       map[string]*Auth
 	scheduler       *authScheduler
 	modelAliasHints modelAliasHintIndex
+	usageStats      usageRequestStatsCache
 
 	oauthModelAlias atomic.Value
 	runtimeConfig   atomic.Value
@@ -198,8 +198,8 @@ func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
 	m.mu.Unlock()
 }
 
-// roundTripperFor returns a round tripper for.
-func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
+// AuthRoundTripper returns the transport configured for a credential.
+func (m *Manager) AuthRoundTripper(auth *Auth) http.RoundTripper {
 	m.mu.RLock()
 	p := m.rtProvider
 	m.mu.RUnlock()
@@ -237,7 +237,12 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
+	m.mu.Lock()
 	m.runtimeConfig.Store(cfg)
+	if m.refreshLoop != nil {
+		m.refreshLoop.resizeWorkers(m.refreshWorkers())
+	}
+	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.resetModelShards()
 	}
@@ -580,6 +585,7 @@ func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth,
 			return false, nil
 		}
 		auth.StateVersion = stateVersion
+		auth.CredentialIdentityVersion = persisted.CredentialIdentityVersion
 		if !synchronizeCurrent {
 			return true, nil
 		}
@@ -587,6 +593,7 @@ func (m *Manager) persistWithStore(ctx context.Context, store Store, auth *Auth,
 		if current := m.auths[auth.ID]; current != nil {
 			if current == auth || current.StateVersion == previousVersion {
 				current.StateVersion = stateVersion
+				current.CredentialIdentityVersion = persisted.CredentialIdentityVersion
 			}
 		}
 		m.mu.Unlock()
@@ -943,6 +950,22 @@ func (m *Manager) List() []*Auth {
 	return out
 }
 
+// ListByProvider returns snapshots only for credentials from the specified provider.
+func (m *Manager) ListByProvider(provider string) []*Auth {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*Auth
+	for _, auth := range m.auths {
+		if auth != nil && auth.Provider == provider {
+			out = append(out, auth.Clone())
+		}
+	}
+	return out
+}
+
 // GetByID returns a by id.
 func (m *Manager) GetByID(id string) (*Auth, bool) {
 	if m == nil {
@@ -1074,15 +1097,7 @@ func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
 	}
 
 	for registryModel, stateModel := range models {
-		blocked, reason, _ := isAuthBlockedForModel(authForAvailability, stateModel, now)
-		legacyModel := canonicalModelKey(registryModel)
-		if !blocked && stateModel != legacyModel {
-			if legacyBlocked, legacyReason, _ := isAuthBlockedForModel(authForAvailability, legacyModel, now); legacyBlocked {
-				blocked = true
-				reason = legacyReason
-				stateModel = legacyModel
-			}
-		}
+		stateModel, blocked, reason, _ := dispatchModelBlockStatus(authForAvailability, stateModel, registryModel, now)
 		if blocked && reason == blockReasonCooldown {
 			modelRegistry.SetModelQuotaExceeded(auth.ID, registryModel)
 		} else {
@@ -1104,9 +1119,6 @@ func (m *Manager) reconcileRegistryModelStatesLocked(authID string) {
 				suspendReason = strings.TrimSpace(state.StatusMessage)
 			}
 		}
-		// Recreate the suspension so a transition from quota to another error
-		// also updates the registry reason.
-		modelRegistry.ResumeClientModel(auth.ID, registryModel)
 		modelRegistry.SuspendClientModel(auth.ID, registryModel, suspendReason)
 	}
 }
@@ -1123,7 +1135,7 @@ func shouldSuspendRegistryModel(auth *Auth, model string, reason blockReason) bo
 	if state == nil {
 		return false
 	}
-	if isModelSupportResultError(state.LastError) {
+	if isModelSupportResultError(state.LastError) || isForceCooldownResultError(state.LastError) {
 		return true
 	}
 	switch statusCodeFromResult(state.LastError) {
@@ -1232,11 +1244,16 @@ func classifyDispatchAvailability(auth *Auth, blockedModel string, blocked bool,
 }
 
 // dispatchModelBlockStatus preserves the upstream-first check and legacy route fallback.
+// Published-route providers only check source state (including any legacy
+// unqualified source key) so rebinding an alias never inherits another source's cooldown.
 // Returning the checked model lets diagnostics identify the state that blocks dispatch.
 func dispatchModelBlockStatus(auth *Auth, resolvedModel, routeModel string, now time.Time) (string, bool, blockReason, time.Time) {
-	blockedModel := resolvedModel
+	blockedModel := publishedModelStateKey(auth, resolvedModel)
 	blocked, reason, next := isAuthBlockedForModel(auth, blockedModel, now)
-	if !blocked && resolvedModel != canonicalModelKey(routeModel) {
+	if blocked || isPublishedSourceModelKey(auth, resolvedModel) {
+		return blockedModel, blocked, reason, next
+	}
+	if resolvedModel != canonicalModelKey(routeModel) {
 		blockedModel = routeModel
 		blocked, reason, next = isAuthBlockedForModel(auth, blockedModel, now)
 	}
@@ -1324,6 +1341,12 @@ func (m *Manager) useSchedulerFastPath() bool {
 
 // Dispatch processes dispatch.
 func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedModel string, opts Options) (*DispatchDecision, error) {
+	selectionReturned := false
+	defer func() {
+		if !selectionReturned {
+			opts.SessionAffinity.Finish(false)
+		}
+	}()
 	// Build the candidate view before applying availability rules.
 	if m == nil {
 		return nil, &Error{Code: "provider_not_found", Message: "manager is nil"}
@@ -1331,9 +1354,32 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if len(providers) == 0 {
+	normalizedProviders := normalizeProviderKeys(providers)
+	if len(normalizedProviders) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	// Home session bindings have a stable cross-provider scope. Keep it
+	// separate from the current provider set used for selection and accounting.
+	opts.SessionAffinityScope = "mixed"
+	providerForSelector := "mixed"
+	if len(normalizedProviders) == 1 {
+		providerForSelector = normalizedProviders[0]
+	}
+	requestedProviders := normalizedProviders
+	if len(opts.ExcludedProviders) > 0 {
+		excluded := normalizeProviderKeys(opts.ExcludedProviders)
+		eligible := make([]string, 0, len(normalizedProviders))
+		for _, provider := range normalizedProviders {
+			if !containsProvider(excluded, provider) {
+				eligible = append(eligible, provider)
+			}
+		}
+		normalizedProviders = eligible
+	}
+	if len(normalizedProviders) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no provider available"}
+	}
+	providers = normalizedProviders
 
 	routeModel := strings.TrimSpace(requestedModel)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
@@ -1355,7 +1401,14 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 	if !modelAllowedByID(routeKey, allowedModelIDs) {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, opts, nil, defaultRequestRetry)
+	// Admission exclusions fence this attempt, not the request's future retry rounds.
+	// Keep API-key, model, pin, provider and credential-policy restrictions intact.
+	retryBudgetOpts := opts
+	if len(excludedConcurrencyCandidatesFromOptions(opts)) > 0 {
+		retryBudgetOpts.Metadata = cloneAnyMap(opts.Metadata)
+		delete(retryBudgetOpts.Metadata, ExcludedConcurrencyCandidatesMetadataKey)
+	}
+	retrySummary := m.summarizeDispatchAvailability(providers, routeModel, retryBudgetOpts, nil, defaultRequestRetry)
 	requestRetry := retrySummary.requestRetry
 	if !retrySummary.hasRequestRetry || requestRetry < 0 {
 		requestRetry = 0
@@ -1366,7 +1419,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		for {
 			auth, providerKey, errPick := m.scheduler.pickMixed(ctx, providers, routeModel, opts, tried)
 			if errPick != nil {
-				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
+				return nil, m.finalizeDispatchUnavailableError(errPick, providers, routeModel, opts, excludedAuthIDs, tried, nil, defaultRequestRetry)
 			}
 			if auth == nil {
 				return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1405,26 +1458,34 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 	}
 
-	filterWeights := !m.hasPluginScheduler()
+	allowPinnedAccounting := !m.hasPluginScheduler()
+	unpinnedAllowedAuthIDs := unpinnedAllowedAuthIDsFromOptions(opts)
 	allowedAuthIDs := allowedAuthIDsFromOptions(opts)
-	normalizedProviders := normalizeProviderKeys(providers)
-	if len(normalizedProviders) == 0 {
-		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-	providerForSelector := "mixed"
-	if len(normalizedProviders) == 1 {
-		providerForSelector = normalizedProviders[0]
-	}
+	pinnedAuthID := pinnedAuthIDFromOptions(opts)
 	registryRef := registry.GetGlobalRegistry()
 
 	tried := cloneAuthIDSet(excludedAuthIDs)
 	for {
+		opts.SessionAffinity.Reset()
 		now := time.Now()
 		m.mu.RLock()
 		selector := m.selector
+		affinity, _ := selector.(*SessionAffinitySelector)
 		pluginScheduler := m.pluginScheduler
+		var concurrencyBlocked map[string]struct{}
+		// Match CPA eligibility before priority scoping, independently of plugin accounting.
+		weighted := isWeightedSelector(selector)
+		trackPinnedAccounting := pinnedAuthID != "" && allowPinnedAccounting && weighted
 		dispatchCandidates := make([]dispatchCandidate, 0, len(m.auths))
 		availableAuths := make([]*Auth, 0, len(m.auths))
+		var transientAuthIDs map[string]struct{}
+		if affinity, ok := selector.(*SessionAffinitySelector); ok && affinity.rebindOn == "quota" {
+			transientAuthIDs = make(map[string]struct{})
+		}
+		var accountingAuths []*Auth
+		if trackPinnedAccounting {
+			accountingAuths = make([]*Auth, 0, len(m.auths))
+		}
 		totalCandidates := 0
 		cooldownCount := 0
 		var earliest time.Time
@@ -1432,32 +1493,53 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if filterWeights && isWeightedSelector(selector) && authWeight(candidate) <= 0 {
+			if weighted && authWeight(candidate) <= 0 {
 				continue
 			}
-			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
+			if !authAllowedByID(candidate.ID, unpinnedAllowedAuthIDs) {
 				continue
 			}
-			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
-				continue
-			}
-			if !authAllowedByID(candidate.ID, allowedAuthIDs) {
+			if !trackPinnedAccounting && !authAllowedByID(candidate.ID, allowedAuthIDs) {
 				continue
 			}
 			providerKey := strings.ToLower(strings.TrimSpace(candidate.Provider))
 			if providerKey == "" {
 				continue
 			}
-			if !containsProvider(normalizedProviders, providerKey) {
+			if !containsProvider(requestedProviders, providerKey) {
 				continue
 			}
 			if routeKey != "" && (registryRef == nil || !registryRef.ClientSupportsModel(candidate.ID, routeKey)) {
 				continue
 			}
-			totalCandidates++
+			pinnedAllowed := authAllowedByID(candidate.ID, allowedAuthIDs)
+			if transientAuthIDs != nil && pinnedAllowed && credentialPolicyAllows(credentialPolicy, candidate) {
+				resolved := m.resolveDispatchModel(candidate, routeModel)
+				if resolved.Model != "" {
+					availabilityAuth := m.effectiveAvailabilityAuth(candidate, now)
+					blockedModel, _, _, _ := dispatchModelBlockStatus(availabilityAuth, resolved.Key, routeModel, now)
+					if !sessionAffinityQuotaBlocked(availabilityAuth, blockedModel, now) {
+						transientAuthIDs[candidate.ID] = struct{}{}
+					}
+				}
+			}
+			// Pool pauses constrain selection, not protection of a healthy binding.
+			if !containsProvider(normalizedProviders, providerKey) {
+				continue
+			}
+			// Retry limits constrain this attempt, not the session binding lifetime.
+			if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
+				continue
+			}
+			if _, excluded := tried[strings.TrimSpace(candidate.ID)]; excluded {
+				continue
+			}
+			if pinnedAllowed {
+				totalCandidates++
+			}
 			dispatchCandidate, okCandidate, reason, next := m.buildDispatchCandidate(candidate, providerKey, routeModel, credentialPolicy, now)
 			if !okCandidate {
-				if reason == blockReasonCooldown {
+				if pinnedAllowed && reason == blockReasonCooldown {
 					cooldownCount++
 					if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 						earliest = next
@@ -1466,6 +1548,19 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				continue
 			}
 			if concurrencyCandidateExcluded(opts, candidate.ID, dispatchCandidate.upstreamKey) {
+				if affinity != nil && affinity.rebindOn == "never" && pinnedAllowed {
+					if concurrencyBlocked == nil {
+						concurrencyBlocked = make(map[string]struct{})
+					}
+					concurrencyBlocked[candidate.ID] = struct{}{}
+				}
+				continue
+			}
+			// Pinning restricts selection, not the eligible pool used for accounting.
+			if trackPinnedAccounting {
+				accountingAuths = append(accountingAuths, dispatchCandidate.availabilityAuth)
+			}
+			if !pinnedAllowed {
 				continue
 			}
 			dispatchCandidates = append(dispatchCandidates, dispatchCandidate)
@@ -1474,27 +1569,56 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		m.mu.RUnlock()
 
 		if len(availableAuths) == 0 {
+			if len(concurrencyBlocked) > 0 {
+				bound, errBinding := affinity.activeNeverBinding(ctx, opts, selectionArgForSelector(selector, routeModel))
+				if errBinding != nil {
+					return nil, errBinding
+				}
+				if _, blocked := concurrencyBlocked[bound]; blocked {
+					return nil, sessionAuthUnavailableError(bound)
+				}
+			}
 			errUnavailable := dispatchUnavailableError(routeModel, providerForSelector, totalCandidates, cooldownCount, earliest, now)
-			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, defaultRequestRetry)
+			return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, nil, defaultRequestRetry)
 		}
 
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = SessionAffinitySelection{}
-		}
 		var auth *Auth
+		var pluginExcluded map[string]struct{}
+		var delegated bool
 		if pluginScheduler != nil {
-			pluginAuth, handled, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths)
+			pluginAuth, excluded, delegateBuiltin, errPluginPick := m.pickViaPluginScheduler(ctx, pluginScheduler, providerForSelector, normalizedProviders, routeModel, opts, tried, availableAuths, affinity)
 			if errPluginPick != nil {
 				return nil, errPluginPick
 			}
-			if handled && pluginAuth != nil {
-				auth = pluginAuth
-			}
+			auth, pluginExcluded, delegated = pluginAuth, excluded, delegateBuiltin
 		}
 
 		if auth == nil {
+			var builtinCandidates []*Auth
+			if len(pluginExcluded) > 0 {
+				availableAuths = filterPluginExcludedAuths(availableAuths, pluginExcluded)
+				weightedFallback := !delegated && isWeightedSelector(selector)
+				if weightedFallback {
+					availableAuths = positiveWeightAuths(availableAuths)
+				}
+				if len(availableAuths) == 0 {
+					bound, errBinding := affinity.activeNeverBinding(ctx, opts, selectionArgForSelector(selector, routeModel))
+					if errBinding != nil {
+						return nil, errBinding
+					}
+					if bound != "" {
+						return nil, sessionAuthUnavailableError(bound)
+					}
+					// The plugin sees only ready credentials. Re-scan with the fallback's
+					// weight rules for this pick.
+					opts.positiveWeightOnly = weightedFallback
+					errUnavailable := &Error{Code: "auth_not_found", Message: "no auth available"}
+					return nil, m.finalizeDispatchUnavailableError(errUnavailable, normalizedProviders, routeModel, opts, excludedAuthIDs, tried, pluginExcluded, defaultRequestRetry)
+				}
+				builtinCandidates = availableAuths
+			}
 			if isBuiltInSelector(selector) && len(excludedConcurrencyCandidatesFromOptions(opts)) == 0 {
-				builtinAuth, handledBuiltin, errBuiltinPick := m.pickViaBuiltinScheduler(ctx, schedulerStrategyCurrent, providerForSelector, normalizedProviders, routeModel, opts, tried)
+				builtinAuth, handledBuiltin, errBuiltinPick := m.pickViaBuiltinScheduler(ctx, schedulerStrategyCurrent, providerForSelector, normalizedProviders, routeModel, opts, tried, builtinCandidates)
 				if errBuiltinPick != nil {
 					return nil, errBuiltinPick
 				}
@@ -1503,8 +1627,15 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 				}
 			}
 			if auth == nil {
+				selectorCtx := ctx
+				if transientAuthIDs != nil {
+					selectorCtx = context.WithValue(selectorCtx, sessionAffinityTransientAuthIDsKey{}, transientAuthIDs)
+				}
+				if len(accountingAuths) > 0 {
+					selectorCtx = context.WithValue(selectorCtx, weightedAccountingPoolKey{}, accountingAuths)
+				}
 				var errPick error
-				auth, errPick = selector.Pick(ctx, providerForSelector, selectionArgForSelector(selector, routeModel), opts, availableAuths)
+				auth, errPick = selector.Pick(selectorCtx, providerForSelector, selectionArgForSelector(selector, routeModel), opts, availableAuths)
 				if errPick != nil {
 					return nil, errPick
 				}
@@ -1512,6 +1643,9 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		}
 		if auth == nil {
 			return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if _, excluded := pluginExcluded[auth.ID]; excluded {
+			return nil, &Error{Code: "auth_unavailable", Message: "selector returned auth outside candidates"}
 		}
 		var selectedCandidate dispatchCandidate
 		foundCandidate := false
@@ -1552,7 +1686,10 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 		if upstream == "" {
 			upstream = routeModel
 		}
+		selectionReturned = true
+		selectionID, _ := opts.Metadata["selection_id"].(string)
 		return &DispatchDecision{
+			SelectionID:   selectionID,
 			Auth:          fullAuth.Clone(),
 			Provider:      providerKey,
 			UpstreamModel: upstream,
@@ -1565,7 +1702,7 @@ func (m *Manager) Dispatch(ctx context.Context, providers []string, requestedMod
 }
 
 func (m *Manager) summarizeDispatchAvailability(providers []string, routeModel string, opts Options, excludedAuthIDs map[string]struct{}, defaultRequestRetry int) dispatchAvailabilitySummary {
-	if m != nil && m.scheduler != nil && !m.hasPluginScheduler() && m.useSchedulerFastPath() {
+	if m != nil && m.scheduler != nil && !opts.positiveWeightOnly && !m.hasPluginScheduler() && m.useSchedulerFastPath() {
 		return m.scheduler.summarizeDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRequestRetry)
 	}
 	return m.scanDispatchAvailability(providers, routeModel, opts, excludedAuthIDs, defaultRequestRetry)
@@ -1590,13 +1727,14 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	registryRef := registry.GetGlobalRegistry()
 	retryRound := requestRetryRoundFromOptions(opts)
 
-	filterWeights := !m.hasPluginScheduler()
+	hasConcurrencyExclusions := len(excludedConcurrencyCandidatesFromOptions(opts)) > 0
 	m.mu.RLock()
+	weighted := isWeightedSelector(m.selector)
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
 			continue
 		}
-		if filterWeights && isWeightedSelector(m.selector) && authWeight(candidate) <= 0 {
+		if (opts.positiveWeightOnly || weighted) && authWeight(candidate) <= 0 {
 			continue
 		}
 		if !requestRetryRoundAllowed(candidate, retryRound, defaultRequestRetry) {
@@ -1619,7 +1757,7 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 			continue
 		}
 		resolved := m.resolveDispatchModel(candidate, routeModel)
-		if strings.TrimSpace(resolved.Model) == "" {
+		if strings.TrimSpace(resolved.Model) == "" || (hasConcurrencyExclusions && concurrencyCandidateExcluded(opts, candidate.ID, resolved.Key)) {
 			continue
 		}
 		authForAvailability := m.effectiveAvailabilityAuth(candidate, summary.now)
@@ -1645,8 +1783,19 @@ func (m *Manager) scanDispatchAvailability(providers []string, routeModel string
 	return summary
 }
 
-func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs map[string]struct{}, defaultRequestRetry int) error {
-	if m == nil || errDispatch == nil {
+func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers []string, routeModel string, opts Options, roundExcludedAuthIDs, triedAuthIDs, pluginExcludedAuthIDs map[string]struct{}, defaultRequestRetry int) error {
+	if m == nil {
+		return errDispatch
+	}
+	// Retry-round forecasts are only valid after candidate-pool exhaustion.
+	// In particular, a canceled broad-allowlist scan has no availability result.
+	switch exhausted := errDispatch.(type) {
+	case *modelCooldownError:
+	case *Error:
+		if exhausted.Code != "auth_not_found" && exhausted.Code != "auth_unavailable" {
+			return errDispatch
+		}
+	default:
 		return errDispatch
 	}
 
@@ -1662,6 +1811,9 @@ func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers 
 			nextRound++
 		}
 		nextRoundOpts := withRequestRetryDispatchMetadata(opts, nextRound, defaultRequestRetry)
+		// The next pick runs the plugin again. Neither its exclusions nor its
+		// current fallback strategy are a restriction on that round.
+		nextRoundOpts.positiveWeightOnly = false
 		summary = m.summarizeDispatchAvailability(providers, routeModel, nextRoundOpts, nil, defaultRequestRetry)
 		provider := "mixed"
 		if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
@@ -1672,8 +1824,15 @@ func (m *Manager) finalizeDispatchUnavailableError(errDispatch error, providers 
 	}
 
 	if !hasSummary {
-		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, triedAuthIDs, defaultRequestRetry)
-		if summary.total > 0 && summary.cooldownCount == summary.total && !summary.earliest.IsZero() {
+		ineligible := triedAuthIDs
+		if len(pluginExcludedAuthIDs) > 0 {
+			ineligible = cloneAuthIDSet(triedAuthIDs)
+			for id := range pluginExcludedAuthIDs {
+				ineligible[id] = struct{}{}
+			}
+		}
+		summary = m.summarizeDispatchAvailability(providers, routeModel, opts, ineligible, defaultRequestRetry)
+		if len(pluginExcludedAuthIDs) > 0 || (summary.total > 0 && summary.cooldownCount == summary.total && !summary.earliest.IsZero()) {
 			provider := "mixed"
 			if normalizedProviders := normalizeProviderKeys(providers); len(normalizedProviders) == 1 {
 				provider = normalizedProviders[0]
@@ -1854,17 +2013,7 @@ func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Erro
 	if auth == nil || errRefresh == nil {
 		return nil
 	}
-	unknownOutcome := false
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
-		}
-		codexauth.RecordRefreshOutcomeUnknown(auth.Metadata, errRefresh)
-		var authErr *Error
-		unknownOutcome = codexauth.IsRefreshOutcomeUnknown(errRefresh) ||
-			(errors.As(errRefresh, &authErr) && authErr.Code == ErrorCodeRefreshOutcomeUnknown)
-	}
-	if !unknownOutcome && isTerminalRefreshAuthError(errRefresh) {
+	if isTerminalRefreshAuthError(errRefresh) {
 		refreshFailure := newUnauthorizedRefreshErrorFrom(errRefresh)
 		disableAuthAfterUnauthorized(auth, nil, refreshFailure, now)
 		return refreshFailure
@@ -1880,12 +2029,6 @@ func ApplyRefreshFailureState(auth *Auth, errRefresh error, now time.Time) *Erro
 		}
 	}
 	refreshFailure := newTransientRefreshErrorFrom(errRefresh)
-	if unknownOutcome {
-		refreshFailure.Code = ErrorCodeRefreshOutcomeUnknown
-		refreshFailure.Message = "credential refresh outcome unknown; replace the refresh credentials before retrying"
-		refreshFailure.Retryable = false
-		refreshFailure.Upstream = nil
-	}
 	if refreshFailure.Diagnostic != "" && !strings.Contains(refreshFailure.Diagnostic, "retry_at=") {
 		refreshFailure.Diagnostic = logging.SafeDiagnosticForLog(refreshFailure.Diagnostic + " retry_at=" + retryAt.UTC().Format(time.RFC3339Nano))
 	}
@@ -2061,7 +2204,7 @@ func unsupportedRefreshDiagnostic(auth *Auth) string {
 	}
 	reason := "no_refresh_handler"
 	switch provider {
-	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai":
+	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai", "copilot":
 		if auth == nil || strings.TrimSpace(metaStringValue(auth.Metadata, "refresh_token")) == "" {
 			reason = "missing_refresh_token"
 		}
@@ -2222,9 +2365,6 @@ func isTerminalRefreshAuthError(errRefresh error) bool {
 	if errRefresh == nil || errors.Is(errRefresh, context.Canceled) || errors.Is(errRefresh, context.DeadlineExceeded) {
 		return false
 	}
-	if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
-		return false
-	}
 	var authErr *Error
 	if errors.As(errRefresh, &authErr) && authErr != nil {
 		switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
@@ -2266,7 +2406,7 @@ func authSupportsBuiltInRefresh(auth *Auth) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
-	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai":
+	case "codex", "claude", "kimi", "kimi-ai", "antigravity", "xai", "copilot":
 		return metaStringValue(auth.Metadata, "refresh_token") != ""
 	case "meta":
 		return extractMetaDCAToken(auth) != ""
@@ -2569,19 +2709,13 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		interval = refreshCheckInterval
 	}
 
+	// Publish the replacement atomically with respect to stop and reconfiguration.
 	m.mu.Lock()
-	cancelPrev := m.refreshCancel
-	m.refreshCancel = nil
-	m.refreshLoop = nil
-	m.mu.Unlock()
-	if cancelPrev != nil {
-		cancelPrev()
+	if m.refreshCancel != nil {
+		m.refreshCancel()
 	}
-
 	ctx, cancelCtx := context.WithCancel(parent)
-	loop := newAuthAutoRefreshLoop(m, interval, refreshMaxConcurrency)
-
-	m.mu.Lock()
+	loop := newAuthAutoRefreshLoop(m, interval, m.refreshWorkers())
 	m.refreshCancel = cancelCtx
 	m.refreshLoop = loop
 	m.mu.Unlock()
@@ -2632,6 +2766,16 @@ func (m *Manager) stopResultPersistWorkers() {
 		cancelPersist()
 	}
 	m.resultPersistWG.Wait()
+}
+
+func (m *Manager) refreshWorkers() int {
+	workers := refreshMaxConcurrency
+	if m != nil {
+		if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+			workers = cfg.AuthAutoRefreshWorkers
+		}
+	}
+	return workers
 }
 
 // stopAutoRefresh stops an auto refresh.
@@ -2723,24 +2867,18 @@ func (m *Manager) RefreshNowObserved(ctx context.Context, authIndex, observedAcc
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.AuthRoundTripper(target))
 	}
 	cancelRefresh()
 	now = time.Now().UTC()
 	if errRefresh != nil {
-		if (errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil) && !codexauth.IsRefreshOutcomeUnknown(errRefresh) {
+		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
 			return nil, errRefresh
 		}
 		snapshot := target.Clone()
 		refreshFailure := ApplyRefreshFailureState(snapshot, errRefresh, now)
 		logCredentialRefreshFailure(ctx, snapshot, refreshFailure)
-		persistCtx := ctx
-		if codexauth.IsRefreshOutcomeUnknown(errRefresh) {
-			var cancelPersist context.CancelFunc
-			persistCtx, cancelPersist = withRefreshProviderTimeout(context.WithoutCancel(ctx))
-			defer cancelPersist()
-		}
-		updatedPersisted, errUpdate := m.Update(persistCtx, snapshot)
+		updatedPersisted, errUpdate := m.Update(ctx, snapshot)
 		if errUpdate != nil {
 			return nil, errUpdate
 		}
@@ -2846,12 +2984,12 @@ func (m *Manager) RefreshAuthCredential(ctx context.Context, target *Auth) (*Aut
 	refreshAttempted := handledPluginRefresh
 	if !handledPluginRefresh {
 		refreshAttempted = authSupportsBuiltInRefresh(target)
-		updated, errRefresh = refreshCredential(m.withCodexRefreshJournal(refreshCtx), cfg, target.Clone(), m.roundTripperFor(target))
+		updated, errRefresh = refreshCredential(refreshCtx, cfg, target.Clone(), m.AuthRoundTripper(target))
 	}
 	cancelRefresh()
 	now := time.Now().UTC()
 	if errRefresh != nil {
-		if (errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil) && !codexauth.IsRefreshOutcomeUnknown(errRefresh) {
+		if errors.Is(errRefresh, context.Canceled) || ctx.Err() != nil {
 			return target.Clone(), errRefresh
 		}
 		snapshot := target.Clone()

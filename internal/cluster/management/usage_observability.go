@@ -33,6 +33,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"capabilities": gin.H{
+			"antigravity_tos_pause_status":         true,
 			"quota_snapshots":                      true,
 			"quota_snapshot_details":               true,
 			"quota_recollect":                      h.quotaRecollect != nil,
@@ -69,6 +70,7 @@ func (h *Handler) GetCapabilities(c *gin.Context) {
 			"topology":                             true,
 			"users":                                true,
 			"access_groups":                        true,
+			"channel_group_credential_candidates":  true,
 			"user_period_limits":                   true,
 			"credential_in_flight_snapshots":       true,
 			"credential_in_flight_snapshot_cursor": true,

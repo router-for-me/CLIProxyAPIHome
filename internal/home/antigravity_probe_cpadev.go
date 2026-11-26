@@ -2,17 +2,13 @@
 
 package home
 
-import (
-	"context"
-
-	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
-)
+import cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 
 const (
 	antigravityModelBaseURLDaily     = cpasdkauth.AntigravityModelBaseURLDaily
 	antigravityModelsPath            = cpasdkauth.AntigravityModelsPath
 	antigravityPersistedHintsMetaKey = cpasdkauth.AntigravityPersistedHintsMetaKey
+	antigravityProbeHTTP11           = true
 )
 
 type antigravityProbeStatus = cpasdkauth.AntigravityProbeStatus
@@ -32,31 +28,6 @@ func buildPersistedAntigravityCapabilityHintsValue(project, endpoint string, hin
 
 func parsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedProject, expectedEndpoint string) (antigravityModelCapabilityHints, bool) {
 	hints, ok := cpasdkauth.ParsePersistedAntigravityCapabilityHints(metadata, expectedProject, expectedEndpoint)
-	if !ok {
-		return antigravityModelCapabilityHints{}, false
-	}
-	return antigravityModelCapabilityHints{
-		ModelIDs:          hints.ModelIDs,
-		WebSearchModelIDs: hints.WebSearchModelIDs,
-	}, true
-}
-
-func (r *Runtime) probeAntigravityModelCapabilityHints(ctx context.Context, auth *coreauth.Auth, baseURLs []string, proxyURL, accessToken, userAgent string) (antigravityModelCapabilityHints, antigravityProbeStatus) {
-	hints, status := cpasdkauth.FetchAntigravityAvailableModels(ctx, cpasdkauth.AntigravityModelProbeRequest{
-		BaseURLs:    baseURLs,
-		ProxyURL:    proxyURL,
-		AccessToken: accessToken,
-		ProjectID:   antigravityProjectID(auth),
-		UserAgent:   userAgent,
-	})
-	return antigravityModelCapabilityHints{
-		ModelIDs:          hints.ModelIDs,
-		WebSearchModelIDs: hints.WebSearchModelIDs,
-	}, status
-}
-
-func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabilityHints, bool) {
-	hints, ok := cpasdkauth.ParseAntigravityModelCapabilityHints(body)
 	if !ok {
 		return antigravityModelCapabilityHints{}, false
 	}

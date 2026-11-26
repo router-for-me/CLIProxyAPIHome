@@ -19,7 +19,6 @@ import (
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/access"
-	configaccess "github.com/router-for-me/CLIProxyAPIHome/internal/access/config_access"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/concurrency"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -62,6 +61,11 @@ type Runtime struct {
 	originalStore           coreauth.Store
 
 	cancel context.CancelFunc
+
+	copilotMu       sync.RWMutex
+	copilotAccounts map[string]copilotAccountModels
+	copilotWake     chan struct{}
+	copilotDone     chan struct{}
 
 	antigravityProbeMu        sync.Mutex
 	antigravityProbeWg        sync.WaitGroup
@@ -158,10 +162,15 @@ type DispatchResponsePreparer func(*DispatchResult) (unaccounted []byte, account
 
 // DispatchConcurrencyContext carries the RESP connection identity required for admission.
 type DispatchConcurrencyContext struct {
-	Fingerprint     string
-	ConnectedAt     time.Time
-	Controlled      bool
-	ProtocolVersion int
+	Stream             bool
+	RequestID          string
+	TraceID            string
+	ExecutionSessionID string
+	RequestedModel     string
+	Fingerprint        string
+	ConnectedAt        time.Time
+	Controlled         bool
+	ProtocolVersion    int
 	// RetryRound carries the zero-based CPA request retry round.
 	RetryRound int
 	// RetryRoundPresent distinguishes an explicit wire retry_round=0 from an
@@ -183,11 +192,7 @@ type clusterAuthStateObserver interface {
 }
 
 type clusterUsageStore interface {
-	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error
-}
-
-type clusterUsageOutcomeStore interface {
-	StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
+	StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error)
 }
 
 type appLogStore interface {
@@ -264,15 +269,16 @@ func NewRuntime(cfg *config.Config) (*Runtime, error) {
 	pluginHost := newPluginHostForRuntime(cfg)
 
 	accessManager := access.NewManager()
-	configaccess.Register(&cfg.SDKConfig)
 
 	runtime := &Runtime{
-		cfg:           cfg,
-		authDir:       cfg.AuthDir,
-		accessManager: accessManager,
-		coreManager:   coreManager,
-		pluginHost:    pluginHost,
-		originalStore: store,
+		cfg:             cfg,
+		authDir:         cfg.AuthDir,
+		accessManager:   accessManager,
+		coreManager:     coreManager,
+		pluginHost:      pluginHost,
+		originalStore:   store,
+		copilotWake:     make(chan struct{}, 1),
+		copilotAccounts: make(map[string]copilotAccountModels),
 	}
 	coreManager.SetPluginAuthRefresher(runtime)
 	coreManager.SetPluginScheduler(runtime)
@@ -385,6 +391,9 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 		return errLoad
 	}
 
+	r.copilotDone = make(chan struct{})
+	go r.runCopilotDiscovery(runCtx, r.copilotDone)
+
 	clusterMode := r.clusterAutoRefreshGated()
 	if clusterMode {
 		log.Infof("core auth auto-refresh waiting for cluster master")
@@ -421,6 +430,10 @@ func (r *Runtime) Stop() {
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
+	}
+	if r.copilotDone != nil {
+		<-r.copilotDone
+		r.copilotDone = nil
 	}
 	if r.fileWatcher != nil {
 		_ = r.fileWatcher.Stop()
@@ -511,7 +524,10 @@ func (r *Runtime) RefreshNowLocalObserved(ctx context.Context, authIndex, observ
 	if errRefresh != nil {
 		return nil, errRefresh
 	}
-	return BuildRefreshPayload(updated)
+	if updated != nil && updated.Provider == "copilot" {
+		r.publishCopilotModels(updated.ID)
+	}
+	return BuildRefreshPayload(updated, r.Config())
 }
 
 // UpdateAuthInMemory updates an auth in memory.
@@ -551,7 +567,11 @@ func (r *Runtime) UpdateAuthInMemory(ctx context.Context, auth *coreauth.Auth) (
 			update.ModelStates = mergeModelStates(update.ModelStates, current.ModelStates)
 		}
 	}
-	return r.coreManager.Update(coreauth.WithSkipPersist(ctx), update)
+	applied, errUpdate := r.coreManager.Update(coreauth.WithSkipPersist(ctx), update)
+	if errUpdate == nil && applied != nil && applied.Provider == "copilot" {
+		r.publishCopilotModels(applied.ID)
+	}
+	return applied, errUpdate
 }
 
 // RefreshClusterAuthIndex refreshes refresh cluster auth index.
@@ -568,24 +588,12 @@ func (r *Runtime) RefreshClusterAuthIndex(ctx context.Context, uuid string) erro
 	return refresher.RefreshAuthIndex(ctx, uuid)
 }
 
-// PersistClusterUsagePayload stores a cluster usage payload with its trusted receive time.
-func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
-	persisted, _, errPersist := r.PersistClusterUsagePayloadOutcome(ctx, payload, receivedAt)
-	return persisted, errPersist
-}
-
-// PersistClusterUsagePayloadOutcome stores a cluster usage payload with its trusted receive time
-// and reports whether the payload was newly inserted (false when deduplicated).
-func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, bool, error) {
+// PersistClusterUsagePayload stores a cluster usage payload with its trusted
+// receive time. It reports whether the cluster store handled the payload and
+// whether the payload was newly inserted (false when deduplicated).
+func (r *Runtime) PersistClusterUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (persisted bool, inserted bool, err error) {
 	if r == nil || r.clusterAdapter == nil || !r.clusterAdapter.Enabled() {
 		return false, false, nil
-	}
-	if outcomeStore, ok := r.clusterAdapter.(clusterUsageOutcomeStore); ok && outcomeStore != nil {
-		inserted, errStore := outcomeStore.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
-		if errStore != nil {
-			return false, false, errStore
-		}
-		return true, inserted, nil
 	}
 	store, ok := r.clusterAdapter.(clusterUsageStore)
 	if !ok || store == nil {
@@ -593,10 +601,11 @@ func (r *Runtime) PersistClusterUsagePayloadOutcome(ctx context.Context, payload
 	}
 	// Acknowledge usage only after its database transaction commits. A failed
 	// write must reach the sender, not disappear from an in-memory queue.
-	if errStore := store.StoreUsagePayload(ctx, payload, receivedAt); errStore != nil {
+	inserted, errStore := store.StoreUsagePayload(ctx, payload, receivedAt)
+	if errStore != nil {
 		return false, false, errStore
 	}
-	return true, true, nil
+	return true, inserted, nil
 }
 
 // PersistAppLogPayload stores a CPA app log payload in the runtime database.
@@ -729,12 +738,15 @@ func (r *Runtime) ListPendingPluginTasks(ctx context.Context, nodeType string, n
 }
 
 // BuildRefreshPayload builds a build refresh payload.
-func BuildRefreshPayload(updated *coreauth.Auth) ([]byte, error) {
+func BuildRefreshPayload(updated *coreauth.Auth, cfg *config.Config) ([]byte, error) {
 	// Resolve credential context before calling upstream OAuth services.
 	if updated == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
-	auth := SanitizeAuthForDownstream(updated)
+	auth, errSanitize := SanitizeAuthForDownstream(updated, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	if auth == nil {
 		return nil, fmt.Errorf("auth manager: auth not found")
 	}
@@ -866,6 +878,7 @@ func (r *Runtime) clearDisabledCooldowns(ctx context.Context) error {
 }
 
 type DispatchResult struct {
+	SelectionID   string
 	Model         string
 	AccessToken   string
 	BaseURL       string
@@ -912,7 +925,7 @@ func (r *Runtime) DispatchForAPIKeyWithConcurrency(ctx context.Context, reqModel
 }
 
 func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, headers http.Header, apiKey string, credentialPolicy string, excludedAuthIDs []string, pinnedAuthID string, concurrencyCtx DispatchConcurrencyContext) (*DispatchResult, error) {
-	opts := coreauth.Options{}
+	opts := coreauth.Options{Stream: concurrencyCtx.Stream}
 	if headers != nil {
 		opts.Headers = headers.Clone()
 	}
@@ -920,23 +933,24 @@ func (r *Runtime) dispatchForAPIKey(ctx context.Context, reqModel string, header
 	if errAllowed != nil {
 		return nil, r.withModelAliasHint(ctx, errAllowed, reqModel, apiKey)
 	}
-	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
-	if pinnedAuthID != "" {
-		pinnedAllowed := allowedAuthIDs == nil
-		for _, allowedAuthID := range allowedAuthIDs {
-			if strings.TrimSpace(allowedAuthID) == pinnedAuthID {
-				pinnedAllowed = true
-				break
-			}
-		}
-		allowedAuthIDs = []string{}
-		if pinnedAllowed {
-			allowedAuthIDs = append(allowedAuthIDs, pinnedAuthID)
+	metadata := make(map[string]any)
+	for key, value := range map[string]string{
+		"request_id": concurrencyCtx.RequestID, "trace_id": concurrencyCtx.TraceID,
+		"execution_session_id":             concurrencyCtx.ExecutionSessionID,
+		coreauth.RequestedModelMetadataKey: concurrencyCtx.RequestedModel,
+		"node_kind":                        headers.Get("X-Node-Kind"),
+		"canonical_session_id":             coreauth.NormalizeExplicitID(headers.Get("X-Session-ID")),
+		"parent_session_id":                coreauth.NormalizeExplicitID(headers.Get("X-Parent-Session-ID")),
+	} {
+		if value != "" {
+			metadata[key] = value
 		}
 	}
-	metadata := make(map[string]any)
 	if allowedAuthIDs != nil {
 		metadata[coreauth.AllowedAuthIDsMetadataKey] = allowedAuthIDs
+	}
+	if pinnedAuthID = strings.TrimSpace(pinnedAuthID); pinnedAuthID != "" {
+		metadata[coreauth.PinnedAuthIDMetadataKey] = pinnedAuthID
 	}
 	if allowedModelIDs != nil {
 		metadata[coreauth.AllowedModelIDsMetadataKey] = allowedModelIDs
@@ -977,6 +991,23 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("home runtime: no providers available")
 	}
+	for _, provider := range providers {
+		if provider != "antigravity" {
+			continue
+		}
+		until, errPause := r.AntigravityTOSPauseDeadline(ctx)
+		if errPause != nil {
+			return nil, fmt.Errorf("read Antigravity pool pause: %w", errPause)
+		}
+		if until.After(time.Now()) {
+			// Keep the provider scope stable for session affinity; only fence candidates.
+			opts.ExcludedProviders = append(append([]string(nil), opts.ExcludedProviders...), "antigravity")
+			if len(providers) == 1 {
+				return nil, &coreauth.Error{Code: "antigravity_tos_pause", Message: "Antigravity credential pool is paused", Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
+			}
+		}
+		break
+	}
 
 	if !r.supportsRequestedModel(reqModel) {
 		trimmedModel := strings.TrimSpace(reqModel)
@@ -989,24 +1020,45 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		}
 	}
 
-	// Database-backed admissions commit the binding and the concurrency counter
-	// in one transaction. Standalone dispatch without a limiter can CAS directly.
-	// Legacy custom admitters without a shared store retain selector-side commits.
-	if r.concurrencyAdmitter == nil || r.sessionAffinityStore != nil {
-		opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
-	}
+	// Database-backed admissions commit the binding and concurrency counter in
+	// one transaction. Local/custom stores are committed separately below, but
+	// weighted reservations always remain owned by dispatch until admission ends.
+	opts.SessionAffinity = &coreauth.SessionAffinitySelection{}
+	defer func() { opts.SessionAffinity.Finish(false) }()
 	var lastCandidateError error
+	var capacityRetryError error
+	var capacityRetryDelay time.Duration
+	var admissionErrorsByCredential map[string]error
 	for {
+		opts.SessionAffinity.Reset()
 		if errContext := ctx.Err(); errContext != nil {
 			return nil, errContext
 		}
-		if opts.SessionAffinity != nil {
-			*opts.SessionAffinity = coreauth.SessionAffinitySelection{}
-		}
 		decision, errDispatch := r.coreManager.Dispatch(ctx, providers, reqModel, opts)
 		if errDispatch != nil {
-			if lastCandidateError != nil {
-				return nil, lastCandidateError
+			// A recoverable admission failure may clear sooner than the remaining
+			// pool's cooldown. Only compare typed cooldowns; never mask rejection,
+			// protocol incompatibility, cancellation, or another dispatch failure.
+			var cooldown interface {
+				ErrorCode() string
+				RetryAfter() *time.Duration
+			}
+			if capacityRetryError != nil && errors.As(errDispatch, &cooldown) && cooldown.ErrorCode() == "model_cooldown" {
+				if delay := cooldown.RetryAfter(); delay != nil && capacityRetryDelay < *delay {
+					return nil, capacityRetryError
+				}
+			}
+			if dispatchErr, ok := errDispatch.(*coreauth.Error); ok {
+				switch dispatchErr.Code {
+				case "auth_not_found", "auth_unavailable":
+					if lastCandidateError != nil {
+						return nil, lastCandidateError
+					}
+				case "session_auth_unavailable":
+					if admissionErr := admissionErrorsByCredential[dispatchErr.BoundCredentialID()]; admissionErr != nil {
+						return nil, admissionErr
+					}
+				}
 			}
 			return nil, errDispatch
 		}
@@ -1023,6 +1075,22 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if !validConcurrencyModel {
 			return nil, fmt.Errorf("home runtime: invalid canonical concurrency model key")
 		}
+		var modelInfo *DispatchModelInfo
+		if decision.Provider == "copilot" {
+			modelInfo = r.copilotDispatchModelInfo(decision, reqModel, time.Now())
+			if modelInfo == nil {
+				// The full credential can have changed since the scheduler read the registry.
+				if opts.Metadata == nil {
+					opts.Metadata = make(map[string]any)
+				}
+				excluded, _ := opts.Metadata[coreauth.ExcludedAuthIDsMetadataKey].([]string)
+				opts.Metadata[coreauth.ExcludedAuthIDsMetadataKey] = append(append([]string(nil), excluded...), auth.ID)
+				r.wakeCopilotDiscovery()
+				continue
+			}
+		} else {
+			modelInfo = dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel)
+		}
 		accessToken := extractAccessToken(auth)
 		baseURL := ""
 		apiKey := ""
@@ -1031,10 +1099,11 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 			apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 		}
 		result := &DispatchResult{
-			Model: upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
+			SelectionID: decision.SelectionID,
+			Model:       upstreamModel, AccessToken: accessToken, BaseURL: baseURL, APIKey: apiKey,
 			RequestRetry: decision.RequestRetry,
 			ForceMapping: decision.ForceMapping, OriginalAlias: decision.OriginalAlias,
-			ModelInfo: dispatchModelInfoForAuth(auth.ID, upstreamModel, reqModel),
+			ModelInfo: modelInfo,
 			AuthID:    auth.ID, Provider: decision.Provider, Auth: auth.Clone(),
 			Concurrency: ConcurrencyAdmissionResult{CredentialID: auth.ID, Model: concurrencyModel},
 		}
@@ -1050,8 +1119,8 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 		if opts.SessionAffinity != nil {
 			binding = opts.SessionAffinity.Commit
 		}
-		// Explicitly installed local/custom selectors cannot participate in the
-		// database admission transaction. Keep their selector-side CAS behavior.
+		// Local/custom stores cannot participate in the database admission
+		// transaction. Commit their binding before admission instead.
 		if binding != nil && r.concurrencyAdmitter != nil && opts.SessionAffinity.Store != r.sessionAffinityStore {
 			swapped, errSwap := opts.SessionAffinity.Store.CompareAndSwapSessionBinding(ctx, *binding)
 			if errSwap != nil {
@@ -1076,7 +1145,28 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				if !concurrencyCandidateIneligible(admissionType) {
 					return nil, errAdmit
 				}
+				if admissionType == "credential_concurrency_exceeded" || admissionType == "credential_model_concurrency_exceeded" {
+					var delay *time.Duration
+					var timed interface{ RetryAfter() *time.Duration }
+					if errors.As(errAdmit, &timed) {
+						delay = timed.RetryAfter()
+					}
+					if delay == nil || *delay <= 0 {
+						retryDelay := time.Duration(r.ConcurrencyRetryAfterMS(0)) * time.Millisecond
+						errAdmit = &concurrencyRetryError{error: errAdmit, retryAfter: retryDelay}
+						delay = &retryDelay
+					}
+					if capacityRetryError == nil || *delay < capacityRetryDelay {
+						capacityRetryError, capacityRetryDelay = errAdmit, *delay
+					}
+				}
 				lastCandidateError = errAdmit
+				// Keep the actionable admission failure for this credential, including
+				// missing protocol support, when a never-rebind session cannot fail over.
+				if admissionErrorsByCredential == nil {
+					admissionErrorsByCredential = make(map[string]error)
+				}
+				admissionErrorsByCredential[auth.ID] = errAdmit
 				excluded := coreauth.ExcludedConcurrencyCandidate{CredentialID: auth.ID}
 				if admissionType == "credential_model_concurrency_exceeded" {
 					excluded.Model = concurrencyModel
@@ -1092,6 +1182,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				if !admission.Accounted {
 					return nil, fmt.Errorf("home runtime: concurrency admission result mismatch")
 				}
+				opts.SessionAffinity.Finish(true)
 				result.Concurrency.Accounted = true
 				result.AdmissionFenceFailure = fmt.Errorf("home runtime: concurrency admission result mismatch")
 				return result, nil
@@ -1106,6 +1197,7 @@ func (r *Runtime) dispatchWithOptions(ctx context.Context, reqModel string, opts
 				continue
 			}
 		}
+		opts.SessionAffinity.Finish(true)
 		return result, nil
 	}
 }
@@ -1202,6 +1294,10 @@ func (r *Runtime) allowedDispatchIDsForAPIKey(ctx context.Context, apiKey string
 // visible to this API key. Policy failures omit the optional hint.
 func (r *Runtime) withModelAliasHint(ctx context.Context, err error, reqModel, apiKey string) error {
 	if err == nil || r == nil || r.coreManager == nil {
+		return err
+	}
+	var rejection *coreauth.SchedulerRejectError
+	if errors.As(err, &rejection) {
 		return err
 	}
 	authErr, structured := err.(*coreauth.Error)

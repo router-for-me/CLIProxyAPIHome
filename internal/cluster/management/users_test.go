@@ -215,7 +215,7 @@ func TestGetCapabilitiesDeclaresUserDomain(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("response is not JSON: %v", err)
 	}
-	for _, key := range []string{"users", "access_groups", "user_period_limits"} {
+	for _, key := range []string{"users", "access_groups", "user_period_limits", "channel_group_credential_candidates"} {
 		if !payload.Capabilities[key] {
 			t.Fatalf("capabilities[%q] missing or false", key)
 		}

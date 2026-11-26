@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	cpaauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	baseauth "github.com/router-for-me/CLIProxyAPIHome/internal/auth"
 )
 
@@ -45,6 +46,8 @@ type Auth struct {
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// ProxyConnectionPool is carried to CPA; Home does not create upstream pools.
+	ProxyConnectionPool *cpaauth.ProxyConnectionPoolOverride `json:"proxy_connection_pool,omitempty"`
 	// Attributes stores provider specific metadata needed by executors (immutable configuration).
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
@@ -82,6 +85,8 @@ type Auth struct {
 	Runtime any `json:"-"`
 	// StateVersion is the storage revision of this runtime snapshot when available.
 	StateVersion int64 `json:"-"`
+	// CredentialIdentityVersion fences state across storage identity changes and restorations.
+	CredentialIdentityVersion int64 `json:"-"`
 
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
@@ -144,6 +149,9 @@ type ModelState struct {
 	// QuotaResetAt marks an operator reset so peers can merge it without
 	// discarding unrelated local execution errors.
 	QuotaResetAt time.Time `json:"quota_reset_at,omitzero"`
+	// LastObservedAt is the event time of the newest usage result applied to
+	// this model. Older or replayed results are fenced by it.
+	LastObservedAt time.Time `json:"last_observed_at,omitzero"`
 }
 
 // recentRequestBucketID handles a recent request bucket id.
@@ -223,6 +231,7 @@ func (a *Auth) Clone() *Auth {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.ProxyConnectionPool = a.ProxyConnectionPool.Clone()
 	copyAuth.LastError = cloneError(a.LastError)
 	copyAuth.LastRefreshError = cloneError(a.LastRefreshError)
 	if a.RuntimeDisableCooling != nil {

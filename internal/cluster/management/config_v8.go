@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"gopkg.in/yaml.v3"
 )
@@ -25,13 +27,18 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	}
 	yamlRequest := strings.HasSuffix(c.FullPath(), "/config.yaml")
 	if c.Request.Method == http.MethodGet {
-		stored, err := h.configRoot(ctx)
+		stored, err := h.configV8Root(ctx)
 		if err != nil {
 			respondError(c, http.StatusInternalServerError, "config_load_failed", err)
 			return
 		}
-		if err = h.applyCredentialConfig(ctx, stored); err != nil {
-			respondError(c, http.StatusInternalServerError, "auth_load_failed", err)
+		auths, errAuths := h.repo.ListAuths(ctx)
+		if errAuths != nil {
+			respondError(c, http.StatusInternalServerError, "auth_load_failed", errAuths)
+			return
+		}
+		if errApply := cluster.ApplyV8CredentialConfigToRoot(stored, auths); errApply != nil {
+			respondError(c, http.StatusInternalServerError, "auth_load_failed", errApply)
 			return
 		}
 		doc, data, err := configV8Document(stored)
@@ -122,6 +129,27 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": 8})
+}
+
+// configV8Root reads committed configuration without initializing or locking lifecycle state.
+func (h *Handler) configV8Root(ctx context.Context) (map[string]any, error) {
+	if h == nil || h.repo == nil {
+		return nil, errors.New("cluster management repository is nil")
+	}
+	snapshot, errSnapshot := h.repo.LoadConfigSnapshot(ctx)
+	if errSnapshot != nil {
+		return nil, errSnapshot
+	}
+	root, errRoot := cluster.ConfigRootFromSnapshot(snapshot)
+	if errRoot != nil {
+		return nil, errRoot
+	}
+	lifecycleConfig, errLifecycle := h.repo.LifecycleConfig(ctx)
+	if errLifecycle != nil {
+		return nil, errLifecycle
+	}
+	root["credential-concurrency"] = lifecycleConfig
+	return root, nil
 }
 
 // configV8Document produces the same normalized view for reads and transactional edits.
@@ -219,12 +247,15 @@ func updateConfigV8Document(doc *yaml.Node, parts []string, update *yaml.Node, m
 	if err = root.Decode(&values); err != nil {
 		return nil, false, &configV8ResponseError{http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()}}
 	}
+	submittedGroups, _ := values["api-keys"].(map[string]any)
 	values, err = config.NormalizeConfigRoot(values)
 	if err != nil {
 		return nil, false, &configV8ResponseError{http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()}}
 	}
 	var previous map[string]any
+	var previousGroups map[string]any
 	if err = before.Decode(&previous); err == nil {
+		previousGroups, _ = previous["api-keys"].(map[string]any)
 		previous, err = config.NormalizeConfigRoot(previous)
 	}
 	if err != nil {
@@ -233,16 +264,22 @@ func updateConfigV8Document(doc *yaml.Node, parts []string, update *yaml.Node, m
 	// Unchanged families can be omitted; individual unchanged credentials in a
 	// changed family are preserved by repository reconciliation.
 	credentialsChanged := false
+	changedGroups := make(map[string]any)
 	for _, key := range []string{"gemini-api-key", "interactions-api-key", "vertex-api-key", "codex-api-key", "xai-api-key", "meta-api-key", "claude-api-key", "openai-compatibility"} {
-		if reflect.DeepEqual(previous[key], values[key]) {
+		family := strings.TrimSuffix(key, "-api-key")
+		if reflect.DeepEqual(previous[key], values[key]) && reflect.DeepEqual(submittedGroups[family], previousGroups[family]) {
 			delete(values, key)
 			continue
 		}
 		credentialsChanged = true
+		if group, ok := submittedGroups[family]; ok {
+			changedGroups[family] = group
+		}
 		if _, retained := values[key]; !retained {
 			values[key] = []any{}
 		}
 	}
+	config.SetV8CredentialGroups(values, changedGroups)
 	config.ApplyHomeRuntimeScalars(values)
 	if _, err = configFromRoot(values); err != nil {
 		return nil, false, &configV8ResponseError{http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()}}

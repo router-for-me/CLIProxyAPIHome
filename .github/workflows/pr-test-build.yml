@@ -6,9 +6,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pr-test-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
@@ -19,28 +23,59 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d home_test"
-          --health-interval 10s
+          --tmpfs /var/lib/postgresql/data:rw,size=1g
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d home_test"
+          --health-interval 1s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 30
     env:
-      HOME_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/home_test?sslmode=disable
-      CLIPROXY_HOME_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/home_test?sslmode=disable
+      CGO_ENABLED: '1'
+      GOTOOLCHAIN: local
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Locate Go caches
+        id: go-cache
+        shell: bash
+        run: |
+          go_version=$(go env GOVERSION)
+          modules=$(go env GOMODCACHE)
+          build=$(go env GOCACHE)
+          {
+            echo "prefix=home-pr-go-v2-${ImageOS}-${RUNNER_ARCH}-${go_version}-cgo1-"
+            echo "modules=$modules"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go-cache.outputs.modules }}
+          key: ${{ steps.go-cache.outputs.prefix }}modules-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: ${{ steps.go-cache.outputs.prefix }}modules-
+      - name: Cache Go build artifacts
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.go-cache.outputs.build }}
+          key: ${{ steps.go-cache.outputs.prefix }}build-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: ${{ steps.go-cache.outputs.prefix }}build-
       - name: Refresh models catalog
         run: |
           git fetch --depth 1 https://github.com/router-for-me/models.git main
           git show FETCH_HEAD:models.json > internal/registry/models/models.json
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: Verify transport, quota, cluster and management behavior
-        run: go test -v ./internal/proxyutil ./internal/quota ./internal/cluster/...
+        env:
+          HOME_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/home_test?sslmode=disable
+          CLIPROXY_HOME_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/home_test?sslmode=disable
+          # Keep SQLite fixtures on tmpfs, but write Go's test executables to runner.temp.
+          TMPDIR: /dev/shm
+          GOTMPDIR: ${{ runner.temp }}
+        run: go test -count=1 -v ./internal/proxyutil ./internal/quota ./internal/cluster/...
       - name: Build
         run: |
-          CGO_ENABLED=1 go build -o test-output ./cmd/home
+          go build -o test-output ./cmd/home
           rm -f test-output

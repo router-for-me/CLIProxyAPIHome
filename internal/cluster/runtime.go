@@ -133,14 +133,9 @@ func (a *RuntimeAdapter) LoadConfigYAML(ctx context.Context) ([]byte, error) {
 	return payload, nil
 }
 
-// StoreUsagePayload stores an usage payload with its trusted Home receive time.
-func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) error {
-	_, errStore := a.StoreUsagePayloadOutcome(ctx, payload, receivedAt)
-	return errStore
-}
-
-// StoreUsagePayloadOutcome stores an usage payload and reports whether it was newly inserted.
-func (a *RuntimeAdapter) StoreUsagePayloadOutcome(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
+// StoreUsagePayload stores an usage payload with its trusted Home receive time
+// and reports whether it was newly inserted (false when deduplicated).
+func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, receivedAt time.Time) (bool, error) {
 	if !a.Enabled() {
 		return false, fmt.Errorf("cluster runtime adapter is disabled")
 	}
@@ -153,6 +148,14 @@ func (a *RuntimeAdapter) StoreUsagePayloadOutcome(ctx context.Context, payload s
 	a.mu.RUnlock()
 	_, inserted, errAppend := a.repo.AppendUsageWithRuntimeOutcome(ctx, payload, metadata)
 	return inserted, errAppend
+}
+
+// DeliverPluginUsage fences pending delivery and persists its completion marker.
+func (a *RuntimeAdapter) DeliverPluginUsage(ctx context.Context, payload string, deliver func() error) error {
+	if !a.Enabled() {
+		return fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.DeliverPluginUsage(ctx, payload, deliver)
 }
 
 // StoreAppLogPayload stores a CPA app log payload.
@@ -292,6 +295,14 @@ func (a *RuntimeAdapter) AllowedDispatchIDsForAPIKeyModel(ctx context.Context, a
 	return a.repo.AllowedDispatchIDsForAPIKeyModel(ctx, apiKey, modelID)
 }
 
+// AllowedUsageIDsForAPIKeyModel resolves completed-usage permissions without billing admission.
+func (a *RuntimeAdapter) AllowedUsageIDsForAPIKeyModel(ctx context.Context, apiKey string, modelID string) ([]string, []string, error) {
+	if !a.Enabled() {
+		return nil, nil, fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.AllowedUsageIDsForAPIKeyModel(ctx, apiKey, modelID)
+}
+
 // ModelAccessForAPIKey loads the credential/model policy used by model listings.
 func (a *RuntimeAdapter) ModelAccessForAPIKey(ctx context.Context, apiKey string) (*coreauth.ModelAccess, error) {
 	if !a.Enabled() {
@@ -378,6 +389,8 @@ func (a *RuntimeAdapter) SaveWithStateVersion(ctx context.Context, auth *coreaut
 	}
 
 	saveAuth.StateVersion = record.Version
+	saveAuth.CredentialIdentityVersion = quotaCredentialIdentityVersion(*record)
+	auth.CredentialIdentityVersion = saveAuth.CredentialIdentityVersion
 	a.cacheAuthSnapshot(auth.ID, record, saveAuth)
 	return auth.ID, record.Version, nil
 }
@@ -385,7 +398,7 @@ func (a *RuntimeAdapter) SaveWithStateVersion(ctx context.Context, auth *coreaut
 // MutateAuthState implements coreauth.StateMutator. It applies mutate to the
 // persisted auth row under the cluster write lock so availability transitions
 // stay atomic across Home nodes, then refreshes the local index and cache.
-func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate func(auth *coreauth.Auth) bool) (*coreauth.Auth, error) {
+func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate func(auth *coreauth.Auth) coreauth.StateMutation) (*coreauth.Auth, error) {
 	// Keep validation before state changes so failures leave existing data intact.
 	if !a.Enabled() {
 		return nil, fmt.Errorf("cluster runtime adapter is disabled")
@@ -394,7 +407,10 @@ func (a *RuntimeAdapter) MutateAuthState(ctx context.Context, id string, mutate 
 	if uuid == "" {
 		return nil, fmt.Errorf("cluster auth uuid is required")
 	}
-	auth, record, changed, errMutate := a.repo.MutateAuth(ctx, uuid, "update", mutate)
+	auth, record, changed, errMutate := a.repo.mutateAuthState(ctx, uuid, "update", mutate)
+	if errors.Is(errMutate, gorm.ErrRecordNotFound) {
+		return nil, fmt.Errorf("%w: %w", coreauth.ErrAuthNotFound, errMutate)
+	}
 	if errMutate != nil {
 		return nil, errMutate
 	}
@@ -762,6 +778,14 @@ func authIndexFromRecord(record *AuthRecord, auth *coreauth.Auth) AuthIndex {
 		item.Quota = auth.Quota
 		item.ModelStates = auth.ModelStates
 		item.Attributes = cloneStringMap(auth.Attributes)
+		if kind := auth.AuthKind(); kind != "" {
+			if item.Attributes == nil {
+				item.Attributes = make(map[string]string, 1)
+			}
+			if strings.TrimSpace(item.Attributes["auth_kind"]) == "" {
+				item.Attributes["auth_kind"] = kind
+			}
+		}
 		item.ModelMetadata = modelMetadataFromAuth(auth)
 		item.DisableCooling = disableCooling
 		if item.Version == 0 {
@@ -829,14 +853,29 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 		metadata[antigravityCapabilityHintsMetadataKey] = cloneMetadataValue(raw)
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
-		for _, key := range []string{"project_id", "base_url", "user_agent"} {
+		for _, key := range []string{"project_id", "projectId", "project", "base_url", "user_agent"} {
 			if s, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(s) != "" {
 				metadata[key] = strings.TrimSpace(s)
 			}
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "copilot") {
+		for _, key := range []string{"base_url", "account_id"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				metadata[key] = value
+			}
+		}
+		if expiry, ok := auth.ExpirationTime(); ok {
+			metadata["expired"] = expiry.UTC().Format(time.RFC3339Nano)
+		}
+	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		metadata["request_retry"] = requestRetry
+	}
+	if rules, exists := auth.Metadata["request_scoped_errors"]; exists && rules != nil {
+		metadata["request_scoped_errors"] = cloneMetadataValue(rules)
+	} else if rules, exists := auth.Metadata["request-scoped-errors"]; exists && rules != nil {
+		metadata["request_scoped_errors"] = cloneMetadataValue(rules)
 	}
 	if weight, exists := auth.Metadata["weight"]; exists {
 		metadata["weight"] = weight

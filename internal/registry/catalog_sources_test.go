@@ -275,11 +275,12 @@ func TestPublishCatalogPreservesOptionalSections(t *testing.T) {
 	old := *original
 	old.Devin = []*ModelInfo{{ID: "devin/preserved"}}
 	old.Meta = []*ModelInfo{{ID: "meta/preserved"}}
+	old.Copilot = []*ModelInfo{{ID: "copilot-preserved"}}
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = &old
 	modelsCatalogStore.mu.Unlock()
 	incoming := old
-	incoming.Devin, incoming.Meta = nil, nil
+	incoming.Devin, incoming.Meta, incoming.Copilot = nil, nil, nil
 	data, errMarshal := json.Marshal(&incoming)
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
@@ -289,8 +290,11 @@ func TestPublishCatalogPreservesOptionalSections(t *testing.T) {
 		t.Fatal(errPublish)
 	}
 	got := getModels()
-	if len(changed) != 0 || len(got.Devin) != 1 || got.Devin[0].ID != "devin/preserved" || len(got.Meta) != 1 || got.Meta[0].ID != "meta/preserved" {
-		t.Fatalf("optional sections not preserved: Devin=%+v Meta=%+v changed=%v", got.Devin, got.Meta, changed)
+	if len(changed) != 0 ||
+		len(got.Devin) != 1 || got.Devin[0].ID != "devin/preserved" ||
+		len(got.Meta) != 1 || got.Meta[0].ID != "meta/preserved" ||
+		len(got.Copilot) != 1 || got.Copilot[0].ID != "copilot-preserved" {
+		t.Fatalf("optional sections not preserved: Devin=%+v Meta=%+v Copilot=%+v changed=%v", got.Devin, got.Meta, got.Copilot, changed)
 	}
 	if _, errPublish := publishCatalogBytes([]byte(`{}`)); errPublish == nil || getModels() != got {
 		t.Fatal("invalid catalog replaced last valid catalog")

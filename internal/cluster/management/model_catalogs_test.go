@@ -180,6 +180,9 @@ func newModelCatalogConfigHarness(t *testing.T) *modelCatalogConfigHarness {
 	db, cleanup := openManagementLogTestDB(t)
 	t.Cleanup(cleanup)
 	repo := cluster.NewRepository(db)
+	if _, errEnsure := repo.EnsureLifecycleConfig(t.Context(), cluster.DefaultHeartbeatTimeout()); errEnsure != nil {
+		t.Fatal(errEnsure)
+	}
 	handler := NewHandler(repo, nil, "127.0.0.1", 0)
 	router := gin.New()
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodPatch} {

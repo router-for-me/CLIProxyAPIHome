@@ -126,6 +126,13 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		}
 	}
 	label := provider
+	if provider == "copilot" {
+		delete(metadata, "copilot_catalog")
+		delete(metadata, "supported_endpoints")
+		if username, _ := metadata["username"].(string); username != "" {
+			label = username
+		}
+	}
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -50,5 +51,66 @@ func TestCredentialModelsV8ExclusionCandidates(t *testing.T) {
 	modelRegistry.RegisterClientWithCandidates(auth.ID, "claude", nil, []*registry.ModelInfo{})
 	if got := string(read("/v8/management/credentials/models")["exclusion_models"]); got != "[]" {
 		t.Fatalf("known empty catalog must be [], got %s", got)
+	}
+}
+
+func TestGetStaticModelDefinitionsNamespacesCopilotAndDevin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, "", 0)
+	engine := gin.New()
+	engine.GET("/v8/management/routing/model-definitions/:channel", handler.GetStaticModelDefinitions)
+	engine.GET("/v8/management/models", handler.GetModelsV8)
+
+	fetchModels := func(path string, dest any) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+		body := struct {
+			Models any `json:"models"`
+		}{Models: dest}
+		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &body); errDecode != nil {
+			t.Fatalf("decode %s: %v", path, errDecode)
+		}
+	}
+
+	var grouped map[string][]billingModelDefinition
+	fetchModels("/v8/management/models?scope=static", &grouped)
+	for _, tc := range []struct {
+		query, channel string
+	}{
+		{"Copilot", "copilot"},
+		{"Devin", "devin"},
+	} {
+		prefix := tc.channel + "/"
+		var routingDefs []registry.ModelInfo
+		var staticCatalog []billingModelDefinition
+		fetchModels("/v8/management/routing/model-definitions/"+tc.query, &routingDefs)
+		fetchModels("/v8/management/models?scope=static&channel="+tc.query, &staticCatalog)
+		if len(routingDefs) == 0 || len(routingDefs) != len(staticCatalog) || len(grouped[tc.channel]) != len(staticCatalog) {
+			t.Fatalf("%s lengths: routing=%d static=%d grouped=%d", tc.channel, len(routingDefs), len(staticCatalog), len(grouped[tc.channel]))
+		}
+		for i := range routingDefs {
+			if strings.HasPrefix(staticCatalog[i].ID, prefix) {
+				t.Fatalf("%s scope=static unexpectedly prefixed: %q", tc.channel, staticCatalog[i].ID)
+			}
+			if want := prefix + staticCatalog[i].ID; routingDefs[i].ID != want {
+				t.Fatalf("%s routing model[%d] = %q, want %q", tc.channel, i, routingDefs[i].ID, want)
+			}
+			want := billingModelTarget{Provider: tc.channel, Model: routingDefs[i].ID}
+			for _, model := range []billingModelDefinition{staticCatalog[i], grouped[tc.channel][i]} {
+				if model.ID != staticCatalog[i].ID || len(model.BillingModels) != 1 || model.BillingModels[0] != want {
+					t.Fatalf("%s static model %q has billing targets %v, want %v", tc.channel, model.ID, model.BillingModels, want)
+				}
+			}
+		}
+	}
+
+	var claudeDefs []registry.ModelInfo
+	fetchModels("/v8/management/routing/model-definitions/claude", &claudeDefs)
+	if len(claudeDefs) == 0 || strings.HasPrefix(claudeDefs[0].ID, "claude/") {
+		t.Fatal("expected a native Claude catalog ID")
 	}
 }

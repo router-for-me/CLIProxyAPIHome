@@ -9,26 +9,26 @@ import (
 )
 
 func TestValidateDevinModelsJSON(t *testing.T) {
-	t.Run("valid envelope namespaced", func(t *testing.T) {
+	t.Run("legacy prefixed id is normalized to bare", func(t *testing.T) {
 		models, err := ValidateDevinModelsJSON([]byte(`{"devin":[{"id":"devin/swe-2","display_name":"SWE-2"}]}`))
 		if err != nil {
 			t.Fatalf("ValidateDevinModelsJSON() error = %v", err)
 		}
-		if len(models) != 1 || models[0].ID != "devin/swe-2" || models[0].Type != "devin" {
+		if len(models) != 1 || models[0].ID != "swe-2" || models[0].Type != "devin" {
 			t.Fatalf("models = %+v", models)
 		}
 	})
-	t.Run("bare id is namespaced", func(t *testing.T) {
+	t.Run("bare id stays bare", func(t *testing.T) {
 		models, err := ValidateDevinModelsJSON([]byte(`{"devin":[{"id":"swe-2"}]}`))
 		if err != nil {
 			t.Fatalf("ValidateDevinModelsJSON() error = %v", err)
 		}
-		if len(models) != 1 || models[0].ID != "devin/swe-2" {
+		if len(models) != 1 || models[0].ID != "swe-2" {
 			t.Fatalf("models = %+v", models)
 		}
 	})
-	t.Run("duplicate id", func(t *testing.T) {
-		if _, err := ValidateDevinModelsJSON([]byte(`{"devin":[{"id":"devin/swe-2"},{"id":"devin/SWE-2"}]}`)); err == nil {
+	t.Run("duplicate id across bare and legacy prefixed", func(t *testing.T) {
+		if _, err := ValidateDevinModelsJSON([]byte(`{"devin":[{"id":"devin/swe-2"},{"id":"SWE-2"}]}`)); err == nil {
 			t.Fatal("expected duplicate id error")
 		}
 	})
@@ -45,7 +45,7 @@ func TestEmbeddedDevinModelsLoadedOnStartup(t *testing.T) {
 			found[model.ID] = true
 		}
 	}
-	for _, id := range []string{"devin/swe-2", "devin/claude-fable-5-1", "devin/gpt-6-astra"} {
+	for _, id := range []string{"swe-2", "claude-fable-5-1", "gpt-6-astra"} {
 		if !found[id] {
 			t.Errorf("embedded catalog missing %q", id)
 		}
@@ -80,7 +80,7 @@ func TestDevinModelsRemoteFetchFallback(t *testing.T) {
 	updater.refresh(context.Background(), "", 0)
 
 	updated := GetDevinModels()
-	if len(updated) != 1 || updated[0].ID != "devin/custom-test-model" {
+	if len(updated) != 1 || updated[0].ID != "custom-test-model" {
 		t.Fatalf("updated catalog = %+v", updated)
 	}
 }
@@ -104,7 +104,7 @@ func TestDevinModelsRemoteSkipsInvalidPrimaryAndUsesBackup(t *testing.T) {
 	updater.refresh(context.Background(), "", 0)
 
 	updated := GetDevinModels()
-	if len(updated) != 1 || updated[0].ID != "devin/backup-model" {
+	if len(updated) != 1 || updated[0].ID != "backup-model" {
 		t.Fatalf("updated catalog = %+v, want backup-model from second source", updated)
 	}
 }

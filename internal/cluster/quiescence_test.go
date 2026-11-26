@@ -87,7 +87,13 @@ func assertQuiescenceLockOrder(t *testing.T, order []string) {
 	}
 }
 
+// Keep the *testing.T signature for table-driven repository factory callbacks.
 func newPostgresQuiescenceRepository(t *testing.T) *Repository {
+	t.Helper()
+	return newPostgresQuiescenceTestRepository(t)
+}
+
+func newPostgresQuiescenceTestRepository(t testing.TB) *Repository {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("HOME_TEST_POSTGRES_DSN"))
 	if dsn == "" {
@@ -109,7 +115,7 @@ func newPostgresQuiescenceRepository(t *testing.T) *Repository {
 		t.Fatalf("create postgres schema: %v", errCreate)
 	}
 
-	db, errSchemaOpen := gorm.Open(postgres.Open(postgresDSNWithSearchPath(dsn, schema)), databaseGORMConfig(defaultDatabaseSlowQueryThreshold))
+	db, errSchemaOpen := Open(t.Context(), PGSQLConfig{PostgresURI: postgresDSNWithSearchPath(dsn, schema)})
 	if errSchemaOpen != nil {
 		if errDrop := adminDB.Exec("DROP SCHEMA " + schema + " CASCADE").Error; errDrop != nil {
 			t.Errorf("drop postgres schema after open failure: %v", errDrop)

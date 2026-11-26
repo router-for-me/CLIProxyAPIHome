@@ -24,12 +24,12 @@ Home 示例端口通常为 `8327`。显式 `-addr` 优先；未指定时，Home 
 
 ## API 版本
 
-本文以 v8 Management API 为主。`/v0/management` 继续供现有客户端使用，与 v8 共享 Home 数据库和运行时。v8 不只是替换 URL 前缀：配置请求体和部分资源路径也已改变。旧写入契约见文末 v0 迁移附录。
+本文介绍 v8 Management API。`/v0/management` 已移除，旧接口返回 `404`，不提供重定向。请按文末的路由和配置映射迁移至 `/v8/management`；配置请求体及部分资源路径也已改变，不能只替换 URL 前缀。
 
 | 接口 | 基础路径 | 契约 |
 | --- | --- | --- |
 | Management API | `/v8/management` | 配置树和 Home 管理资源。 |
-| 旧 Management API | `/v0/management` | 原有扁平配置和 provider 专用路由。 |
+| 已移除的 Management API | `/v0/management` | 已移除，请使用 v8 路由和请求体。 |
 | User API | `/user` | 基础路径及用户 token 认证保持不变，见 [User API](../user/api_CN.md)。 |
 | 插件资源 | `/v0/resource/plugins/...` | Home 返回的资源 URL 保留原路径。 |
 
@@ -43,7 +43,7 @@ Home management state 存储在 database-backed cluster repository 中。如果�
 
 ## 认证
 
-`/v8/management/*` 和 `/v0/management/*` 管理路由需要 management key。例外是 `GET/POST /v8/management/oauth/callback`：该接口通过待完成的 OAuth `state` 校验，不经过管理密钥中间件；仍受接口可用性检查约束，Management API 禁用时 v8 回调也禁用。
+`/v8/management/*` 管理路由需要 management key。例外是 `GET/POST /v8/management/oauth/callback`：该接口通过待完成的 OAuth `state` 校验，不经过管理密钥中间件；仍受接口可用性检查约束，Management API 禁用时 v8 回调也禁用。
 
 支持的请求头：
 
@@ -135,6 +135,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/billing/settings/diagnostics` |
 | `GET` | `/capabilities` |
 | `POST` | `/certificates/clients` |
+| `GET` | `/channel-group-credential-candidates` |
 | `GET` | `/channel-group-details` |
 | `POST` | `/channel-group-details` |
 | `DELETE` | `/channel-group-details/:id` |
@@ -231,6 +232,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 | `GET` | `/request-events/filter-options` |
 | `GET` | `/request-logs` |
 | `POST` | `/requests/api-call` |
+| `GET` | `/routing/antigravity/tos-pause` |
 | `POST` | `/routing/cooldown/reset` |
 | `GET` | `/routing/model-definitions/:channel` |
 | `GET` | `/server/latest-version` |
@@ -259,6 +261,8 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 
 返回持久化 Home 配置和数据库中上游 API Key 凭证的规范化 v8 视图，包含 `config-version: 8`。这是持久化配置视图，不保证列出所有运行时默认值；未配置的可选字段可以省略。读取响应设置 `Cache-Control: no-store`。
 
+v8 配置 GET（包括子树和 YAML）读取已提交数据，不初始化生命周期配置，也不对其加行锁。初始化和生命周期校验在启动阶段完成；生命周期记录缺失时返回 `500 config_load_failed`，不会在读取时创建默认值。
+
 响应节选：
 
 ```json
@@ -276,7 +280,7 @@ DB-backed handler 通常同时返回机器可读 `error` 和可读 `message`：
 }
 ```
 
-与 v0 运行时 JSON 响应不同，v8 配置树可以包含 `server`、`management` 和上游密钥内容。JSON 读取（包括子树读取）仅明确隐藏 `oauth.providers.codex.live-media-relay.ice-servers[]` 中的 `username` 和 `credential`，并非通用脱敏接口。YAML 接口包含这些 TURN 凭据。
+v8 配置树可以包含 `server`、`management` 和上游密钥内容。JSON 读取（包括子树读取）仅明确隐藏 `oauth.providers.codex.live-media-relay.ice-servers[]` 中的 `username` 和 `credential`，并非通用脱敏接口。YAML 接口包含这些 TURN 凭据。
 
 ### GET/PUT/PATCH/DELETE `/config/*path`
 
@@ -351,7 +355,7 @@ JSON 写入仅在新旧 ICE server 的 `urls` 列表内容和顺序相同时保�
 
 只读路径为 `credentials/concurrency/lifecycle-config-revision`、`credentials/concurrency/observation-barrier-revision` 和 `plugins/auth-revision`。替换包含这些字段的对象时，必须保留它们当前是否存在以及对应的值；直接设置或删除会被拒绝。
 
-Home 将 `observability.usage.usage-statistics-enabled` 规范化为 `true`，将 `oauth.providers.aistudio.ws-auth` 规范化为 `false`。`routing.cooldown.disable-cooling` 仍控制 Home 本地调度冷却，下发给 CPA 的配置独立强制关闭 CPA 本地冷却。`server.port` 配置的是 CPA，运行中的 CPA 需重启才重新绑定端口；Home 监听仍使用 `-addr` 或 `cluster.yaml` 的 `node.port`。`oauth.auth-dir` 仍是导入导出路径，不是运行时文件写入位置。
+Home 将 `observability.usage.usage-statistics-enabled` 规范化为 `true`。旧的 `oauth.providers.aistudio.ws-auth` 仅为兼容保留并规范化为 `false`，不再下发；CPA 在 Home 模式下不提供 `/v1/ws`。`routing.cooldown.disable-cooling` 仍控制 Home 本地调度冷却，下发给 CPA 的配置独立强制关闭 CPA 本地冷却。`server.port` 配置的是 CPA，运行中的 CPA 需重启才重新绑定端口；Home 监听仍使用 `-addr` 或 `cluster.yaml` 的 `node.port`。`oauth.auth-dir` 仍是导入导出路径，不是运行时文件写入位置。
 
 ### 模型目录来源
 
@@ -379,7 +383,13 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 `PATCH /config/oauth/providers/antigravity` 请求体示例：
 
 ```json
-{ "sensitive-words": ["API", "proxy"], "connection-pool": { "enabled": true } }
+{
+  "sensitive-words": ["API", "proxy"],
+  "sensitive-words-replace": {
+    "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+  },
+  "connection-pool": { "enabled": true }
+}
 ```
 
 `oauth.providers` 下的设置仅作用于 OAuth。API Key 凭证使用自己的分组/key 选项，不会隐式继承 v8 OAuth provider 配置。
@@ -397,6 +407,35 @@ Payload 规则使用 `/config/requests/payload`，Antigravity OAuth 配置使用
 Home 在数据库和下发配置中保留兼容的
 运行时字段投影，让当前依赖的 CPA SDK 也能消费共享值。
 
+#### Home 策略与 CPA 执行配置
+
+现有配置接口也支持下列字段。所有值均持久化到数据库，并在配置读取和导入导出中保留。显式的 `false`、`0`、空集合和 `null` 会原样保留，SDK 默认值不会回写。CPA 执行字段依据 Home 当前依赖的 CPA SDK 版本校验，因此升级 SDK 通常即可支持新选项，无需改动 Home；未知字段仍被拒绝。标为 CPA 的配置仅由 Home 保存和下发，不会作用于 Home 自身的 HTTP 服务或上游连接；旧 CPA 节点可能忽略尚未支持的选项。
+
+| 范围 | 字段 |
+| --- | --- |
+| Home 调度 | `routing.session-affinity-rebind-on`；`oauth.providers.antigravity.tos-pause-window` |
+| Home 模型目录 | `oauth.settings.<provider>[]`（`name`、可选 `alias`、`max-context-length`） |
+| CPA 服务 | `server.max-request-body-bytes`、`server.response-compression.enabled/min-bytes`、`server.shutdown-timeout`、`server.github-token` |
+| CPA 客户端兼容 | `client.codex.enable-apply-patch`、`client.codex.web-search-result-cache.enabled/ttl/limit`、`client.claude.show-codex-commentary` |
+| CPA Codex 执行 | `upstream.codex.upstream-request-compression`、`upstream.codex.upstream-request-compression-min-bytes`、`upstream.codex.websocket-compression`；`oauth.providers.codex.signin-with-chatgpt-identifier` |
+| CPA Claude 执行 | `upstream.claude.server-side-fallback`、`upstream.claude.session-date-pin-days`（仅内存模式；使用 Home KV 时忽略）；`upstream.claude.header-defaults.native-entrypoints/anthropic-beta-strip/anthropic-beta-append/inject-diagnostics/client-request-id` |
+| CPA 提示词策略 | `oauth.providers.antigravity.sensitive-patterns-replace`、`oauth.providers.devin.sensitive-patterns-replace`、`api-keys.claude[].keys[].cloak.sensitive-patterns-replace`；按顺序执行的 `{pattern, replacement}` Go RE2 规则 |
+| 凭证执行选项 | `api-keys.<provider>[].connection-pool`（组级和单 Key）；`api-keys.vertex[].interactions`；`api-keys.vertex[].models[].openapi`；`oauth.model-alias.vertex[].openapi` |
+
+`routing.session-affinity-rebind-on` 控制已绑定凭证不可用时的切换行为：`any`（默认）在任何切换时重新绑定；`quota` 在临时故障时保留原绑定，仅在配额、认证或模型支持错误时重绑；`never` 拒绝从仍有效的绑定切换。可用提供商变化不会改变会话绑定作用域：禁用已绑定提供商的最后一个凭证时，`never` 会拒绝调度；启用其他提供商也不会替换健康绑定。过期绑定始终可以重新选择。重绑定只依据请求模型的当前故障或凭证级阻断；`quota` 下临时的并发避让或重试排除不会触发重绑。
+
+`tos-pause-window` 在 Home 中默认 `0`（关闭）。省略或留空时显式下发 `"0"`，避免 CPA 节点回退到自身默认值；显式非空值保持不变。设置 `6h` 等正时长可启用；设为 `0`、`off`、`false`、`none` 或 `disabled` 可禁用。带 `ErrorInfo.reason=TOS_VIOLATION` 的 Google RPC 403 `PERMISSION_DENIED` 会在该窗口内暂停整个 Antigravity 凭证池。暂停期间 Home 仅排除 Antigravity 候选，其他提供商的已有绑定保持有效，`never` 策略下也不受影响。
+
+`oauth.settings.<provider>[]` 覆盖 OAuth 模型的 `max-context-length`，在排除规则和别名之后、前缀之前应用。对于带命名空间的渠道（`copilot`、`devin`），`name` 同时支持裸目录 ID 和 provider 限定源名（例如 `gpt-5.3-codex` 或 `copilot/gpt-5.3-codex`、`swe-2` 或 `devin/swe-2`）。匹配 `alias` 的条目优先于匹配 `name` 的条目，凭据前缀副本会继承解析结果。不影响 API Key 模型。
+
+`connection-pool` 需显式启用：空块 `connection-pool: {}` 使用 CPA 默认值（`idle-conn-timeout: 300s`、`max-idle-conns-per-host: 2`）。字段为 `enabled`、`idle-conn-timeout`、`max-idle-conns-per-host`。单 Key 配置覆盖组配置；缺失或 `null` 的字段继承组值，`enabled: false` 表示该 Key 禁用。有效配置随凭证下发，Home 自身不创建连接池。
+
+八类 API Key 的 V8 回读和 YAML 导出都会保留提交时的组成员、分组连接池和单 Key 覆盖。可以区分字段缺省、`null`、`{}`、显式的 `enabled: false` 和 `max-idle-conns-per-host: 0`。旧凭据若已丢失原始分组，会保留现有表示，直到用户重新提交分组。凭据 ID、轮换后的密钥和删除状态均以数据库中的当前记录为准。
+
+`api-keys.vertex[].models[].openapi` 和 `oauth.model-alias.vertex[].openapi` 的显式 `true`/`false` 会在凭证下发时投影到 `vertex_model_openapi` 属性；未设置或 `null` 时保留 CPA 的自动路由。凭证级规则优先于 OAuth 别名规则，别名规则不影响 API Key 凭证。删除设置后，下次派发或刷新即不再携带该投影，无需重写数据库凭证。凭证执行选项格式损坏时，合成、派发或刷新会明确失败，不会静默丢弃。
+
+`server.github-token` 是下发给可信 CPA 节点的秘密，不是 Home 管理密钥。凭证身份、秘密和调度信息仍保存在 Auth 记录中；凭证的原始私有配置仅保留供导出，不随凭证下发给 CPA。
+
 #### Credential concurrency lifecycle 字段
 
 两个配置响应都包含 `credentials.concurrency` 对象。`lifecycle-config-revision` 和 `observation-barrier-revision` 由 Home 管理：替换整个配置或该子树时，客户端必须保留这两个字段的当前值；Home 从单例记录派生它们。observation barrier 初始为 `0`，在 policy 变更时单调递增，Home 始终下发当前值。不能通过 YAML import 或 Management API 修改这两个 revision。
@@ -411,6 +450,8 @@ Home 在数据库和下发配置中保留兼容的
 | `cleanup-interval` | `5s` | lifecycle cleanup interval。 |
 
 所有 duration 必须为正数。Home 还要求 `node.heartbeat-timeout + reclaim-grace > cpa-heartbeat-timeout + cpa-cancel-bound`，duration 求和溢出也会被视为无效。存在状态为 `active` 或 `canceling` 的 CPA membership 时，仅对 `cpa-heartbeat-timeout`、`cpa-cancel-bound`、`reclaim-grace` 或 `cleanup-interval` 的变更返回 `lifecycle configuration is in use`；完全相同的配置会按未变更接受，非安全时序调优字段仍可更新。
+
+订阅仅在 Home 成功持久化存活状态后续期心跳期限。临时数据库超时会跳过 PONG，不立即隔离订阅；但如果在该 membership 的 `cpa-heartbeat-timeout` 内始终未能成功持久化，Home 会独立计时并隔离该精确 lifetime。期限由 lifetime 持有：订阅断线或退订不能取消期限，且期限在客户端数量同步或初始消息发送之前注册。即使数据库不可用，到期也会取消关联命令连接和本地任务。配置/集群消息和 RTT 回显均不能延长期限；明确的 membership 失效或 Home fencing 仍立即触发隔离。此 Home 侧保护兼容现有 CPA 客户端；更新后的 CPA 客户端同样仅允许有效心跳 PONG 续期接收期限。
 
 ## 节点、版本和证书
 
@@ -1834,7 +1875,9 @@ OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表�
 
 OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考及缓存写入 TTL token 单价。可选 token 单价未设置时使用父桶单价，显式为零时保持免费；即使其他分支配置了同一细分维度，也不会漏计。
 
-创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 自动从已有 usage 与价格规则发现模型）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 合并已有用量与价格规则中的模型 ID、Copilot/Devin 静态目录以及其余可用路由按凭证解析出的计价 ID，其中包括 Devin 插件路由和旧版注册路由）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+
+自动发现合并各来源后最多接受 10,000 个不同的目标。超出上限时，Home 会在拉取定价目录前返回 `422 import_target_limit_exceeded`，不创建预览。此时可显式提供 `targets` 分批导入。
 
 当前 preview target 只描述通配符 base 规则（`service_tier: "*"`、`min_input_tokens: 0`）；其他 target scope 会被拒绝，不会被静默改写。已匹配行会包含官方价格、倍率后的最终价格、精确的 `write_rule`、带 `revision` 的完整可选 `existing_rule` 快照，以及机器可读的原因。models.dev 上下文分段会生成不同包含式下界的通配符行；`row_multipliers` 按返回的精确 row key 生效，包含 context-band 行。cache-read 和 cache-write 价格从固定的 catalog snapshot 导入。当 cost 对象包含 input 价格但省略 `cache_read` 或 `cache_write` 时，Home 分别按 `input * 0.1` 或 `input * 1.25` 派生缺失价格；显式值（包括零）保持不变。出现不支持的价格维度、格式错误或无效的价格/分段、重复分段，或 tier 缺少 base 已配置价格维度时，整个 target 都不可应用；服务端不会导入可能低估计费的子集。
 
@@ -1969,7 +2012,7 @@ OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考�
 | `/config/api-keys/claude` | `claude` |
 | `/config/api-keys/xai` | `xai` |
 | `/config/api-keys/meta` | `meta` |
-| `/config/api-keys/openai-compatibility` | 配置的兼容 provider 名称 |
+| `/config/api-keys/openai-compatibility` | `openai-compatible-<小写组名>`（例如 `openai-compatible-copilot`） |
 
 所有路径支持 `GET`、`PUT`、`PATCH` 和 `DELETE`。`GET` 直接返回分组数组。`PUT` 和 `PATCH` 都替换该家族的整个数组，不追加元素，也不按下标修改单个 key。`DELETE` 移除家族并清空其 provider-key 记录；也可提交 `[]` 清空列表。删除单个 key 时，需提交保留其他 key 及其 `id` 的完整家族列表。成功响应为 `{"status":"ok","config-version":8}`。
 
@@ -2031,6 +2074,12 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 
 每个 key 可设置整数 `weight`，缺省为 `1`，最大 `1000000`；非正数仅在启用加权调度时排除该凭证。权重属于 key，不能放在分组上。配置 key 列表中的显式 `null`、字符串和小数均不合法。OAuth/文件凭证可在上传的 auth JSON 顶层携带数值 `weight`。
 
+开启 `routing.session-affinity` 后，粘性命中（包括继承父会话绑定）的请求也会消耗权重额度，但不会为了均衡迁移已有绑定；新建或重新选择的会话优先分配给低于目标份额的凭证。不同优先级层、allowlist、重试排除和冷却子集按实际候选凭证集合隔离额度，回到原候选池时继续使用保留额度。粘性请求只与绑定凭证同优先级层的可用凭证记账，固定凭证（pinned）请求在固定凭证所属优先级层内按固定前的合格候选池记账，低优先级绑定不会改变高优先级凭证之间的比例。
+
+结算后的额度限制在候选池总权重的 ±32 倍，因此请求比例是近似目标而非严格保证。粘性请求的完整额度增量无法放入上限时，保留绑定但不预留、不记账；新会话继续赚取额度和偿还欠额，避免超额粘性流量饿死小权重凭证。并发选择能看到未提交的预留；存在未结算预留时，已提交余额可暂时超出上限，抵消额度保留至整个池结算完毕，最后一个预留回滚也会触发裁剪。绑定提交及并发准入成功后确认预留，失败或重试时释放，不消耗已提交额度。
+
+额度保存在各 Home 进程内，进程重启、选择器替换或有界候选池缓存淘汰后重置；权重变化会重置对应池额度并使该池的旧预留失效。数据库共享绑定不变。
+
 ### Provider 专属 Key 选项
 
 | 字段 | Provider | 含义 |
@@ -2038,7 +2087,7 @@ key 上缺省或为 `null` 的共享字段继承分组值，再使用该字段�
 | `disable-codex-cloaking` | Codex | 可选布尔值，控制该 API Key 凭证的 Codex 身份请求头。 |
 | `websockets` | Codex、xAI | 启用 Responses WebSocket 传输。 |
 | `alpha-search` | Codex | 允许 `/v1/alpha/search` 通过配置的上游 `/alpha/search` 执行。 |
-| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`cache-user-id` 的对象。 |
+| `cloak` | Claude | 包含 `mode`、`strict-mode`、`sensitive-words`、`sensitive-words-replace`、`sensitive-patterns-replace`、`cache-user-id` 的对象。 |
 | `experimental-cch-signing` | Claude | 兼容保留；支持的直连上游已自动签名。 |
 | `rebuild-mid-system-message` | Claude | 重建会话正文中间的 system 消息。 |
 | `native-tool-search` | Claude | 信任自定义 base URL 支持 Anthropic 原生 tool search（`defer_loading` + `tool_reference`），用于 Codex `tool_search`；官方 `api.anthropic.com` 凭证自动启用。需要开启 `upstream.claude.tool-search`。 |
@@ -2050,6 +2099,8 @@ Gemini/Interactions 接受 API key 或非空分组 base URL。Vertex 将 `api-ke
 ### OpenAI 兼容分组
 
 `api-keys.openai-compatibility[]` 保留兼容 provider 的结构，用 `keys` 替代旧 `api-key-entries`。分组字段包括 `name`、`base-url`、`priority`、`disabled`、`prefix`、`models`、`headers`、`disable-cooling`、`request-retry`、`request-scoped-errors` 和 `support-prompt-cache-key`。每个 key 仅接受 `id` / 输入兼容 `uuid`、`api-key`、`proxy-url` 和 `weight`，不支持原生 provider 的 key 级共享字段覆盖。`keys` 为空数组时保留已有的无 key 回退凭证行为，其身份由分组 `id` 表示。
+
+配置中仍使用原组名。路由、分发和模型计费目标使用带前缀的 provider 键；已有的 `openai-compatible-` 前缀不会重复添加。空名称或保留名 `openai-compatibility` 使用 `openai-compatibility`。共享数据库升级到版本 21 前，请先停止所有旧版 Home，避免旧节点写回裸键。迁移保留凭证 ID 和模型别名；请核对使用裸组名的价格规则，它们不会自动改绑到兼容组。
 
 `PUT /config/api-keys/openai-compatibility` 请求体示例：
 
@@ -2166,7 +2217,7 @@ v8 列表项仅在匹配到 Home 进程中已注册的可用额度插件时额�
 | `quota_provider` | string | 凭证的 provider key。 |
 | `quota_plugin_id` | string | 后端按插件宿主两轮匹配规则选出的插件 ID，可直接用于 `/plugins/:id/quota`。 |
 
-这些字段不添加到 v0 的 `/auth-files` 响应。匹配会归一化 provider key，排除熔断插件；插件可显式支持内置 provider。仅带有 `quota_probe` 或具有 Home 内置采集器的凭证不会因此声明支持插件额度。
+匹配会归一化 provider key，排除熔断插件；插件可显式支持内置 provider。仅带有 `quota_probe` 或具有 Home 内置采集器的凭证不会因此声明支持插件额度。
 
 ### GET `/credentials/models?name=<name-or-id>`
 
@@ -2198,13 +2249,11 @@ Query 参数：
 
 `models` 是凭据当前已注册的客户端可见模型 ID，已经应用排除规则、OAuth 别名和前缀。该列表用于查看实际路由模型，不应用于生成排除规则。
 
-`exclusion_models` 是当前 Home 节点在上述转换之前保存的候选模型快照，包含已被排除的模型。条目结构与 `models` 相同，其中 `id` 是 `excluded_models` 实际匹配的 ID。即使所有候选模型都已被排除，该列表仍保留。没有候选快照时返回 `null`（例如凭据已禁用，或该 Provider 路径不应用凭据排除规则）；空数组表示已知的空候选列表。旧版 Home 不返回该字段。候选列表不可用时，客户端应保留手动规则编辑，不得使用 `models` 代替。此字段仅添加到 v8，旧版 v0 响应不变。
+`exclusion_models` 是当前 Home 节点在上述转换之前保存的候选模型快照，包含已被排除的模型。条目结构与 `models` 相同，其中 `id` 是 `excluded_models` 实际匹配的 ID。即使所有候选模型都已被排除，该列表仍保留。没有候选快照时返回 `null`（例如凭据已禁用，或该 Provider 路径不应用凭据排除规则）；空数组表示已知的空候选列表。旧版 Home 不返回该字段。候选列表不可用时，客户端应保留手动规则编辑，不得使用 `models` 代替。
 
 ### GET `/credentials/model-states` 与 `/credentials/:credential_id/model-states`
 
 读取**当前 Home 节点运行时**中的模型执行历史和有效阻断状态。这是只读快照，不进行凭证选取、不读取数据库完整凭证、不混合持久化状态，也不汇总其他 Home 节点。
-
-v0 兼容列表路径：`GET /auth-files/model-states`。
 
 | Query | 类型 | 说明 |
 | --- | --- | --- |
@@ -2301,6 +2350,8 @@ Query 参数：
 输出：`application/json; charset=utf-8` 附件。
 
 ### POST `/credentials`
+
+GitHub Copilot 支持导入 CPA 生成的 `type: copilot` 凭据 JSON。Home 将 GitHub 长期凭据存入 `refresh_token`，并在 Copilot 短期 token 到期前五分钟刷新。Home 向每个账号的可信 API 主机发现模型，发布账号可用模型与通用目录 `copilot` 段的交集。账号模型在发现成功后可用。空目录、权限拒绝、快照过期、token 过期或旧主机的快照均不会为该账号发布模型。基础路由发布为 `copilot/<原生模型 ID>`（与 Devin 的 `devin/<原生模型 ID>` 语义一致），支持 OAuth 别名、排除规则、OAuth 模型设置和凭据前缀。
 
 上传一个或多个 credential JSON payload。
 
@@ -2463,9 +2514,11 @@ Selector 字段：
 
 批量请求即使部分刷新失败也返回 `200`，应检查 `results[].success`。输入错误返回 `400`，单凭证不存在返回 `404`，单凭证刷新失败返回 `500 refresh_failed`，协调器不可用返回 `503`。
 
-Codex 刷新中断或响应无法读取、解析时，刷新结果可能处于不确定状态。Home 在发送请求前，先在数据库中占用该刷新凭证。对于等待结果或结果不明的凭证，即使租约到期、服务重启，或删除后重新导入相同凭证，也不会重新提交；只有确定请求尚未发送的失败才会解除占用。Home 使用 `refresh_outcome_unknown` 单独记录这种状态，不会将其视为刷新凭证被明确拒绝。恢复时需要重新连接 Codex 或导入替换后的刷新凭证；等待重试退避结束不能消除结果的不确定性。
+Codex 刷新对临时网络错误、响应读取或解析失败、未返回有效 access token 等情况进行有限次数重试。重试耗尽后进入正常刷新退避，后续仍可再次尝试。提供方明确拒绝凭证（`invalid_grant`、refresh token 过期、撤销或已复用）时仍需要恢复凭证；仅未获取到 access token 不再要求更换凭证。
 
-刷新成功后，Home 先保存结果回执，再发布更新后的凭证。后续使用旧刷新凭证的调用会复用尚未过期的结果，并沿已记录的轮换链获取更新的凭证。回执过期后需要恢复，即使提供方曾返回相同的 refresh token。`codex_refresh_journal` 表包含凭证，已纳入 v17 数据库快照；备份和迁移时必须与认证数据库一同保护、保留。仅导出认证目录无法保留这段历史。升级前应停止旧版 Home 进程，也不要通过未共享此数据库协议的部署或外部客户端刷新相同凭证。启动迁移会将与当前凭据匹配的旧 metadata 保护标记写入日志。旧租约本身无法标识已经使用的刷新凭据；对于此前未留下凭据指纹记录的刷新交换，日志无法重建其历史。
+并发 Codex 刷新的等待方会独立响应自身取消或超时，不会取消共享刷新或其他调用者。发起方保留刷新结果，包括已返回的令牌轮换结果。
+
+Home 保留既有的刷新租约协调及并发凭证更新保护。旧 `codex_refresh_outcomes` metadata 和 `codex_refresh_journal` 记录不再阻止刷新。日志表仅为兼容旧数据库和快照（包括 v17 备份）而保留；历史回执可能包含凭证，已有数据库备份仍需妥善保护。
 
 ### GET `/oauth/auth-url`
 
@@ -2481,6 +2534,7 @@ Codex 刷新中断或响应无法读取、解析时，刷新结果可能处于�
 | `xai` | xAI OAuth。 |
 | `devin` | Devin PKCE OAuth。 |
 | `meta` | Meta 设备授权流程。 |
+| `copilot` | GitHub Copilot 设备授权流程。 |
 | 插件 `oauth_provider` | 由 Home 已加载并注册的插件处理登录。 |
 
 通用响应：
@@ -2493,7 +2547,7 @@ Codex 刷新中断或响应无法读取、解析时，刷新结果可能处于�
 }
 ```
 
-Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。通过 `/oauth/status?state=...` 轮询完成状态。
+Kimi、Kimi AI 和 Meta 返回验证 URL，由 Home 后台设备授权任务完成登录。Meta 在上游提供时额外返回 `user_code`；若没有完整验证 URL，打开 `url` 后输入该代码。GitHub Copilot 用户打开 `url` 并输入返回的 `user_code`。通过 `/oauth/status?state=...` 轮询完成状态，也可调用 `DELETE /oauth/session?state=...` 取消会话。
 
 插件需在 `/plugins` 中满足 `supports_oauth: true`、`effective_enabled: true` 且 `oauth_provider` 非空。插件 provider key 由小写字母、数字、连字符组成；v8 插件收到的回调路由为 `/v8/management/oauth/callback`。缺少 provider 返回 `400 {"error":"provider is required"}`，未知或不可用 provider 返回 `404 {"error":"provider_not_found"}`。
 
@@ -2534,7 +2588,7 @@ Query 参数：
 
 ### GET/POST `/oauth/callback`
 
-此 v8 接口不要求管理密钥，通过数据库中待完成的 OAuth state 校验，仍受 Management API 可用性检查约束。v0 的 `POST /v0/management/oauth-callback` 仍要求管理认证。
+此 v8 接口不要求管理密钥，通过数据库中待完成的 OAuth state 校验，仍受 Management API 可用性检查约束。
 
 `GET` 接受查询参数，`POST` 接受 JSON：
 
@@ -2556,7 +2610,7 @@ Query 参数：
 | `provider` | 否 | 默认取 state 对应会话的 provider。内置回调兼容 `anthropic`/`claude`、`codex`/`openai`、`antigravity`/`anti-gravity`、`xai`/`x-ai`/`grok`、`devin`；插件会话使用其 `oauth_provider`。 |
 | `redirect_url` | 否，仅 POST | 完整回调 URL，用于补全缺失的 state、code 或 error。 |
 
-Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
+Kimi、Kimi AI、Meta 和 Copilot 使用设备授权，不通过此回调完成。provider 与 state 不匹配会被拒绝。成功返回 `200 {"status":"ok"}` 仅表示接受回调，不代表 token 交换完成。内置 provider 在后台交换 code；插件回调保存元数据，后续 `/oauth/status` 轮询插件并持久化成功的凭证。
 
 | 状态码 | error |
 | --- | --- |
@@ -2593,6 +2647,14 @@ Kimi、Kimi AI 和 Meta 使用设备授权，不通过此回调完成。provider
 Home 会把生成的 credential 作为 DB-backed OAuth auth records 存储，并在 `auth-file` 中返回生成的 `<uuid>.json` 名称。
 
 ## 凭证额度和冷却操作
+
+### GET `/routing/antigravity/tos-pause`
+
+Home 读取调度器使用的 Antigravity 共享暂停截止时间。截止时间晚于观测时间时，整个池处于暂停状态。窗口已关闭、截止时间缺失或已过期时，返回 `"paused": false, "resume_at": null`。`observed_at` 为服务端观测时间，`resume_at` 为预计恢复时间，两者均使用 UTC（RFC 3339）。运行时不可用或截止时间读取失败时返回 `503 antigravity_tos_pause_unavailable`。响应使用 `Cache-Control: no-store`。
+
+```json
+{ "paused": true, "resume_at": "2026-11-20T04:30:00Z", "observed_at": "2026-11-20T04:25:00Z" }
+```
 
 ### POST `/routing/cooldown/reset`
 
@@ -2873,6 +2935,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credentials.in
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `capabilities.usage` | boolean | 是否支持旧版 `GET /observability/usage/api-keys` 能力。 |
+| `capabilities.antigravity_tos_pause_status` | boolean | 是否支持读取 Antigravity 凭据池当前的暂停状态。 |
 | `capabilities.quota_snapshots` | boolean | 是否支持 DB-backed `GET /quota/credentials` 额度快照列表。 |
 | `capabilities.quota_snapshot_details` | boolean | 是否支持 `GET /quota/credentials/:credential_id`。 |
 | `capabilities.quota_recollect` | boolean | 是否支持 `POST /quota/collect` 按需额度采集。 |
@@ -2898,6 +2961,7 @@ Home 管理的 CPA 使用数据库支持的 observation 配置。`credentials.in
 | `capabilities.topology` | boolean | 是否支持 `GET /topology` Home + CPA 集群拓扑接口。 |
 | `capabilities.users` | boolean | 是否支持 `/users` 用户管理路由。 |
 | `capabilities.access_groups` | boolean | 是否支持 `/channel-groups` 与 `/model-groups` 访问范围路由。 |
+| `capabilities.channel_group_credential_candidates` | boolean | 添加凭证范围绑定时可读取轻量候选列表。 |
 | `capabilities.user_period_limits` | boolean | 是否支持用户周期限额配置字段，以及 `GET /users/:id/period-limits` 和 `POST /users/:id/period-limits/reset`。 |
 | `capabilities.credential_in_flight_snapshots` | boolean | 是否支持独立的 CPA in-flight observation snapshot 接口。 |
 | `capabilities.credential_in_flight_snapshot_cursor` | boolean | `GET /credentials/in-flight` 是否支持数据库支持的稳定 snapshot cursor 多页读取。 |
@@ -3136,7 +3200,7 @@ usage 活动归属于通过 `auth_index` 解析出的当前 DB 凭证，因此�
 
 只有 `capabilities.usage_token_breakdown_v2=true` 时，客户端才能消费规范化 Token Accounting。客户端必须读取该显式能力，不能通过探测 usage 路由推断支持，也不能使用旧 Token 字段自行拼装明细。能力为 `false` 时，服务端可能已经为新归一化记录返回 `token_breakdown`，但所选范围仍可能包含等待回填的历史记录。旧的 `input_tokens`、`output_tokens`、`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens` 和 `total_tokens` 继续用于诊断与向后兼容；这些字段并非互斥，不能直接堆叠求和。
 
-`input_tokens` 与 `output_tokens` 在以下接口使用同一显示口径：`/usage/overview`（`totals`、`trend[]`、`model_efficiency[]` 与 `top`）、`/usage/records`、`/usage/records/:id`、`/usage/export`、`/usage/aggregates`、`/usage/realtime`（`current_usage[]`）、`/usage/session-tree`，以及 `/request-events` 的列表、详情和导出。该口径与 `/billing/charges`、`/billing/overview` 一致。usage 记录为 Token Accounting v2 且质量为 `complete` 时，`input_tokens` 包含未缓存输入、缓存读取和缓存写入，`output_tokens` 包含普通输出与推理 Token；等待回填以及 `unclassified`、`inconsistent` 记录保留原始计数。聚合结果按该逐条口径求和。`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens`、`total_tokens`、`token_breakdown` 与 `performance.tps` 不变。该转换只在读取时进行，不改写已存储的 usage 记录。
+`input_tokens` 与 `output_tokens` 在以下接口使用同一显示口径：`/usage/overview`（`totals`、`trend[]`、`model_efficiency[]` 与 `top`）、`/usage/records`、`/usage/records/:id`、`/usage/export`、`/usage/aggregates`、`/usage/realtime`（`current_usage[]`）、`/usage/session-tree`，以及 `/request-events` 的列表、详情和导出。该口径与 `/billing/charges`、`/billing/overview` 一致。usage 记录为 Token Accounting v2 且质量为 `complete` 时，`input_tokens` 包含未缓存输入、缓存读取和缓存写入，`output_tokens` 包含普通输出与推理 Token；等待回填以及 `unclassified`、`inconsistent` 记录保留原始计数。聚合结果按该逐条口径求和。`reasoning_tokens`、`cached_tokens`、`cache_read_tokens`、`cache_creation_tokens`、`total_tokens` 和 `token_breakdown` 不变。请求事件和用量记录（含导出）的 `performance.tps` 为显示的 `output_tokens` 除以请求总耗时（秒），不扣除 TTFT。耗时或显示输出量非正时，TPS 返回 `null`。该转换只在读取时进行，不改写已存储的 usage 记录。
 
 能力启用后，`totals`、每个 `trend[]` 桶、每条 usage record 和每个 aggregate item 都包含以下结构：
 
@@ -3576,7 +3640,9 @@ Query 参数：
 
 ### GET `/models?scope=available|static`
 
-可用模型在 v8 响应中额外包含 `billing_models`，元素为 `{"provider": "z-ai", "model": "glm-5.3-flash"}`。这些计价身份按凭证使用实际调度解析器生成，去重后按供应商和模型排序。公开 `id`（例如 `team/MY-MODEL`）可能对应多个上游模型，同一供应商下也可能存在多个映射。模型价格编辑器应使用这些组合，不能把公开别名或合并后的 `name` 当作计价模型。空数组表示未解析到可靠身份，不应回退猜测。静态模型和旧版响应不含该字段，可继续使用原有 `(providers[], id)` 候选。此元数据不会修改已有价格规则或历史账单。
+可用模型在 v8 响应中额外包含 `billing_models`，元素为 `{"provider": "z-ai", "model": "glm-5.3-flash"}`。这些计价身份按凭证使用实际调度解析器生成，去重后按供应商和模型排序。公开 `id`（例如 `team/MY-MODEL`）可能对应多个上游模型，同一供应商下也可能存在多个映射。模型价格编辑器应使用这些组合，不能把公开别名或合并后的 `name` 当作计价模型。空数组表示未解析到可靠身份，不应回退猜测。
+
+Copilot 和 Devin 的 v8 静态目录也返回 `billing_models`。例如，Copilot 的静态 `id` 为 `claude-fable-5`，对应的计价组合为 `{"provider":"copilot","model":"copilot/claude-fable-5"}`。Devin 的 `swe-2` 对应 `devin/swe-2`。价格编辑器按计价组合合并静态目录和可用路由。旧版 Home 省略该字段时，编辑器可为这两家的静态原生 ID 补上供应商前缀。其他静态模型沿用 `(providers[], id)`。此元数据不会修改已有价格规则或历史账单。
 
 从当前 runtime registry 或静态模型目录返回模型定义。
 
@@ -3650,6 +3716,7 @@ Query 参数：
 
 返回指定 channel 的静态模型 metadata。
 返回的模型记录同样包含上文所述的权威 `providers` 字段。
+对于 `copilot` 和 `devin`，返回的模型 `id` 会带有命名空间前缀（`copilot/<id>`、`devin/<id>`），与 OAuth 排除规则和别名规则（应用别名与凭证前缀前）保持一致。
 
 支持的 channel：
 
@@ -3669,6 +3736,7 @@ antigravity
 xai
 x-ai
 grok
+copilot
 devin
 meta
 muse
@@ -3805,6 +3873,14 @@ Channel groups 限制某个客户端 API key 可以使用哪些 auth records。�
 { "status": "ok" }
 ```
 
+### GET `/channel-group-credential-candidates`
+
+列出可供绑定编辑器展示的 OAuth 凭证和提供商 API 密钥。每项具有可直接作为绑定 `auth_id` 提交的规范 ID、显示名称、可选的 `provider` 和 `state`。已删除的凭证和身份不一致的旧记录会被排除。已禁用或暂不可用的凭证带有状态，可用于解释为何无法选择。
+
+```json
+{ "credential_candidates": [{ "auth_id": "auth-db-id", "display_name": "Team A", "provider": "codex" }] }
+```
+
 ### GET `/channel-group-details`
 
 列出 channel group detail rows。
@@ -3815,6 +3891,7 @@ Query 参数：
 | --- | --- | --- |
 | `channel_group_id` | integer | 按 group ID 过滤；也接受 `channel-group-id`、`group_id`、`group-id`。 |
 | `auth_id` | string | 按 auth ID 过滤；也接受 `auth-id`。 |
+| `include` | string | 传入 `credential` 时附带每条绑定的凭证摘要。 |
 
 输出示例：
 
@@ -3833,7 +3910,13 @@ Query 参数：
 }
 ```
 
+带上 `include=credential` 时，每行增加 `credential`，对象字段与候选列表相同。仅当绑定的原始 `auth_id` 与凭证表的 `uuid`、`id` 和 `index` 完全一致时才解析。名称优先取凭证标签，其次为兼容提供商名称，邮箱标签会脱敏，缺少名称时显示原始 ID。状态按优先级为 `deleted`、`disabled`、`unavailable`，未设置表示没有这些标记；调度还取决于请求与运行时策略。凭证的删除状态独立于绑定行的 `deleted_at`。
+
+已完成查询但无法确认身份时，`credential` 为 `null`。若摘要查询出错，仍返回绑定行，同时省略各行的 `credential` 并在响应顶层设置 `credential_metadata_unavailable: true`。未请求摘要或旧版服务忽略该参数时，响应沿用基础格式。
+
 ### GET `/channel-group-details/:id`
+
+支持与列表接口相同的 `include=credential` 参数和摘要状态。
 
 返回单个 detail row：
 
@@ -4121,6 +4204,8 @@ Query 参数：
 
 修改单个 channel 时，向 `/config/oauth/model-alias/claude` 提交原始别名数组；删除时对该路径执行 `DELETE`。v8 不使用 v0 的 `items`、`channel`、`provider`、`aliases` 包装。写入成功返回 `{"status":"ok","config-version":8}`。与其他配置树接口一致，`null` 保留为值，不表示删除。
 
+对于带命名空间的渠道（`copilot`、`devin`），排除规则与别名 `name` 均使用公开的 provider 限定源名（例如 `copilot/gpt-5.3-codex`、`devin/swe-2`），`alias` 按配置原样发布（Home 不会自动补 `copilot/` 或 `devin/` 前缀；如需发布 `copilot/friendly`，请显式配置 `alias: "copilot/friendly"`）。凭据前缀在别名之后应用：可选前缀下，显式别名与前缀副本同名时显式别名优先；开启 `force-model-prefix` 时只发布加过凭据前缀的路由。启用 `force-mapping: true` 时，响应名使用配置的原始 `alias`（保留 `alias` 中显式写入的前缀，不含凭据前缀）。
+
 当下游请求使用了已通过别名发布的上游模型 ID 时，Home 可能在 `auth_not_found` 或 `model_not_found` 错误中附加最多三个可见的对外模型 ID，包括因缺少价格而拒绝的请求。提示覆盖 API Key 和 OAuth 别名，包含必要的凭据前缀，并遵守客户端 Key 的凭据、模型及模型专属渠道权限。禁用凭据、未发布或被排除的模型不会出现在提示中；权限查询失败时省略提示。错误码和路由规则保持不变。
 
 ## 配置字段参考
@@ -4189,9 +4274,12 @@ Query 参数：
 | `routing.strategy` | string | `round-robin`、`weighted-round-robin` 或 `fill-first`。 |
 | `routing.session-affinity` | boolean | 数据库支持的会话粘性凭证路由，使用同一数据库的 Home 节点共享绑定。绑定保留至空闲过期，不因配置重载或进程重启丢失；凭证不可用时可重新选择。需升级所有 Home 节点才能保证集群一致性。 |
 | `routing.session-affinity-ttl` | string | 会话与凭证绑定的空闲超时，成功派发后续期，默认 `1h`。 |
+| `routing.session-affinity-subagents` | optional boolean | 控制 Home 中尚无有效绑定的子会话是否继承父凭证。普通子会话仅在同 provider、同模型内继承；Guardian 请求（`X-Openai-Subagent: guardian`，大小写不敏感）可跨模型继承父会话在合格真实 provider 上最近的有效选择，已有子绑定优先。默认 `true`；关闭 `session-affinity` 时忽略。设为 `false` 后使用普通凭证选择，不清除已有子绑定，也不禁用 fork、compaction 和消息哈希回退；不保证选中的凭证一定与父会话不同。配置重载后生效，集群需升级全部 Home 节点。原始请求头不含 fork/compaction 标记时，CPA 必须通过 `node_kind` / `X-Node-Kind` 转发。 |
 | `oauth.providers.antigravity.signature-cache-enabled` | boolean pointer | 启用 Antigravity thinking signature cache validation。 |
 | `oauth.providers.antigravity.signature-bypass-strict` | boolean pointer | 控制 Antigravity signature bypass 严格程度。 |
-| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中使用零宽字符混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words` | array of string | 在 system instructions 中进行混淆的敏感词列表。 |
+| `oauth.providers.antigravity.sensitive-words-replace` | object string to string | 在 system instructions 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
+| `oauth.providers.antigravity.sensitive-patterns-replace` | `{pattern, replacement}` 数组 | 在 system instructions 中按顺序执行的 Go RE2 正则替换规则（`replacement` 为空字符串表示删除匹配内容）。 |
 | `api-keys.gemini` | 分组数组 | 上游 gemini 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.interactions` | 分组数组 | 上游 interactions 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
 | `api-keys.codex` | 分组数组 | 上游 codex 分组，每组包含 `keys`；见上游 API Key 配置章节。 |
@@ -4217,7 +4305,10 @@ Query 参数：
 | `requests.payload.default-raw` | array of `PayloadRule` | 设置缺失的 raw JSON payload params。 |
 | `requests.payload.override` | array of `PayloadRule` | 覆盖 JSON payload params。 |
 | `requests.payload.override-raw` | array of `PayloadRule` | 覆盖 raw JSON payload params。 |
+| `requests.payload.replace` | array of `PayloadReplaceRule` | 由 CPA 按顺序对选中的消息文本或已有字符串字段执行字面量或 Go RE2 正则替换。 |
 | `requests.payload.filter` | array of `PayloadFilterRule` | 移除 JSON payload paths。 |
+
+Guardian 选择历史存入数据库，跨 Home 节点、配置重载和重启共享。只有在开启 `session-affinity-subagents` 时成功派发／并发准入才更新选择顺序；完成／usage 回报及父绑定查询不更新顺序。关闭后仍保留普通粘性绑定，但不再维护 Guardian 历史，并将本次使用的绑定从该历史中移除。重新开启后从后续成功选择继续记录，不回补关闭期间的选择。继承的凭证仍必须属于当前请求的合格候选集合。Guardian 可复用仍合格的低优先级凭证；冷启动选择仍遵循普通优先级规则。fork／compaction 不走 Guardian 跨模型继承。数据库版本 19 通过正常启动迁移新增 Guardian 字段及查询索引，并继续支持 v18 可移植快照。会过期的选择元数据及内部会话计数器记录存于现有 `session_affinity` 表内，不新增独立表（均不纳入可移植快照）；升级前的绑定在下一次成功派发时补充选择元数据。需升级全部 Home 节点后再依赖跨节点 Guardian 继承。
 
 ### v8 补充字段
 
@@ -4236,10 +4327,9 @@ Query 参数：
 | `server.discovery.advertise-management` | boolean | 是否广播管理接口，默认 `false`。 |
 | `credentials.concurrency` | object | Home 并发限制生命周期和释放调优；revision 只读，见配置章节。 |
 | `credentials.in-flight` | object | 观测快照、过期、大小及暂存限制。 |
-| `routing.session-affinity-subagents` | optional boolean | CPA 的父会话凭证继承兼容选项；Home 继续管理自己的会话层级。 |
 | `routing.cooldown.save-cooldown-status` | boolean | CPA 兼容设置；Home 运行时冷却状态由数据库持久化。 |
 | `routing.cooldown.transient-error-cooldown-seconds` | integer | 随配置携带的 CPA 临时错误冷却设置。 |
-| `oauth.providers.aistudio.ws-auth` | boolean | Home 规范化为 `false`。 |
+| `oauth.providers.aistudio.ws-auth` | boolean | 仅兼容保留并规范化为 `false`，不下发给 CPA；Home 模式不提供 `/v1/ws`。 |
 | `oauth.request-scoped-errors` | provider 到 rule array 的对象 | OAuth 请求级错误覆盖规则。 |
 | `upstream.codex.disable-codex-cloaking` | boolean | 不再强制注入 Codex OAuth 和 API Key 请求的官方身份请求头。 |
 | `upstream.codex.stream-bootstrap-buffering` | boolean | 缓冲生成前帧，允许在提交流前切换凭证，默认 `false`。 |
@@ -4263,7 +4353,9 @@ Query 参数：
 | `oauth.providers.antigravity.connection-pool.idle-conn-timeout` | duration string | 空闲超时，默认 `30s`，最大 `210s`。 |
 | `oauth.providers.antigravity.connection-pool.max-idle-conns-per-host` | optional integer | 每凭证每 host 的空闲连接数，默认 `2`。 |
 | `upstream.xai.inject-x-search` | boolean | 请求未提供时注入原生 `x_search`。 |
-| `oauth.providers.devin.sensitive-words` | string array | system prompt/消息中需要混淆的词。 |
+| `oauth.providers.devin.sensitive-words` | string array | system prompt 中匹配后整行剔除的敏感词列表。 |
+| `oauth.providers.devin.sensitive-words-replace` | object string to string | system prompt 中按目标字符串替换为字面量文本的映射（空字符串表示删除匹配短语）。 |
+| `oauth.providers.devin.sensitive-patterns-replace` | `{pattern, replacement}` 数组 | 在 system prompt 中按顺序执行的 Go RE2 正则替换规则（`replacement` 为空字符串表示删除匹配内容）。 |
 | `oauth.model-alias.*[].display-name` | string | 可选目录显示名覆盖。 |
 | `multimedia.gpt-image-2-base-model` | string | GPT Image 2 请求使用的基础模型。 |
 | `multimedia.video-result-auth-cache-ttl` | duration string | 视频结果与凭证关联缓存的有效期。 |
@@ -4284,6 +4376,14 @@ Payload 嵌套结构：
     "params": {
       "reasoning.effort": "high"
     }
+  },
+  "PayloadReplaceRule": {
+    "models": [{ "name": "*", "protocol": "claude", "from-protocol": "openai" }],
+    "target": { "role": "user", "positions": [1, 2] },
+    "replacements": [
+      { "you are hero": "you are fool" },
+      { "remove this phrase": "" }
+    ]
   },
   "PayloadFilterRule": {
     "models": [
@@ -4310,6 +4410,33 @@ Payload 嵌套结构：
 }
 ```
 
+可使用 `PUT /config/requests/payload/replace` 提交规则数组，或使用 `PATCH /config/requests/payload` 提交 `{"replace": [...]}` 并保留其他规则段。Home 只校验、保存和下发规则，不执行替换；使用正则、`system`/`developer` 角色或路径目标前，请先将下游 CPA 节点升级到 v8.0.77 或更新版本。
+
+- **角色目标：** `target.role` 支持 `user`、`system`、`developer`。填写该角色从 1 开始的 `positions`，或使用 `all: true`，两者互斥。角色以最终上游请求为准：顶层系统指令算一条消息；如果翻译时将 developer 内容合并进 system，请选 `system`。角色目标逐个处理消息文本块，不修改图片、工具结果或思考内容。
+- **路径目标：** `target.paths` 是相对于提供商请求体根节点的非空 gjson 风格路径列表，不能与 `role`、`positions` 或 `all` 一起使用。只替换已存在的字符串，不区分角色；跳过缺失或非字符串的值，不递归遍历对象或数组。同一规则中解析到的每条路径最多处理一次。
+- **替换项：** 可使用区分大小写的字面量映射（例如 `{"old label":"new label"}`，源字符串不能为空），或 Go RE2 正则（例如 `{"pattern":"(item)-([0-9]+)","replacement":"${1}_${2}"}`）。替换值为空字符串时删除匹配内容。无效正则只跳过该项并由 CPA 记录警告，不影响其他替换项；结构非法的规则在写入数据库前被拒绝。
+
+规则及其替换项均按列表顺序执行，位于 override 之后、filter 之前。模型匹配条件与其他 payload 规则一致。
+
+`PUT /config/requests/payload/replace` 请求体示例：这条 Codex 规则选中每个函数工具的 `description`，以及 `metadata.description` 字段。它依次执行字面量替换和删除，将 `User-42` 改为 `account-42`，并删除 `<debug>...</debug>` 块（包括跨行的块）。
+
+```json
+[
+  {
+    "models": [{ "name": "*", "protocol": "codex" }],
+    "target": {
+      "paths": ["tools.#(type==\"function\")#.description", "metadata.description"]
+    },
+    "replacements": [
+      { "old name": "new name" },
+      { "remove this phrase": "" },
+      { "pattern": "(?i)user-(\\d+)", "replacement": "account-${1}" },
+      { "pattern": "(?s)<debug>.*?</debug>", "replacement": "" }
+    ]
+  }
+]
+```
+
 `PayloadModelRule` 字段：
 
 | 字段 | 类型 | 说明 |
@@ -4323,9 +4450,9 @@ Payload 嵌套结构：
 | `exist` | array of string | 指定 payload JSON path 必须存在且不是 `null`。 |
 | `not-exist` | array of string | 指定 payload JSON path 必须不存在或为 `null`。 |
 
-## v0 兼容与迁移
+## 从已移除的 v0 API 迁移
 
-本附录中的对照路径分别相对于 `/v0/management` 和 `/v8/management`。除前文特别说明的变化外，已有业务资源共享 handler 和响应结构。`/nodes`、`/topology`、`/users`、`/capabilities`、`/credentials/*` 并发操作、`/quota/*`、`/usage/*`、`/request-events`、`/request-logs`、`/billing/*`、`/proxy/*`、模型/渠道分组、`/models`、`/plugin-store-auth` 等 Home 资源在 v8 下保持原名。`/user` 和插件资源 URL 不改名。
+下表将已移除的 `/v0/management` 相对路径映射到受支持的 `/v8/management` 相对路径。v0 列仅用于迁移参考，并非可用接口。除前文特别说明的变化外，已有业务响应结构保持不变。`/nodes`、`/topology`、`/users`、`/capabilities`、`/credentials/*` 并发操作、`/quota/*`、`/usage/*`、`/request-events`、`/request-logs`、`/billing/*`、`/proxy/*`、模型/渠道分组、`/models`、`/plugin-store-auth` 等 Home 资源在 v8 下保持原名。`/user` 和插件资源 URL 不改名。
 
 ### 业务路由映射
 
@@ -4366,7 +4493,7 @@ Payload 嵌套结构：
 | `/meta-auth-url` | `/oauth/auth-url?provider=meta` |
 | `/<plugin-provider>-auth-url` | `/oauth/auth-url?provider=<plugin-provider>` |
 
-v0 回调是需要管理认证的 POST；v8 额外支持 GET，并通过 state 校验，不要求管理密钥。`GET /credentials`、`/credentials/refresh`、`/oauth/session`、`/routing/cooldown/reset`、凭证/插件额度操作及 `DELETE /plugins/:id` 在 v8 显式注册，并不是复制 SDK 所有 v0 接口。
+请将 OAuth 回调 URL 更新为 `/v8/management/oauth/callback`。v8 回调支持 GET 和 POST，通过待完成的 state 校验，不要求管理密钥；旧回调 URL 不再接受请求。
 
 ### 配置布局映射
 
@@ -4440,371 +4567,6 @@ v0 回调是需要管理认证的 POST；v8 额外支持 GET，并通过 state �
 
 启动/导入解析接受旧布局和混合布局。同一字段同时出现新旧值时，显式 v8 字段优先，包括 `false`、`0` 和空集合。旧 V8 provider/client 路径和请求体作为别名接受，写入使用规范布局，未知字段仍拒绝。执行子树 PATCH/PUT 或完整替换时，保留只读 revision 和凭证 ID。
 
-### 旧配置读取与 YAML 完整替换
+### 请求体迁移
 
-`GET /v0/management/config` 仍返回旧运行时 JSON 结构，包括顶层 `proxy-url`、`request-retry` 和 provider 数组等，不会变成 v8 配置树；运行时 JSON schema 隐藏的字段仍不返回。`GET /v0/management/config.yaml` 重建持久化快照及数据库凭证，可能保留旧根节点/OAuth 作用域；获取规范迁移布局应使用 v8 YAML 路由。
-
-`PUT /v0/management/config.yaml` 接受完整 YAML（包括旧/混合布局），替换非凭证配置，仅协调显式提交的 provider 凭证家族。v0 中省略的凭证家族保持不变，空列表清空家族，这与 v8 完整替换不同。`auth-dir` 仍是导入导出路径。成功返回 `{"ok":true,"changed":["config"]}`；提交凭证根节点时 `changed` 还包含 `"auth"`。生命周期限制仍然适用。
-
-以下保留现有客户端使用的 v0 叶节点、配置根节点和 provider 列表写入契约，不是 v8 请求体。特别是旧根节点 PATCH 用 `null` 删除字段，而 v8 配置树 PATCH 保留 `null`。
-
-### 旧 Provider 路由家族
-
-v0 的 `/v0/management/gemini-api-key`、`/v0/management/interactions-api-key`、`/v0/management/vertex-api-key`、`/v0/management/codex-api-key`、`/v0/management/claude-api-key`、`/v0/management/xai-api-key`、`/v0/management/meta-api-key`、`/v0/management/openai-compatibility` 继续支持 GET/PUT/PATCH/DELETE。列表使用扁平凭证条目，兼容 provider 使用 `api-key-entries` 而非 v8 `keys`。前文的模型和凭证选项仍可按 provider 支持范围使用；旧版类型化 JSON 使用 `thinking.zero_allowed` / `dynamic_allowed`。
-
-### 简单配置 Leaf Routes
-
-这些接口会写入 cluster repository 中对应 config root，并 reload Home runtime。
-
-端口变更需要重启 CPA：`PUT/PATCH /v0/management/port` 会立即持久化并下发新值，但已运行的 CPA 不会重新绑定监听端口，必须重启对应的 CPA 进程后才会生效。
-
-| Method | Path | 输入 | 输出 |
-| --- | --- | --- | --- |
-| `GET` | `/v0/management/port` | 无 | `{ "port": number }` |
-| `PUT/PATCH` | `/v0/management/port` | `{ "value": number }`；必须是 `1` 到 `65535` 之间的整数。 | `{ "status": "ok" }` |
-| `GET` | `/v0/management/debug` | 无 | `{ "debug": boolean }` |
-| `PUT/PATCH` | `/v0/management/debug` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/logging-to-file` | 无 | `{ "logging-to-file": boolean }` |
-| `PUT/PATCH` | `/v0/management/logging-to-file` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/logs-max-total-size-mb` | 无 | `{ "logs-max-total-size-mb": number }` |
-| `PUT/PATCH` | `/v0/management/logs-max-total-size-mb` | `{ "value": number }`；负数保存为 `0` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/error-logs-max-files` | 无 | `{ "error-logs-max-files": number }` |
-| `PUT/PATCH` | `/v0/management/error-logs-max-files` | `{ "value": number }`；负数保存为 `10` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/usage-statistics-enabled` | 无 | `{ "usage-statistics-enabled": boolean }` |
-| `PUT/PATCH` | `/v0/management/usage-statistics-enabled` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/proxy-url` | 无 | `{ "proxy-url": string }` |
-| `PUT/PATCH` | `/v0/management/proxy-url` | `{ "value": string }` | `{ "status": "ok" }` |
-| `DELETE` | `/v0/management/proxy-url` | 无 | `{ "status": "ok" }` |
-| `GET` | `/v0/management/request-log` | 无 | `{ "request-log": boolean }` |
-| `PUT/PATCH` | `/v0/management/request-log` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/request-retry` | 无 | `{ "request-retry": number }` |
-| `PUT/PATCH` | `/v0/management/request-retry` | `{ "value": number }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/max-retry-credentials` | 无 | `{ "max-retry-credentials": number }` |
-| `PUT/PATCH` | `/v0/management/max-retry-credentials` | `{ "value": number }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/max-retry-interval` | 无 | `{ "max-retry-interval": number }` |
-| `PUT/PATCH` | `/v0/management/max-retry-interval` | `{ "value": number }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/force-model-prefix` | 无 | `{ "force-model-prefix": boolean }` |
-| `PUT/PATCH` | `/v0/management/force-model-prefix` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/routing/strategy` | 无 | `{ "strategy": "round-robin" }` 或 `{ "strategy": "fill-first" }` |
-| `PUT/PATCH` | `/v0/management/routing/strategy` | `{ "value": "round-robin" }`、`roundrobin`、`rr`、`fill-first`、`fillfirst`、`ff` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/quota-exceeded/switch-project` | 无 | `{ "switch-project": boolean }` |
-| `PUT/PATCH` | `/v0/management/quota-exceeded/switch-project` | `{ "value": boolean }` | `{ "status": "ok" }` |
-| `GET` | `/v0/management/quota-exceeded/switch-preview-model` | 无 | `{ "switch-preview-model": boolean }` |
-| `PUT/PATCH` | `/v0/management/quota-exceeded/switch-preview-model` | `{ "value": boolean }` | `{ "status": "ok" }` |
-
-### `/v0/management/payload` Config Root
-
-`GET /v0/management/payload` 输出：
-
-```json
-{
-  "payload": {
-    "default": [
-      {
-        "models": [
-          {
-            "name": "gpt-*",
-            "protocol": "responses",
-            "from-protocol": "openai",
-            "headers": {
-              "X-Client-Tier": "tenant-*"
-            },
-            "match": [{ "metadata.client": "codex" }],
-            "not-match": [{ "metadata.mode": "dev" }],
-            "exist": ["tools.#(type==\"web_search\").type"],
-            "not-exist": ["metadata.disable_payload"]
-          }
-        ],
-        "params": { "reasoning.effort": "high" }
-      }
-    ],
-    "default-raw": [],
-    "override": [],
-    "override-raw": [],
-    "filter": [
-      {
-        "models": [{ "name": "*", "protocol": "responses" }],
-        "params": ["metadata.debug"]
-      }
-    ]
-  }
-}
-```
-
-`GET /v0/management/payload` 返回完整持久化 payload root，包括旧前端暂不识别的高级 model matcher 字段。
-
-`PUT /v0/management/payload` 接受原始 payload object、`{ "value": <payload> }` 或 `{ "payload": <payload> }`。它会替换完整 `payload` root，并校验完整 schema，不会静默丢弃高级 matcher 字段。
-
-`PATCH /v0/management/payload` 接受相同 body 形态，并对现有 `payload` root 应用 object merge-patch 语义：提交的 object 字段会递归合并，`null` 删除字段，array 作为整体替换，patch 中未出现的 sibling 字段会保留。这样前端只更新 `filter` 等单个 section 时，不会删除 `default`、`override` 或高级 matcher 字段。
-
-`DELETE /v0/management/payload` 从 config snapshot 删除该 root。
-
-写入成功返回：
-
-```json
-{ "status": "ok" }
-```
-
-### `/v0/management/antigravity` Config Root
-
-`GET /v0/management/antigravity` 输出：
-
-```json
-{
-  "antigravity": {
-    "sensitive-words": ["API", "proxy"]
-  }
-}
-```
-
-`GET /v0/management/antigravity` 返回持久化的 `antigravity` provider config root。
-
-`PUT /v0/management/antigravity` 接受原始 antigravity object、`{ "value": <antigravity> }` 或 `{ "antigravity": <antigravity> }`。它会替换完整 `antigravity` root，并校验其 schema。
-
-`PATCH /v0/management/antigravity` 接受相同 body 形态，并对现有 `antigravity` root 应用 object merge-patch 语义：提交的 object 字段会递归合并，`null` 删除字段，array 作为整体替换。
-
-`DELETE /v0/management/antigravity` 从 config snapshot 删除该 root。
-
-写入成功返回：
-
-```json
-{ "status": "ok" }
-```
-
-### 旧 Provider 列表操作
-
-#### GET Provider Key Routes
-
-输入：无。
-
-输出示例：
-
-```json
-{
-  "gemini-api-key": [
-    {
-      "auth_index": "auth-db-id",
-      "id": "auth-db-id",
-      "api-key": "AIza...",
-      "base-url": "https://generativelanguage.googleapis.com",
-      "prefix": "team-a",
-      "proxy-url": "",
-      "disabled": false,
-      "priority": 10,
-      "headers": { "X-Test": "1" },
-      "models": [
-        { "name": "gemini-upstream", "alias": "gemini-alias" }
-      ]
-    }
-  ]
-}
-```
-
-#### PUT Provider Key Routes
-
-整体替换对应 provider 的完整列表。
-
-输入可以是数组：
-
-```json
-[
-  {
-    "api-key": "provider-key",
-    "base-url": "https://api.example.com",
-    "models": [
-      { "name": "upstream-model", "alias": "alias-model" }
-    ]
-  }
-]
-```
-
-也可以是 wrapper：
-
-```json
-{ "items": [ { "api-key": "provider-key" } ] }
-```
-
-Home 还接受 `{ "<route-key>": [...] }`、`{ "list": [...] }`、`{ "data": [...] }` 或单个 entry object。
-
-成功输出：
-
-```json
-{ "status": "ok" }
-```
-
-#### PATCH Provider Key Routes
-
-更新单条 provider credential。
-
-输入示例：
-
-```json
-{
-  "index": 0,
-  "match": "old-api-key",
-  "name": "openai-provider-name",
-  "value": {
-    "api-key": "new-api-key",
-    "base-url": "https://api.example.com",
-    "proxy-url": "",
-    "headers": { "X-Test": "1" },
-    "excluded-models": ["model-a"]
-  }
-}
-```
-
-Selector 字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `index` | integer | provider 过滤后列表中的从 0 开始下标。 |
-| `match` | string | 匹配 API-key 值。 |
-| `name` | string | OpenAI-compatible provider name 或 auth label。 |
-| `id` | string | DB auth ID。 |
-| `uuid` | string | `id` 的 alias。 |
-| query `base-url` | string | 可选 base URL，用于缩小 API-key 匹配范围。 |
-
-`PATCH` 不使用 body 中的 `auth_index` 作为 DB ID selector；按 ID patch 请使用 `id` 或 `uuid`。
-
-如果 selector 仍匹配多条凭证，请求会被拒绝。当相同 API key 和 base URL 的条目通过 `prefix`、`proxy-url` 或 `headers` 区分时，应使用 `id`、`uuid` 或 `index` 精确选择一条凭证。
-
-在 `value` 中，`disable-cooling` 接受 boolean 覆盖值，`request-retry` 接受整数额外重试轮次覆盖。将任一字段设为 `null` 会清除现有覆盖并继承全局设置；将 `request-retry` 设为负值也会清除覆盖；省略字段则保留其当前覆盖不变。
-
-成功输出：
-
-```json
-{ "status": "ok" }
-```
-
-#### DELETE Provider Key Routes
-
-删除单条 provider credential。
-
-Query 参数：
-
-| Query | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | string | DB auth ID。 |
-| `uuid` | string | `id` 的 alias。 |
-| `auth_index` | string | DB auth ID 或 runtime index。 |
-| `index` | integer | provider 过滤后列表中的从 0 开始下标。 |
-| `api-key` | string | API-key 值。 |
-| `api_key` | string | `api-key` 的 alias。 |
-| `match` | string | `api-key` 的 alias。 |
-| `base-url` | string | 可选 base URL，用于缩小 API-key 匹配范围。 |
-| `base_url` | string | `base-url` 的 alias。 |
-| `name` | string | Provider 或 compatibility name。 |
-
-如果 selector 仍匹配多条凭证，请求会被拒绝。请使用 `id`、`uuid`、`auth_index` 或 `index` 精确删除一条凭证。
-
-成功输出：
-
-```json
-{ "status": "ok" }
-```
-
-### OAuth 模型规则
-
-#### `/v0/management/oauth-excluded-models`
-
-GET 输出：
-
-```json
-{
-  "oauth-excluded-models": {
-    "claude": ["claude-opus-4.5"]
-  }
-}
-```
-
-PUT 输入：
-
-```json
-{
-  "claude": ["claude-opus-4.5"]
-}
-```
-
-或：
-
-```json
-{
-  "items": {
-    "claude": ["claude-opus-4.5"]
-  }
-}
-```
-
-PATCH 输入：
-
-```json
-{
-  "provider": "claude",
-  "models": ["claude-opus-4.5"]
-}
-```
-
-DELETE query：
-
-| Query | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `provider` | string | 是 | 要移除的 provider key。 |
-
-写入成功返回 `{ "status": "ok" }`。
-
-#### `/v0/management/oauth-model-alias`
-
-GET 输出：
-
-```json
-{
-  "oauth-model-alias": {
-    "claude": [
-      { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-    ]
-  }
-}
-```
-
-PUT 输入：
-
-```json
-{
-  "claude": [
-    { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-  ]
-}
-```
-
-或：
-
-```json
-{
-  "items": {
-    "claude": [
-      { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-    ]
-  }
-}
-```
-
-PATCH 输入：
-
-```json
-{
-  "channel": "claude",
-  "provider": "claude",
-  "aliases": [
-    { "name": "claude-sonnet-4", "alias": "sonnet", "fork": true, "force-mapping": true }
-  ]
-}
-```
-
-DELETE query：
-
-| Query | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `channel` | string | 条件必填 | 要移除的 alias channel。 |
-| `provider` | string | 条件必填 | `channel` 的 alias。 |
-
-写入成功返回 `{ "status": "ok" }`。
+请使用 V8 配置树路由，不再使用已移除的扁平叶节点/provider 接口。Provider 凭证使用 `api-keys.<provider>` 分组和 `keys`。V8 `PUT /config`、`PUT /config.yaml` 替换完整配置，包括省略的凭证家族；局部更新请使用子树写入。V8 配置树 PATCH 将 `null` 保留为值，删除子树请使用 DELETE。按前文约定保留只读 revision 和凭证 ID。

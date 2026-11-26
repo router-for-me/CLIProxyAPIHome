@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
@@ -86,17 +87,11 @@ func TestRuntimeConfigFromRootPreservesGlobalDisableCoolingAndHomeInvariants(t *
 	if errConfig != nil {
 		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
 	}
-	if len(cfg.APIKeys) != 0 {
-		t.Fatalf("APIKeys = %#v, want nil/empty", cfg.APIKeys)
-	}
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("UsageStatisticsEnabled = false, want true")
 	}
 	if !cfg.DisableCooling {
 		t.Fatal("DisableCooling = false, want Home global cooling disabled")
-	}
-	if cfg.WebsocketAuth {
-		t.Fatal("WebsocketAuth = true, want false")
 	}
 	if !cfg.RemoteManagement.AllowRemote {
 		t.Fatal("RemoteManagement.AllowRemote = false, want preserved true")
@@ -339,14 +334,18 @@ func TestRuntimeConfigFromRootPreservesAdvancedPayloadModelMatchers(t *testing.T
 		},
 	}
 
-	cfg, payload, errConfig := RuntimeConfigFromRoot(root)
+	_, payload, errConfig := RuntimeConfigFromRoot(root)
 	if errConfig != nil {
 		t.Fatalf("RuntimeConfigFromRoot() error = %v", errConfig)
 	}
-	if len(cfg.Payload.Default) != 1 || len(cfg.Payload.Default[0].Models) != 1 {
-		t.Fatalf("payload default models = %#v, want one advanced matcher", cfg.Payload.Default)
+	cpa, errCPA := cpaconfig.ParseConfigBytes(payload)
+	if errCPA != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errCPA)
 	}
-	model := cfg.Payload.Default[0].Models[0]
+	if len(cpa.Payload.Default) != 1 || len(cpa.Payload.Default[0].Models) != 1 {
+		t.Fatalf("payload default models = %#v, want one advanced matcher", cpa.Payload.Default)
+	}
+	model := cpa.Payload.Default[0].Models[0]
 	if model.FromProtocol != "responses" {
 		t.Fatalf("FromProtocol = %q, want responses", model.FromProtocol)
 	}

@@ -36,7 +36,10 @@ func TestApplyCredentialConfigToRootHydratesAPIKeyAuths(t *testing.T) {
 	auths[7].Attributes["provider_key"] = "compat"
 	auths[7].Metadata = map[string]any{"request_retry": 2}
 
-	counts := ApplyCredentialConfigToRoot(root, auths)
+	counts, errApply := ApplyCredentialConfigToRoot(root, auths)
+	if errApply != nil {
+		t.Fatal(errApply)
+	}
 	if counts.GeminiKeys != 1 || counts.InteractionsKeys != 1 || counts.VertexKeys != 1 || counts.CodexKeys != 1 || counts.XAIKeys != 1 || counts.MetaKeys != 1 || counts.ClaudeKeys != 1 || counts.OpenAICompatibility != 1 {
 		t.Fatalf("unexpected credential counts: %#v", counts)
 	}
