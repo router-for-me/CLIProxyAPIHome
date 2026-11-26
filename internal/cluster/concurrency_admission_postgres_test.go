@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -486,5 +487,173 @@ func assertPostgresConcurrencyCountersUnchanged(t *testing.T, repo *Repository, 
 		if found == nil || found.ActiveCount != expected.ActiveCount {
 			t.Fatalf("counter rows = %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestPostgresAdmissionSerializesNativeRetirement(t *testing.T) {
+	for _, order := range []string{"admit-first", "retire-first"} {
+		for _, policy := range []string{"none", "limited"} {
+			t.Run(order+"/"+policy, func(t *testing.T) {
+				repo := newPostgresQuiescenceRepository(t)
+				ctx, cancelCtx := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancelCtx()
+				seedConcurrencyAdmissionLifetime(t, repo, "fp-a", "home-a")
+				seedConcurrencyAdmissionAuth(t, repo, "cred-1")
+				if policy == "limited" {
+					seedConcurrencyAdmissionPolicy(t, repo, "cred-1", int64Pointer(2), nil)
+				}
+				req := ConcurrencyAdmissionRequest{CredentialID: "cred-1", Model: "gpt", Lifetime: concurrencyAdmissionLifetime(t, repo, "fp-a", "home-a"), ProtocolVersion: 1}
+				holderPID := make(chan postgresBackendPIDResult, 1)
+				contenderPID := make(chan postgresBackendPIDResult, 1)
+				locked, release := make(chan struct{}), make(chan struct{})
+				var releaseOnce sync.Once
+				t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+				wait := func() {
+					close(locked)
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+				}
+				admitDone, retireDone := make(chan error, 1), make(chan error, 1)
+				admit := func(holder bool) {
+					pid := contenderPID
+					if holder {
+						pid = holderPID
+					}
+					admissionCtx := context.WithValue(ctx, concurrencyContenderBackendPIDContextKey{}, postgresContenderBackendPIDHook(pid))
+					if holder {
+						admissionCtx = context.WithValue(admissionCtx, concurrencyAdmissionPolicyLockAcquiredContextKey{}, wait)
+					}
+					_, errAdmit := repo.AdmitCredentialConcurrency(admissionCtx, req)
+					admitDone <- errAdmit
+				}
+				retire := func(holder bool) {
+					retireDone <- repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+						pid := contenderPID
+						if holder {
+							pid = holderPID
+						}
+						if errPID := postgresContenderBackendPIDHook(pid)(tx); errPID != nil {
+							return errPID
+						}
+						if errRetire := retireProviderAuthTx(ctx, tx, "cred-1"); errRetire != nil {
+							return errRetire
+						}
+						if holder {
+							wait()
+						}
+						return nil
+					})
+				}
+				if order == "admit-first" {
+					go admit(true)
+				} else {
+					go retire(true)
+				}
+				select {
+				case <-locked:
+				case <-ctx.Done():
+					t.Fatal("holder did not acquire credential lock")
+				}
+				if order == "admit-first" {
+					go retire(false)
+				} else {
+					go admit(false)
+				}
+				waitForPostgresContendersBlockedByHolder(t, ctx, repo, holderPID, contenderPID)
+				releaseOnce.Do(func() { close(release) })
+				select {
+				case errAdmit := <-admitDone:
+					if order == "admit-first" && errAdmit != nil {
+						t.Fatalf("admit-first: %v", errAdmit)
+					}
+					if order == "retire-first" && !errors.Is(errAdmit, ErrConcurrencyAuthUnavailable) {
+						t.Fatalf("retire-first: %v", errAdmit)
+					}
+				case <-ctx.Done():
+					t.Fatal("admission did not finish")
+				}
+				select {
+				case errRetire := <-retireDone:
+					if errRetire != nil {
+						t.Fatal(errRetire)
+					}
+				case <-ctx.Done():
+					t.Fatal("retirement did not finish")
+				}
+				want := int64(0)
+				if order == "admit-first" && policy == "limited" {
+					want = 1
+				}
+				if got := countConcurrencyAdmissionCounters(t, repo); got != want {
+					t.Fatalf("counter = %d, want %d", got, want)
+				}
+				if want == 1 {
+					if errRelease := repo.ApplyConcurrencyRelease(ctx, ConcurrencyReleaseRequest{CredentialID: "cred-1", Model: "gpt", ReleaseSeq: 1, Lifetime: req.Lifetime}); errRelease != nil {
+						t.Fatal(errRelease)
+					}
+					if got := loadReleaseCounter(t, repo, "cred-1", "gpt", "fp-a"); got.ActiveCount != 0 || got.LastReleaseSeq != 1 {
+						t.Fatalf("released counter = %#v", got)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPostgresAdmissionWaitsForPolicyActivationBeforeHomeLock(t *testing.T) {
+	repo := newPostgresQuiescenceRepository(t)
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCtx()
+	seedConcurrencyAdmissionLifetime(t, repo, "fp-a", "home-a")
+	seedConcurrencyAdmissionAuth(t, repo, "cred-1")
+	preparePostgresConcurrencyPolicyPatch(t, ctx, repo, "home-a")
+	lifetime := concurrencyAdmissionLifetime(t, repo, "fp-a", "home-a")
+	locked, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	holderPID, contenderPID := make(chan postgresBackendPIDResult, 1), make(chan postgresBackendPIDResult, 1)
+	patchCtx := context.WithValue(ctx, concurrencyContenderBackendPIDContextKey{}, postgresContenderBackendPIDHook(holderPID))
+	patchCtx = context.WithValue(patchCtx, concurrencyPolicyPatchAuthLockAcquiredContextKey{}, func() {
+		close(locked)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	})
+	patchDone := make(chan error, 1)
+	go func() {
+		_, errPatch := repo.PatchCredentialConcurrencyPolicy(patchCtx, "cred-1", ConcurrencyPolicyPatch{MaxInFlight: OptionalLimit{Set: true, Value: 1}}, nil)
+		patchDone <- errPatch
+	}()
+	select {
+	case <-locked:
+	case <-ctx.Done():
+		t.Fatal("policy activation did not lock auth")
+	}
+	admitDone := make(chan error, 1)
+	go func() {
+		admitCtx := context.WithValue(ctx, concurrencyContenderBackendPIDContextKey{}, postgresContenderBackendPIDHook(contenderPID))
+		result, errAdmit := repo.AdmitCredentialConcurrency(admitCtx, ConcurrencyAdmissionRequest{CredentialID: "cred-1", Model: "gpt", Lifetime: lifetime, ProtocolVersion: 1})
+		if errAdmit == nil && !result.Accounted {
+			errAdmit = errors.New("admission missed activated policy")
+		}
+		admitDone <- errAdmit
+	}()
+	waitForPostgresContendersBlockedByHolder(t, ctx, repo, holderPID, contenderPID)
+	releaseOnce.Do(func() { close(release) })
+	for _, done := range []<-chan error{patchDone, admitDone} {
+		select {
+		case errDone := <-done:
+			if errDone != nil {
+				t.Fatal(errDone)
+			}
+		case <-ctx.Done():
+			t.Fatal("policy activation and admission did not finish")
+		}
+	}
+	if got := countConcurrencyAdmissionCounters(t, repo); got != 1 {
+		t.Fatalf("counter = %d", got)
 	}
 }
