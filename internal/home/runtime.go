@@ -78,6 +78,9 @@ type Runtime struct {
 	antigravityCancel         context.CancelFunc
 
 	fileWatcher interface{ Stop() error }
+
+	// schedulerHost replaces pluginHost's scheduling surface in tests.
+	schedulerHost schedulerHost
 }
 
 func (r *Runtime) SetPluginStoreAuthResolver(resolver func(context.Context) ([]pluginstore.ResolvedAuthConfig, error)) {
