@@ -6,11 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/regexp"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )

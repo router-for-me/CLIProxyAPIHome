@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	log "github.com/sirupsen/logrus"
 )
 

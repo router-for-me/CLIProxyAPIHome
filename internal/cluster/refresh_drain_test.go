@@ -3,11 +3,11 @@ package cluster
 import (
 	"context"
 	"errors"
-	"regexp"
 	goruntime "runtime"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/regexp"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 )
 
