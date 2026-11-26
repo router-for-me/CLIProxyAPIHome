@@ -2,12 +2,12 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"gorm.io/gorm"
 )
@@ -16,6 +16,11 @@ const (
 	OAuthSessionTTL          = 20 * time.Minute
 	oauthCompletedSessionTTL = time.Minute
 )
+
+// OAuthSessionResult is the public result kept on a completed OAuth session.
+type OAuthSessionResult struct {
+	AuthIDs []string `json:"auth_ids"`
+}
 
 // ErrOAuthSessionNotPending reports that session data can no longer be changed.
 var ErrOAuthSessionNotPending = errors.New("oauth session is not pending")
@@ -243,7 +248,7 @@ func (r *Repository) CompleteOAuthSessionWithAuths(ctx context.Context, state st
 			}
 		}
 		// Keep only the public result after clearing the pending session's secrets.
-		result, errMarshal := json.Marshal(map[string]any{"auth_ids": authIDs})
+		result, errMarshal := json.Marshal(OAuthSessionResult{AuthIDs: authIDs})
 		if errMarshal != nil {
 			return errMarshal
 		}

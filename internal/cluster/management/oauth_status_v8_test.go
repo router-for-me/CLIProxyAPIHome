@@ -2,7 +2,6 @@ package management
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -10,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
@@ -42,18 +42,13 @@ func TestOAuthStatusV8ReturnsPersistedCredentialID(t *testing.T) {
 	// Read through a new handler and repository, as another Home node would.
 	reader := NewHandler(cluster.NewRepository(db), nil, "127.0.0.1", 0)
 	engine := gin.New()
-	engine.GET("/v8/management/oauth/status", reader.GetAuthStatusV8)
-	engine.GET("/v0/management/get-auth-status", reader.GetAuthStatus)
+	engine.GET("/v8/management/oauth/status", reader.GetAuthStatus)
 	for range 2 {
 		body := oauthStatusV8Request(t, engine, "/v8/management/oauth/status?state="+session.State)
 		want := map[string]any{"status": "ok", "auth_id": auths[0].ID, "auth_ids": []any{auths[0].ID}}
 		if !reflect.DeepEqual(body, want) {
 			t.Fatalf("status = %#v, want %#v", body, want)
 		}
-	}
-	legacy := oauthStatusV8Request(t, engine, "/v0/management/get-auth-status?state="+session.State)
-	if !reflect.DeepEqual(legacy, map[string]any{"status": "ok"}) {
-		t.Fatalf("legacy status changed: %#v", legacy)
 	}
 	completed, errCompleted := repo.GetOAuthSession(ctx, session.State)
 	if errCompleted != nil || completed == nil {
@@ -86,7 +81,7 @@ func TestOAuthStatusV8MultipleCredentialsAndNonSuccess(t *testing.T) {
 	repo := cluster.NewRepository(db)
 	h := NewHandler(repo, nil, "127.0.0.1", 0)
 	engine := gin.New()
-	engine.GET("/oauth/status", h.GetAuthStatusV8)
+	engine.GET("/oauth/status", h.GetAuthStatus)
 	for _, state := range []string{"multiple", "pending", "cancelled", "legacy"} {
 		session, errSession := cluster.NewOAuthSessionRecord("codex", state, nil, time.Now())
 		if errSession != nil {
@@ -151,7 +146,7 @@ func TestOAuthStatusV8FirstPluginSuccessPollReturnsIDs(t *testing.T) {
 	h := NewHandler(repo, nil, "127.0.0.1", 0)
 	h.pluginOAuthStatus = plugin
 	engine := gin.New()
-	engine.GET("/oauth/status", h.GetAuthStatusV8)
+	engine.GET("/oauth/status", h.GetAuthStatus)
 	for range 2 {
 		body := oauthStatusV8Request(t, engine, "/oauth/status?state="+session.State)
 		want := map[string]any{"status": "ok", "auth_ids": []any{"plugin-first", "plugin-second"}}

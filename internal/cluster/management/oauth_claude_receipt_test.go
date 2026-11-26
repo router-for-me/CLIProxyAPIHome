@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"io"
 	"math/big"
 	"net"
@@ -21,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
@@ -131,7 +131,7 @@ func TestClaudeOAuthCompletionReceipt(t *testing.T) {
 	h := NewHandler(repo, runtime, "127.0.0.1", 0)
 	router := gin.New()
 	router.GET("/oauth/auth-url", h.StartOAuthV8)
-	router.GET("/oauth/status", h.GetAuthStatusV8)
+	router.GET("/oauth/status", h.GetAuthStatus)
 	start := oauthStatusV8Request(t, router, "/oauth/auth-url?provider=claude")
 	state, ok := start["state"].(string)
 	if !ok || state == "" {
@@ -171,7 +171,7 @@ func TestClaudeOAuthCompletionReceipt(t *testing.T) {
 		t.Fatal("stored Claude expiry is missing or invalid")
 	}
 	reader := gin.New()
-	reader.GET("/oauth/status", NewHandler(cluster.NewRepository(db), nil, "127.0.0.1", 0).GetAuthStatusV8)
+	reader.GET("/oauth/status", NewHandler(cluster.NewRepository(db), nil, "127.0.0.1", 0).GetAuthStatus)
 	result := oauthStatusV8Request(t, reader, "/oauth/status?state="+url.QueryEscape(state))
 	want := map[string]any{"status": "ok", "auth_id": auths[0].ID, "auth_ids": []any{auths[0].ID}}
 	if !reflect.DeepEqual(result, want) {
