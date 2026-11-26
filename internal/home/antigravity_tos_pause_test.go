@@ -60,7 +60,7 @@ func TestAntigravityTOSPauseSharedDispatchAndReplay(t *testing.T) {
 	if errRecord := first.recordAntigravityTOSPause(ctx, result, false); errRecord != nil {
 		t.Fatal(errRecord)
 	}
-	until, errDeadline := second.antigravityTOSPauseDeadline(ctx)
+	until, errDeadline := second.AntigravityTOSPauseDeadline(ctx)
 	if errDeadline != nil || !until.Equal(observed.Add(6*time.Hour)) {
 		t.Fatalf("shared deadline = %v %v", until, errDeadline)
 	}
@@ -68,7 +68,7 @@ func TestAntigravityTOSPauseSharedDispatchAndReplay(t *testing.T) {
 	if errReplay := second.recordAntigravityTOSPause(ctx, result, true); errReplay != nil {
 		t.Fatal(errReplay)
 	}
-	unchanged, errRead := first.antigravityTOSPauseDeadline(ctx)
+	unchanged, errRead := first.AntigravityTOSPauseDeadline(ctx)
 	if errRead != nil || !unchanged.Equal(until) {
 		t.Fatal("redelivery extended an active pause")
 	}
@@ -86,7 +86,7 @@ func TestAntigravityTOSPauseSharedDispatchAndReplay(t *testing.T) {
 		t.Fatalf("pause blocked another provider: %+v %v", decision, errDispatch)
 	}
 	cfg.Antigravity.TOSPauseWindow = "off"
-	if deadline, errDisabled := second.antigravityTOSPauseDeadline(ctx); errDisabled != nil || !deadline.IsZero() {
+	if deadline, errDisabled := second.AntigravityTOSPauseDeadline(ctx); errDisabled != nil || !deadline.IsZero() {
 		t.Fatalf("disabled pause = %v %v", deadline, errDisabled)
 	}
 	cfg.Antigravity.TOSPauseWindow = "6h"
@@ -95,7 +95,7 @@ func TestAntigravityTOSPauseSharedDispatchAndReplay(t *testing.T) {
 	if errExpired := first.recordAntigravityTOSPause(ctx, result, true); errExpired != nil {
 		t.Fatal(errExpired)
 	}
-	if deadline, errExpired := second.antigravityTOSPauseDeadline(ctx); errExpired != nil || deadline.After(time.Now()) {
+	if deadline, errExpired := second.AntigravityTOSPauseDeadline(ctx); errExpired != nil || deadline.After(time.Now()) {
 		t.Fatal("old usage replay rearmed an expired pause")
 	}
 }

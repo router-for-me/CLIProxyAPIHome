@@ -3,28 +3,19 @@
 package home
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"slices"
 	"strings"
 
 	cpasdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPIHome/internal/proxyutil"
-	log "github.com/sirupsen/logrus"
 )
 
 const (
 	antigravityModelBaseURLDaily     = "https://daily-cloudcode-pa.googleapis.com"
 	antigravityModelsPath            = "/v1internal:fetchAvailableModels"
 	antigravityPersistedHintsMetaKey = "antigravity_capability_hints"
-	antigravityMaxCatalogModels      = 1024
-	antigravityMaxModelIDBytes       = 256
+	antigravityProbeHTTP11           = false
 	antigravityHubFallbackVersion    = "2.29.0"
 	antigravityHubPlatform           = "os_type=darwin; arch=arm64"
 )
@@ -42,11 +33,6 @@ const (
 	antigravityProbeStatusAuthError
 	antigravityProbeStatusTransientError
 )
-
-type antigravityFetchAvailableModelsResponse struct {
-	WebSearchModelIDs []string                   `json:"webSearchModelIds"`
-	Models            map[string]json.RawMessage `json:"models"`
-}
 
 func defaultAntigravityModelUserAgent(configured string) string {
 	ua := strings.TrimSpace(cpasdkauth.AntigravityRequestUserAgent(configured))
@@ -228,89 +214,6 @@ func parsePersistedAntigravityModelSet(raw any) (map[string]struct{}, bool) {
 	default:
 		return nil, false
 	}
-}
-
-func (r *Runtime) probeAntigravityModelCapabilityHints(ctx context.Context, auth *coreauth.Auth, baseURLs []string, proxyURL, accessToken, userAgent string) (antigravityModelCapabilityHints, antigravityProbeStatus) {
-	if len(baseURLs) == 0 {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	client := &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	transport, _, errProxy := proxyutil.BuildHTTPTransport(proxyURL)
-	if errProxy != nil {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	if transport != nil {
-		client.Transport = transport
-		defer transport.CloseIdleConnections()
-	}
-	project := antigravityProjectID(auth)
-	body, errMarshal := json.Marshal(map[string]string{"project": project})
-	if errMarshal != nil {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURLs[0], "/")+antigravityModelsPath, bytes.NewReader(body))
-	if errReq != nil {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", userAgent)
-	resp, errDo := client.Do(req)
-	if errDo != nil {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Debug("antigravity model fetch: response close failed")
-		}
-	}()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusAuthError
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	const maxCatalogBytes = 8 << 20
-	data, errRead := io.ReadAll(io.LimitReader(resp.Body, maxCatalogBytes+1))
-	if errRead != nil || len(data) > maxCatalogBytes {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	hints, ok := parseAntigravityModelCapabilityHints(data)
-	if !ok {
-		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
-	}
-	return hints, antigravityProbeStatusSuccess
-}
-
-func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabilityHints, bool) {
-	var parsed antigravityFetchAvailableModelsResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return antigravityModelCapabilityHints{}, false
-	}
-	if len(parsed.Models) > antigravityMaxCatalogModels || len(parsed.WebSearchModelIDs) > antigravityMaxCatalogModels {
-		return antigravityModelCapabilityHints{}, false
-	}
-	webSearchModels := make(map[string]struct{}, len(parsed.WebSearchModelIDs))
-	for _, modelID := range parsed.WebSearchModelIDs {
-		modelID = normalizeAntigravityFetchedModelID(modelID)
-		if modelID != "" {
-			webSearchModels[modelID] = struct{}{}
-		}
-	}
-	var modelIDs map[string]struct{}
-	if parsed.Models != nil {
-		modelIDs = make(map[string]struct{}, len(parsed.Models))
-		for id := range parsed.Models {
-			if normalized := normalizeAntigravityFetchedModelID(id); normalized != "" {
-				modelIDs[normalized] = struct{}{}
-			}
-		}
-	}
-	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs}, true
 }
 
 func normalizeAntigravityFetchedModelID(modelID string) string {

@@ -1,7 +1,6 @@
 package home
 
 import (
-	cpaconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 )
@@ -33,7 +32,7 @@ func applyOAuthSettings(cfg *config.Config, provider, authKind string, models []
 		if model == nil {
 			continue
 		}
-		setting := cpaconfig.ResolveOAuthModelSetting(settings, model.ID, model.MetadataModelID, model.Name)
+		setting := config.ResolveOAuthModelSetting(settings, model.ID, model.MetadataModelID, model.Name, model.SourceModelID)
 		if setting != nil && setting.MaxContextLength > 0 {
 			clone := *model
 			clone.ContextLength = setting.MaxContextLength

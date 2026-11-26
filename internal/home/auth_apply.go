@@ -24,7 +24,8 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	op := "register"
 	var err error
 	var applied *coreauth.Auth
-	if existing, ok := r.coreManager.GetByID(auth.ID); ok && existing != nil {
+	existing, _ := r.coreManager.GetByID(auth.ID)
+	if existing != nil {
 		auth.CreatedAt = existing.CreatedAt
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
@@ -48,6 +49,12 @@ func (r *Runtime) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth = applied
 	}
 
+	if existing != nil && !strings.EqualFold(strings.TrimSpace(existing.Provider), strings.TrimSpace(auth.Provider)) {
+		auth = r.pruneStaleAuthModels(auth.ID)
+		if auth == nil {
+			return
+		}
+	}
 	r.registerModelsForAuth(auth)
 	r.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 	r.coreManager.RefreshSchedulerEntry(auth.ID)
@@ -174,7 +181,9 @@ func (r *Runtime) applyCoreAuthRemove(ctx context.Context, authID string) {
 		log.Errorf("failed to delete auth %s: %v", authID, errDel)
 	}
 	r.cancelStaleAntigravityProbes(authID)
-	registry.GetGlobalRegistry().UnregisterClient(authID)
+	if r.pruneStaleAuthModels(authID) != nil {
+		return
+	}
 
 	if provider != "" {
 		log.Infof("auth removed (auth=%s provider=%s label=%s)", authID, provider, label)

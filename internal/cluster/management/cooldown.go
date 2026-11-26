@@ -4,11 +4,35 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"gorm.io/gorm"
 )
+
+// GetAntigravityTOSPause reports whether Home is currently excluding the entire pool.
+func (h *Handler) GetAntigravityTOSPause(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	if h == nil || h.runtime == nil {
+		respondError(c, http.StatusServiceUnavailable, "antigravity_tos_pause_unavailable", nil)
+		return
+	}
+	ctx, cancel := h.requestContext(c)
+	defer cancel()
+	deadline, errRead := h.runtime.AntigravityTOSPauseDeadline(ctx)
+	if errRead != nil {
+		respondError(c, http.StatusServiceUnavailable, "antigravity_tos_pause_unavailable", nil)
+		return
+	}
+	observedAt := time.Now().UTC()
+	var resumeAt *time.Time
+	if deadline.After(observedAt) {
+		deadline = deadline.UTC()
+		resumeAt = &deadline
+	}
+	c.JSON(http.StatusOK, gin.H{"paused": resumeAt != nil, "resume_at": resumeAt, "observed_at": observedAt})
+}
 
 // ClearCredentialCooldown clears Home-owned quota cooldown state for one
 // credential, optionally limited to one model.

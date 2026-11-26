@@ -35,6 +35,7 @@ type antigravityCapabilityCacheEntry struct {
 	appliedRevision   uint64
 	persistedRevision uint64
 	pending           bool
+	pendingEnum       *antigravityModelEnumPublication
 }
 
 type antigravityFailureState struct {
@@ -68,14 +69,21 @@ var (
 type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
-	ModelIDs map[string]struct{}
-	revision uint64
+	ModelIDs       map[string]struct{}
+	modelEnumScope string
+	revision       uint64
+
+	// Catalog fields are only retained for the pending KV publication.
+	modelEnums        map[string]string
+	thinkingGroups    map[string]map[string]int
+	thinkingWebSearch map[string]bool
 }
 
 func (h antigravityModelCapabilityHints) clone() antigravityModelCapabilityHints {
 	return antigravityModelCapabilityHints{
 		WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs),
 		ModelIDs:          maps.Clone(h.ModelIDs),
+		modelEnumScope:    h.modelEnumScope,
 		revision:          h.revision,
 	}
 }
@@ -296,11 +304,12 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 	userAgent := resolveAntigravityModelUserAgent(probeAuth)
 	cacheKey := antigravityCapabilityKeyForRoute(probeAuth, baseURLs[0], proxyURL, userAgent)
 	accessToken := extractAccessToken(probeAuth)
+	enumScope := antigravityModelEnumScope(probeAuth)
 	if accessToken == "" || ctx.Err() != nil {
 		return cacheKey, r.cachedAntigravityHintsForKey(probeAuth, baseURLs[0], cacheKey)
 	}
-	failureKey := cacheKey + fmt.Sprintf("/%x", sha256.Sum256([]byte(accessToken)))
-	lookup := func() (antigravityModelCapabilityHints, bool) {
+	failureKey := antigravityModelProbeKey(cacheKey, enumScope, accessToken)
+	lookup := func() (antigravityCapabilityCacheEntry, bool) {
 		persisted, hasPersisted := r.persistedAntigravityHintsForAuth(probeAuth, baseURLs[0])
 		antigravityCapabilityMu.Lock()
 		defer antigravityCapabilityMu.Unlock()
@@ -314,15 +323,22 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 			entry.lastUsed = now
 			antigravityCapabilityCache[cacheKey] = entry
 		}
-		return entry.hints.clone(), now.Before(entry.expiresAt) || now.Before(antigravityAuthFailureCache[failureKey].nextRetry)
+		fresh := entry.hints.modelEnumScope == enumScope && now.Before(entry.expiresAt)
+		if !fresh {
+			// An expired or different scope's publication is not eligible for retry.
+			entry.pendingEnum = nil
+		}
+		canReuse := fresh && (entry.pendingEnum == nil || entry.pendingEnum.version > 0)
+		return entry, canReuse || now.Before(antigravityAuthFailureCache[failureKey].nextRetry)
 	}
-	if hints, cached := lookup(); cached {
-		return cacheKey, hints
+	if entry, cached := lookup(); cached {
+		r.publishAntigravityModelEnums(ctx, probeAuth.ID, cacheKey, entry)
+		return cacheKey, entry.hints.clone()
 	}
 
 	resultCh := antigravityCapabilityGroup.DoChan(failureKey, func() (any, error) {
-		if hints, cached := lookup(); cached {
-			return hints, nil
+		if entry, cached := lookup(); cached {
+			return entry.hints, nil
 		}
 		probeCtx, finish, active := r.beginAntigravityAccountProbe(ctx, probeAuth, cacheKey, failureKey, accessToken)
 		if !active {
@@ -347,16 +363,17 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 		select {
 		case antigravityProbeSlots <- struct{}{}:
 		case <-probeCtx.Done():
-			hints, _ := lookup()
-			return hints, nil
+			entry, _ := lookup()
+			return entry.hints, nil
 		}
 		defer func() { <-antigravityProbeSlots }()
 
+		enumVersion, enumEnabled := r.reserveAntigravityModelEnumVersion(probeCtx, enumScope)
 		hints, status := r.probeAntigravityModelCapabilityHints(probeCtx, probeAuth, baseURLs, proxyURL, accessToken, userAgent)
 		antigravityCapabilityMu.Lock()
-		defer antigravityCapabilityMu.Unlock()
 		current := antigravityCapabilityCache[cacheKey]
 		if probeCtx.Err() != nil || current.probeRevision != revision {
+			antigravityCapabilityMu.Unlock()
 			return current.hints.clone(), nil
 		}
 		now := antigravityNowFunc()
@@ -372,12 +389,29 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 		}
 		if status == antigravityProbeStatusSuccess && hints.ModelIDs != nil {
 			hints.revision = revision
+			hints.modelEnumScope = enumScope
+			current.pendingEnum = nil
+			if enumEnabled {
+				current.pendingEnum = &antigravityModelEnumPublication{version: enumVersion}
+				if enumVersion > 0 {
+					current.pendingEnum.models = hints.modelEnums
+					current.pendingEnum.thinkingGroups = hints.thinkingGroups
+					current.pendingEnum.thinkingWebSearch = hints.thinkingWebSearch
+				}
+			}
+			hints.modelEnums = nil
+			hints.thinkingGroups = nil
+			hints.thinkingWebSearch = nil
 			current.hints, current.expiresAt, current.lastUsed = hints.clone(), now.Add(antigravityCapabilityCacheTTL), now
 			antigravityCapabilityCache[cacheKey] = current
 			delete(antigravityAuthFailureCache, failureKey)
+			antigravityCapabilityMu.Unlock()
+			r.publishAntigravityModelEnums(probeCtx, probeAuth.ID, cacheKey, current)
 			return hints, nil
 		}
 		antigravityAuthFailureCache[failureKey] = nextAntigravityFailure(antigravityAuthFailureCache[failureKey], now, rand.Int64N)
+		antigravityCapabilityMu.Unlock()
+		r.storeAntigravityModelEnums(probeCtx, probeAuth.ID, enumScope, nil)
 		retained := current.hints.clone()
 		if status == antigravityProbeStatusSuccess && len(hints.WebSearchModelIDs) > 0 {
 			retained.WebSearchModelIDs = hints.WebSearchModelIDs
@@ -386,12 +420,12 @@ func (r *Runtime) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 	})
 	select {
 	case <-ctx.Done():
-		hints, _ := lookup()
-		return cacheKey, hints
+		entry, _ := lookup()
+		return cacheKey, entry.hints.clone()
 	case result := <-resultCh:
 		if result.Err != nil || result.Val == nil {
-			hints, _ := lookup()
-			return cacheKey, hints
+			entry, _ := lookup()
+			return cacheKey, entry.hints.clone()
 		}
 		return cacheKey, result.Val.(antigravityModelCapabilityHints).clone()
 	}
@@ -532,7 +566,7 @@ func (r *Runtime) antigravityModelsAndCandidatesForHintsWithConfig(auth *coreaut
 		baseModels = filterAntigravityModels(baseModels, hints)
 	}
 	baseModels = applyAntigravityFetchedModelCapabilities(baseModels, hints)
-	baseModels = r.appendPluginModels("antigravity", baseModels)
+	baseModels = appendDistinctModels(baseModels, r.pluginModelsForProvider("antigravity"))
 	authKind := antigravityAuthKind(auth)
 	excluded := r.oauthExcludedModels(cfg, "antigravity", authKind)
 	if auth != nil && auth.Attributes != nil {
@@ -1089,14 +1123,16 @@ func (r *Runtime) refreshAntigravityModels(ctx context.Context) {
 		if token == "" {
 			continue
 		}
-		failureKey := key + fmt.Sprintf("/%x", sha256.Sum256([]byte(token)))
+		enumScope := antigravityModelEnumScope(snapshot)
+		failureKey := antigravityModelProbeKey(key, enumScope, token)
 		hasModels := len(registry.GetGlobalRegistry().GetModelsForClient(snapshot.ID)) > 0 ||
 			registry.GetGlobalRegistry().GetModelCandidatesForClient(snapshot.ID) != nil
 		antigravityCapabilityMu.RLock()
 		entry := antigravityCapabilityCache[key]
 		registered := entry.appliedRevision == entry.hints.revision && hasModels
 		persisted := entry.hints.ModelIDs == nil || entry.persistedRevision == entry.hints.revision
-		fresh := (antigravityNowFunc().Before(entry.expiresAt) && registered && persisted) || antigravityNowFunc().Before(antigravityAuthFailureCache[failureKey].nextRetry)
+		now := antigravityNowFunc()
+		fresh := (entry.hints.modelEnumScope == enumScope && now.Before(entry.expiresAt) && registered && persisted && entry.pendingEnum == nil) || now.Before(antigravityAuthFailureCache[failureKey].nextRetry)
 		antigravityCapabilityMu.RUnlock()
 		if fresh {
 			continue

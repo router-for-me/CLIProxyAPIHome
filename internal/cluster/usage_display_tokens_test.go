@@ -35,7 +35,7 @@ func TestUsageObservabilityDisplayTokensAcrossManagementReads(t *testing.T) {
 	var wantTotal tokenPair
 	usageIDs := make(map[string]uint, len(cases))
 	for index, tc := range cases {
-		payload := fmt.Sprintf(`{"timestamp":"2026-06-10T12:00:%02dZ","provider":%q,"model":"display-model","request_id":%q,"session_id":"display-session","auth_index":%q,"endpoint":"/v1/responses","tokens":{%s}}`,
+		payload := fmt.Sprintf(`{"timestamp":"2026-06-10T12:00:%02dZ","provider":%q,"model":"display-model","request_id":%q,"session_id":"display-session","auth_index":%q,"endpoint":"/v1/responses","latency_ms":1000,"ttft_ms":300,"tokens":{%s}}`,
 			index, tc.provider, tc.name, "display-"+tc.provider, tc.tokens)
 		usage, errAppend := repo.AppendUsage(ctx, payload, "192.0.2.10")
 		if errAppend != nil {
@@ -68,6 +68,13 @@ func TestUsageObservabilityDisplayTokensAcrossManagementReads(t *testing.T) {
 	for _, record := range records.Records {
 		if got := (tokenPair{record.Tokens.InputTokens, record.Tokens.OutputTokens}); got != want[record.RequestID] {
 			t.Fatalf("record %s tokens = %+v, want %+v", record.RequestID, got, want[record.RequestID])
+		}
+		if wantTPS := float64(want[record.RequestID].output); wantTPS == 0 {
+			if record.Performance.TPS != nil {
+				t.Errorf("record %s TPS = %v, want nil", record.RequestID, *record.Performance.TPS)
+			}
+		} else if record.Performance.TPS == nil || *record.Performance.TPS != wantTPS {
+			t.Errorf("record %s performance = %+v, want TPS %v", record.RequestID, record.Performance, wantTPS)
 		}
 	}
 	detail, errDetail := repo.GetUsageObservabilityRecord(ctx, fmt.Sprint(usageIDs["claude"]))

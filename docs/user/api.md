@@ -891,7 +891,7 @@ Discount metadata is not returned in this version. Clients must not derive, infe
 | `availability_rate` | number | Successes over samples, rounded to four decimals. **Present only when `status` is `observed`.** |
 | `avg_latency_ms` | number | Mean end-to-end latency of measured successful requests. Absent when nothing was measurable. |
 | `avg_ttft_ms` | number | Mean time to first token. Only streamed responses report it, so it can be absent while `avg_latency_ms` is present. |
-| `output_tokens_per_second` | number | Total output tokens over total generation time, which weights long generations the way a caller experiences them. |
+| `output_tokens_per_second` | number | Sum of output tokens divided by sum of full request latencies (seconds), for successful requests with positive output and latency. Complete v2 accounting includes reasoning tokens in output; other rows use the original reported output count. |
 | `first_observed_at` / `last_observed_at` | string | RFC3339 bounds of the observations actually found, which can be much narrower than the window. `last_observed_at` may also appear on an `insufficient_data` model. |
 
 When `status` is `insufficient_data`, no rate, latency, or throughput is published. Clients must render this as "not enough data", never as full availability. The summary is cluster-wide model health and is cached briefly in-process; it contains no per-user request data.

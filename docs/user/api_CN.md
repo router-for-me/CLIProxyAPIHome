@@ -891,7 +891,7 @@ Authorization: Bearer user.jwt.token
 | `availability_rate` | number | 成功数除以观测数，保留四位小数。**仅在 `status` 为 `observed` 时出现。** |
 | `avg_latency_ms` | number | 可测量的成功请求的端到端平均延迟。无可测量样本时不返回。 |
 | `avg_ttft_ms` | number | 平均首 token 时间。仅流式响应上报，因此可能在 `avg_latency_ms` 存在时缺失。 |
-| `output_tokens_per_second` | number | 总输出 token 除以总生成耗时，长生成的权重更高，与调用方的实际体感一致。 |
+| `output_tokens_per_second` | number | 对输出量和耗时均为正的成功请求，用总输出 token 数除以请求总耗时之和（秒）。完整的 v2 核算将推理 token 计入输出，其余记录使用原始上报的输出计数。 |
 | `first_observed_at` / `last_observed_at` | string | 实际观测的 RFC3339 时间边界，可能远窄于窗口。`insufficient_data` 的模型也可能带有 `last_observed_at`。 |
 
 `status` 为 `insufficient_data` 时不返回可用率、延迟与吞吐。客户端必须渲染为"数据不足"，绝不能渲染为完全可用。该汇总是集群级的模型健康度，在进程内做短时缓存，不包含任何单个用户的请求数据。

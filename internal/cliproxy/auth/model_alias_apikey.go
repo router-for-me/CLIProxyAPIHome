@@ -6,15 +6,17 @@ import (
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
 const homeConfigModelsMetadataKey = "home_config_models"
 
 type dispatchModelResolution struct {
-	Model         string
-	Key           string
-	ForceMapping  bool
-	OriginalAlias string
+	Model           string
+	Key             string
+	ForceMapping    bool
+	OriginalAlias   string
+	PublishedSource bool
 }
 
 // rewriteModelForAuth returns a rewrite model for auth.
@@ -96,8 +98,174 @@ func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
 	return strings.TrimSpace(routeModel)
 }
 
+// ResolveBillingModel returns the canonical execution ID and whether dispatch
+// resolved it from a source recorded on the published route.
+func (m *Manager) ResolveBillingModel(auth *Auth, routeModel string) (model string, publishedSource bool) {
+	resolved := m.resolveDispatchModel(auth, routeModel)
+	return resolved.Key, resolved.PublishedSource
+}
+
+func isCopilotAuth(auth *Auth) bool {
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "copilot")
+}
+
+func usesPublishedModelRoutes(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "copilot", "devin":
+		return true
+	default:
+		return false
+	}
+}
+
+func publishedSourceModelID(sourceID, metadataID string, legacyCopilot bool) string {
+	// Older Copilot registrations stored the source in the metadata field.
+	if sourceID == "" && legacyCopilot {
+		if metadataID = strings.TrimSpace(metadataID); metadataID != "" {
+			return "copilot/" + strings.TrimPrefix(metadataID, "copilot/")
+		}
+	}
+	return strings.TrimSpace(sourceID)
+}
+
+func publishedModelRouteForAuth(reg *registry.ModelRegistry, auth *Auth, routeModel string) (*registry.ModelInfo, suffixResult) {
+	suffix := parseModelSuffix(routeModel)
+	route := reg.GetModelInfoForClient(auth.ID, suffix.ModelName)
+	if route == nil {
+		if trimmed := strings.TrimSpace(routeModel); trimmed != "" && trimmed != suffix.ModelName {
+			route = reg.GetModelInfoForClient(auth.ID, trimmed)
+		}
+	}
+	return route, suffix
+}
+
+func isPublishedSourceModelKey(auth *Auth, resolvedModel string) bool {
+	if !usesPublishedModelRoutes(auth) {
+		return false
+	}
+	prefix := strings.ToLower(strings.TrimSpace(auth.Provider)) + "/"
+	return strings.HasPrefix(canonicalModelKey(resolvedModel), prefix)
+}
+
+func publishedNativeSourceModelKey(auth *Auth, model string) (string, bool) {
+	if !isPublishedSourceModelKey(auth, model) {
+		return "", false
+	}
+	canonical := canonicalModelKey(model)
+	prefix := strings.ToLower(strings.TrimSpace(auth.Provider)) + "/"
+	native, qualified := strings.CutPrefix(canonical, prefix)
+	if !qualified || native == "" {
+		return "", false
+	}
+	return native, true
+}
+
+// publishedModelStateKey returns the active ModelStates key for a published
+// source model, falling back to an unqualified legacy key when newer or
+// alone. Unqualified public aliases must never be matched here.
+func publishedModelStateKey(auth *Auth, model string) string {
+	native, ok := publishedNativeSourceModelKey(auth, model)
+	if !ok {
+		return model
+	}
+	canonical := canonicalModelKey(model)
+	legacy := auth.ModelStates[native]
+	if legacy == nil {
+		return model
+	}
+	current := auth.ModelStates[canonical]
+	if current == nil {
+		return native
+	}
+	if !legacy.LastObservedAt.IsZero() && !current.LastObservedAt.IsZero() {
+		if legacy.LastObservedAt.After(current.LastObservedAt) {
+			return native
+		}
+	} else if legacy.UpdatedAt.After(current.UpdatedAt) {
+		return native
+	}
+	return model
+}
+
+// migratePublishedModelState consolidates a legacy unqualified source state
+// into its canonical provider-qualified source key before applying feedback.
+// The caller must own the auth snapshot or hold the manager's write lock.
+func migratePublishedModelState(auth *Auth, model string) bool {
+	native, ok := publishedNativeSourceModelKey(auth, model)
+	if !ok {
+		return false
+	}
+	canonical := canonicalModelKey(model)
+	if _, exists := auth.ModelStates[native]; !exists {
+		return false
+	}
+	if publishedModelStateKey(auth, canonical) == native {
+		if auth.ModelStates == nil {
+			auth.ModelStates = make(map[string]*ModelState)
+		}
+		auth.ModelStates[canonical] = auth.ModelStates[native]
+	}
+	delete(auth.ModelStates, native)
+	return true
+}
+
+// publishedResultModelKey normalizes bare native execution models reported by
+// older nodes to the published canonical source key when known from the
+// credential's published routes or existing canonical state.
+func publishedResultModelKey(reg *registry.ModelRegistry, auth *Auth, model string) string {
+	canonical := canonicalModelKey(model)
+	if canonical == "" || !usesPublishedModelRoutes(auth) {
+		return canonical
+	}
+	prefix := strings.ToLower(strings.TrimSpace(auth.Provider)) + "/"
+	if strings.HasPrefix(canonical, prefix) {
+		return canonical
+	}
+	if reg != nil && auth.ID != "" {
+		legacyCopilot := isCopilotAuth(auth)
+		for _, info := range reg.GetModelsForClient(auth.ID) {
+			if info == nil {
+				continue
+			}
+			sourceID := canonicalModelKey(publishedSourceModelID(info.SourceModelID, info.MetadataModelID, legacyCopilot))
+			if sourceID == "" {
+				continue
+			}
+			if native, qualified := strings.CutPrefix(sourceID, prefix); qualified && native == canonical {
+				return sourceID
+			}
+			if info.SourceModelID != "" && canonicalModelKey(info.MetadataModelID) == canonical {
+				return sourceID
+			}
+		}
+	}
+	if auth.ModelStates[prefix+canonical] != nil {
+		return prefix + canonical
+	}
+	return canonical
+}
+
 // resolveDispatchModel resolves the auth-specific upstream model used for execution and runtime state.
 func (m *Manager) resolveDispatchModel(auth *Auth, routeModel string) dispatchModelResolution {
+	if usesPublishedModelRoutes(auth) {
+		// Publication resolves collisions per account and keeps the response alias across prefixing.
+		// Base-name lookup takes precedence over literal suffixed aliases.
+		route, suffix := publishedModelRouteForAuth(registry.GetGlobalRegistry(), auth, routeModel)
+		if route != nil {
+			if sourceID := publishedSourceModelID(route.SourceModelID, route.MetadataModelID, isCopilotAuth(auth)); sourceID != "" {
+				return dispatchModelResolution{
+					Model:           preserveResolvedModelSuffix(sourceID, suffix),
+					Key:             canonicalModelKey(sourceID),
+					ForceMapping:    route.ResponseModelAlias != "",
+					OriginalAlias:   route.ResponseModelAlias,
+					PublishedSource: true,
+				}
+			}
+		}
+	}
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	oauthAlias := m.resolveOAuthModelAlias(auth, requestedModel)
 	if strings.TrimSpace(oauthAlias.upstreamModel) != "" {
@@ -173,12 +341,10 @@ func modelAliasEntriesFromMetadata(raw any) []modelAliasEntry {
 	}
 	out := make([]modelAliasEntry, 0, len(items))
 	for _, item := range items {
-		if !metadataBool(item["user_defined"]) {
-			continue
-		}
 		alias := strings.TrimSpace(metadataString(item["id"]))
 		name := strings.TrimSpace(metadataString(item["name"]))
-		if name == "" {
+		if name == "" && metadataBool(item["user_defined"]) {
+			// Older configured models stored the upstream name in display_name.
 			name = strings.TrimSpace(metadataString(item["display_name"]))
 		}
 		if alias == "" || name == "" {

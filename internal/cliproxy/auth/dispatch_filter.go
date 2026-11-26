@@ -242,6 +242,27 @@ func normalizedAllowedModelID(modelID string) string {
 	return strings.ToLower(modelID)
 }
 
+type schedulerPickFilter struct {
+	allowed, tried      map[string]struct{}
+	policy              string
+	round, defaultRetry int
+}
+
+func newSchedulerPickFilter(opts Options, tried, candidateIDs map[string]struct{}) schedulerPickFilter {
+	allowed := candidateIDs // A supplied pool was already filtered by Dispatch's allowlist and pin.
+	if allowed == nil {
+		allowed = allowedAuthIDsFromOptions(opts)
+	}
+	return schedulerPickFilter{allowed, tried, credentialPolicyFromOptions(opts), requestRetryRoundFromOptions(opts), requestRetryDefaultFromOptions(opts)}
+}
+
+func (f schedulerPickFilter) predicate() func(*scheduledAuth) bool {
+	if len(f.tried) == 0 && f.allowed == nil && f.policy == "" && f.round == 0 {
+		return nil
+	}
+	return schedulerPredicate(f.tried, f.allowed, f.policy, f.round, f.defaultRetry)
+}
+
 func schedulerPredicate(tried map[string]struct{}, allowed map[string]struct{}, credentialPolicy string, retryRound, defaultRequestRetry int) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {

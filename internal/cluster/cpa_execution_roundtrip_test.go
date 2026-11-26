@@ -15,8 +15,64 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"gopkg.in/yaml.v3"
 )
+
+func TestGeminiAPIKeyAliasDispatchFromSQLite(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		levels  []string
+		options string
+	}{
+		{name: "default thinking"},
+		{name: "configured thinking", levels: []string{"low", "medium", "high"}, options: ", thinking: {levels: [low, medium, high]}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			input := filepath.Join(t.TempDir(), "config.yaml")
+			writeFile(t, input, strings.ReplaceAll(`config-version: 8
+api-keys:
+  gemini:
+    - base-url: https://gemini.example.test
+      models:
+        - {name: agy-gemini-4-argon, alias: gemini-4-argon, display-name: Argon, force-mapping: trueTHINKING}
+        - {name: agy-gemini-4-neon, alias: gemini-4-neon, display-name: Neon, force-mapping: trueTHINKING}
+      keys: [{api-key: test-key}]
+`, "THINKING", tc.options))
+			repo := NewRepository(openImportTestSQLite(t))
+			if _, errImport := ImportLocalState(ctx, ImportOptions{ConfigPath: input, Repository: repo}); errImport != nil {
+				t.Fatal(errImport)
+			}
+			// Load models from the persisted credentials without API keys in runtime config.
+			runtime, errRuntime := home.NewRuntime(&appconfig.Config{})
+			if errRuntime != nil {
+				t.Fatal(errRuntime)
+			}
+			t.Cleanup(runtime.Stop)
+			runtime.SetClusterAdapter(NewRuntimeAdapter(repo, ""))
+			if errReload := runtime.ReloadAuths(ctx); errReload != nil {
+				t.Fatal(errReload)
+			}
+			for _, auth := range runtime.CoreManager().List() {
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+			}
+			for _, alias := range []string{"gemini-4-argon", "gemini-4-neon"} {
+				result, errDispatch := runtime.DispatchForAPIKey(ctx, alias, nil, "")
+				if errDispatch != nil {
+					t.Fatalf("dispatch %s: %v", alias, errDispatch)
+				}
+				if want := "agy-" + alias; result.Model != want || !result.ForceMapping || result.OriginalAlias != alias {
+					t.Errorf("dispatch %s: model=%q force_mapping=%t original_alias=%q, want %q with forced mapping to %q", alias, result.Model, result.ForceMapping, result.OriginalAlias, want, alias)
+				}
+				info := result.ModelInfo
+				if tc.levels != nil && (info == nil || info.UserDefined || info.Thinking == nil || !reflect.DeepEqual(info.Thinking.Levels, tc.levels)) {
+					t.Errorf("dispatch %s: model info=%+v, want configured levels %v", alias, info, tc.levels)
+				}
+			}
+		})
+	}
+}
 
 func TestCPAExecutionExportRejectsMalformedCredentialMetadata(t *testing.T) {
 	for _, tc := range []struct {
@@ -198,13 +254,13 @@ api-keys:
 			t.Fatalf("%s dispatch lost model compatibility", auth.Provider)
 		}
 		switch auth.Provider {
-		case "codex", "gateway":
+		case "codex", "openai-compatible-gateway":
 			pool := downstream.ProxyConnectionPool
 			if pool == nil || pool.Enabled == nil || *pool.Enabled || pool.MaxIdleConnsPerHost == nil {
 				t.Fatalf("%s dispatch pool = %+v", auth.Provider, pool)
 			}
 			wantIdle, wantCount := "300s", 7
-			if auth.Provider == "gateway" {
+			if auth.Provider == "openai-compatible-gateway" {
 				wantIdle, wantCount = "123s", 9
 			}
 			if pool.IdleConnTimeout != wantIdle || *pool.MaxIdleConnsPerHost != wantCount {

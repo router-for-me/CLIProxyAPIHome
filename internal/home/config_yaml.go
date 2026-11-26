@@ -37,7 +37,7 @@ func (r *Runtime) ReadConfigYAMLContext(ctx context.Context) ([]byte, error) {
 		if len(data) == 0 {
 			return nil, fmt.Errorf("home runtime: config is empty")
 		}
-		filtered, errFilter := sanitizeConfigYAMLForDownstream(data)
+		filtered, errFilter := sanitizeConfigYAMLForDownstream(data, r.pluginHost != nil && r.pluginHost.HasSchedulerContinuity())
 		if errFilter != nil {
 			return nil, errFilter
 		}
@@ -54,7 +54,7 @@ func (r *Runtime) ReadConfigYAMLContext(ctx context.Context) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("home runtime: config is empty")
 	}
-	filtered, errFilter := sanitizeConfigYAMLForDownstream(data)
+	filtered, errFilter := sanitizeConfigYAMLForDownstream(data, r.pluginHost != nil && r.pluginHost.HasSchedulerContinuity())
 	if errFilter != nil {
 		return nil, errFilter
 	}
@@ -94,7 +94,7 @@ func (r *Runtime) PublishConfigYAML(payload []byte) {
 		return
 	}
 
-	filtered, errFilter := sanitizeConfigYAMLForDownstream(payload)
+	filtered, errFilter := sanitizeConfigYAMLForDownstream(payload, r.pluginHost != nil && r.pluginHost.HasSchedulerContinuity())
 	if errFilter != nil || len(filtered) == 0 {
 		return
 	}
@@ -134,11 +134,10 @@ var downstreamExcludedConfigKeys = []string{
 	"openai-compatibility",
 	"vertex-api-key",
 	"oauth-model-alias",
-	"oauth-excluded-models",
 }
 
 // sanitizeConfigYAMLForDownstream sanitizes a config yaml for downstream.
-func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
+func sanitizeConfigYAMLForDownstream(payload []byte, continuity ...bool) ([]byte, error) {
 	// Normalize source data before building the derived payload.
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("home runtime: config is empty")
@@ -176,6 +175,23 @@ func sanitizeConfigYAMLForDownstream(payload []byte) ([]byte, error) {
 	}
 	for _, key := range downstreamExcludedConfigKeys {
 		delete(normalized, key)
+	}
+	// CPA needs Antigravity exclusions for variants selected after Home dispatch.
+	// Keep the other providers' rules Home-only and preserve each pattern intact.
+	const exclusionsKey = "oauth-excluded-models"
+	exclusions, _ := normalized[exclusionsKey].(map[string]any)
+	for provider := range exclusions {
+		if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+			delete(exclusions, provider)
+		}
+	}
+	if len(exclusions) == 0 {
+		delete(normalized, exclusionsKey)
+	}
+	// Advertise the optional read-only scheduler RPC separately from user config.
+	normalized["home-scheduler-protocol"] = 0
+	if len(continuity) > 0 && continuity[0] {
+		normalized["home-scheduler-protocol"] = 1
 	}
 	appconfig.ApplyDownstreamHomeModeScalars(normalized)
 	forced, errMarshal := yaml.Marshal(normalized)

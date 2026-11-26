@@ -10,7 +10,7 @@ import (
 // currentDatabaseVersion is shared by the live schema migration gate and the
 // portable snapshot format. Increment it for every required startup migration
 // or snapshot format change, and retain mappings for prior snapshot formats.
-const currentDatabaseVersion = 19
+const currentDatabaseVersion = 21
 
 // databaseModel describes one managed Home database table.
 type databaseModel struct {
@@ -634,8 +634,18 @@ func databaseSnapshotModels(formatVersion int) ([]databaseModel, bool) {
 		return databaseSnapshotV16Models, true
 	case 17:
 		return databaseSnapshotV17Models, true
-	case 18, currentDatabaseVersion:
+	case 18, 19:
 		// Version 19 only adds expiring Guardian selection metadata.
+		models := append([]databaseModel(nil), homeDatabaseModels...)
+		for index := range models {
+			if models[index].name == "usage" {
+				models[index] = newDatabaseModel[databaseSnapshotV19UsageRecord]("usage", []string{"id"}, true, true)
+				break
+			}
+		}
+		return models, true
+	case 20, currentDatabaseVersion:
+		// Version 21 only namespaces existing OpenAI-compatible provider keys.
 		return homeDatabaseModels, true
 	default:
 		return nil, false

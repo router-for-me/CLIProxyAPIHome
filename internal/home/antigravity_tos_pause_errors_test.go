@@ -45,7 +45,7 @@ func TestAntigravityTOSPausePersistenceFailuresAndConcurrentReplay(t *testing.T)
 	result.ObservedAt = time.Now().Add(-time.Minute)
 	failure := errors.New("injected KV failure")
 	adapter.readErr = failure
-	if _, errRead := runtime.antigravityTOSPauseDeadline(ctx); !errors.Is(errRead, failure) {
+	if _, errRead := runtime.AntigravityTOSPauseDeadline(ctx); !errors.Is(errRead, failure) {
 		t.Fatalf("read failure hidden: %v", errRead)
 	}
 	if errRecord := runtime.recordAntigravityTOSPause(ctx, result, false); !errors.Is(errRecord, failure) {
@@ -58,7 +58,7 @@ func TestAntigravityTOSPausePersistenceFailuresAndConcurrentReplay(t *testing.T)
 	adapter.writeErr = nil
 	adapter.value = []byte("invalid-deadline")
 	var numberError *strconv.NumError
-	if _, errRead := runtime.antigravityTOSPauseDeadline(ctx); !errors.As(errRead, &numberError) {
+	if _, errRead := runtime.AntigravityTOSPauseDeadline(ctx); !errors.As(errRead, &numberError) {
 		t.Fatalf("malformed deadline hidden: %v", errRead)
 	}
 	if errRecord := runtime.recordAntigravityTOSPause(ctx, result, false); !errors.As(errRecord, &numberError) {
@@ -79,7 +79,7 @@ func TestAntigravityTOSPausePersistenceFailuresAndConcurrentReplay(t *testing.T)
 			t.Fatal(errRecord)
 		}
 	}
-	deadline, errDeadline := runtime.antigravityTOSPauseDeadline(ctx)
+	deadline, errDeadline := runtime.AntigravityTOSPauseDeadline(ctx)
 	if errDeadline != nil || !deadline.Equal(result.ObservedAt.Add(6*time.Hour)) {
 		t.Fatalf("concurrent replay changed the fence: %v, %v", deadline, errDeadline)
 	}
