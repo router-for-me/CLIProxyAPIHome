@@ -180,6 +180,9 @@ func publishCatalogBytes(data []byte) ([]string, error) {
 		if len(parsed.Meta) == 0 {
 			parsed.Meta = old.Meta
 		}
+		if len(parsed.Copilot) == 0 {
+			parsed.Copilot = old.Copilot
+		}
 	}
 	changed := detectChangedProviders(old, &parsed)
 	modelsCatalogStore.mu.Lock()

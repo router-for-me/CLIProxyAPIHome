@@ -100,7 +100,7 @@ func TestCatalogSourcesHotReload(t *testing.T) {
 				t.Fatal(errUnmarshal)
 			}
 			devin := GetDevinModels()
-			if getModels().Claude[0].ID == "claude-"+label && len(codex.Models) > 0 && codex.Models[0]["slug"] == "codex-"+label && len(devin) == 1 && devin[0].ID == "devin/"+label {
+			if getModels().Claude[0].ID == "claude-"+label && len(codex.Models) > 0 && codex.Models[0]["slug"] == "codex-"+label && len(devin) == 1 && devin[0].ID == label {
 				return
 			}
 			select {
@@ -134,14 +134,14 @@ func TestCatalogSourcesHotReload(t *testing.T) {
 		t.Fatal(errWrite)
 	}
 	devinCatalogUpdater.refresh(ctx, b.DevinCatalog, generation)
-	if got := GetDevinModels(); len(got) != 1 || got[0].ID != "devin/b" {
+	if got := GetDevinModels(); len(got) != 1 || got[0].ID != "b" {
 		t.Fatal("failed file refresh replaced last valid catalog")
 	}
 	if errWrite := os.WriteFile(b.DevinCatalog, []byte(`{"devin":[{"id":"devin/reread"}]}`), 0600); errWrite != nil {
 		t.Fatal(errWrite)
 	}
 	devinCatalogUpdater.refresh(ctx, b.DevinCatalog, generation)
-	if got := GetDevinModels(); len(got) != 1 || got[0].ID != "devin/reread" {
+	if got := GetDevinModels(); len(got) != 1 || got[0].ID != "reread" {
 		t.Fatal("file refresh did not reread source")
 	}
 	cancel()

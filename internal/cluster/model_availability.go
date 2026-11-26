@@ -126,6 +126,7 @@ func (r *Repository) ListModelAvailability(ctx context.Context, query ModelAvail
 		scope = scope.Where(`"usage"."timestamp" < ?`, query.ToExclusive)
 	}
 
+	outputTokens := `(` + usageObservabilitySQLDisplayTokens(`"usage"`, "output_tokens") + `)`
 	var rows []modelAvailabilityRow
 	if errScan := scope.Select(`
 		LOWER("usage"."model") AS model_key,
@@ -135,8 +136,8 @@ func (r *Repository) ListModelAvailability(ctx context.Context, query ModelAvail
 		SUM(CASE WHEN "usage"."failed" THEN 1 ELSE 0 END) AS failed_count,
 		AVG(CASE WHEN "usage"."failed" THEN NULL WHEN "usage"."latency_ms" > 0 THEN "usage"."latency_ms" END) AS avg_latency_ms,
 		AVG(CASE WHEN "usage"."failed" THEN NULL WHEN "usage"."ttft_ms" > 0 THEN "usage"."ttft_ms" END) AS avg_ttft_ms,
-		SUM(CASE WHEN "usage"."failed" THEN 0 WHEN "usage"."latency_ms" > 0 AND "usage"."output_tokens" > 0 THEN "usage"."output_tokens" ELSE 0 END) AS throughput_output_tokens,
-		SUM(CASE WHEN "usage"."failed" THEN 0 WHEN "usage"."latency_ms" > 0 AND "usage"."output_tokens" > 0 THEN "usage"."latency_ms" ELSE 0 END) AS throughput_latency_ms,
+		SUM(CASE WHEN "usage"."failed" THEN 0 WHEN "usage"."latency_ms" > 0 AND ` + outputTokens + ` > 0 THEN ` + outputTokens + ` ELSE 0 END) AS throughput_output_tokens,
+		SUM(CASE WHEN "usage"."failed" THEN 0 WHEN "usage"."latency_ms" > 0 AND ` + outputTokens + ` > 0 THEN "usage"."latency_ms" ELSE 0 END) AS throughput_latency_ms,
 		MIN("usage"."timestamp") AS first_observed_at,
 		MAX("usage"."timestamp") AS last_observed_at`).
 		Group(`LOWER("usage"."model")`).

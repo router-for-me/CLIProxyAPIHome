@@ -150,6 +150,14 @@ func (a *RuntimeAdapter) StoreUsagePayload(ctx context.Context, payload string, 
 	return inserted, errAppend
 }
 
+// DeliverPluginUsage fences pending delivery and persists its completion marker.
+func (a *RuntimeAdapter) DeliverPluginUsage(ctx context.Context, payload string, deliver func() error) error {
+	if !a.Enabled() {
+		return fmt.Errorf("cluster runtime adapter is disabled")
+	}
+	return a.repo.DeliverPluginUsage(ctx, payload, deliver)
+}
+
 // StoreAppLogPayload stores a CPA app log payload.
 func (a *RuntimeAdapter) StoreAppLogPayload(ctx context.Context, clientIP string, payload string) error {
 	if !a.Enabled() {
@@ -381,6 +389,8 @@ func (a *RuntimeAdapter) SaveWithStateVersion(ctx context.Context, auth *coreaut
 	}
 
 	saveAuth.StateVersion = record.Version
+	saveAuth.CredentialIdentityVersion = quotaCredentialIdentityVersion(*record)
+	auth.CredentialIdentityVersion = saveAuth.CredentialIdentityVersion
 	a.cacheAuthSnapshot(auth.ID, record, saveAuth)
 	return auth.ID, record.Version, nil
 }
@@ -843,10 +853,20 @@ func modelMetadataFromAuth(auth *coreauth.Auth) map[string]any {
 		metadata[antigravityCapabilityHintsMetadataKey] = cloneMetadataValue(raw)
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
-		for _, key := range []string{"project_id", "base_url", "user_agent"} {
+		for _, key := range []string{"project_id", "projectId", "project", "base_url", "user_agent"} {
 			if s, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(s) != "" {
 				metadata[key] = strings.TrimSpace(s)
 			}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "copilot") {
+		for _, key := range []string{"base_url", "account_id"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				metadata[key] = value
+			}
+		}
+		if expiry, ok := auth.ExpirationTime(); ok {
+			metadata["expired"] = expiry.UTC().Format(time.RFC3339Nano)
 		}
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {

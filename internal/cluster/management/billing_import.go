@@ -43,7 +43,11 @@ func (h *Handler) PreviewBillingModelPriceImport(c *gin.Context) {
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	if body.AutoDiscover && len(body.Targets) == 0 {
-		discovered, errDiscover := h.discoverBillingImportTargetsWithRegistry(ctx)
+		discovered, errDiscover := h.repo.DiscoverBillingImportTargets(ctx, h.billingImportRegistryTargets)
+		if errors.Is(errDiscover, cluster.ErrBillingImportTargetLimitExceeded) {
+			respondError(c, http.StatusUnprocessableEntity, "import_target_limit_exceeded", errDiscover)
+			return
+		}
 		if errDiscover != nil {
 			respondError(c, http.StatusInternalServerError, "billing_import_preview_failed", errDiscover)
 			return
@@ -879,43 +883,25 @@ func parseLiteLLMBillingImportCatalog(raw []byte, sourceURL string, fetchedAt ti
 	return catalog, nil
 }
 
-func (h *Handler) discoverBillingImportTargetsWithRegistry(ctx context.Context) ([]cluster.BillingModelPriceImportTarget, error) {
-	targets, errTargets := h.repo.DiscoverBillingImportTargets(ctx)
-	if errTargets != nil {
-		return nil, errTargets
+func (h *Handler) billingImportRegistryTargets(yield func(provider, model string) bool) {
+	// Current catalogs supply native Copilot and Devin IDs without pruning routes.
+	for _, channel := range []string{"copilot", "devin"} {
+		for _, model := range registry.GetStaticModelDefinitionsByChannel(channel) {
+			if model != nil && !yield(channel, catalogRouteModelID(channel, model.ID)) {
+				return
+			}
+		}
 	}
-	seen := make(map[string]struct{}, len(targets))
-	for _, t := range targets {
-		seen[strings.ToLower(strings.TrimSpace(t.Provider))+"::"+strings.TrimSpace(t.Model)] = struct{}{}
-	}
-	for _, def := range registry.GetGlobalRegistry().GetAvailableModelDefinitions() {
-		if def == nil {
+	models := registry.GetGlobalRegistry().GetAvailableModelDefinitions()
+	for route := range h.availableBillingRoutes(models) {
+		provider := route.Target.Provider
+		if provider == "copilot" || (provider == "devin" && route.PublishedSource) {
 			continue
 		}
-		modelID := strings.TrimSpace(def.ID)
-		if modelID == "" || strings.Contains(modelID, "*") {
-			continue
-		}
-		for _, rawProv := range def.Providers {
-			prov := strings.ToLower(strings.TrimSpace(rawProv))
-			if prov == "" || strings.Contains(prov, "*") {
-				continue
-			}
-			key := prov + "::" + modelID
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			targets = append(targets, cluster.BillingModelPriceImportTarget{
-				Provider:       prov,
-				Model:          modelID,
-				ServiceTier:    cluster.BillingServiceTierWildcard,
-				MinInputTokens: 0,
-				Label:          modelID,
-			})
+		if !yield(provider, route.Target.Model) {
+			return
 		}
 	}
-	return targets, nil
 }
 
 func canonicalBillingImportProvider(provider string) string {

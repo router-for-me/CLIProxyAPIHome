@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -151,7 +152,7 @@ type Config struct {
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// vertex, antigravity, claude, codex, kimi, xai, meta, devin.
+	// vertex, antigravity, claude, codex, kimi, xai, meta, devin, copilot.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, meta-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
@@ -275,6 +276,41 @@ type OAuthModelAlias struct {
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 	// OpenAPI selects the Vertex execution endpoint without changing Home alias resolution.
 	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
+}
+
+// ResolveOAuthModelSetting finds the best matching OAuthModelSetting for a given model.
+// An exact Alias match on the model ID takes precedence over a general Name match.
+// Within the same match specificity, later entries in the slice override earlier ones.
+func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID string, modelNames ...string) *OAuthModelSetting {
+	if len(settings) == 0 {
+		return nil
+	}
+	id := strings.ToLower(strings.TrimSpace(modelID))
+
+	var aliasMatch *OAuthModelSetting
+	var nameMatch *OAuthModelSetting
+
+	for i := range settings {
+		entry := &settings[i]
+		entryName := strings.ToLower(strings.TrimSpace(entry.Name))
+		entryAlias := strings.ToLower(strings.TrimSpace(entry.Alias))
+		if entryName == "" && entryAlias == "" {
+			continue
+		}
+
+		if entryAlias != "" && id != "" && id == entryAlias {
+			aliasMatch = entry
+		} else if entryAlias == "" && (id == entryName || slices.ContainsFunc(modelNames, func(name string) bool {
+			return strings.ToLower(strings.TrimSpace(name)) == entryName
+		})) {
+			nameMatch = entry
+		}
+	}
+
+	if aliasMatch != nil {
+		return aliasMatch
+	}
+	return nameMatch
 }
 
 // ClaudeKey represents the configuration for a Claude API key,
@@ -966,6 +1002,19 @@ func validateProviderCredentialID(id string) error {
 		return fmt.Errorf("%w: %q", ErrInvalidProviderCredentialID, id)
 	}
 	return nil
+}
+
+// OpenAICompatibleProviderKey maps a configured group name to CPA's internal routing namespace.
+func OpenAICompatibleProviderKey(name string) string {
+	const prefix = "openai-compatible-"
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "openai-compatibility"
+	}
+	if name == "openai-compatibility" || strings.HasPrefix(name, prefix) {
+		return name
+	}
+	return prefix + name
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

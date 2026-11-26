@@ -87,3 +87,30 @@ func TestOAuthSettingsAntigravityDiscoveredCatalog(t *testing.T) {
 		t.Fatal("OAuth settings recreated an authoritative empty discovered catalog")
 	}
 }
+
+func TestOAuthModelConfigCopilotDisplayName(t *testing.T) {
+	cfg := &config.Config{OAuthModelAlias: map[string][]config.OAuthModelAlias{
+		"copilot": {{Name: "copilot/custom", Alias: "alias", DisplayName: "Custom Alpha"}},
+	}}
+	for _, tc := range []struct {
+		name     string
+		nativeID string
+		model    ModelInfo
+		want     string
+	}{
+		{name: "catalog name", nativeID: "alpha", model: ModelInfo{ID: "alpha", DisplayName: "Alpha"}, want: "Alpha (Copilot)"},
+		{name: "existing suffix", nativeID: "beta", model: ModelInfo{ID: "beta", DisplayName: "Beta (Copilot)"}, want: "Beta (Copilot)"},
+		{name: "native ID fallback", nativeID: "alpha", model: ModelInfo{ID: "alpha"}, want: "alpha (Copilot)"},
+		{name: "alias display name", nativeID: "custom", model: ModelInfo{ID: "custom"}, want: "Custom Alpha"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := tc.model
+			setCopilotModelDisplayName(&model, tc.nativeID)
+			applyModelNamespace(&model, "copilot", tc.nativeID, model.ID)
+			models, _ := applyOAuthModelConfig(cfg, "copilot", "oauth", []*ModelInfo{&model}, nil)
+			if len(models) != 1 || models[0].DisplayName != tc.want {
+				t.Fatalf("published models = %+v, want one model named %q", models, tc.want)
+			}
+		})
+	}
+}

@@ -46,6 +46,7 @@ type ExcludedConcurrencyCandidate struct {
 // This is a deliberately small subset of CPA's execution options: CLIProxyAPIHome only needs
 // headers / query / raw request bytes for selector decisions, and a generic metadata bag.
 type Options struct {
+	Stream          bool
 	Headers         http.Header
 	Query           url.Values
 	OriginalRequest []byte
@@ -56,6 +57,8 @@ type Options struct {
 	SessionAffinityScope string
 	// ExcludedProviders fences unavailable pools without changing session-binding namespaces.
 	ExcludedProviders []string
+	// positiveWeightOnly classifies an exhausted weighted fallback, not the plugin's candidate pool.
+	positiveWeightOnly bool
 }
 
 func requestRetryRoundFromOptions(opts Options) int {

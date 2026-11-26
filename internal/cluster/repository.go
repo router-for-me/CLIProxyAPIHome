@@ -21,10 +21,13 @@ import (
 )
 
 type Repository struct {
-	db                 *gorm.DB
-	cpaSnapshotMu      sync.Mutex
-	sessionRootCacheMu sync.RWMutex
-	sessionRootCache   map[string]string
+	db                       *gorm.DB
+	cpaSnapshotMu            sync.Mutex
+	sessionRootCacheMu       sync.RWMutex
+	sessionRootCache         map[string]string
+	usagePluginPending       sync.Map
+	usagePluginAdmissionOnce sync.Once
+	usagePluginAdmission     chan struct{}
 }
 
 type UpsertResult string
@@ -152,6 +155,7 @@ func RecordToAuth(record *AuthRecord) (*coreauth.Auth, error) {
 	}
 	auth.Index = record.Index
 	auth.StateVersion = record.Version
+	auth.CredentialIdentityVersion = quotaCredentialIdentityVersion(*record)
 
 	return auth, nil
 }

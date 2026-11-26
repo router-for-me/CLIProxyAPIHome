@@ -40,6 +40,13 @@ func (a *usagePersistenceAdapter) StoreUsagePayload(_ context.Context, payload s
 	return true, nil
 }
 
+func (a *usagePersistenceAdapter) DeliverPluginUsage(_ context.Context, _ string, deliver func() error) error {
+	if deliver != nil {
+		return errors.New("persistence-only test adapter does not support plugin delivery")
+	}
+	return nil
+}
+
 func newUsageIngestionTestRuntime(t *testing.T, registerAuth bool) (*gorm.DB, *home.Runtime) {
 	t.Helper()
 	ctx := context.Background()

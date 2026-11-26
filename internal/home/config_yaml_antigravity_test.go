@@ -2,6 +2,8 @@ package home
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -92,6 +94,46 @@ func TestSanitizeConfigYAMLForDownstreamAntigravityTOSPauseWindow(t *testing.T) 
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestAntigravityOAuthExclusionsReachDownstreamConfig(t *testing.T) {
+	for name, source := range map[string]string{
+		"legacy": `oauth-excluded-models: {" Antigravity ": ["gemini-demo-low", "gemini-demo-*,aux"], codex: ["private-codex"]}`,
+		"v8":     `oauth: {excluded-models: {antigravity: ["gemini-demo-low", "gemini-demo-*,aux"], codex: ["private-codex"]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			check := func(wire []byte, want map[string][]string) {
+				t.Helper()
+				cpa, errParse := cpaconfig.ParseConfigBytes(wire)
+				if errParse != nil {
+					t.Fatal(errParse)
+				}
+				if !reflect.DeepEqual(cpa.OAuthExcludedModels, want) {
+					t.Errorf("CPA OAuthExcludedModels = %v, want %v", cpa.OAuthExcludedModels, want)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if errWrite := os.WriteFile(path, []byte(source), 0o600); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			rt := &Runtime{configPath: path}
+			wire, errRead := rt.ReadConfigYAMLContext(t.Context())
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			check(wire, map[string][]string{"antigravity": {"gemini-demo-low", "gemini-demo-*,aux"}})
+
+			var published []byte
+			t.Cleanup(rt.SubscribeConfigYAML(func(wire []byte) error {
+				published = wire
+				return nil
+			}))
+			rt.PublishConfigYAML([]byte(`oauth: {excluded-models: {antigravity: ["gemini-demo-high"], codex: ["private-codex"]}}`))
+			check(published, map[string][]string{"antigravity": {"gemini-demo-high"}})
+			rt.PublishConfigYAML([]byte(`oauth: {excluded-models: {codex: ["private-codex"]}}`))
+			check(published, nil)
 		})
 	}
 }

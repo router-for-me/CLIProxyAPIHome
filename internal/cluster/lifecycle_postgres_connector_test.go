@@ -16,6 +16,26 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestPostgresConnectorClosesUsageDeliveryPool(t *testing.T) {
+	deliveryConnector := &gateTraceConnector{}
+	deliveryPool := sql.OpenDB(deliveryConnector)
+	pool := sql.OpenDB(lifecyclePostgresConnector{Connector: &gateTraceConnector{}, usageDeliveryPool: deliveryPool})
+	t.Cleanup(func() {
+		if errClose := pool.Close(); errClose != nil {
+			t.Error(errClose)
+		}
+	})
+	if errPing := deliveryPool.PingContext(t.Context()); errPing != nil {
+		t.Fatal(errPing)
+	}
+	if errClose := pool.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	if deliveryConnector.closes != 1 || deliveryPool.Stats().OpenConnections != 0 {
+		t.Fatalf("delivery pool not closed: connections closed=%d stats=%+v", deliveryConnector.closes, deliveryPool.Stats())
+	}
+}
+
 func newLifecyclePostgresDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("HOME_TEST_POSTGRES_DSN"))
