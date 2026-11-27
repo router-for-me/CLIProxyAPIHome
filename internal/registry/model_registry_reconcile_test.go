@@ -10,6 +10,43 @@ import (
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
+func TestLocalExecutorRouteOwnersFollowRegistration(t *testing.T) {
+	reg := &ModelRegistry{
+		models: make(map[string]*ModelRegistration), clientModels: make(map[string][]string),
+		clientModelInfos: make(map[string]map[string]*ModelInfo), clientProviders: make(map[string]string),
+		mutex: &sync.RWMutex{},
+	}
+	reg.RegisterClient("b", "gemini", []*ModelInfo{{ID: "ACP/Shared"}, {ID: "acp/shared"}, {ID: "acp/shared"}, {ID: "plain"}})
+	reg.RegisterClient("a", "codex", []*ModelInfo{{ID: "acp/shared"}})
+	for _, tt := range []struct {
+		query string
+		want  map[string][]string
+	}{
+		{"", map[string][]string{"acp/shared": {"a", "b"}}},
+		{"acp/SHARED", map[string][]string{"acp/shared": {"a", "b"}}},
+		{"plain", map[string][]string{}},
+	} {
+		if got := reg.LocalExecutorRouteOwners(tt.query); !reflect.DeepEqual(got, tt.want) {
+			t.Fatalf("owners(%q) = %v, want %v", tt.query, got, tt.want)
+		}
+	}
+	reg.RegisterClient("b", "gemini", []*ModelInfo{{ID: "AcP/SHARED"}, {ID: "acp/new"}})
+	reg.UnregisterClient("a")
+	want := map[string][]string{"acp/shared": {"b"}, "acp/new": {"b"}}
+	if got := reg.LocalExecutorRouteOwners(""); !reflect.DeepEqual(got, want) {
+		t.Fatalf("owners after replacement = %v, want %v", got, want)
+	}
+	reg.RegisterClientWithCandidates("b", "gemini", []*ModelInfo{{ID: "acp/new"}}, []*ModelInfo{{ID: "acp/shared"}})
+	want = map[string][]string{"acp/new": {"b"}}
+	if got := reg.LocalExecutorRouteOwners(""); !reflect.DeepEqual(got, want) {
+		t.Fatalf("owners after exclusion = %v, want %v", got, want)
+	}
+	reg.RegisterClient("b", "gemini", nil)
+	if got := reg.LocalExecutorRouteOwners(""); len(got) != 0 {
+		t.Fatalf("empty registration retained routes: %v", got)
+	}
+}
+
 func TestModelRegistryStateLogsOnlyTransitions(t *testing.T) {
 	const clientID = "state-client"
 	const modelID = "state-model"

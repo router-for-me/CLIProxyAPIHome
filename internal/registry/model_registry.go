@@ -4,6 +4,8 @@
 package registry
 
 import (
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -131,6 +133,8 @@ type ModelRegistry struct {
 	models map[string]*ModelRegistration
 	// clientModels maps client ID to the models it provides
 	clientModels map[string][]string
+	// Only credential routes in the ACP namespace can shadow a local executor.
+	localExecutorOwners map[string]map[string]struct{}
 	// clientModelInfos maps client ID to a map of model ID -> ModelInfo
 	// This preserves the original model info provided by each client
 	clientModelInfos map[string]map[string]*ModelInfo
@@ -185,6 +189,8 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 }
 
 const modelQuotaExceededWindow = 5 * time.Minute
+
+const LocalExecutorPrefix = "acp/"
 
 // RegisterClient registers a client and its supported models
 // Parameters:
@@ -259,6 +265,7 @@ func (r *ModelRegistry) registerClient(clientID, clientProvider string, models, 
 	now := time.Now()
 
 	oldModels, hadExisting := r.clientModels[clientID]
+	r.updateLocalExecutorOwners(clientID, oldModels, rawModelIDs)
 	oldProvider := r.clientProviders[clientID]
 	providerChanged := oldProvider != provider
 	if !hadExisting {
@@ -569,6 +576,7 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 		return
 	}
 
+	r.updateLocalExecutorOwners(clientID, models, nil)
 	now := time.Now()
 	for _, modelID := range models {
 		if registration, isExists := r.models[modelID]; isExists {
@@ -612,6 +620,52 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 	log.Debugf("Unregistered client %s", clientID)
 	// Separator line after completing client unregistration (after the summary line)
 	misc.LogCredentialSeparator()
+}
+
+// updateLocalExecutorOwners updates the reverse index under the registry write lock.
+func (r *ModelRegistry) updateLocalExecutorOwners(clientID string, oldModels, newModels []string) {
+	for _, id := range oldModels {
+		if len(id) < len(LocalExecutorPrefix) || !strings.EqualFold(id[:len(LocalExecutorPrefix)], LocalExecutorPrefix) {
+			continue
+		}
+		key := strings.ToLower(id)
+		owners := r.localExecutorOwners[key]
+		delete(owners, clientID)
+		if len(owners) == 0 {
+			delete(r.localExecutorOwners, key)
+		}
+	}
+	for _, id := range newModels {
+		if len(id) < len(LocalExecutorPrefix) || !strings.EqualFold(id[:len(LocalExecutorPrefix)], LocalExecutorPrefix) {
+			continue
+		}
+		key := strings.ToLower(id)
+		if r.localExecutorOwners == nil {
+			r.localExecutorOwners = make(map[string]map[string]struct{})
+		}
+		if r.localExecutorOwners[key] == nil {
+			r.localExecutorOwners[key] = make(map[string]struct{})
+		}
+		r.localExecutorOwners[key][clientID] = struct{}{}
+	}
+}
+
+// LocalExecutorRouteOwners returns credential IDs for one ACP route or for all collisions.
+func (r *ModelRegistry) LocalExecutorRouteOwners(requested string) map[string][]string {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	owners := make(map[string][]string)
+	if requested != "" {
+		key := strings.ToLower(requested)
+		if ids := r.localExecutorOwners[key]; len(ids) != 0 {
+			owners[key] = slices.Sorted(maps.Keys(ids))
+		}
+		return owners
+	}
+	for key, ids := range r.localExecutorOwners {
+		owners[key] = slices.Sorted(maps.Keys(ids))
+	}
+	return owners
 }
 
 // GetModelCandidatesForClient returns a copy of the exclusion candidates.

@@ -2,13 +2,14 @@ package home
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
-const LocalExecutorPrefix = "acp/"
+const LocalExecutorPrefix = registry.LocalExecutorPrefix
 
 // IsLocalExecutorUsage distinguishes a local account index from a Home credential.
 func IsLocalExecutorUsage(provider, executorType, authID, alias string) bool {
@@ -40,16 +41,13 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 	}
 	reserved := make(map[string][]string)
 	if manager := r.CoreManager(); manager != nil {
-		reg := registry.GetGlobalRegistry()
-		for _, auth := range manager.List() {
-			if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
-				continue
-			}
-			_, models := reg.GetClientModelRoutes(auth.ID)
-			for _, name := range models {
-				if key := strings.ToLower(name); strings.HasPrefix(key, LocalExecutorPrefix) {
-					reserved[key] = append(reserved[key], auth.ID)
-				}
+		reserved = registry.GetGlobalRegistry().LocalExecutorRouteOwners(requestedModel)
+		for name, ids := range reserved {
+			ids = slices.DeleteFunc(ids, func(id string) bool { return !manager.CredentialEnabled(id) })
+			if len(ids) == 0 {
+				delete(reserved, name)
+			} else {
+				reserved[name] = ids
 			}
 		}
 	}

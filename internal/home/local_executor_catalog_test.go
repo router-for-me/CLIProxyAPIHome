@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
+	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"gopkg.in/yaml.v3"
@@ -175,4 +177,26 @@ store: {id: sample, tags: [ACP], version: 1.0.0, source-url: "https://example.in
 			t.Fatalf("shared load was discarded or restarted: routes = %#v, error = %v", routes, errRoutes)
 		}
 	})
+}
+
+func BenchmarkLocalExecutorRoutesWithoutACP(b *testing.B) {
+	for _, count := range []int{0, 1000} {
+		b.Run(fmt.Sprintf("credentials_%d", count), func(b *testing.B) {
+			m := coreauth.NewManager(nil, nil, nil)
+			cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{"ordinary": {}}}}
+			rt := &Runtime{cfg: cfg, coreManager: m}
+			ctx := b.Context()
+			for i := range count {
+				if _, errRegister := m.Register(ctx, &coreauth.Auth{ID: fmt.Sprintf("account-%d", i), Provider: "gemini"}); errRegister != nil {
+					b.Fatal(errRegister)
+				}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if routes, _, errRoutes := rt.LocalExecutorRoutes(ctx, ""); errRoutes != nil || len(routes) != 0 {
+					b.Fatal("unexpected ACP routes", errRoutes)
+				}
+			}
+		})
+	}
 }

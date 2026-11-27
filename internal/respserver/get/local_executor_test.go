@@ -189,6 +189,19 @@ plugins:
 		if got := gjson.GetBytes(send(t, "local-plugin-dispatch", "acp-native-only", "a"), "error.type").String(); got != "model_forbidden" {
 			t.Fatalf("credential alias permission = %q", got)
 		}
+		for _, state := range []struct {
+			disabled bool
+			status   coreauth.Status
+		}{{true, coreauth.StatusActive}, {false, coreauth.StatusDisabled}} {
+			credential.Disabled, credential.Status = state.disabled, state.status
+			if _, errUpdate := rt.CoreManager().Update(ctx, credential); errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+			if !gjson.GetBytes(send(t, "models", "acp-open", "a"), plugin+`.#(id=="`+public+`")`).Exists() ||
+				gjson.GetBytes(send(t, "local-plugin-dispatch", "acp-open", "a"), "kind").String() != "local-plugin" {
+				t.Fatalf("disabled credential still owns the ACP route (disabled=%t, status=%s)", state.disabled, state.status)
+			}
+		}
 	})
 	for _, action := range []string{"disable instance", "disable all plugins", "uninstall"} {
 		t.Run(action, func(t *testing.T) {
