@@ -483,22 +483,35 @@ func TestACPModelCatalogQuotesChargedPriceAndCountsLocalUsage(t *testing.T) {
 	if _, errSettings := handler.repo.UpdateBillingSettings(ctx, cluster.BillingSettingsPatch{PublicModelPricing: &enabled}); errSettings != nil {
 		t.Fatal(errSettings)
 	}
-	for model, fee := range map[string]float64{public: 2, native: 7, "shared": 9, "acp/" + fallback: 3} {
-		if _, errPrice := handler.repo.CreateBillingModelPrice(ctx, cluster.BillingModelPriceUpdate{
-			Provider: provider, Model: model, Enabled: true, RequestPrice: fee,
-		}); errPrice != nil {
+	for _, rule := range []cluster.BillingModelPriceUpdate{
+		{Model: public, RequestPrice: 2},
+		{Model: public, ServiceTier: "flex", RequestPrice: 3},
+		{Model: native, MinInputTokens: 1000, RequestPrice: 7},
+		{Model: native, MinInputTokens: 2000, ServiceTier: "flex", RequestPrice: 8},
+		{Model: "shared", RequestPrice: 9},
+		{Model: "acp/" + fallback, RequestPrice: 3},
+	} {
+		rule.Provider, rule.Enabled = provider, true
+		if _, errPrice := handler.repo.CreateBillingModelPrice(ctx, rule); errPrice != nil {
 			t.Fatal(errPrice)
 		}
 	}
 	user := createUserModelTestUser(t, handler, "acp-buyer")
 	createUserModelAPIKey(t, handler, user.ID, "acp-buyer-key", nil)
 	stamp := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	// Different input lengths identify both the tier and the expected charge.
+	cases := []struct {
+		input int64
+		tier  string
+		fee   float64
+	}{{1, "auto", 2}, {2, "flex", 3}, {1000, "auto", 7}, {1200, "flex", 7}, {2000, "flex", 8}, {2200, "auto", 7}}
 	for i := range 12 {
+		tt := cases[i%len(cases)]
 		alias := public
 		if i%2 == 1 {
 			alias += "(high)"
 		}
-		payload := fmt.Sprintf(`{"timestamp":%q,"execution_id":"local-%d","provider":"sample","executor_type":"plugin:sample","model":"team/shared","alias":%q,"api_key":"acp-buyer-key","tokens":{"input_tokens":1}}`, stamp, i, alias)
+		payload := fmt.Sprintf(`{"timestamp":%q,"execution_id":"local-%d","provider":"sample","executor_type":"plugin:sample","model":"team/shared","alias":%q,"api_key":"acp-buyer-key","service_tier":%q,"tokens":{"input_tokens":%d}}`, stamp, i, alias, tt.tier, tt.input)
 		if _, errUsage := handler.repo.AppendUsage(ctx, payload, "127.0.0.1"); errUsage != nil {
 			t.Fatal(errUsage)
 		}
@@ -515,10 +528,17 @@ func TestACPModelCatalogQuotesChargedPriceAndCountsLocalUsage(t *testing.T) {
 	if errCharges != nil || len(charges.Records) != 13 {
 		t.Fatalf("charges = %d, error = %v", len(charges.Records), errCharges)
 	}
-	fees := map[string]float64{native: 7, fallback: 3}
+	fees := map[int64]float64{}
+	for _, tt := range cases {
+		fees[tt.input] = tt.fee
+	}
 	for _, charge := range charges.Records {
-		if charge.Amount != fees[charge.Model] {
-			t.Fatalf("charge for %s = %v, want %v", charge.Model, charge.Amount, fees[charge.Model])
+		want := fees[charge.InputTokens]
+		if charge.Model == fallback {
+			want = 3
+		}
+		if charge.Amount != want {
+			t.Fatalf("charge for %s (%d tokens) = %v, want %v", charge.Model, charge.InputTokens, charge.Amount, want)
 		}
 	}
 	for _, catalog := range []userModelListPayload{
@@ -526,11 +546,24 @@ func TestACPModelCatalogQuotesChargedPriceAndCountsLocalUsage(t *testing.T) {
 		getUserModels(t, handler.ListAccessibleModels, "/models/accessible", createUserBillingBearerToken(t, handler, user.ID)),
 	} {
 		byID := indexUserModelsByID(catalog.Models)
-		for model, fee := range fees {
+		for model, tiers := range map[string]map[string]map[int64]float64{
+			native:   {"*": {0: 2, 1000: 7}, "flex": {0: 3, 1000: 7, 2000: 8}},
+			fallback: {"*": {0: 3}},
+		} {
 			quote := byID["acp/"+model].Pricing
-			if quote == nil || len(quote.Providers) != 1 || len(quote.Providers[0].Tiers) != 1 || len(quote.Providers[0].Tiers[0].Rungs) != 1 ||
-				quote.Providers[0].Tiers[0].Rungs[0].RequestPrice != fee {
-				t.Fatalf("ACP quote for %s does not match charge of %v: %+v", model, fee, quote)
+			if quote == nil || len(quote.Providers) != 1 {
+				t.Fatalf("missing ACP quote for %s: %+v", model, quote)
+			}
+			got := map[string]map[int64]float64{}
+			for _, tier := range quote.Providers[0].Tiers {
+				rungs := map[int64]float64{}
+				for _, rung := range tier.Rungs {
+					rungs[rung.MinInputTokens] = rung.RequestPrice
+				}
+				got[tier.ServiceTier] = rungs
+			}
+			if !reflect.DeepEqual(got, tiers) {
+				t.Errorf("ACP quote for %s = %v, want %v", model, got, tiers)
 			}
 		}
 		acp, credential := byID[public].Availability, byID[native].Availability
