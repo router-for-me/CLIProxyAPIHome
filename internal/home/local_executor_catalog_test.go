@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -181,6 +182,74 @@ store: {id: sample, tags: [ACP], version: 1.0.0, source-url: "https://example.in
 	})
 }
 
+type blockingCatalogDownload chan context.Context
+
+func (started blockingCatalogDownload) Do(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	started <- ctx
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestLocalExecutorCatalogDownloadLifetime(t *testing.T) {
+	for _, action := range []string{"disable", "uninstall", "stop", "download timeout"} {
+		t.Run(action, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				started := make(blockingCatalogDownload)
+				t.Cleanup(replaceHomePluginStoreClientForTest(started))
+				platform := CurrentPluginPlatform()
+				item := homePluginConfigFromYAML(t, fmt.Sprintf(`enabled: true
+store:
+  id: sample
+  version: 1.0.0
+  tags: [ACP]
+  install:
+    type: direct
+    artifacts:
+      - {goos: %s, goarch: %s, url: https://store.example/sample.zip, sha256: "%s"}
+`, platform.GOOS, platform.GOARCH, strings.Repeat("a", 64)))
+				cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Dir: t.TempDir(), Configs: map[string]config.PluginInstanceConfig{"sample": item}}}
+				rt := &Runtime{cfg: cfg}
+				_, catalogs, errStart := rt.observeLocalExecutorCatalogs(t.Context())
+				if errStart != nil || len(catalogs) != 1 {
+					t.Fatalf("start download: catalogs=%d, error=%v", len(catalogs), errStart)
+				}
+				downloadCtx := <-started
+				// Advance the virtual clock past the entire worker budget.
+				time.Sleep(localExecutorWorkerTimeout + time.Second)
+				if errDownload := downloadCtx.Err(); errDownload != nil {
+					t.Fatalf("worker deadline interrupted download: %v", errDownload)
+				}
+				wantErr := context.Canceled
+				switch action {
+				case "disable", "uninstall":
+					next := &config.Config{Plugins: cfg.Plugins}
+					next.Plugins.Configs = maps.Clone(cfg.Plugins.Configs)
+					if action == "disable" {
+						disabled := item
+						disabled.Enabled = new(bool)
+						next.Plugins.Configs["sample"] = disabled
+					} else {
+						delete(next.Plugins.Configs, "sample")
+					}
+					rt.cfgMu.Lock()
+					rt.cfg = next
+					rt.cfgMu.Unlock()
+					rt.reconcilePluginArtifacts(t.Context(), cfg, next)
+				case "stop":
+					rt.Stop()
+				case "download timeout":
+					wantErr = context.DeadlineExceeded
+				}
+				<-catalogs[0].ready
+				if !errors.Is(catalogs[0].err, wantErr) || !errors.Is(downloadCtx.Err(), wantErr) {
+					t.Fatalf("catalog error=%v, download error=%v, want %v", catalogs[0].err, downloadCtx.Err(), wantErr)
+				}
+			})
+		})
+	}
+}
+
 func TestLocalExecutorCatalogCachedInput(t *testing.T) {
 	const settings = `enabled: true
 store: {id: sample, tags: [ACP], version: 1.0.0, source-url: https://store.example/registry.json, install: {type: direct}}
@@ -220,6 +289,42 @@ ratio: !!float 0
 	if routes, _, errRoutes := rt.LocalExecutorRoutes(t.Context(), ""); errRoutes != nil || len(routes) != 0 {
 		t.Fatal("a warm cache accepted a store declaration that cold discovery would skip")
 	}
+}
+
+func TestLocalExecutorCatalogRetriesUnchangedConfig(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{
+			"sample": homePluginConfigFromYAML(t, `enabled: true
+store: {id: sample, tags: [ACP], version: 1.0.0, source-url: https://store.example/registry.json, install: {type: direct}}`),
+		}}}
+		rt := &Runtime{cfg: cfg}
+		var attempts atomic.Int32
+		rt.SetLocalExecutorCatalogLoader(func(ctx context.Context, _ *config.Config, _ pluginstore.Manifest, _ []byte) ([]registry.ModelInfo, error) {
+			if attempts.Add(1) == 1 {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return []registry.ModelInfo{{ID: "recovered"}}, nil
+		})
+		_, catalogs, errStart := rt.observeLocalExecutorCatalogs(t.Context())
+		if errStart != nil || len(catalogs) != 1 {
+			t.Fatalf("start catalog: count=%d error=%v", len(catalogs), errStart)
+		}
+		start := time.Now()
+		<-catalogs[0].ready
+		if !errors.Is(catalogs[0].err, context.DeadlineExceeded) || time.Since(start) != localExecutorWorkerTimeout {
+			t.Fatalf("worker ended after %v: %v", time.Since(start), catalogs[0].err)
+		}
+		routes, _, errRead := rt.LocalExecutorRoutes(t.Context(), "acp/recovered")
+		if errRead != nil || len(routes) != 0 || attempts.Load() != 1 {
+			t.Fatal("failed catalog retried before its backoff expired")
+		}
+		time.Sleep(localExecutorCatalogRetry)
+		routes, _, errRead = rt.LocalExecutorRoutes(t.Context(), "acp/recovered")
+		if errRead != nil || routes["acp/recovered"].Plugin != "sample" || attempts.Load() != 2 {
+			t.Fatal("unchanged configuration did not recover after the retry deadline")
+		}
+	})
 }
 
 func TestLocalExecutorCatalogIgnoresSupersededRead(t *testing.T) {

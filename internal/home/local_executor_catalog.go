@@ -33,7 +33,8 @@ const (
 	localExecutorCatalogDir       = ".acp-catalog"
 	localExecutorCatalogResult    = "catalog.json"
 	localExecutorCatalogReceipt   = "catalog-v1.ready"
-	localExecutorCatalogTimeout   = 20 * time.Second
+	localExecutorDownloadTimeout  = 2 * time.Minute
+	localExecutorWorkerTimeout    = 20 * time.Second
 	localExecutorCatalogRetry     = 30 * time.Second
 	localExecutorCatalogFirstRead = 100 * time.Millisecond
 )
@@ -207,7 +208,7 @@ func (r *Runtime) startLocalExecutorCatalogLocked(cfg *config.Config, manifest p
 		return nil
 	}
 	// The installed configuration owns this worker across independent client requests.
-	loadCtx, cancel := context.WithTimeout(context.Background(), localExecutorCatalogTimeout)
+	loadCtx, cancel := context.WithCancel(context.Background())
 	catalog := &localExecutorCatalog{
 		manifest:     manifest,
 		priority:     item.Priority,
@@ -235,7 +236,12 @@ func (r *Runtime) startLocalExecutorCatalogLocked(cfg *config.Config, manifest p
 		if errContext := loadCtx.Err(); errContext != nil {
 			catalog.err = errContext
 		} else if loader := r.localExecutorCatalogLoader; loader != nil {
-			catalog.models, catalog.err = loader(loadCtx, cfg, manifest, raw)
+			workerCtx, cancelWorker := context.WithTimeout(loadCtx, localExecutorWorkerTimeout)
+			catalog.models, catalog.err = loader(workerCtx, cfg, manifest, raw)
+			if catalog.err == nil {
+				catalog.err = workerCtx.Err()
+			}
+			cancelWorker()
 		} else {
 			catalog.models, catalog.err = r.readLocalExecutorCatalog(loadCtx, cfg, catalog, artifactKey)
 		}
@@ -279,16 +285,22 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 		return nil, errPath
 	}
 	if path == "" {
-		auth, errAuth := r.resolvePluginStoreAuth(ctx)
+		downloadCtx, cancelDownload := context.WithTimeout(ctx, localExecutorDownloadTimeout)
+		auth, errAuth := r.resolvePluginStoreAuth(downloadCtx)
 		if errAuth != nil {
+			cancelDownload()
 			return nil, errAuth
 		}
-		defer pluginstore.ClearResolvedAuthConfigs(auth)
 		client := newPluginStoreClient(cfg, auth)
-		if _, errInstall := client.InstallManifest(ctx, manifest, pluginStoreInstallOptions(root, platform, nil, manifest.ID)); errInstall != nil {
+		_, errInstall := client.InstallManifest(downloadCtx, manifest, pluginStoreInstallOptions(root, platform, nil, manifest.ID))
+		cancelDownload()
+		pluginstore.ClearResolvedAuthConfigs(auth)
+		if errInstall != nil {
 			return nil, errInstall
 		}
 	}
+	workerCtx, cancelWorker := context.WithTimeout(ctx, localExecutorWorkerTimeout)
+	defer cancelWorker()
 	executable, errExe := os.Executable()
 	if errExe != nil {
 		return nil, errExe
@@ -312,7 +324,7 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 				log.WithError(errRemove).Debug("remove plugin catalog worker directory")
 			}
 		}()
-		cmd := exec.CommandContext(ctx, executable, LocalExecutorCatalogWorkerArg)
+		cmd := exec.CommandContext(workerCtx, executable, LocalExecutorCatalogWorkerArg)
 		cmd.Dir = workerDir
 		cmd.Stdin = bytes.NewReader(request)
 		cmd.Env = []string{
@@ -321,7 +333,7 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 		}
 		cmd.Env = append(cmd.Env, "CLIPROXY_PLUGIN_MODE=catalog")
 		if errRun := cmd.Run(); errRun != nil {
-			if errContext := ctx.Err(); errContext != nil {
+			if errContext := workerCtx.Err(); errContext != nil {
 				return response, errContext
 			}
 			return response, errRun
@@ -354,7 +366,7 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 	for _, model := range response.Models {
 		out = append(out, *pluginModelToHomeModel(model))
 	}
-	return out, nil
+	return out, workerCtx.Err()
 }
 
 // Prune only this platform's content-addressed artifacts. A disabled installation
