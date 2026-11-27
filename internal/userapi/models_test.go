@@ -14,7 +14,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -454,13 +457,129 @@ func TestAccessibleModelsFoldUsageSpellingsIntoOneSummary(t *testing.T) {
 // model with no known channel is the case where nothing in the table can be
 // confirmed to describe the route a request would take, so it is the last case
 // that should quote all of it.
+func TestACPModelCatalogQuotesChargedPriceAndCountsLocalUsage(t *testing.T) {
+	handler, closeRepo := newUserModelTestHandler(t)
+	defer closeRepo()
+	ctx := t.Context()
+	const provider, native, public = "sample", "team/shared", "acp/team/shared"
+	const fallback = "team/public-price"
+	plugins := map[string]any{"enabled": true, "configs": map[string]any{provider: map[string]any{
+		"enabled": true, "store": map[string]any{"id": provider, "version": "1.0.0", "tags": []string{"ACP"},
+			"source-url": "https://example.invalid/registry.json", "install": map[string]string{"type": "direct"}},
+	}}}
+	if errSave := handler.repo.UpsertConfigValue(ctx, "plugins", plugins); errSave != nil {
+		t.Fatal(errSave)
+	}
+	handler.runtime = &home.Runtime{}
+	handler.runtime.SetPluginSyncConfigLoader(handler.repo.LoadPluginSyncConfig)
+	handler.runtime.SetLocalExecutorCatalogLoader(func(context.Context, *config.Config, pluginstore.Manifest, []byte) ([]registry.ModelInfo, error) {
+		return []registry.ModelInfo{{ID: native}, {ID: fallback}}, nil
+	})
+	models := registry.GetGlobalRegistry()
+	models.RegisterClient(t.Name(), provider, []*registry.ModelInfo{{ID: native}})
+	t.Cleanup(func() { models.UnregisterClient(t.Name()) })
+
+	enabled := true
+	if _, errSettings := handler.repo.UpdateBillingSettings(ctx, cluster.BillingSettingsPatch{PublicModelPricing: &enabled}); errSettings != nil {
+		t.Fatal(errSettings)
+	}
+	for _, rule := range []cluster.BillingModelPriceUpdate{
+		{Model: public, RequestPrice: 2},
+		{Model: public, ServiceTier: "flex", RequestPrice: 3},
+		{Model: native, MinInputTokens: 1000, RequestPrice: 7},
+		{Model: native, MinInputTokens: 2000, ServiceTier: "flex", RequestPrice: 8},
+		{Model: "shared", RequestPrice: 9},
+		{Model: "acp/" + fallback, RequestPrice: 3},
+	} {
+		rule.Provider, rule.Enabled = provider, true
+		if _, errPrice := handler.repo.CreateBillingModelPrice(ctx, rule); errPrice != nil {
+			t.Fatal(errPrice)
+		}
+	}
+	user := createUserModelTestUser(t, handler, "acp-buyer")
+	createUserModelAPIKey(t, handler, user.ID, "acp-buyer-key", nil)
+	stamp := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	// Different input lengths identify both the tier and the expected charge.
+	cases := []struct {
+		input int64
+		tier  string
+		fee   float64
+	}{{1, "auto", 2}, {2, "flex", 3}, {1000, "auto", 7}, {1200, "flex", 7}, {2000, "flex", 8}, {2200, "auto", 7}}
+	for i := range 12 {
+		tt := cases[i%len(cases)]
+		alias := public
+		if i%2 == 1 {
+			alias += "(high)"
+		}
+		payload := fmt.Sprintf(`{"timestamp":%q,"execution_id":"local-%d","provider":"sample","executor_type":"plugin:sample","model":"team/shared","alias":%q,"api_key":"acp-buyer-key","service_tier":%q,"tokens":{"input_tokens":%d}}`, stamp, i, alias, tt.tier, tt.input)
+		if _, errUsage := handler.repo.AppendUsage(ctx, payload, "127.0.0.1"); errUsage != nil {
+			t.Fatal(errUsage)
+		}
+	}
+	for _, payload := range []string{
+		fmt.Sprintf(`{"timestamp":%q,"provider":"sample","executor_type":"plugin:sample","model":"team/shared","alias":"acp/team/shared","auth_id":"home-credential","failed":true}`, stamp),
+		fmt.Sprintf(`{"timestamp":%q,"execution_id":"fallback","provider":"sample","executor_type":"plugin:sample","model":"team/public-price","alias":"acp/team/public-price(high)","api_key":"acp-buyer-key","tokens":{"input_tokens":1}}`, stamp),
+	} {
+		if _, errUsage := handler.repo.AppendUsage(ctx, payload, "127.0.0.1"); errUsage != nil {
+			t.Fatal(errUsage)
+		}
+	}
+	charges, errCharges := handler.repo.ListBillingCharges(ctx, cluster.BillingChargeQuery{UserID: &user.ID, Limit: 20})
+	if errCharges != nil || len(charges.Records) != 13 {
+		t.Fatalf("charges = %d, error = %v", len(charges.Records), errCharges)
+	}
+	fees := map[int64]float64{}
+	for _, tt := range cases {
+		fees[tt.input] = tt.fee
+	}
+	for _, charge := range charges.Records {
+		want := fees[charge.InputTokens]
+		if charge.Model == fallback {
+			want = 3
+		}
+		if charge.Amount != want {
+			t.Fatalf("charge for %s (%d tokens) = %v, want %v", charge.Model, charge.InputTokens, charge.Amount, want)
+		}
+	}
+	for _, catalog := range []userModelListPayload{
+		getUserModels(t, handler.ListModels, "/models", ""),
+		getUserModels(t, handler.ListAccessibleModels, "/models/accessible", createUserBillingBearerToken(t, handler, user.ID)),
+	} {
+		byID := indexUserModelsByID(catalog.Models)
+		for model, tiers := range map[string]map[string]map[int64]float64{
+			native:   {"*": {0: 2, 1000: 7}, "flex": {0: 3, 1000: 7, 2000: 8}},
+			fallback: {"*": {0: 3}},
+		} {
+			quote := byID["acp/"+model].Pricing
+			if quote == nil || len(quote.Providers) != 1 {
+				t.Fatalf("missing ACP quote for %s: %+v", model, quote)
+			}
+			got := map[string]map[int64]float64{}
+			for _, tier := range quote.Providers[0].Tiers {
+				rungs := map[int64]float64{}
+				for _, rung := range tier.Rungs {
+					rungs[rung.MinInputTokens] = rung.RequestPrice
+				}
+				got[tier.ServiceTier] = rungs
+			}
+			if !reflect.DeepEqual(got, tiers) {
+				t.Errorf("ACP quote for %s = %v, want %v", model, got, tiers)
+			}
+		}
+		acp, credential := byID[public].Availability, byID[native].Availability
+		if acp == nil || credential == nil || acp.SampleCount != 12 || acp.SuccessCount != 12 || credential.SampleCount != 1 {
+			t.Fatalf("ACP availability = %+v, credential availability = %+v", acp, credential)
+		}
+	}
+}
+
 func TestModelPricingWithholdsQuotesWhenNoProviderCanServe(t *testing.T) {
 	index := newModelPriceIndex([]cluster.BillingModelPriceRecord{
 		{Provider: "anthropic", Model: "orphan-model", ServiceTier: "*", MinInputTokens: 0, InputPricePerMillion: 5, Enabled: true},
 		{Provider: "openai", Model: "orphan-model", ServiceTier: "*", MinInputTokens: 0, InputPricePerMillion: 7, Enabled: true},
 	})
 
-	withoutProviders := index.pricingFor("orphan-model", nil)
+	withoutProviders := index.pricingFor([]string{"orphan-model"}, nil)
 	if status, _ := withoutProviders["status"].(string); status != pricingStatusUnpublished {
 		t.Errorf("status without providers = %q, want %q", status, pricingStatusUnpublished)
 	}
@@ -469,12 +588,12 @@ func TestModelPricingWithholdsQuotesWhenNoProviderCanServe(t *testing.T) {
 	}
 
 	// Blank entries are not a serving channel either.
-	if status, _ := index.pricingFor("orphan-model", []string{" ", ""})["status"].(string); status != pricingStatusUnpublished {
+	if status, _ := index.pricingFor([]string{"orphan-model"}, []string{" ", ""})["status"].(string); status != pricingStatusUnpublished {
 		t.Errorf("status with blank providers = %q, want %q", status, pricingStatusUnpublished)
 	}
 
 	// Naming a channel still prices it, and still prices only it.
-	served := index.pricingFor("orphan-model", []string{"anthropic"})
+	served := index.pricingFor([]string{"orphan-model"}, []string{"anthropic"})
 	if status, _ := served["status"].(string); status != pricingStatusPublished {
 		t.Fatalf("status with a serving provider = %q, want %q", status, pricingStatusPublished)
 	}

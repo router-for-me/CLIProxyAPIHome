@@ -150,7 +150,7 @@ func (r *Runtime) applyConfigAndReloadAuths(ctx context.Context, cfg *config.Con
 	}
 	logConfigChanges(oldCfg, cfg)
 
-	r.deleteRemovedPluginArtifacts(ctx, oldCfg, cfg)
+	r.reconcilePluginArtifacts(ctx, oldCfg, cfg)
 	r.refreshAccessProviders()
 	managementasset.SetCurrentConfig(cfg)
 	registry.UpdateModelCatalogSources(cfg.Models)

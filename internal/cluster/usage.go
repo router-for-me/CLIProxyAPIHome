@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -373,13 +374,15 @@ func (r *Repository) AppendUsageWithRuntimeOutcome(ctx context.Context, payload 
 	record.QuotaCredentialID = ""
 	record.QuotaIdentityVersion = 0
 	record.QuotaIdentityKey = ""
-	resolved, identityKey, found, errResolve := resolveQuotaUsageCredential(ctx, db, record.AuthIndex, record.AuthType)
-	if errResolve != nil {
-		log.WithError(errResolve).Warn("usage quota credential resolution ignored")
-	} else if found {
-		record.QuotaCredentialID = resolved.UUID
-		record.QuotaIdentityVersion = quotaCredentialIdentityVersion(resolved)
-		record.QuotaIdentityKey = identityKey
+	if !home.IsLocalExecutorUsage(record.Provider, record.ExecutorType, gjson.Get(payload, "auth_id").String(), record.Alias) {
+		resolved, identityKey, found, errResolve := resolveQuotaUsageCredential(ctx, db, record.AuthIndex, record.AuthType)
+		if errResolve != nil {
+			log.WithError(errResolve).Warn("usage quota credential resolution ignored")
+		} else if found {
+			record.QuotaCredentialID = resolved.UUID
+			record.QuotaIdentityVersion = quotaCredentialIdentityVersion(resolved)
+			record.QuotaIdentityKey = identityKey
+		}
 	}
 	inserted := false
 	errTransaction := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

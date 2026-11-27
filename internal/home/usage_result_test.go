@@ -56,6 +56,23 @@ func TestRecordUsagePayloadUsesModelAsUpstreamKey(t *testing.T) {
 	}
 }
 
+func TestLocalExecutorUsageLeavesHomeCredentialHealthUntouched(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID: "local-acp-index-collision", Index: "slot-index", Provider: "antigravity", Status: coreauth.StatusActive,
+	}
+	rt := newUsageResultTestRuntime(t, auth)
+	if err := rt.RecordUsagePayload(t.Context(), `{
+		"auth_index":"slot-index","provider":"alpha","executor_type":"plugin:alpha","alias":"acp/team/local-model",
+		"model":"local-model","failed":true,"fail":{"status_code":429,"body":"local slots exhausted"}
+	}`); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := rt.coreManager.GetByID(auth.ID)
+	if !ok || got.Unavailable || len(got.ModelStates) != 0 {
+		t.Fatalf("local failure changed Home credential health: %#v", got)
+	}
+}
+
 func TestRecordUsagePayloadUsesAntigravityQuotaResetTimestamp(t *testing.T) {
 	auth := &coreauth.Auth{
 		ID:       "usage-reset-timestamp-auth",

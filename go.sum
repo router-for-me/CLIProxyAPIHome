@@ -159,8 +159,8 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rogpeppe/go-internal v1.15.0 h1:D0RCU5rMAp+SpgkiNdrjfJ+LX4J1M32V2NeCY7EJ6hc=
 github.com/rogpeppe/go-internal v1.15.0/go.mod h1:DrUVZyrJU+txYW5/1kwtXQSMFio52ZOxX7yM1VHvnxs=
-github.com/router-for-me/CLIProxyAPI/v8 v8.1.1 h1:UFaC4/IPgb2+c2BMAd+XKL64iOrNdiQH95+S5t41HTE=
-github.com/router-for-me/CLIProxyAPI/v8 v8.1.1/go.mod h1:6wsM59rPo+/w22SY93kn/125VJlEsvMTuFCOHGKX4do=
+github.com/router-for-me/CLIProxyAPI/v8 v8.1.6 h1:BmC2DNvrPiaHM4JZkxvexrei1N7dl4DSzi5fBzceXC4=
+github.com/router-for-me/CLIProxyAPI/v8 v8.1.6/go.mod h1:6wsM59rPo+/w22SY93kn/125VJlEsvMTuFCOHGKX4do=
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966 h1:JIAuq3EEf9cgbU6AtGPK4CTG3Zf6CKMNqf0MHTggAUA=

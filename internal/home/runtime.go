@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -54,11 +55,21 @@ type Runtime struct {
 	pluginSyncConfigLoader  func(context.Context) (*config.Config, error)
 	pluginSyncNodeActive    func(context.Context, string, string) (bool, error)
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
-	clusterAdapter          ClusterAdapter
-	sessionAffinityStore    coreauth.SessionAffinityStore
-	concurrencyAdmitter     ConcurrencyAdmitter
-	clusterRefresh          func(context.Context, string, string) ([]byte, error)
-	originalStore           coreauth.Store
+
+	localExecutorCatalogMu     sync.Mutex
+	localExecutorStopped       bool
+	localExecutorReadRevision  atomic.Uint64
+	localExecutorConfig        *config.Config
+	localExecutorCatalogs      map[string]*localExecutorCatalog
+	localExecutorCatalogLoader localExecutorCatalogLoader
+	localExecutorArtifactMu    sync.Mutex
+	localExecutorWorkers       map[string]int
+
+	clusterAdapter       ClusterAdapter
+	sessionAffinityStore coreauth.SessionAffinityStore
+	concurrencyAdmitter  ConcurrencyAdmitter
+	clusterRefresh       func(context.Context, string, string) ([]byte, error)
+	originalStore        coreauth.Store
 
 	cancel context.CancelFunc
 
@@ -362,6 +373,9 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
+	r.localExecutorCatalogMu.Lock()
+	r.localExecutorStopped = false
+	r.localExecutorCatalogMu.Unlock()
 	r.cfgMu.Lock()
 	if r.antigravityCancel != nil {
 		r.antigravityCancel()
@@ -385,6 +399,7 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	if errPluginSync := r.syncPluginStoreManifests(runCtx, r.Config()); errPluginSync != nil {
 		return errPluginSync
 	}
+	r.reconcilePluginArtifacts(runCtx, nil, r.Config())
 	r.applyPluginConfig(runCtx, r.Config())
 
 	if errLoad := r.loadAuths(runCtx); errLoad != nil {
@@ -417,6 +432,14 @@ func (r *Runtime) Stop() {
 	if r == nil {
 		return
 	}
+	r.localExecutorCatalogMu.Lock()
+	r.localExecutorStopped = true
+	r.localExecutorReadRevision.Add(1)
+	for _, catalog := range r.localExecutorCatalogs {
+		catalog.cancel()
+	}
+	clear(r.localExecutorCatalogs)
+	r.localExecutorCatalogMu.Unlock()
 	r.cfgMu.Lock()
 	antigravityCancel := r.antigravityCancel
 	r.antigravityCancel = nil

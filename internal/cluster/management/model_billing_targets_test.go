@@ -11,9 +11,11 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -101,7 +103,7 @@ func TestModelsV8DoesNotInventUnresolvedBillingTargets(t *testing.T) {
 	modelRegistry.RegisterClient(id, "z-ai", []*registry.ModelInfo{{ID: id, Name: "unverified-name"}})
 	t.Cleanup(func() { modelRegistry.UnregisterClient(id) })
 	handler := &Handler{}
-	for _, model := range handler.availableBillingModelDefinitions() {
+	for _, model := range handler.availableBillingModelDefinitions(nil) {
 		if model.ID == id {
 			if model.BillingModels == nil || len(model.BillingModels) != 0 {
 				t.Fatalf("unresolved catalog must expose an empty target list: %#v", model.BillingModels)
@@ -196,6 +198,56 @@ func TestBillingImportDiscoversExecutionModelBehindAliases(t *testing.T) {
 	}
 	if len(modelRegistry.GetModelsForClient(copilotAuth.ID)) != 0 {
 		t.Fatal("available models endpoint did not prune stale Copilot runtime models")
+	}
+}
+
+func TestBillingImportAutoDiscoverIncludesPublishedACPRoute(t *testing.T) {
+	db, cleanup := openManagementLogTestDB(t)
+	t.Cleanup(cleanup)
+	repo := cluster.NewRepository(db)
+	runtime := &home.Runtime{}
+	runtime.SetPluginSyncConfigLoader(repo.LoadPluginSyncConfig)
+	runtime.SetLocalExecutorCatalogLoader(func(context.Context, *config.Config, pluginstore.Manifest, []byte) ([]registry.ModelInfo, error) {
+		return []registry.ModelInfo{{ID: "team/shared"}}, nil
+	})
+	handler := NewHandler(repo, runtime, "127.0.0.1", 0)
+	engine := gin.New()
+	const path = "/v8/management/billing/model-prices/import/preview"
+	engine.POST(path, handler.PreviewBillingModelPriceImport)
+	const body = `{"source":"openrouter","auto_discover":true,"catalog_json":{"data":[{"id":"sample/team/shared","pricing":{"prompt":"0.000001","completion":"0.000002"}}]}}`
+	for _, enabled := range []bool{true, false} {
+		plugins := map[string]any{"enabled": enabled, "configs": map[string]any{
+			"sample": map[string]any{"enabled": true, "store": map[string]any{
+				"id": "sample", "version": "1.0.0", "tags": []string{"ACP"},
+				"source-url": "https://example.invalid/registry.json", "install": map[string]string{"type": "direct"},
+			}},
+		}}
+		if errSave := repo.UpsertConfigValue(t.Context(), "plugins", plugins); errSave != nil {
+			t.Fatal(errSave)
+		}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("HTTP %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var preview cluster.BillingModelPriceImportPreview
+		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &preview); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		found := false
+		for _, row := range preview.Rows {
+			if row.Provider == "sample" && row.Model == "team/shared" {
+				found = true
+				if !row.Applicable {
+					t.Fatalf("ACP pricing target did not match the catalog: %+v", row)
+				}
+			}
+		}
+		if found != enabled {
+			t.Fatalf("plugin enabled = %v, discovered native target = %v", enabled, found)
+		}
 	}
 }
 

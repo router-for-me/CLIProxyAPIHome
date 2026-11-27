@@ -82,9 +82,6 @@ func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Conf
 		ctx = context.Background()
 	}
 	auth, errAuth := r.resolvePluginStoreAuth(ctx)
-	if errAuth != nil {
-		return fmt.Errorf("home plugins: resolve store auth: %w", errAuth)
-	}
 	defer pluginstore.ClearResolvedAuthConfigs(auth)
 	platform := CurrentPluginPlatform()
 	client := newPluginStoreClient(cfg, auth)
@@ -103,32 +100,53 @@ func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Conf
 	sort.Strings(ids)
 	for _, id := range ids {
 		item := cfg.Plugins.Configs[id]
+		catalog := isLocalExecutorStoreConfig(item)
 		if !pluginConfigEnabled(item) || !pluginInstanceLoadsInHome(id, item) {
 			continue
 		}
 		manifest, okManifest, errManifest := storeManifestFromPluginConfig(id, item)
 		if errManifest != nil {
+			if catalog {
+				continue
+			}
 			return errManifest
 		}
 		if !okManifest {
 			continue
 		}
-		syncKey, errKey := pluginStoreManifestKey(root, platform, manifest)
-		if errKey != nil {
-			return errKey
-		}
-		if r.pluginStoreArtifactCurrent(root, manifest, syncKey) {
+		if catalog && manifest.ID != id {
 			continue
 		}
-		result, errInstall := r.installPluginStoreManifest(ctx, client, manifest, root, platform)
-		if errInstall != nil {
-			return errInstall
+		var errSync error
+		if errAuth != nil {
+			errSync = fmt.Errorf("home plugins: resolve store auth: %w", errAuth)
+		} else {
+			errSync = r.syncPluginStoreManifest(ctx, client, manifest, root, platform)
 		}
-		if errMark := r.markPluginStoreSynced(root, manifest, syncKey, result); errMark != nil {
-			return errMark
+		if errSync == nil {
+			continue
 		}
+		if !catalog {
+			return errSync
+		}
+		log.WithError(errSync).WithField("plugin_id", id).Warn("ACP plugin unavailable in Home runtime")
 	}
 	return nil
+}
+
+func (r *Runtime) syncPluginStoreManifest(ctx context.Context, client pluginstore.Client, manifest pluginstore.Manifest, root string, platform PluginPlatform) error {
+	syncKey, errKey := pluginStoreManifestKey(root, platform, manifest)
+	if errKey != nil {
+		return errKey
+	}
+	if r.pluginStoreArtifactCurrent(root, manifest, syncKey) {
+		return nil
+	}
+	result, errInstall := r.installPluginStoreManifest(ctx, client, manifest, root, platform)
+	if errInstall != nil {
+		return errInstall
+	}
+	return r.markPluginStoreSynced(root, manifest, syncKey, result)
 }
 
 func (r *Runtime) installPluginStoreManifest(ctx context.Context, client pluginstore.Client, manifest pluginstore.Manifest, root string, platform PluginPlatform) (pluginstore.InstallResult, error) {
@@ -152,19 +170,27 @@ func pluginRootFromConfigDir(root string) string {
 	return root
 }
 
-func (r *Runtime) deleteRemovedPluginArtifacts(ctx context.Context, oldCfg *config.Config, newCfg *config.Config) {
-	_ = ctx
-	if r == nil || oldCfg == nil {
+// Reconcile catalogs after publication so a failed config reload cannot prewarm
+// or prune files for a configuration that never took effect.
+func (r *Runtime) reconcilePluginArtifacts(ctx context.Context, oldCfg *config.Config, newCfg *config.Config) {
+	if r == nil {
 		return
+	}
+	if _, _, errCatalog := r.observeLocalExecutorCatalogs(ctx); errCatalog != nil {
+		log.WithError(errCatalog).Warn("refresh ACP plugin catalogs")
+	} else {
+		if newCfg != nil {
+			r.pruneLocalExecutorArtifacts(newCfg.Plugins.Dir)
+		}
+		if oldCfg != nil && (newCfg == nil || pluginRootFromConfigDir(oldCfg.Plugins.Dir) != pluginRootFromConfigDir(newCfg.Plugins.Dir)) {
+			r.pruneLocalExecutorArtifacts(oldCfg.Plugins.Dir)
+		}
 	}
 	removed := removedHomeLoadedStorePluginIDs(oldCfg, newCfg)
 	if len(removed) == 0 {
 		return
 	}
-	root := strings.TrimSpace(oldCfg.Plugins.Dir)
-	if root == "" {
-		root = "plugins"
-	}
+	root := pluginRootFromConfigDir(oldCfg.Plugins.Dir)
 	for _, id := range removed {
 		path, deleted, errDelete := r.deletePluginArtifact(root, id)
 		if errDelete != nil {

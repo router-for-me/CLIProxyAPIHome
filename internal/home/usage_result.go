@@ -36,6 +36,9 @@ func (r *Runtime) recordUsagePayload(ctx context.Context, payload string, skipRe
 	if payload == "" || !gjson.Valid(payload) {
 		return fmt.Errorf("invalid usage json")
 	}
+	if IsLocalExecutorUsage(gjson.Get(payload, "provider").String(), gjson.Get(payload, "executor_type").String(), gjson.Get(payload, "auth_id").String(), gjson.Get(payload, "alias").String()) {
+		return nil
+	}
 
 	authIndex := strings.TrimSpace(gjson.Get(payload, "auth_index").String())
 	if authIndex == "" {

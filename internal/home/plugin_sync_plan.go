@@ -125,6 +125,24 @@ func (r *Runtime) buildPluginSyncPlan(ctx context.Context, request pluginstore.P
 func buildPluginSyncItem(ctx context.Context, httpClient pluginstore.HTTPDoer, manifest pluginstore.Manifest, goos, goarch string, rules []pluginstore.ResolvedAuthConfig) (pluginstore.Manifest, []pluginstore.ResolvedAuthConfig, error) {
 	switch manifest.InstallType() {
 	case pluginstore.InstallTypeDirect:
+		if len(manifest.Install.Artifacts) == 0 {
+			// Older store installations pinned the registry URL and version only.
+			source := pluginstore.Source{URL: manifest.SourceURL}
+			client := pluginstore.NewClientWithResolvedAuth(httpClient, source.URL, rules)
+			store, errFetch := client.FetchRegistry(ctx)
+			if errFetch != nil {
+				return pluginstore.Manifest{}, nil, fmt.Errorf("fetch direct install source: %w", errFetch)
+			}
+			plugin, found := store.PluginByID(manifest.ID)
+			if !found || pluginstore.PluginInstallType(plugin) != pluginstore.InstallTypeDirect {
+				return pluginstore.Manifest{}, nil, fmt.Errorf("direct plugin %q not found in source", manifest.ID)
+			}
+			pinned, errPin := DirectPluginStoreManifest(source, plugin, manifest.Version)
+			if errPin != nil {
+				return pluginstore.Manifest{}, nil, errPin
+			}
+			manifest.Install = pinned.Install
+		}
 		artifact, errArtifact := pluginstore.SelectArtifact(manifest.Install, goos, goarch)
 		if errArtifact != nil {
 			return pluginstore.Manifest{}, nil, errArtifact
@@ -140,6 +158,39 @@ func buildPluginSyncItem(ctx context.Context, httpClient pluginstore.HTTPDoer, m
 	default:
 		return pluginstore.Manifest{}, nil, fmt.Errorf("unsupported install type %q", manifest.Install.Type)
 	}
+}
+
+// DirectPluginStoreManifest pins the requested registry version and its platform artifacts.
+func DirectPluginStoreManifest(source pluginstore.Source, plugin pluginstore.Plugin, requestedVersion string) (pluginstore.Manifest, error) {
+	version := NormalizePluginStoreVersion(requestedVersion)
+	if version == "" {
+		version = NormalizePluginStoreVersion(plugin.Version)
+	}
+	if NormalizePluginStoreVersion(plugin.Version) == version {
+		plugin.Version = version
+		return pluginstore.ManifestFromPlugin(source, plugin)
+	}
+	for _, candidate := range plugin.Versions {
+		if NormalizePluginStoreVersion(candidate.Version) != version {
+			continue
+		}
+		plugin.Version = version
+		plugin.Install = candidate.Install
+		if strings.TrimSpace(plugin.Install.Type) == "" {
+			plugin.Install.Type = pluginstore.InstallTypeDirect
+		}
+		return pluginstore.ManifestFromPlugin(source, plugin)
+	}
+	return pluginstore.Manifest{}, fmt.Errorf("direct plugin version %q not found", version)
+}
+
+// NormalizePluginStoreVersion accepts either spelling of a version tag.
+func NormalizePluginStoreVersion(version string) string {
+	version = strings.TrimSpace(version)
+	if strings.HasPrefix(strings.ToLower(version), "v") {
+		return strings.TrimSpace(version[1:])
+	}
+	return version
 }
 
 func buildGitHubPluginSyncItem(ctx context.Context, httpClient pluginstore.HTTPDoer, manifest pluginstore.Manifest, goos, goarch string, rules []pluginstore.ResolvedAuthConfig) (pluginstore.Manifest, []pluginstore.ResolvedAuthConfig, error) {

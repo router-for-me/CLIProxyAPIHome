@@ -42,6 +42,9 @@ func TestSyncPluginStoreManifestsInstallsCurrentPlatformArtifact(t *testing.T) {
 	defer restore()
 
 	rt := &Runtime{}
+	rt.SetPluginSyncConfigLoader(func(context.Context) (*config.Config, error) {
+		return nil, errors.New("catalog configuration unavailable")
+	})
 	cfg := &config.Config{
 		Plugins: config.PluginsConfig{
 			Enabled: true,
@@ -397,7 +400,10 @@ func TestDeleteRemovedPluginArtifactsRemovesCurrentPlatformFile(t *testing.T) {
 	}
 
 	rt := &Runtime{}
-	rt.deleteRemovedPluginArtifacts(context.Background(), homeLoadedPluginSyncTestConfig(t, root), &config.Config{
+	rt.SetPluginSyncConfigLoader(func(context.Context) (*config.Config, error) {
+		return nil, errors.New("catalog configuration unavailable")
+	})
+	rt.reconcilePluginArtifacts(context.Background(), homeLoadedPluginSyncTestConfig(t, root), &config.Config{
 		Plugins: config.PluginsConfig{
 			Enabled: true,
 			Dir:     root,
@@ -430,7 +436,7 @@ func TestDeleteRemovedPluginArtifactsRemovesHomeArtifactWhenLoadInHomeDisabled(t
 	}
 
 	rt := &Runtime{}
-	rt.deleteRemovedPluginArtifacts(context.Background(), homeLoadedPluginSyncTestConfig(t, root), homePluginSyncTestConfig(t, root))
+	rt.reconcilePluginArtifacts(context.Background(), homeLoadedPluginSyncTestConfig(t, root), homePluginSyncTestConfig(t, root))
 
 	for _, target := range targets {
 		if _, errStat := os.Stat(target); !os.IsNotExist(errStat) {

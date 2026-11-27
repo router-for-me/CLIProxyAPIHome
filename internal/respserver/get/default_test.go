@@ -18,7 +18,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func newGetTestRuntime(t *testing.T) *home.Runtime {
+func newGetTestRuntime(t *testing.T) (*home.Runtime, *cluster.Repository) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -43,12 +43,13 @@ func newGetTestRuntime(t *testing.T) *home.Runtime {
 	if errRuntime != nil {
 		t.Fatalf("NewRuntime() error = %v", errRuntime)
 	}
-	rt.SetClusterAdapter(cluster.NewRuntimeAdapter(cluster.NewRepository(db), ""))
-	return rt
+	repo := cluster.NewRepository(db)
+	rt.SetClusterAdapter(cluster.NewRuntimeAdapter(repo, ""))
+	return rt, repo
 }
 
 func TestHandleDefaultGETPlainKeyUsesKV(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	if written, errSet := rt.KVSet(context.Background(), "plain:key", []byte("value"), 0, ""); errSet != nil || !written {
 		t.Fatalf("KVSet() = %v, %v, want true, nil", written, errSet)
 	}
@@ -60,7 +61,7 @@ func TestHandleDefaultGETPlainKeyUsesKV(t *testing.T) {
 }
 
 func TestHandleDefaultGETPlainKeyMissingReturnsNullBulk(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	reply := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", "missing"})
 	if reply.Kind != dispatch.ReplyKindBulkString || reply.BulkString != nil {
 		t.Fatalf("handleDefault(GET missing) = %#v, want null bulk", reply)
@@ -68,7 +69,7 @@ func TestHandleDefaultGETPlainKeyMissingReturnsNullBulk(t *testing.T) {
 }
 
 func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	rt.SetClusterRefreshHandler(func(ctx context.Context, authIndex, observedAccessTokenSHA256 string) ([]byte, error) {
 		if authIndex != "auth-1" {
 			t.Fatalf("authIndex = %q, want auth-1", authIndex)
@@ -86,7 +87,7 @@ func TestHandleDefaultGETRefreshJSONCompatibility(t *testing.T) {
 }
 
 func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	rt.SetClusterRefreshHandler(func(context.Context, string, string) ([]byte, error) {
 		return nil, &coreauth.Error{
 			Code:       "authentication_error",
@@ -115,7 +116,7 @@ func TestHandleDefaultGETRefreshPreservesAuthenticationError(t *testing.T) {
 }
 
 func TestHandleDefaultGETRefreshUsesGenericTransientInfrastructureError(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	rt.SetClusterRefreshHandler(func(context.Context, string, string) ([]byte, error) {
 		return nil, errors.New("database unavailable: provider-secret")
 	})
@@ -133,7 +134,7 @@ func TestHandleDefaultGETRefreshUsesGenericTransientInfrastructureError(t *testi
 }
 
 func TestHandleDefaultGETRefreshPreservesUpstreamResponse(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	tests := []struct {
 		name   string
 		status int
@@ -182,7 +183,7 @@ func TestHandleDefaultGETRefreshPreservesUpstreamResponse(t *testing.T) {
 }
 
 func TestHandleDefaultGETJSONErrorsRemainJSON(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 
 	unsupported := handleDefault(context.Background(), dispatch.Env{Runtime: rt}, []string{"GET", `{"type":"unknown"}`})
 	if unsupported.Kind != dispatch.ReplyKindBulkString || !strings.Contains(strings.ToLower(gjson.GetBytes(unsupported.BulkString, "error.message").String()), "unsupported") {
@@ -198,7 +199,7 @@ func TestHandleDefaultGETJSONErrorsRemainJSON(t *testing.T) {
 func TestHandleDefaultModelsRejectsBadCredentials(t *testing.T) {
 	// The models branch must route through AuthenticateHTTPRequest, so requests
 	// without a valid credential surface an auth error instead of model data.
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 
 	cases := []struct {
 		name      string

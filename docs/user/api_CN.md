@@ -896,6 +896,8 @@ Authorization: Bearer user.jwt.token
 
 `status` 为 `insufficient_data` 时不返回可用率、延迟与吞吐。客户端必须渲染为"数据不足"，绝不能渲染为完全可用。该汇总是集群级的模型健康度，在进程内做短时缓存，不包含任何单个用户的请求数据。
 
+已发布的 ACP 路由使用插件 ID 作为计价 provider。匹配精度相同的规则时，完整注册模型 ID 优先于带 `acp/` 的公开 ID。每个服务档位的价格阶梯都包含实际生效的回退价格，包括输入长度未达到高优先级规则门槛的情况。可用率按公开 ID 汇总本地 ACP 调用，包括带推理后缀的请求。
+
 ## Billing
 
 用户计费路由位于 `/user` 基础路径下，因此完整路径是 `/user/billing/overview` 和 `/user/billing/charges`。两个路由都需要 `/user/register` 或 `/user/login` 返回的现有 Bearer token，响应只包含当前认证 Bearer 用户的数据。

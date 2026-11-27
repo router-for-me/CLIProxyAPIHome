@@ -62,6 +62,67 @@ plugins:
 	}
 }
 
+func TestBuildPluginSyncPlanResolvesLegacyDirectVersion(t *testing.T) {
+	const sourceURL = "https://store.example/registry.json"
+	const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const registryJSON = `{"schema_version":2,"plugins":[{"id":"legacy","name":"Legacy","author":"test","description":"test",
+		"version":"2.0.0","install":{"type":"direct","artifacts":[{"goos":"linux","goarch":"amd64","url":"https://files.example/v2.zip","sha256":"` + checksum + `"}]},
+		"versions":[{"version":"1.0.0","install":{"type":"direct","artifacts":[{"goos":"linux","goarch":"amd64","url":"https://files.example/v1.zip","sha256":"` + checksum + `"}]}}]}]}`
+	for _, tt := range []struct{ version, archive string }{
+		{"v1.0.0", "v1.zip"}, {"2.0.0", "v2.zip"}, {"0.5.0", ""},
+	} {
+		t.Run(tt.version, func(t *testing.T) {
+			rt := pluginSyncPlanRuntime(t, fmt.Sprintf(`
+plugins:
+  enabled: true
+  configs:
+    current:
+      enabled: true
+      store: {id: current, version: 1.0.0, install: {type: direct, artifacts: [{goos: linux, goarch: amd64, url: "https://public.example/new.zip", sha256: "%s"}]}}
+    legacy:
+      enabled: true
+      store: {schema-version: 2, id: legacy, version: %s, source-url: "%s", install: {type: direct}}
+`, checksum, tt.version, sourceURL))
+			client := &pluginSyncPlanHTTPClient{responses: map[string]pluginSyncPlanHTTPResponse{
+				sourceURL: {body: registryJSON, wantAuth: "Bearer registry-only"},
+			}}
+			rt.pluginSyncHTTPClient = client
+			rt.SetPluginStoreAuthResolver(func(context.Context) ([]pluginstore.ResolvedAuthConfig, error) {
+				return []pluginstore.ResolvedAuthConfig{
+					{Match: sourceURL, ApplyTo: []string{pluginstore.RequestKindRegistry}, Type: pluginstore.AuthTypeBearer, Token: pluginstore.Secret("registry-only")},
+					{Match: "https://files.example/", ApplyTo: []string{pluginstore.RequestKindArtifact}, Type: pluginstore.AuthTypeBearer, Token: pluginstore.Secret("artifact-only")},
+				}, nil
+			})
+			req := pluginstore.PluginSyncRequest{SchemaVersion: pluginstore.PluginSyncSchemaVersion, GOOS: "linux", GOARCH: "amd64"}
+			plan, errPlan := rt.BuildPluginSyncPlan(t.Context(), req)
+			defer plan.Clear()
+			if tt.archive == "" {
+				if errPlan == nil || len(plan.Items) != 0 {
+					t.Fatal("a missing pinned version must fail the plan")
+				}
+			} else {
+				if errPlan != nil || len(plan.Items) != 2 || plan.Items[0].Manifest.ID != "current" {
+					t.Fatalf("mixed plan has %d items, error %v", len(plan.Items), errPlan)
+				}
+				item := plan.Items[1]
+				files := item.Manifest.Install.Artifacts
+				if item.Manifest.ID != "legacy" || item.Manifest.Version != tt.version || len(files) != 1 ||
+					files[0].URL != "https://files.example/"+tt.archive || files[0].SHA256 != checksum ||
+					len(item.Auth) != 1 || string(item.Auth[0].Token) != "artifact-only" {
+					t.Fatal("legacy plan did not pin the requested artifact and its own download credentials")
+				}
+			}
+			clear(client.authorization)
+			req.InstalledVersions = map[string]string{"legacy": tt.version}
+			skipped, errSkip := rt.BuildPluginSyncPlan(t.Context(), req)
+			defer skipped.Clear()
+			if errSkip != nil || len(skipped.Items) != 1 || len(client.authorization) != 0 {
+				t.Fatalf("installed legacy version: items=%d requests=%d error=%v", len(skipped.Items), len(client.authorization), errSkip)
+			}
+		})
+	}
+}
+
 func TestBuildPluginSyncPlanUsesSemanticVersionEquality(t *testing.T) {
 	runtime := pluginSyncPlanRuntime(t, `
 plugins:

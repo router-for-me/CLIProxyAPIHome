@@ -43,7 +43,19 @@ func (h *Handler) PreviewBillingModelPriceImport(c *gin.Context) {
 	ctx, cancel := h.requestContext(c)
 	defer cancel()
 	if body.AutoDiscover && len(body.Targets) == 0 {
-		discovered, errDiscover := h.repo.DiscoverBillingImportTargets(ctx, h.billingImportRegistryTargets)
+		routes, _, errRoutes := h.runtime.LocalExecutorRoutes(ctx, "")
+		if errRoutes != nil {
+			respondError(c, http.StatusInternalServerError, "billing_import_preview_failed", errRoutes)
+			return
+		}
+		discovered, errDiscover := h.repo.DiscoverBillingImportTargets(ctx, func(yield func(string, string) bool) {
+			for _, route := range routes {
+				if !yield(route.Plugin, route.Model.SourceModelID) {
+					return
+				}
+			}
+			h.billingImportRegistryTargets(yield)
+		})
 		if errors.Is(errDiscover, cluster.ErrBillingImportTargetLimitExceeded) {
 			respondError(c, http.StatusUnprocessableEntity, "import_target_limit_exceeded", errDiscover)
 			return

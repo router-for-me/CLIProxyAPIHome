@@ -747,7 +747,13 @@ Home 在数据库和下发配置中保留兼容的
 
 ## Plugin Store
 
-插件商店接口用于列出 registry 中的插件，并把选中的插件写入数据库驱动的 Home 配置。安装接口写入的是 `plugins.configs.<pluginID>.store` 固定 manifest。GitHub release 安装会固定 repository、version 和 release tag；direct 安装会固定 version 和来源 registry URL，Home-mode CPA 节点随后在应用配置时从该 registry 解析当前平台的 artifact URL 与 SHA-256。通过 store 安装的插件默认不会被 Home 进程下载或加载；只有可信的 provider/auth 插件确实需要在 Home 内运行时，才显式设置 `plugins.configs.<pluginID>.load-in-home: true`。
+插件商店接口用于列出 registry 中的插件，并把选中的插件写入数据库驱动的 Home 配置。安装接口将固定版本的 manifest 写入 `plugins.configs.<pluginID>.store`。GitHub release 安装固定 repository、version 和 release tag。direct 安装固定版本、来源 registry URL 以及各平台的文件地址和 SHA-256。如果旧版 direct 清单只保存了版本和来源地址，CPA 请求同步时，Home 会从该来源解析固定版本，并返回对应平台的文件。通过商店安装的 provider/auth 插件若需在 Home 运行时执行，使用 `plugins.configs.<pluginID>.load-in-home: true`。ACP 目录读取使用短生命周期的子进程。
+
+已启用的 ACP 插件在安装版本存在目录时，会在可用模型列表中发布 `acp/<完整注册 ID>`。所有 CPA 使用 Home 解析出的同一份目录。同名凭证模型和显式别名优先。多个 ACP 插件注册相同 ID 时，选择 `priority` 最大的插件，同值按插件 ID 升序选择。收到请求的 CPA 使用本机账号状态执行选定插件，传入插件注册的完整模型 ID。
+
+Home 通过插件的静态模型接口，从商店固定版本的插件包读取模型定义和注册 ID。发布 ACP 模型要求商店条目带有 `ACP` 标签。插件需要在无登录账号时返回静态目录，并提供适用于 Home 平台的原生产物。通过 `PATCH /config/plugins/configs/<插件ID>` 修改插件配置。停用插件会撤回路由并保留固定版本的目录文件。升级或卸载插件后，Home 会在目录读取结束后清理本机平台已过期的目录文件。
+
+Home 会为每个目录子进程设置 `CLIPROXY_PLUGIN_MODE=catalog`。支持此模式的插件在注册时向当前工作目录的 `catalog-v1.ready` 写入单个字符 `1`，末尾不加换行。第一个子进程读取插件在 `Metadata.ConfigFields` 中声明的字段名，第二个子进程收到这些字段对应的配置值，再读取静态模型。两个子进程各用一个新的工作目录，插件需要分别写入回执。没有回执的插件仅在配置中只有宿主字段时才能发布默认目录。Home 独立加载各插件，目录就绪后即可发布其中的模型。
 
 ### GET `/plugins/store`
 
@@ -818,7 +824,7 @@ Home 在数据库和下发配置中保留兼容的
 
 ### POST `/plugins/store/:id/install`
 
-从 registry 条目安装插件配置 manifest。如果多个来源包含同一插件 ID，传入 `?source=<source_id>` 指定来源。`github-release` 条目默认安装 GitHub 最新 release；传入 `version` 可固定安装指定 release tag，例如 `1.0.3` 或 `v1.0.3`。`direct` 条目会写入 source-backed v2 manifest；如果传入 `version`，必须匹配 registry 条目的顶层版本或 `versions[]` 中的某个版本。
+从 registry 条目安装插件配置 manifest。如果多个来源包含同一插件 ID，传入 `?source=<source_id>` 指定来源。`github-release` 条目默认安装 GitHub 最新 release。传入 `version` 可固定安装指定 release tag，例如 `1.0.3` 或 `v1.0.3`。`direct` 条目将所选版本的各平台文件写入 v2 manifest。传入的 `version` 必须匹配 registry 条目的顶层版本或 `versions[]` 中的某个版本。
 
 输入 body：可选 JSON。
 
@@ -1875,7 +1881,7 @@ OpenAI 规定未传 `service_tier` 时为 `auto`；`auto` 是 Home 的内部表�
 
 OpenRouter 时段定价表达式的每个分支均保留图片/音频、思考及缓存写入 TTL token 单价。可选 token 单价未设置时使用父桶单价，显式为零时保持免费；即使其他分支配置了同一细分维度，也不会漏计。
 
-创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照（或直接解析请求体中的可选 `catalog_json`）；客户端提供 `targets`（或设 `auto_discover: true` 合并已有用量与价格规则中的模型 ID、Copilot/Devin 静态目录以及其余可用路由按凭证解析出的计价 ID，其中包括 Devin 插件路由和旧版注册路由）、匹配策略、别名、行倍率和可选的来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
+创建服务端的不可变模型价格导入预览，支持 `source` 为 `"models.dev"`、`"openrouter"`、`"litellm"` 或 `"auto"`。服务端拉取并固定来源快照，也可以直接解析请求中的 `catalog_json`。客户端可提供 `targets` 或设置 `auto_discover: true`。自动发现会合并已有用量与价格规则、Copilot 和 Devin 静态目录、按凭证解析出的计价 ID（含 Devin 插件路由和旧版注册路由），以及已发布的 ACP 路由。ACP 计价目标使用插件 ID 作为 provider，模型名使用完整注册 ID，首次调用前即可导入。客户端还可指定匹配策略、别名、行倍率及来源匹配覆盖。客户端可控的输入无效时返回 `422 invalid_import_preview`，目录拉取失败时返回 `502 models_dev_fetch_failed`，内部 preview 持久化失败时返回 `500 billing_import_preview_failed`。成功响应包含 `preview_id`、`preview_revision`、来源信息、`generated_at`、`expires_at`、明确的 `atomic: true`、行和精确汇总。
 
 自动发现合并各来源后最多接受 10,000 个不同的目标。超出上限时，Home 会在拉取定价目录前返回 `422 import_target_limit_exceeded`，不创建预览。此时可显式提供 `targets` 分批导入。
 

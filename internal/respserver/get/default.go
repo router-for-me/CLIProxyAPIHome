@@ -49,7 +49,7 @@ func handleDefault(ctx context.Context, env dispatch.Env, args []string) dispatc
 	typeValue := strings.ToLower(strings.TrimSpace(gjson.Get(jsonArg, "type").String()))
 
 	switch typeValue {
-	case "models":
+	case "models", "local-plugin-dispatch":
 		return handleDefaultModels(ctx, env, jsonArg)
 	case "refresh":
 		return handleDefaultRefresh(ctx, env, jsonArg)
@@ -80,7 +80,14 @@ func handleDefaultModels(ctx context.Context, env dispatch.Env, jsonArg string) 
 		return dispatch.BulkString([]byte(buildAuthErrorJSON(access.NewInternalAuthError("Model access service error", errPolicy))))
 	}
 
-	payload, errBuild := buildModelsJSON(env, policy)
+	if strings.EqualFold(strings.TrimSpace(gjson.Get(jsonArg, "type").String()), "local-plugin-dispatch") {
+		return handleLocalExecutorDispatch(ctx, env, policy, authResult, gjson.Get(jsonArg, "model").String())
+	}
+	routes, _, errRoutes := env.Runtime.LocalExecutorRoutes(ctx, "")
+	if errRoutes != nil {
+		return dispatch.BulkString([]byte(buildErrorJSON(homeerrors.MessageError)))
+	}
+	payload, errBuild := buildModelsJSON(env, policy, routes)
 	if errBuild != nil {
 		return dispatch.BulkString([]byte(buildErrorJSON(errBuild.Error())))
 	}

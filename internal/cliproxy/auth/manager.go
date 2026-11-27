@@ -950,6 +950,14 @@ func (m *Manager) List() []*Auth {
 	return out
 }
 
+// CredentialEnabled checks routing eligibility without copying the credential.
+func (m *Manager) CredentialEnabled(id string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	a := m.auths[id]
+	return a != nil && !a.Disabled && a.Status != StatusDisabled
+}
+
 // ListByProvider returns snapshots only for credentials from the specified provider.
 func (m *Manager) ListByProvider(provider string) []*Auth {
 	if m == nil {
