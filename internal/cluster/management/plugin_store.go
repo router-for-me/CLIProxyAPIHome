@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	appconfig "github.com/router-for-me/CLIProxyAPIHome/internal/config"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/node"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/util"
 	"gopkg.in/yaml.v3"
@@ -303,7 +304,7 @@ func (h *Handler) InstallPluginFromStore(c *gin.Context) {
 func pluginStoreInstallManifest(ctx context.Context, client pluginstore.Client, source pluginstore.Source, plugin pluginstore.Plugin, requestedVersion string) (pluginstore.Manifest, string, error) {
 	switch pluginstore.PluginInstallType(plugin) {
 	case pluginstore.InstallTypeDirect:
-		manifest, errManifest := pluginStoreDirectManifest(source, plugin, requestedVersion)
+		manifest, errManifest := home.DirectPluginStoreManifest(source, plugin, requestedVersion)
 		if errManifest != nil {
 			return pluginstore.Manifest{}, "plugin_manifest_invalid", errManifest
 		}
@@ -321,29 +322,6 @@ func pluginStoreInstallManifest(ctx context.Context, client pluginstore.Client, 
 	default:
 		return pluginstore.Manifest{}, "plugin_manifest_invalid", fmt.Errorf("unsupported install type %q", plugin.Install.Type)
 	}
-}
-
-func pluginStoreDirectManifest(source pluginstore.Source, plugin pluginstore.Plugin, requestedVersion string) (pluginstore.Manifest, error) {
-	version := normalizePluginStoreRequestedVersion(requestedVersion)
-	if version == "" {
-		version = normalizePluginStoreRequestedVersion(plugin.Version)
-	}
-	if normalizePluginStoreRequestedVersion(plugin.Version) == version {
-		plugin.Version = version
-		return pluginstore.ManifestFromPlugin(source, plugin)
-	}
-	for _, candidate := range plugin.Versions {
-		if normalizePluginStoreRequestedVersion(candidate.Version) != version {
-			continue
-		}
-		plugin.Version = version
-		plugin.Install = candidate.Install
-		if strings.TrimSpace(plugin.Install.Type) == "" {
-			plugin.Install.Type = pluginstore.InstallTypeDirect
-		}
-		return pluginstore.ManifestFromPlugin(source, plugin)
-	}
-	return pluginstore.Manifest{}, fmt.Errorf("direct plugin version %q not found", version)
 }
 
 func pluginInstallRequestedVersion(c *gin.Context) (string, error) {
@@ -366,7 +344,7 @@ func pluginInstallRequestedVersion(c *gin.Context) (string, error) {
 	if requestedVersion == "" {
 		return bodyVersion, nil
 	}
-	if bodyVersion == "" || normalizePluginStoreRequestedVersion(bodyVersion) == normalizePluginStoreRequestedVersion(requestedVersion) {
+	if bodyVersion == "" || home.NormalizePluginStoreVersion(bodyVersion) == home.NormalizePluginStoreVersion(requestedVersion) {
 		return requestedVersion, nil
 	}
 	return "", fmt.Errorf("version query %q does not match request body version %q", requestedVersion, bodyVersion)
@@ -398,14 +376,6 @@ func pluginStoreReleaseTagCandidates(version string) []string {
 		return []string{version, strings.TrimSpace(version[1:])}
 	}
 	return []string{version, "v" + version}
-}
-
-func normalizePluginStoreRequestedVersion(version string) string {
-	version = strings.TrimSpace(version)
-	if strings.HasPrefix(strings.ToLower(version), "v") {
-		return strings.TrimSpace(version[1:])
-	}
-	return version
 }
 
 func (h *Handler) pluginStoreRequestContext(c *gin.Context) (context.Context, context.CancelFunc) {

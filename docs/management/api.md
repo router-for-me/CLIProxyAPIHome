@@ -748,7 +748,7 @@ Example response:
 
 ## Plugin Store
 
-Plugin store routes list registry entries and install a selected plugin into the DB-backed Home config. Install writes `plugins.configs.<pluginID>.store` with a pinned manifest. GitHub-release installs pin the repository, version, and exact release tag; direct installs pin the version and source registry URL, then Home-mode CPA nodes resolve the current-platform artifact URL and SHA-256 from that registry during runtime config application. Running store-installed provider/auth plugins in the Home runtime requires `plugins.configs.<pluginID>.load-in-home: true`. ACP catalog reads use a short-lived subprocess.
+Plugin store routes list registry entries and install a selected plugin into the DB-backed Home config. Install writes a pinned manifest at `plugins.configs.<pluginID>.store`. GitHub-release installs pin the repository, version, and exact release tag. Direct installs pin the version, registry URL, and platform artifact URLs and SHA-256 checksums. For older direct manifests that contain only a version and registry URL, Home resolves that exact version when a CPA requests its platform's artifact. Running store-installed provider/auth plugins in the Home runtime requires `plugins.configs.<pluginID>.load-in-home: true`. ACP catalog reads use a short-lived subprocess.
 
 An enabled ACP plugin with a catalog for its installed version publishes `acp/<registered-model-id>` in the available model lists. Home resolves the same public IDs for every CPA. A credential model or explicit alias has precedence over the same public ID. Among ACP plugins registering the same ID, the greatest configured `priority` wins, with plugin ID in ascending order as the tie-breaker. The serving CPA executes the selected plugin using the original registered model ID and its own local account state.
 
@@ -825,7 +825,7 @@ Common errors:
 
 ### POST `/plugins/store/:id/install`
 
-Installs a plugin config manifest from a registry entry. If multiple configured sources contain the same plugin ID, pass `?source=<source_id>`. `github-release` entries install the latest GitHub release by default; pass `version` to pin a specific release tag such as `1.0.3` or `v1.0.3`. `direct` entries write a source-backed v2 manifest; when `version` is supplied it must match either the registry entry version or an item in `versions[]`.
+Installs a plugin config manifest from a registry entry. If multiple configured sources contain the same plugin ID, pass `?source=<source_id>`. GitHub-release entries use the latest release by default. Pass `version` to pin a tag such as `1.0.3` or `v1.0.3`. Direct entries write a v2 manifest with the selected version's artifacts. A supplied `version` must match the registry entry version or an item in `versions[]`.
 
 Input body: optional JSON.
 

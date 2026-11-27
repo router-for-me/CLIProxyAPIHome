@@ -747,7 +747,7 @@ Home 在数据库和下发配置中保留兼容的
 
 ## Plugin Store
 
-插件商店接口用于列出 registry 中的插件，并把选中的插件写入数据库驱动的 Home 配置。安装接口写入的是 `plugins.configs.<pluginID>.store` 固定 manifest。GitHub release 安装会固定 repository、version 和 release tag；direct 安装会固定 version 和来源 registry URL，Home-mode CPA 节点随后在应用配置时从该 registry 解析当前平台的 artifact URL 与 SHA-256。通过商店安装的 provider/auth 插件若需在 Home 运行时执行，使用已有的 `plugins.configs.<pluginID>.load-in-home: true`。ACP 目录读取使用短生命周期的子进程。
+插件商店接口用于列出 registry 中的插件，并把选中的插件写入数据库驱动的 Home 配置。安装接口将固定版本的 manifest 写入 `plugins.configs.<pluginID>.store`。GitHub release 安装固定 repository、version 和 release tag。direct 安装固定版本、来源 registry URL 以及各平台的文件地址和 SHA-256。如果旧版 direct 清单只保存了版本和来源地址，CPA 请求同步时，Home 会从该来源解析固定版本，并返回对应平台的文件。通过商店安装的 provider/auth 插件若需在 Home 运行时执行，使用 `plugins.configs.<pluginID>.load-in-home: true`。ACP 目录读取使用短生命周期的子进程。
 
 已启用的 ACP 插件在安装版本存在目录时，会在可用模型列表中发布 `acp/<完整注册 ID>`。所有 CPA 使用 Home 解析出的同一份目录。同名凭证模型和显式别名优先。多个 ACP 插件注册相同 ID 时，选择 `priority` 最大的插件，同值按插件 ID 升序选择。收到请求的 CPA 使用本机账号状态执行选定插件，传入插件注册的完整模型 ID。
 
@@ -824,7 +824,7 @@ Home 会为每个目录子进程设置 `CLIPROXY_PLUGIN_MODE=catalog`。支持�
 
 ### POST `/plugins/store/:id/install`
 
-从 registry 条目安装插件配置 manifest。如果多个来源包含同一插件 ID，传入 `?source=<source_id>` 指定来源。`github-release` 条目默认安装 GitHub 最新 release；传入 `version` 可固定安装指定 release tag，例如 `1.0.3` 或 `v1.0.3`。`direct` 条目会写入 source-backed v2 manifest；如果传入 `version`，必须匹配 registry 条目的顶层版本或 `versions[]` 中的某个版本。
+从 registry 条目安装插件配置 manifest。如果多个来源包含同一插件 ID，传入 `?source=<source_id>` 指定来源。`github-release` 条目默认安装 GitHub 最新 release。传入 `version` 可固定安装指定 release tag，例如 `1.0.3` 或 `v1.0.3`。`direct` 条目将所选版本的各平台文件写入 v2 manifest。传入的 `version` 必须匹配 registry 条目的顶层版本或 `versions[]` 中的某个版本。
 
 输入 body：可选 JSON。
 
