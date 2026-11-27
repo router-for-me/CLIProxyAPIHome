@@ -179,6 +179,47 @@ store: {id: sample, tags: [ACP], version: 1.0.0, source-url: "https://example.in
 	})
 }
 
+func TestLocalExecutorCatalogCachedInput(t *testing.T) {
+	const settings = `enabled: true
+store: {id: sample, tags: [ACP], version: 1.0.0, source-url: https://store.example/registry.json, install: {type: direct}}
+ratio: !!float 0
+`
+	item := homePluginConfigFromYAML(t, settings)
+	cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{"sample": item}}}
+	rt := &Runtime{cfg: cfg}
+	rt.SetLocalExecutorCatalogLoader(func(context.Context, *config.Config, pluginstore.Manifest, []byte) ([]registry.ModelInfo, error) {
+		return []registry.ModelInfo{{ID: "model"}}, nil
+	})
+	read := func() *localExecutorCatalog {
+		t.Helper()
+		catalogs := rt.startLocalExecutorCatalogs(cfg)
+		if len(catalogs) != 1 {
+			t.Fatalf("read catalogs: count=%d", len(catalogs))
+		}
+		<-catalogs[0].ready
+		return catalogs[0]
+	}
+	first := read()
+	item = homePluginConfigFromYAML(t, "# different source location\n"+settings)
+	cfg.Plugins.Configs["sample"] = item
+	if read() != first {
+		t.Fatal("equivalent configuration restarted the catalog")
+	}
+	// The CPA digest encodes both as 0. The catalog worker also receives the YAML tag.
+	yamlMappingValue(&item.Raw, "ratio").Tag = "!!int"
+	changed := read()
+	if changed == first || changed.configDigest != first.configDigest {
+		t.Fatal("a changed scalar tag must reload the catalog even when the CPA digest is identical")
+	}
+	const manifest = "{id: sample, tags: [ACP], version: 1.0.0, source-url: https://store.example/registry.json, install: {type: direct}}"
+	cfg.Plugins.Configs["sample"] = homePluginConfigFromYAML(t, "enabled: true\nother: &manifest "+manifest+"\nstore: "+manifest)
+	read()
+	cfg.Plugins.Configs["sample"] = homePluginConfigFromYAML(t, "enabled: true\nother: &manifest "+manifest+"\nstore: *manifest")
+	if routes, _, errRoutes := rt.LocalExecutorRoutes(t.Context(), ""); errRoutes != nil || len(routes) != 0 {
+		t.Fatal("a warm cache accepted a store declaration that cold discovery would skip")
+	}
+}
+
 func BenchmarkLocalExecutorRoutesWithoutACP(b *testing.B) {
 	for _, count := range []int{0, 1000} {
 		b.Run(fmt.Sprintf("credentials_%d", count), func(b *testing.B) {
@@ -199,4 +240,43 @@ func BenchmarkLocalExecutorRoutesWithoutACP(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkLocalExecutorRoutesWithACP(b *testing.B) {
+	const native = "agy/gemini-3.8-flash"
+	const public = "acp/" + native
+	var item config.PluginInstanceConfig
+	if errParse := yaml.Unmarshal([]byte(`enabled: true
+model_prefix: agy/
+route_unprefixed_models: true
+store:
+  id: cpa-acp
+  version: 0.6.39
+  tags: [Provider, Executor, Management, ACP]
+  source-url: https://store.example/registry.json
+  install:
+    type: direct
+    artifacts:
+      - {goos: windows, goarch: amd64, url: https://store.example/plugin.zip, sha256: fbb39821c2f7a561f453935c044dd71ce32cf53c87da9fdeaae308e48e81c69e}
+`), &item); errParse != nil {
+		b.Fatal(errParse)
+	}
+	rt := &Runtime{cfg: &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{"cpa-acp": item}}}}
+	rt.SetLocalExecutorCatalogLoader(func(context.Context, *config.Config, pluginstore.Manifest, []byte) ([]registry.ModelInfo, error) {
+		return []registry.ModelInfo{{ID: native}}, nil
+	})
+	ctx := b.Context()
+	if routes, _, errRoutes := rt.LocalExecutorRoutes(ctx, public); errRoutes != nil || routes[public].Plugin != "cpa-acp" {
+		b.Fatalf("warm catalog: %v", errRoutes)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, _, errRoutes := rt.LocalExecutorRoutes(ctx, public); errRoutes != nil {
+				b.Error(errRoutes)
+				return
+			}
+		}
+	})
 }

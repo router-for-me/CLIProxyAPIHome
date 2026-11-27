@@ -73,7 +73,7 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 
 	routes := make(map[string]LocalExecutorRoute)
 	for _, plugin := range r.startLocalExecutorCatalogs(cfg) {
-		if !plugin.catalog.available(ctx) {
+		if !plugin.available(ctx) {
 			if errContext := ctx.Err(); errContext != nil {
 				return nil, nil, errContext
 			}
@@ -81,7 +81,7 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 		}
 		id := plugin.manifest.ID
 		version := normalizeDesiredPluginFileVersion(plugin.manifest.Version)
-		for _, model := range plugin.catalog.models {
+		for _, model := range plugin.models {
 			if model.ID == "" || strings.TrimSpace(model.ID) != model.ID {
 				continue
 			}
@@ -95,7 +95,7 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 			model.SourceModelID = model.ID
 			model.ID = public
 			model.Providers = []string{id}
-			routes[public] = LocalExecutorRoute{Plugin: id, Version: version, Model: model, ConfigDigest: plugin.catalog.configDigest}
+			routes[public] = LocalExecutorRoute{Plugin: id, Version: version, Model: model, ConfigDigest: plugin.configDigest}
 			if requestedModel != "" {
 				return routes, nil, nil
 			}

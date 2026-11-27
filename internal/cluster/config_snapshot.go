@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -15,16 +16,32 @@ import (
 	"gorm.io/gorm"
 )
 
-// LoadPluginSyncConfig reads the current store settings, route reservations and download proxy.
+type pluginSyncConfigSnapshot struct {
+	inputs map[string][sha256.Size]byte
+	config *appconfig.Config
+}
+
+// LoadPluginSyncConfig returns a read-only snapshot of the current store settings,
+// route reservations and download proxy. Every call checks the database for changes.
 func (r *Repository) LoadPluginSyncConfig(ctx context.Context) (*appconfig.Config, error) {
 	db, errDB := r.database()
 	if errDB != nil {
 		return nil, errDB
 	}
+	previous := r.pluginSyncConfig.Load()
 	var records []ConfigRecord
 	if errFind := db.WithContext(contextOrBackground(ctx)).Select("key", "value").
 		Where("key IN ?", []string{"plugins", "oauth-model-alias", "proxy-url"}).Find(&records).Error; errFind != nil {
 		return nil, errFind
+	}
+	// Compare the actual row contents so deletes and restores are visible even
+	// when a row version is reused. Do not retain unprojected store credentials.
+	inputs := make(map[string][sha256.Size]byte, len(records))
+	for _, record := range records {
+		inputs[record.Key] = sha256.Sum256(record.Value)
+	}
+	if cached := r.pluginSyncConfig.Load(); cached != nil && maps.Equal(cached.inputs, inputs) {
+		return cached.config, nil
 	}
 	root := make(map[string]any, len(records))
 	for _, record := range records {
@@ -38,7 +55,11 @@ func (r *Repository) LoadPluginSyncConfig(ctx context.Context) (*appconfig.Confi
 		return nil, errProject
 	}
 	cfg, _, errConfig := RuntimeConfigFromRoot(root)
-	return cfg, errConfig
+	if errConfig != nil {
+		return nil, errConfig
+	}
+	r.pluginSyncConfig.CompareAndSwap(previous, &pluginSyncConfigSnapshot{inputs: inputs, config: cfg})
+	return cfg, nil
 }
 
 // LoadConfigAsRuntimeConfig loads a config as runtime config.

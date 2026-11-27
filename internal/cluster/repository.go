@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
@@ -22,6 +23,7 @@ import (
 
 type Repository struct {
 	db                       *gorm.DB
+	pluginSyncConfig         atomic.Pointer[pluginSyncConfigSnapshot]
 	cpaSnapshotMu            sync.Mutex
 	sessionRootCacheMu       sync.RWMutex
 	sessionRootCache         map[string]string

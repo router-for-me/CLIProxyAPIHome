@@ -234,6 +234,16 @@ func TestLoadPluginSyncConfigReadsOnlyRoutingSettings(t *testing.T) {
 		cfg.OAuthModelAlias["gemini"][0].Alias != "acp/reserved" {
 		t.Fatal("missing plugin, alias or proxy configuration")
 	}
+	if cached, errCached := repo.LoadPluginSyncConfig(t.Context()); errCached != nil || cached != cfg {
+		t.Fatalf("unchanged routing rows did not reuse the decoded snapshot: %v", errCached)
+	}
+	if errDelete := db.Delete(&ConfigRecord{}, "key = ?", "proxy-url").Error; errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	withoutProxy, errReload := repo.LoadPluginSyncConfig(t.Context())
+	if errReload != nil || withoutProxy == cfg || withoutProxy.ProxyURL != "" || cfg.ProxyURL == "" {
+		t.Fatalf("proxy removal did not produce an independent snapshot: %v", errReload)
+	}
 	if errDisable := db.Model(&ConfigRecord{}).Where("key = ?", "plugins").Update("value", JSONB(`{"enabled":false}`)).Error; errDisable != nil {
 		t.Fatal(errDisable)
 	}

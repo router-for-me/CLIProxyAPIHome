@@ -2,6 +2,7 @@ package home
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -11,7 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,9 +36,11 @@ const (
 )
 
 type localExecutorCatalog struct {
+	manifest     pluginstore.Manifest
+	priority     int
+	pluginRoot   string
+	input        *yaml.Node
 	configDigest string
-	configKey    [sha256.Size]byte
-	artifactKey  string
 	ready        chan struct{}
 	waitUntil    time.Time
 	cancel       context.CancelFunc
@@ -70,18 +74,38 @@ func isLocalExecutorStoreConfig(item config.PluginInstanceConfig) bool {
 	return false
 }
 
-type installedLocalExecutor struct {
-	manifest pluginstore.Manifest
-	item     config.PluginInstanceConfig
-	catalog  *localExecutorCatalog
-}
-
-func (r *Runtime) startLocalExecutorCatalogs(cfg *config.Config) []installedLocalExecutor {
-	var plugins []installedLocalExecutor
+func (r *Runtime) startLocalExecutorCatalogs(cfg *config.Config) []*localExecutorCatalog {
+	r.localExecutorCatalogMu.Lock()
+	defer r.localExecutorCatalogMu.Unlock()
+	for id, catalog := range r.localExecutorCatalogs {
+		if cfg != nil && cfg.Plugins.Enabled && pluginConfigEnabled(cfg.Plugins.Configs[id]) {
+			continue
+		}
+		catalog.cancel()
+		delete(r.localExecutorCatalogs, id)
+	}
+	if cfg == nil || !cfg.Plugins.Enabled {
+		return nil
+	}
+	var plugins []*localExecutorCatalog
+	root := pluginRootFromConfigDir(cfg.Plugins.Dir)
 	// All new catalogs share one short first-read window, regardless of plugin count.
-	waitUntil := time.Now().Add(localExecutorCatalogFirstRead)
+	now := time.Now()
+	waitUntil := now.Add(localExecutorCatalogFirstRead)
 	for id, item := range cfg.Plugins.Configs {
-		if !pluginConfigEnabled(item) || !isLocalExecutorStoreConfig(item) {
+		if !pluginConfigEnabled(item) {
+			continue
+		}
+		if current := r.localExecutorCatalogs[id]; current != nil {
+			if current.pluginRoot == root && current.priority == item.Priority &&
+				(current.retryAt.IsZero() || now.Before(current.retryAt)) && matchesCatalogConfig(&item.Raw, current.input) {
+				plugins = append(plugins, current)
+				continue
+			}
+			current.cancel()
+			delete(r.localExecutorCatalogs, id)
+		}
+		if !isLocalExecutorStoreConfig(item) {
 			continue
 		}
 		manifest, installed, errManifest := storeManifestFromPluginConfig(id, item)
@@ -92,17 +116,13 @@ func (r *Runtime) startLocalExecutorCatalogs(cfg *config.Config) []installedLoca
 		if !installed || manifest.ID != id || normalizeDesiredPluginFileVersion(manifest.Version) == "" {
 			continue
 		}
-		catalog := r.startLocalExecutorCatalog(cfg, manifest, item, waitUntil)
+		catalog := r.startLocalExecutorCatalogLocked(cfg, manifest, item, root, waitUntil)
 		if catalog != nil {
-			plugins = append(plugins, installedLocalExecutor{manifest: manifest, item: item, catalog: catalog})
+			plugins = append(plugins, catalog)
 		}
 	}
-	sort.Slice(plugins, func(i, j int) bool {
-		left, right := plugins[i], plugins[j]
-		if left.item.Priority != right.item.Priority {
-			return left.item.Priority > right.item.Priority
-		}
-		return left.manifest.ID < right.manifest.ID
+	slices.SortFunc(plugins, func(left, right *localExecutorCatalog) int {
+		return cmp.Or(cmp.Compare(right.priority, left.priority), strings.Compare(left.manifest.ID, right.manifest.ID))
 	})
 	return plugins
 }
@@ -127,7 +147,7 @@ func (c *localExecutorCatalog) available(ctx context.Context) bool {
 	}
 }
 
-func (r *Runtime) startLocalExecutorCatalog(cfg *config.Config, manifest pluginstore.Manifest, item config.PluginInstanceConfig, waitUntil time.Time) *localExecutorCatalog {
+func (r *Runtime) startLocalExecutorCatalogLocked(cfg *config.Config, manifest pluginstore.Manifest, item config.PluginInstanceConfig, root string, waitUntil time.Time) *localExecutorCatalog {
 	values := map[string]any{}
 	if errDecode := item.Raw.Decode(&values); errDecode != nil {
 		log.WithField("plugin_id", manifest.ID).Warn("invalid ACP plugin configuration")
@@ -145,34 +165,22 @@ func (r *Runtime) startLocalExecutorCatalog(cfg *config.Config, manifest plugins
 		log.WithField("plugin_id", manifest.ID).Warn("cannot encode ACP plugin configuration")
 		return nil
 	}
-	digest := fmt.Sprintf("%x", sha256.Sum256(raw))
-	// The CPA digest uses canonical YAML. Preserve scalar tags in the catalog cache key.
-	original, errOriginal := yaml.Marshal(&item.Raw)
-	if errOriginal != nil {
-		log.WithField("plugin_id", manifest.ID).Warn("cannot encode ACP plugin configuration")
-		return nil
-	}
-	configKey := sha256.Sum256(original)
-	artifactKey, errKey := pluginStoreManifestKey(pluginRootFromConfigDir(cfg.Plugins.Dir), CurrentPluginPlatform(), manifest)
+	artifactKey, errKey := pluginStoreManifestKey(root, CurrentPluginPlatform(), manifest)
 	if errKey != nil {
 		log.WithError(errKey).WithField("plugin_id", manifest.ID).Warn("ACP catalog unavailable")
 		return nil
 	}
-	r.localExecutorCatalogMu.Lock()
-	defer r.localExecutorCatalogMu.Unlock()
-	if catalog := r.localExecutorCatalogs[manifest.ID]; catalog != nil && catalog.configDigest == digest &&
-		catalog.configKey == configKey && catalog.artifactKey == artifactKey &&
-		(catalog.retryAt.IsZero() || time.Now().Before(catalog.retryAt)) {
-		return catalog
-	}
-	if previous := r.localExecutorCatalogs[manifest.ID]; previous != nil {
-		previous.cancel()
-	}
 	// The installed configuration owns this worker across independent client requests.
 	loadCtx, cancel := context.WithTimeout(context.Background(), localExecutorCatalogTimeout)
 	catalog := &localExecutorCatalog{
-		configDigest: digest, configKey: configKey, artifactKey: artifactKey,
-		ready: make(chan struct{}), waitUntil: waitUntil, cancel: cancel,
+		manifest:     manifest,
+		priority:     item.Priority,
+		pluginRoot:   root,
+		input:        snapshotCatalogConfig(&item.Raw, make(map[*yaml.Node]*yaml.Node)),
+		configDigest: fmt.Sprintf("%x", sha256.Sum256(raw)),
+		ready:        make(chan struct{}),
+		waitUntil:    waitUntil,
+		cancel:       cancel,
 	}
 	if r.localExecutorCatalogs == nil {
 		r.localExecutorCatalogs = make(map[string]*localExecutorCatalog)
@@ -183,7 +191,7 @@ func (r *Runtime) startLocalExecutorCatalog(cfg *config.Config, manifest plugins
 		if loader := r.localExecutorCatalogLoader; loader != nil {
 			catalog.models, catalog.err = loader(loadCtx, cfg, manifest, raw)
 		} else {
-			catalog.models, catalog.err = r.readLocalExecutorCatalog(loadCtx, cfg, manifest, item, artifactKey)
+			catalog.models, catalog.err = r.readLocalExecutorCatalog(loadCtx, cfg, catalog, artifactKey)
 		}
 		if catalog.err == nil {
 			catalog.err = loadCtx.Err()
@@ -201,11 +209,11 @@ func (r *Runtime) startLocalExecutorCatalog(cfg *config.Config, manifest plugins
 	return catalog
 }
 
-func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Config, manifest pluginstore.Manifest, item config.PluginInstanceConfig, artifactKey string) ([]registry.ModelInfo, error) {
+func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Config, catalog *localExecutorCatalog, artifactKey string) ([]registry.ModelInfo, error) {
 	platform := CurrentPluginPlatform()
-	root := pluginRootFromConfigDir(cfg.Plugins.Dir)
+	manifest := catalog.manifest
 	// Each pinned artifact gets its own directory outside Home runtime discovery.
-	root, errRoot := filepath.Abs(filepath.Join(root, ".acp-catalog", artifactKey))
+	root, errRoot := filepath.Abs(filepath.Join(catalog.pluginRoot, ".acp-catalog", artifactKey))
 	if errRoot != nil {
 		return nil, errRoot
 	}
@@ -232,7 +240,7 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 	runWorker := func(probe, requireReceipt bool, projectedConfig []byte) (localExecutorCatalogResponse, error) {
 		var response localExecutorCatalogResponse
 		request, errRequest := json.Marshal(localExecutorCatalogRequest{
-			Directory: root, Plugin: manifest.ID, Version: version, Priority: item.Priority,
+			Directory: root, Plugin: manifest.ID, Version: version, Priority: catalog.priority,
 			Config: projectedConfig, Probe: probe, RequireReceipt: requireReceipt,
 		})
 		if errRequest != nil {
@@ -277,7 +285,7 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 	if errProbe != nil {
 		return nil, fmt.Errorf("probe plugin catalog: %w", errProbe)
 	}
-	projected, errProject := localExecutorWorkerConfig(&item.Raw, probe)
+	projected, errProject := localExecutorWorkerConfig(catalog.input, probe)
 	if errProject != nil {
 		return nil, errProject
 	}
@@ -328,6 +336,43 @@ func catalogConfigValue(node *yaml.Node) yaml.Node {
 		value.Content = append(value.Content, &copyChild)
 	}
 	return value
+}
+
+// Keep an independent copy of the instance, including targets referenced by aliases.
+func snapshotCatalogConfig(node *yaml.Node, copied map[*yaml.Node]*yaml.Node) *yaml.Node {
+	if snapshot := copied[node]; snapshot != nil {
+		return snapshot
+	}
+	snapshot := *node
+	copied[node] = &snapshot
+	if node.Alias != nil {
+		snapshot.Alias = snapshotCatalogConfig(node.Alias, copied)
+	}
+	if len(node.Content) != 0 {
+		snapshot.Content = make([]*yaml.Node, len(node.Content))
+		for i, child := range node.Content {
+			snapshot.Content[i] = snapshotCatalogConfig(child, copied)
+		}
+	}
+	return &snapshot
+}
+
+// Compare routing inputs without serializing YAML. Preserve scalar tags and the
+// distinction between a literal store declaration and an alias to one.
+func matchesCatalogConfig(node, snapshot *yaml.Node) bool {
+	if node.Kind != snapshot.Kind || node.Tag != snapshot.Tag || node.Value != snapshot.Value ||
+		node.Style != snapshot.Style || len(node.Content) != len(snapshot.Content) {
+		return false
+	}
+	if node.Kind == yaml.AliasNode {
+		return reflect.DeepEqual(node.Alias, snapshot.Alias)
+	}
+	for i, child := range node.Content {
+		if !matchesCatalogConfig(child, snapshot.Content[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 type localExecutorCatalogRequest struct {
