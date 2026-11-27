@@ -5,10 +5,12 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 const LocalExecutorCatalogWorkerArg = "--plugin-catalog-worker"
 
 const (
+	localExecutorCatalogDir       = ".acp-catalog"
 	localExecutorCatalogResult    = "catalog.json"
 	localExecutorCatalogReceipt   = "catalog-v1.ready"
 	localExecutorCatalogTimeout   = 20 * time.Second
@@ -221,7 +224,17 @@ func (r *Runtime) startLocalExecutorCatalogLocked(cfg *config.Config, manifest p
 	r.localExecutorCatalogs[manifest.ID] = catalog
 	go func() {
 		defer cancel()
-		if loader := r.localExecutorCatalogLoader; loader != nil {
+		// Register before touching the artifact. Cleanup holds the same lock while
+		// deleting files, independently of the lock used by route lookups.
+		r.localExecutorArtifactMu.Lock()
+		if r.localExecutorWorkers == nil {
+			r.localExecutorWorkers = make(map[string]int)
+		}
+		r.localExecutorWorkers[artifactKey]++
+		r.localExecutorArtifactMu.Unlock()
+		if errContext := loadCtx.Err(); errContext != nil {
+			catalog.err = errContext
+		} else if loader := r.localExecutorCatalogLoader; loader != nil {
 			catalog.models, catalog.err = loader(loadCtx, cfg, manifest, raw)
 		} else {
 			catalog.models, catalog.err = r.readLocalExecutorCatalog(loadCtx, cfg, catalog, artifactKey)
@@ -229,12 +242,23 @@ func (r *Runtime) startLocalExecutorCatalogLocked(cfg *config.Config, manifest p
 		if catalog.err == nil {
 			catalog.err = loadCtx.Err()
 		}
+		r.localExecutorArtifactMu.Lock()
+		r.localExecutorWorkers[artifactKey]--
+		lastReader := r.localExecutorWorkers[artifactKey] == 0
+		if lastReader {
+			delete(r.localExecutorWorkers, artifactKey)
+		}
+		r.localExecutorArtifactMu.Unlock()
 		r.localExecutorCatalogMu.Lock()
+		obsolete := r.localExecutorCatalogs[manifest.ID] != catalog
 		if catalog.err != nil {
 			catalog.retryAt = time.Now().Add(localExecutorCatalogRetry)
 		}
-		close(catalog.ready)
 		r.localExecutorCatalogMu.Unlock()
+		if lastReader && obsolete {
+			r.pruneLocalExecutorArtifacts(root)
+		}
+		close(catalog.ready)
 		if catalog.err != nil && !errors.Is(loadCtx.Err(), context.Canceled) {
 			log.WithError(catalog.err).WithFields(log.Fields{"plugin_id": manifest.ID, "version": manifest.Version}).Warn("ACP catalog unavailable")
 		}
@@ -246,7 +270,7 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 	platform := CurrentPluginPlatform()
 	manifest := catalog.manifest
 	// Each pinned artifact gets its own directory outside Home runtime discovery.
-	root, errRoot := filepath.Abs(filepath.Join(catalog.pluginRoot, ".acp-catalog", artifactKey))
+	root, errRoot := filepath.Abs(filepath.Join(catalog.pluginRoot, localExecutorCatalogDir, artifactKey))
 	if errRoot != nil {
 		return nil, errRoot
 	}
@@ -331,6 +355,85 @@ func (r *Runtime) readLocalExecutorCatalog(ctx context.Context, cfg *config.Conf
 		out = append(out, *pluginModelToHomeModel(model))
 	}
 	return out, nil
+}
+
+// Prune only this platform's content-addressed artifacts. A disabled installation
+// retains its pinned file. The last worker using an obsolete file retries cleanup.
+func (r *Runtime) pruneLocalExecutorArtifacts(pluginDir string) {
+	root := pluginRootFromConfigDir(pluginDir)
+	r.localExecutorArtifactMu.Lock()
+	defer r.localExecutorArtifactMu.Unlock()
+	cache, errOpen := os.OpenRoot(filepath.Join(root, localExecutorCatalogDir))
+	if errors.Is(errOpen, os.ErrNotExist) {
+		return
+	}
+	if errOpen != nil {
+		log.WithError(errOpen).Warn("open ACP catalog cache for cleanup")
+		return
+	}
+	defer func() {
+		if errClose := cache.Close(); errClose != nil {
+			log.WithError(errClose).Warn("close ACP catalog cache")
+		}
+	}()
+	entries, errRead := fs.ReadDir(cache.FS(), ".")
+	if errRead != nil {
+		log.WithError(errRead).Warn("list ACP catalog cache")
+		return
+	}
+	platform := CurrentPluginPlatform()
+	pinned := make(map[string]bool)
+	r.localExecutorCatalogMu.Lock()
+	cfg := r.localExecutorConfig
+	r.localExecutorCatalogMu.Unlock()
+	if cfg != nil {
+		desiredRoot := pluginRootFromConfigDir(cfg.Plugins.Dir)
+		for id, item := range cfg.Plugins.Configs {
+			if !isLocalExecutorStoreConfig(item) {
+				continue
+			}
+			manifest, installed, errManifest := storeManifestFromPluginConfig(id, item)
+			if errManifest != nil || !installed || manifest.ID != id {
+				continue
+			}
+			key, errKey := pluginStoreManifestKey(desiredRoot, platform, manifest)
+			if errKey == nil {
+				pinned[key] = true
+			}
+		}
+	}
+	for _, entry := range entries {
+		key := entry.Name()
+		if !entry.IsDir() || len(key) != hex.EncodedLen(sha256.Size) || pinned[key] || r.localExecutorWorkers[key] > 0 {
+			continue
+		}
+		if _, errHex := hex.DecodeString(key); errHex != nil {
+			continue
+		}
+		osDir := filepath.Join(key, platform.GOOS)
+		platformDir := filepath.Join(osDir, platform.GOARCH)
+		info, errStat := cache.Lstat(platformDir)
+		if errors.Is(errStat, os.ErrNotExist) {
+			continue
+		}
+		if errStat != nil {
+			log.WithError(errStat).Warn("inspect ACP catalog artifact")
+			continue
+		}
+		if !info.IsDir() {
+			continue
+		}
+		if errRemove := cache.RemoveAll(platformDir); errRemove != nil {
+			log.WithError(errRemove).Warn("remove obsolete ACP catalog artifact")
+			continue
+		}
+		// Remove the empty ancestors only. Other platforms may share this cache.
+		for _, dir := range []string{osDir, key} {
+			if errRemove := cache.Remove(dir); errRemove != nil {
+				break
+			}
+		}
+	}
 }
 
 func localExecutorWorkerConfig(raw *yaml.Node, probe localExecutorCatalogResponse) ([]byte, error) {

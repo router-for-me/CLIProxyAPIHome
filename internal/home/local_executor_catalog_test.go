@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -309,6 +312,95 @@ store: {id: sample, version: 1.0.0, tags: [ACP], source-url: https://store.examp
 	close(resume)
 	if errRoutes := <-done; !errors.Is(errRoutes, context.Canceled) || len(rt.localExecutorCatalogs) != 0 {
 		t.Fatalf("catalogs after stop = %d, error = %v", len(rt.localExecutorCatalogs), errRoutes)
+	}
+}
+
+func TestLocalExecutorArtifactCleanupAcrossVersionsAndWorkers(t *testing.T) {
+	root := t.TempDir()
+	platform := CurrentPluginPlatform()
+	instance := func(id, version string, enabled bool) config.PluginInstanceConfig {
+		return homePluginConfigFromYAML(t, fmt.Sprintf(`enabled: %t
+store: {id: %s, version: %s, tags: [ACP], source-url: https://store.example/registry.json, install: {type: direct}}`, enabled, id, version))
+	}
+	artifact := func(id, version string, platform PluginPlatform) string {
+		m, _, errManifest := storeManifestFromPluginConfig(id, instance(id, version, true))
+		if errManifest != nil {
+			t.Fatal(errManifest)
+		}
+		key, errKey := pluginStoreManifestKey(root, platform, m)
+		if errKey != nil {
+			t.Fatal(errKey)
+		}
+		return filepath.Join(root, localExecutorCatalogDir, key, platform.GOOS, platform.GOARCH, id+"-v"+version+pluginExtension(platform.GOOS))
+	}
+	writeFile := func(path string) error {
+		if errDir := os.MkdirAll(filepath.Dir(path), 0o700); errDir != nil {
+			return errDir
+		}
+		return os.WriteFile(path, []byte("test"), 0o600)
+	}
+	oldVersion := artifact("sample", "1.0.0", platform)
+	current := artifact("sample", "2.0.0", platform)
+	other := artifact("other", "1.0.0", platform)
+	foreign := artifact("sample", "1.0.0", PluginPlatform{GOOS: "foreign", GOARCH: "arch"})
+	otherArch := filepath.Join(filepath.Dir(filepath.Dir(oldVersion)), "another-arch", "library")
+	for _, path := range []string{oldVersion, other, foreign, otherArch} {
+		if errWrite := writeFile(path); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+	cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Dir: root, Configs: map[string]config.PluginInstanceConfig{
+		"sample": instance("sample", "2.0.0", true), "other": instance("other", "1.0.0", false),
+	}}}
+	rt := &Runtime{cfg: cfg}
+	started := make(chan chan struct{}, 2)
+	rt.SetLocalExecutorCatalogLoader(func(ctx context.Context, _ *config.Config, _ pluginstore.Manifest, _ []byte) ([]registry.ModelInfo, error) {
+		finish := make(chan struct{})
+		started <- finish
+		<-ctx.Done()
+		<-finish
+		return nil, writeFile(current)
+	})
+	_, plugins, errStart := rt.observeLocalExecutorCatalogs(t.Context())
+	if errStart != nil || len(plugins) != 1 {
+		t.Fatalf("catalogs = %d, error %v", len(plugins), errStart)
+	}
+	firstReader := <-started
+	// Updating the instance configuration starts a second reader of the same file.
+	changed := &config.Config{Plugins: cfg.Plugins}
+	changed.Plugins.Configs = maps.Clone(cfg.Plugins.Configs)
+	updated := changed.Plugins.Configs["sample"]
+	updated.Priority++
+	changed.Plugins.Configs["sample"] = updated
+	rt.cfgMu.Lock()
+	rt.cfg = changed
+	rt.cfgMu.Unlock()
+	_, reconfigured, errChange := rt.observeLocalExecutorCatalogs(t.Context())
+	if errChange != nil || len(reconfigured) != 1 || reconfigured[0] == plugins[0] {
+		t.Fatalf("reconfigured catalogs = %v, error %v", reconfigured, errChange)
+	}
+	secondReader := <-started
+	next := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Dir: root, Configs: map[string]config.PluginInstanceConfig{"other": cfg.Plugins.Configs["other"]}}}
+	rt.cfgMu.Lock()
+	rt.cfg = next
+	rt.cfgMu.Unlock()
+	rt.reconcilePluginArtifacts(t.Context(), changed, next)
+	close(secondReader)
+	<-reconfigured[0].ready
+	if _, errStat := os.Stat(current); errStat != nil {
+		t.Fatalf("artifact was removed while its first reader was active: %v", errStat)
+	}
+	close(firstReader)
+	<-plugins[0].ready
+	for _, path := range []string{oldVersion, current} {
+		if _, errStat := os.Stat(path); !errors.Is(errStat, os.ErrNotExist) {
+			t.Errorf("obsolete artifact %s: stat %v", path, errStat)
+		}
+	}
+	for _, path := range []string{other, foreign, otherArch} {
+		if _, errStat := os.Stat(path); errStat != nil {
+			t.Errorf("retained artifact %s: stat %v", path, errStat)
+		}
 	}
 }
 

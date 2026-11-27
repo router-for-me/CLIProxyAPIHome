@@ -62,6 +62,8 @@ type Runtime struct {
 	localExecutorConfig        *config.Config
 	localExecutorCatalogs      map[string]*localExecutorCatalog
 	localExecutorCatalogLoader localExecutorCatalogLoader
+	localExecutorArtifactMu    sync.Mutex
+	localExecutorWorkers       map[string]int
 
 	clusterAdapter       ClusterAdapter
 	sessionAffinityStore coreauth.SessionAffinityStore

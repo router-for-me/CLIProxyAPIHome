@@ -170,13 +170,21 @@ func pluginRootFromConfigDir(root string) string {
 	return root
 }
 
-// Reconcile catalogs after publication so a failed reload cannot prewarm its catalogs.
+// Reconcile catalogs after publication so a failed config reload cannot prewarm
+// or prune files for a configuration that never took effect.
 func (r *Runtime) reconcilePluginArtifacts(ctx context.Context, oldCfg *config.Config, newCfg *config.Config) {
 	if r == nil {
 		return
 	}
 	if _, _, errCatalog := r.observeLocalExecutorCatalogs(ctx); errCatalog != nil {
 		log.WithError(errCatalog).Warn("refresh ACP plugin catalogs")
+	} else {
+		if newCfg != nil {
+			r.pruneLocalExecutorArtifacts(newCfg.Plugins.Dir)
+		}
+		if oldCfg != nil && (newCfg == nil || pluginRootFromConfigDir(oldCfg.Plugins.Dir) != pluginRootFromConfigDir(newCfg.Plugins.Dir)) {
+			r.pruneLocalExecutorArtifacts(oldCfg.Plugins.Dir)
+		}
 	}
 	removed := removedHomeLoadedStorePluginIDs(oldCfg, newCfg)
 	if len(removed) == 0 {
