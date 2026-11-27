@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -56,6 +57,9 @@ type Runtime struct {
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
 
 	localExecutorCatalogMu     sync.Mutex
+	localExecutorStopped       bool
+	localExecutorReadRevision  atomic.Uint64
+	localExecutorConfig        *config.Config
 	localExecutorCatalogs      map[string]*localExecutorCatalog
 	localExecutorCatalogLoader localExecutorCatalogLoader
 
@@ -367,6 +371,9 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
+	r.localExecutorCatalogMu.Lock()
+	r.localExecutorStopped = false
+	r.localExecutorCatalogMu.Unlock()
 	r.cfgMu.Lock()
 	if r.antigravityCancel != nil {
 		r.antigravityCancel()
@@ -390,6 +397,7 @@ func (r *Runtime) Start(ctx context.Context, configPath string) error {
 	if errPluginSync := r.syncPluginStoreManifests(runCtx, r.Config()); errPluginSync != nil {
 		return errPluginSync
 	}
+	r.reconcilePluginArtifacts(runCtx, nil, r.Config())
 	r.applyPluginConfig(runCtx, r.Config())
 
 	if errLoad := r.loadAuths(runCtx); errLoad != nil {
@@ -423,6 +431,8 @@ func (r *Runtime) Stop() {
 		return
 	}
 	r.localExecutorCatalogMu.Lock()
+	r.localExecutorStopped = true
+	r.localExecutorReadRevision.Add(1)
 	for _, catalog := range r.localExecutorCatalogs {
 		catalog.cancel()
 	}

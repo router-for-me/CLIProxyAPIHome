@@ -75,29 +75,12 @@ func CurrentPluginPlatform() PluginPlatform {
 }
 
 func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Config) error {
-	if r == nil {
-		return nil
-	}
-	r.localExecutorCatalogMu.Lock()
-	for id, catalog := range r.localExecutorCatalogs {
-		if cfg != nil && cfg.Plugins.Enabled {
-			if item := cfg.Plugins.Configs[id]; pluginConfigEnabled(item) && isLocalExecutorStoreConfig(item) {
-				continue
-			}
-		}
-		catalog.cancel()
-		delete(r.localExecutorCatalogs, id)
-	}
-	r.localExecutorCatalogMu.Unlock()
-	if cfg == nil || !cfg.Plugins.Enabled {
+	if r == nil || cfg == nil || !cfg.Plugins.Enabled {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Catalog reads have their own timeout and can finish after config publication.
-	r.startLocalExecutorCatalogs(cfg)
-
 	auth, errAuth := r.resolvePluginStoreAuth(ctx)
 	defer pluginstore.ClearResolvedAuthConfigs(auth)
 	platform := CurrentPluginPlatform()
@@ -187,19 +170,19 @@ func pluginRootFromConfigDir(root string) string {
 	return root
 }
 
-func (r *Runtime) deleteRemovedPluginArtifacts(ctx context.Context, oldCfg *config.Config, newCfg *config.Config) {
-	_ = ctx
-	if r == nil || oldCfg == nil {
+// Reconcile catalogs after publication so a failed reload cannot prewarm its catalogs.
+func (r *Runtime) reconcilePluginArtifacts(ctx context.Context, oldCfg *config.Config, newCfg *config.Config) {
+	if r == nil {
 		return
+	}
+	if _, _, errCatalog := r.observeLocalExecutorCatalogs(ctx); errCatalog != nil {
+		log.WithError(errCatalog).Warn("refresh ACP plugin catalogs")
 	}
 	removed := removedHomeLoadedStorePluginIDs(oldCfg, newCfg)
 	if len(removed) == 0 {
 		return
 	}
-	root := strings.TrimSpace(oldCfg.Plugins.Dir)
-	if root == "" {
-		root = "plugins"
-	}
+	root := pluginRootFromConfigDir(oldCfg.Plugins.Dir)
 	for _, id := range removed {
 		path, deleted, errDelete := r.deletePluginArtifact(root, id)
 		if errDelete != nil {

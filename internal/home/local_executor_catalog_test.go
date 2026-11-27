@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -81,7 +82,7 @@ func TestLocalExecutorWorkerConfigWithoutReceipt(t *testing.T) {
 	}
 }
 
-func TestSyncPluginStoreManifestsPreloadsIndependentACPCatalogs(t *testing.T) {
+func TestLocalExecutorConfigPreloadsIndependentCatalogs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	cfg := &config.Config{Plugins: config.PluginsConfig{
@@ -116,9 +117,7 @@ store: {id: healthy, tags: [ACP], version: 1.0.0, source-url: "https://example.i
 			return nil, ctx.Err()
 		}
 	})
-	if errSync := rt.syncPluginStoreManifests(ctx, cfg); errSync != nil {
-		t.Fatal(errSync)
-	}
+	rt.reconcilePluginArtifacts(ctx, nil, cfg)
 	for _, started := range []chan struct{}{brokenStarted, healthyStarted} {
 		select {
 		case <-started:
@@ -192,9 +191,9 @@ ratio: !!float 0
 	})
 	read := func() *localExecutorCatalog {
 		t.Helper()
-		catalogs := rt.startLocalExecutorCatalogs(cfg)
-		if len(catalogs) != 1 {
-			t.Fatalf("read catalogs: count=%d", len(catalogs))
+		_, catalogs, errRead := rt.observeLocalExecutorCatalogs(t.Context())
+		if errRead != nil || len(catalogs) != 1 {
+			t.Fatalf("read catalogs: count=%d error=%v", len(catalogs), errRead)
 		}
 		<-catalogs[0].ready
 		return catalogs[0]
@@ -217,6 +216,99 @@ ratio: !!float 0
 	cfg.Plugins.Configs["sample"] = homePluginConfigFromYAML(t, "enabled: true\nother: &manifest "+manifest+"\nstore: *manifest")
 	if routes, _, errRoutes := rt.LocalExecutorRoutes(t.Context(), ""); errRoutes != nil || len(routes) != 0 {
 		t.Fatal("a warm cache accepted a store declaration that cold discovery would skip")
+	}
+}
+
+func TestLocalExecutorCatalogIgnoresSupersededRead(t *testing.T) {
+	for _, version := range []string{"2.0.0", "uninstalled"} {
+		t.Run(version, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				configuration := func(v string) *config.Config {
+					cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{}}}
+					if v != "uninstalled" {
+						cfg.Plugins.Configs["sample"] = homePluginConfigFromYAML(t, fmt.Sprintf(`enabled: true
+store: {id: sample, version: %s, tags: [ACP], source-url: https://store.example/registry.json, install: {type: direct}}`, v))
+					}
+					return cfg
+				}
+				var latest atomic.Pointer[config.Config]
+				latest.Store(configuration("1.0.0"))
+				oldRead, resume := make(chan struct{}), make(chan struct{})
+				slow, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				var pauseOnce atomic.Bool
+				var loads atomic.Int32
+				rt := &Runtime{}
+				rt.SetPluginSyncConfigLoader(func(ctx context.Context) (*config.Config, error) {
+					cfg := latest.Load()
+					if ctx == slow && pauseOnce.CompareAndSwap(false, true) {
+						close(oldRead)
+						<-resume
+					}
+					return cfg, nil
+				})
+				rt.SetLocalExecutorCatalogLoader(func(_ context.Context, _ *config.Config, m pluginstore.Manifest, _ []byte) ([]registry.ModelInfo, error) {
+					loads.Add(1)
+					return []registry.ModelInfo{{ID: m.Version}}, nil
+				})
+				if routes, _, err := rt.LocalExecutorRoutes(t.Context(), ""); err != nil || len(routes) != 1 {
+					t.Fatalf("initial routes = %v, error %v", routes, err)
+				}
+				late := make(chan map[string]LocalExecutorRoute, 1)
+				go func() {
+					routes, _, err := rt.LocalExecutorRoutes(slow, "")
+					if err != nil {
+						t.Error(err)
+					}
+					late <- routes
+				}()
+				<-oldRead
+				latest.Store(configuration(version))
+				current, _, err := rt.LocalExecutorRoutes(t.Context(), "")
+				if err != nil || (version == "uninstalled" && len(current) != 0) ||
+					(version != "uninstalled" && current["acp/"+version].Version != version) {
+					t.Fatalf("updated routes = %v, error %v", current, err)
+				}
+				before := loads.Load()
+				close(resume)
+				if got := <-late; !reflect.DeepEqual(got, current) {
+					t.Fatalf("late reader returned %v, want current routes %v", got, current)
+				}
+				final, _, err := rt.LocalExecutorRoutes(t.Context(), "")
+				if err != nil || !reflect.DeepEqual(final, current) || loads.Load() != before {
+					t.Fatalf("late reader changed publication: routes=%v loads=%d, error=%v", final, loads.Load(), err)
+				}
+			})
+		})
+	}
+}
+
+func TestLocalExecutorCatalogLateReadAfterStop(t *testing.T) {
+	cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{
+		"sample": homePluginConfigFromYAML(t, `enabled: true
+store: {id: sample, version: 1.0.0, tags: [ACP], source-url: https://store.example/registry.json, install: {type: direct}}`),
+	}}}
+	rt := &Runtime{}
+	started, resume := make(chan struct{}), make(chan struct{})
+	rt.SetPluginSyncConfigLoader(func(context.Context) (*config.Config, error) {
+		close(started)
+		<-resume
+		return cfg, nil
+	})
+	rt.SetLocalExecutorCatalogLoader(func(context.Context, *config.Config, pluginstore.Manifest, []byte) ([]registry.ModelInfo, error) {
+		t.Error("stopped runtime started a catalog worker")
+		return nil, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, _, errRoutes := rt.LocalExecutorRoutes(t.Context(), "")
+		done <- errRoutes
+	}()
+	<-started
+	rt.Stop()
+	close(resume)
+	if errRoutes := <-done; !errors.Is(errRoutes, context.Canceled) || len(rt.localExecutorCatalogs) != 0 {
+		t.Fatalf("catalogs after stop = %d, error = %v", len(rt.localExecutorCatalogs), errRoutes)
 	}
 }
 

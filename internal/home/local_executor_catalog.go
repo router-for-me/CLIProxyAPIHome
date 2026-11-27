@@ -74,9 +74,42 @@ func isLocalExecutorStoreConfig(item config.PluginInstanceConfig) bool {
 	return false
 }
 
-func (r *Runtime) startLocalExecutorCatalogs(cfg *config.Config) []*localExecutorCatalog {
-	r.localExecutorCatalogMu.Lock()
-	defer r.localExecutorCatalogMu.Unlock()
+// A read that overlaps a different published configuration must confirm its snapshot
+// before it can cancel workers or replace a ready catalog.
+func (r *Runtime) observeLocalExecutorCatalogs(ctx context.Context) (*config.Config, []*localExecutorCatalog, error) {
+	if r == nil {
+		return nil, nil, nil
+	}
+	for {
+		before := r.localExecutorReadRevision.Load()
+		cfg, errConfig := r.pluginSyncConfig(ctx)
+		if errConfig != nil {
+			return nil, nil, errConfig
+		}
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, nil, errContext
+		}
+		r.localExecutorCatalogMu.Lock()
+		if r.localExecutorStopped {
+			r.localExecutorCatalogMu.Unlock()
+			return nil, nil, context.Canceled
+		}
+		current := r.localExecutorConfig
+		if before != r.localExecutorReadRevision.Load() && cfg != current &&
+			(cfg == nil || current == nil || cfg.ProxyURL != current.ProxyURL ||
+				!reflect.DeepEqual(cfg.Plugins, current.Plugins) || !reflect.DeepEqual(cfg.OAuthModelAlias, current.OAuthModelAlias)) {
+			r.localExecutorCatalogMu.Unlock()
+			continue
+		}
+		r.localExecutorConfig = cfg
+		plugins := r.startLocalExecutorCatalogsLocked(cfg)
+		r.localExecutorReadRevision.Add(1)
+		r.localExecutorCatalogMu.Unlock()
+		return cfg, plugins, nil
+	}
+}
+
+func (r *Runtime) startLocalExecutorCatalogsLocked(cfg *config.Config) []*localExecutorCatalog {
 	for id, catalog := range r.localExecutorCatalogs {
 		if cfg != nil && cfg.Plugins.Enabled && pluginConfigEnabled(cfg.Plugins.Configs[id]) {
 			continue

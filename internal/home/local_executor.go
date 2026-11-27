@@ -31,12 +31,12 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cfg, errConfig := r.pluginSyncConfig(ctx)
+	cfg, plugins, errConfig := r.observeLocalExecutorCatalogs(ctx)
 	if errConfig != nil {
 		return nil, nil, errConfig
 	}
 	requestedModel = coreauth.CanonicalModelID(requestedModel)
-	if requestedModel == "" && (cfg == nil || !cfg.Plugins.Enabled) {
+	if requestedModel == "" && len(plugins) == 0 {
 		return nil, nil, nil
 	}
 	reserved := make(map[string][]string)
@@ -67,12 +67,12 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 	if authIDs, exists := reserved[strings.ToLower(requestedModel)]; exists {
 		return nil, authIDs, nil
 	}
-	if cfg == nil || !cfg.Plugins.Enabled {
+	if len(plugins) == 0 {
 		return nil, nil, nil
 	}
 
 	routes := make(map[string]LocalExecutorRoute)
-	for _, plugin := range r.startLocalExecutorCatalogs(cfg) {
+	for _, plugin := range plugins {
 		if !plugin.available(ctx) {
 			if errContext := ctx.Err(); errContext != nil {
 				return nil, nil, errContext
