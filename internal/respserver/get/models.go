@@ -2,6 +2,7 @@ package get
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"strings"
 
@@ -9,14 +10,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
-	"github.com/tidwall/sjson"
 )
 
 // handleModels handles a models.
 func handleModels(ctx context.Context, env dispatch.Env, args []string) dispatch.Reply {
-	// Normalize source data before building the derived payload.
-	_ = ctx
-
 	if len(args) != 2 {
 		return dispatch.Err("wrong number of arguments for 'get' command")
 	}
@@ -25,7 +22,11 @@ func handleModels(ctx context.Context, env dispatch.Env, args []string) dispatch
 		return dispatch.Err("runtime not ready")
 	}
 
-	payload, errBuild := buildModelsJSON(env, nil)
+	routes, _, errRoutes := env.Runtime.LocalExecutorRoutes(ctx, "")
+	if errRoutes != nil {
+		return dispatch.Err(errRoutes.Error())
+	}
+	payload, errBuild := buildModelsJSON(env, nil, routes)
 	if errBuild != nil {
 		return dispatch.Err(errBuild.Error())
 	}
@@ -34,7 +35,7 @@ func handleModels(ctx context.Context, env dispatch.Env, args []string) dispatch
 
 // buildModelsJSON assembles the models payload grouped by provider bucket.
 // Authentication is the caller's responsibility.
-func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess) (string, error) {
+func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess, localRoutes map[string]home.LocalExecutorRoute) (string, error) {
 	if env.Runtime == nil || env.Runtime.CoreManager() == nil {
 		return "", errRuntimeNotReady
 	}
@@ -86,13 +87,16 @@ func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess) (string, er
 		if id == "" {
 			return
 		}
-		idKey := strings.ToLower(id)
+		idKey := id
+		if auth != nil {
+			idKey = strings.ToLower(id)
+		}
 		b := buckets[groupKey]
 		if b == nil {
 			b = &modelBucket{byID: make(map[string]*registry.ModelInfo), toolSearch: make(map[string]bool)}
 			buckets[groupKey] = b
 		}
-		if groupKey == claudeModelsGroupKey {
+		if groupKey == claudeModelsGroupKey && auth != nil {
 			supported := home.ClaudeNativeToolSearchSupported(auth, manager.ResolveExecutionModel(auth, id))
 			if previous, seen := b.toolSearch[idKey]; seen {
 				supported = previous && supported
@@ -124,22 +128,21 @@ func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess) (string, er
 		}
 	}
 
-	out := "{}"
-	groupKeys := make([]string, 0, len(buckets))
-	for key := range buckets {
-		groupKeys = append(groupKeys, key)
+	for public, route := range localRoutes {
+		if policy.Allows("", public) {
+			addModel(route.Plugin, nil, &route.Model)
+		}
 	}
-	sort.Strings(groupKeys)
 
-	for _, key := range groupKeys {
-		b := buckets[key]
+	out := make(map[string][]*registry.ModelInfo, len(buckets))
+	for key, b := range buckets {
 		if b == nil || len(b.byID) == 0 {
 			continue
 		}
 		models := make([]*registry.ModelInfo, 0, len(b.byID))
 		for idKey, model := range b.byID {
-			if key == claudeModelsGroupKey {
-				model = withToolSearchCapability(model, b.toolSearch[idKey])
+			if toolSearch, computed := b.toolSearch[idKey]; computed {
+				model = withToolSearchCapability(model, toolSearch)
 			}
 			models = append(models, model)
 		}
@@ -148,9 +151,10 @@ func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess) (string, er
 			idJ := strings.ToLower(strings.TrimSpace(models[j].ID))
 			return idI < idJ
 		})
-		out, _ = sjson.Set(out, key, models)
+		out[key] = models
 	}
-	return out, nil
+	raw, errMarshal := json.Marshal(out)
+	return string(raw), errMarshal
 }
 
 // claudeModelsGroupKey is the models payload bucket served by Claude credentials.

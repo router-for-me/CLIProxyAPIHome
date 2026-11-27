@@ -101,7 +101,7 @@ func TestModelsV8DoesNotInventUnresolvedBillingTargets(t *testing.T) {
 	modelRegistry.RegisterClient(id, "z-ai", []*registry.ModelInfo{{ID: id, Name: "unverified-name"}})
 	t.Cleanup(func() { modelRegistry.UnregisterClient(id) })
 	handler := &Handler{}
-	for _, model := range handler.availableBillingModelDefinitions() {
+	for _, model := range handler.availableBillingModelDefinitions(nil) {
 		if model.ID == id {
 			if model.BillingModels == nil || len(model.BillingModels) != 0 {
 				t.Fatalf("unresolved catalog must expose an empty target list: %#v", model.BillingModels)

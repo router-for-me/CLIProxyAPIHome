@@ -3,11 +3,13 @@ package userapi
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/cluster"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -81,10 +83,15 @@ const (
 // registration shape, so credentials, auth identifiers and per-client counts
 // stay out of reach.
 func (h *Handler) ListModels(c *gin.Context) {
+	routes, _, errRoutes := h.runtime.LocalExecutorRoutes(c.Request.Context(), "")
+	if errRoutes != nil {
+		respondError(c, http.StatusInternalServerError, "model_catalog_load_failed", errRoutes)
+		return
+	}
 	ctx, cancel := requestContext(c)
 	defer cancel()
 
-	models := availableUserModels()
+	models := appendLocalUserModels(availableUserModels(), routes, nil)
 	settings, errSettings := h.repo.GetBillingSettings(ctx)
 	if errSettings != nil {
 		respondError(c, http.StatusInternalServerError, "billing_settings_load_failed", errSettings)
@@ -135,13 +142,20 @@ func (h *Handler) ListModels(c *gin.Context) {
 // sell" versus "what can I call today"), and only one of them may be answered
 // without a token.
 func (h *Handler) ListAccessibleModels(c *gin.Context) {
-	ctx, cancel := requestContext(c)
-	defer cancel()
-
-	user, ok := h.authenticatedUser(c, ctx, authFields{})
+	authCtx, cancelAuth := requestContext(c)
+	user, ok := h.authenticatedUser(c, authCtx, authFields{})
+	cancelAuth()
 	if !ok {
 		return
 	}
+
+	routes, _, errRoutes := h.runtime.LocalExecutorRoutes(c.Request.Context(), "")
+	if errRoutes != nil {
+		respondError(c, http.StatusInternalServerError, "model_catalog_load_failed", errRoutes)
+		return
+	}
+	ctx, cancel := requestContext(c)
+	defer cancel()
 
 	access, errAccess := h.repo.UserModelAccess(ctx, user.ID)
 	if errAccess != nil {
@@ -150,6 +164,30 @@ func (h *Handler) ListAccessibleModels(c *gin.Context) {
 	}
 
 	models := filterModelsForAccess(availableUserModels(), access)
+	if len(routes) > 0 && access.APIKeyCount > 0 {
+		keys, errKeys := h.repo.ListAPIKeyRecordsForUser(ctx, user.ID)
+		if errKeys != nil {
+			respondError(c, http.StatusInternalServerError, "model_access_load_failed", errKeys)
+			return
+		}
+		allowed := make(map[string]bool, len(routes))
+		for _, key := range keys {
+			policy, errPolicy := h.repo.ModelAccessForAPIKey(ctx, key.APIKey)
+			if errPolicy != nil {
+				respondError(c, http.StatusInternalServerError, "model_access_load_failed", errPolicy)
+				return
+			}
+			for model := range routes {
+				if policy.Allows("", model) {
+					allowed[model] = true
+				}
+			}
+			if len(allowed) == len(routes) {
+				break
+			}
+		}
+		models = appendLocalUserModels(models, routes, allowed)
+	}
 	modelIDs := make([]string, 0, len(models))
 	for _, model := range models {
 		modelIDs = append(modelIDs, model.ID)
@@ -196,6 +234,19 @@ func availableUserModels() []*registry.ModelInfo {
 		}
 		models = append(models, model)
 	}
+	return models
+}
+
+func appendLocalUserModels(models []*registry.ModelInfo, routes map[string]home.LocalExecutorRoute, allowed map[string]bool) []*registry.ModelInfo {
+	if len(routes) == 0 {
+		return models
+	}
+	for id, route := range routes {
+		if allowed == nil || allowed[id] {
+			models = append(models, &route.Model)
+		}
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	return models
 }
 

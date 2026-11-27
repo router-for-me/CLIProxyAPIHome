@@ -54,11 +54,16 @@ type Runtime struct {
 	pluginSyncConfigLoader  func(context.Context) (*config.Config, error)
 	pluginSyncNodeActive    func(context.Context, string, string) (bool, error)
 	pluginSyncHTTPClient    pluginstore.HTTPDoer
-	clusterAdapter          ClusterAdapter
-	sessionAffinityStore    coreauth.SessionAffinityStore
-	concurrencyAdmitter     ConcurrencyAdmitter
-	clusterRefresh          func(context.Context, string, string) ([]byte, error)
-	originalStore           coreauth.Store
+
+	localExecutorCatalogMu     sync.Mutex
+	localExecutorCatalogs      map[string]*localExecutorCatalog
+	localExecutorCatalogLoader localExecutorCatalogLoader
+
+	clusterAdapter       ClusterAdapter
+	sessionAffinityStore coreauth.SessionAffinityStore
+	concurrencyAdmitter  ConcurrencyAdmitter
+	clusterRefresh       func(context.Context, string, string) ([]byte, error)
+	originalStore        coreauth.Store
 
 	cancel context.CancelFunc
 

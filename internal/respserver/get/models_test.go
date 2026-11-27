@@ -11,7 +11,7 @@ import (
 )
 
 func TestBuildModelsJSONClaudeToolSearchCapability(t *testing.T) {
-	rt := newGetTestRuntime(t)
+	rt, _ := newGetTestRuntime(t)
 	webSearch := true
 	shared := &registry.ModelInfo{ID: "m-official", NativeCapabilities: &registry.NativeCapabilities{WebSearch: &webSearch}}
 	register := func(id, provider string, attrs map[string]string, models ...*registry.ModelInfo) {
@@ -32,7 +32,7 @@ func TestBuildModelsJSONClaudeToolSearchCapability(t *testing.T) {
 	register("ts-codex", "codex", map[string]string{"api_key": "d", "plan_type": "pro"},
 		&registry.ModelInfo{ID: "m-codex"})
 
-	payload, errBuild := buildModelsJSON(dispatch.Env{Runtime: rt}, nil)
+	payload, errBuild := buildModelsJSON(dispatch.Env{Runtime: rt}, nil, nil)
 	if errBuild != nil {
 		t.Fatalf("buildModelsJSON: %v", errBuild)
 	}

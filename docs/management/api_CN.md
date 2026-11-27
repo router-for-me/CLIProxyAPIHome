@@ -747,7 +747,11 @@ Home 在数据库和下发配置中保留兼容的
 
 ## Plugin Store
 
-插件商店接口用于列出 registry 中的插件，并把选中的插件写入数据库驱动的 Home 配置。安装接口写入的是 `plugins.configs.<pluginID>.store` 固定 manifest。GitHub release 安装会固定 repository、version 和 release tag；direct 安装会固定 version 和来源 registry URL，Home-mode CPA 节点随后在应用配置时从该 registry 解析当前平台的 artifact URL 与 SHA-256。通过 store 安装的插件默认不会被 Home 进程下载或加载；只有可信的 provider/auth 插件确实需要在 Home 内运行时，才显式设置 `plugins.configs.<pluginID>.load-in-home: true`。
+插件商店接口用于列出 registry 中的插件，并把选中的插件写入数据库驱动的 Home 配置。安装接口写入的是 `plugins.configs.<pluginID>.store` 固定 manifest。GitHub release 安装会固定 repository、version 和 release tag；direct 安装会固定 version 和来源 registry URL，Home-mode CPA 节点随后在应用配置时从该 registry 解析当前平台的 artifact URL 与 SHA-256。通过商店安装的 provider/auth 插件若需在 Home 运行时执行，使用已有的 `plugins.configs.<pluginID>.load-in-home: true`。ACP 目录读取使用短生命周期的子进程。
+
+已启用的 ACP 插件在安装版本存在目录时，会在可用模型列表中发布 `acp/<完整注册 ID>`。所有 CPA 使用 Home 解析出的同一份目录。同名凭证模型和显式别名优先。多个 ACP 插件注册相同 ID 时，选择 `priority` 最大的插件，同值按插件 ID 升序选择。收到请求的 CPA 使用本机账号状态执行选定插件，传入插件注册的完整模型 ID。
+
+Home 通过插件的静态模型接口，从商店固定版本的插件包读取模型定义和注册 ID。发布 ACP 模型要求商店条目带有 `ACP` 标签。插件需要在无登录账号时返回静态目录，并提供适用于 Home 平台的原生产物。通过已有的 `PATCH /config/plugins/configs/<插件ID>` 修改插件配置。停用或卸载插件会撤回其路由。
 
 ### GET `/plugins/store`
 

@@ -748,7 +748,11 @@ Example response:
 
 ## Plugin Store
 
-Plugin store routes list registry entries and install a selected plugin into the DB-backed Home config. Install writes `plugins.configs.<pluginID>.store` with a pinned manifest. GitHub-release installs pin the repository, version, and exact release tag; direct installs pin the version and source registry URL, then Home-mode CPA nodes resolve the current-platform artifact URL and SHA-256 from that registry during runtime config application. Store-installed plugins are not downloaded or loaded by the Home process by default; set `plugins.configs.<pluginID>.load-in-home: true` only for trusted provider/auth plugins that must run inside Home.
+Plugin store routes list registry entries and install a selected plugin into the DB-backed Home config. Install writes `plugins.configs.<pluginID>.store` with a pinned manifest. GitHub-release installs pin the repository, version, and exact release tag; direct installs pin the version and source registry URL, then Home-mode CPA nodes resolve the current-platform artifact URL and SHA-256 from that registry during runtime config application. Running store-installed provider/auth plugins in the Home runtime requires `plugins.configs.<pluginID>.load-in-home: true`. ACP catalog reads use a short-lived subprocess.
+
+An enabled ACP plugin with a catalog for its installed version publishes `acp/<registered-model-id>` in the available model lists. Home resolves the same public IDs for every CPA. A credential model or explicit alias has precedence over the same public ID. Among ACP plugins registering the same ID, the greatest configured `priority` wins, with plugin ID in ascending order as the tie-breaker. The serving CPA executes the selected plugin using the original registered model ID and its own local account state.
+
+Home reads the model definitions and registered IDs from the pinned plugin artifact using its static model API. Publishing ACP models requires the store entry to carry the `ACP` tag. The plugin must return a static catalog without a logged-in account and provide a native artifact for Home's platform. Use the existing `PATCH /config/plugins/configs/<pluginID>` endpoint to update plugin settings. Uninstalling or disabling the plugin withdraws its routes.
 
 ### GET `/plugins/store`
 

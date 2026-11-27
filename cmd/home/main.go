@@ -52,6 +52,13 @@ func init() {
 
 // main starts the home command entrypoint.
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == home.LocalExecutorCatalogWorkerArg {
+		if errCatalog := home.RunLocalExecutorCatalogWorker(context.Background(), os.Stdin); errCatalog != nil {
+			log.WithError(errCatalog).Error("plugin catalog worker failed")
+			os.Exit(1)
+		}
+		return
+	}
 	os.Exit(run())
 }
 

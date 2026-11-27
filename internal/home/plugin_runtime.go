@@ -505,6 +505,7 @@ func pluginThinkingToHomeThinking(thinking *sdkpluginhost.ThinkingSupport) *regi
 		Max:            thinking.Max,
 		ZeroAllowed:    thinking.ZeroAllowed,
 		DynamicAllowed: thinking.DynamicAllowed,
+		DisableType:    thinking.DisableType,
 		Levels:         cloneStringSlice(thinking.Levels),
 	}
 }

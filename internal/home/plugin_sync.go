@@ -75,16 +75,31 @@ func CurrentPluginPlatform() PluginPlatform {
 }
 
 func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Config) error {
-	if r == nil || cfg == nil || !cfg.Plugins.Enabled {
+	if r == nil {
+		return nil
+	}
+	r.localExecutorCatalogMu.Lock()
+	if cfg == nil || !cfg.Plugins.Enabled {
+		clear(r.localExecutorCatalogs)
+	} else {
+		for id := range r.localExecutorCatalogs {
+			item := cfg.Plugins.Configs[id]
+			if !pluginConfigEnabled(item) || !isLocalExecutorStoreConfig(item) {
+				delete(r.localExecutorCatalogs, id)
+			}
+		}
+	}
+	r.localExecutorCatalogMu.Unlock()
+	if cfg == nil || !cfg.Plugins.Enabled {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Catalog reads have their own timeout and can finish after config publication.
+	go r.loadLocalExecutorCatalogs(context.WithoutCancel(ctx), cfg)
+
 	auth, errAuth := r.resolvePluginStoreAuth(ctx)
-	if errAuth != nil {
-		return fmt.Errorf("home plugins: resolve store auth: %w", errAuth)
-	}
 	defer pluginstore.ClearResolvedAuthConfigs(auth)
 	platform := CurrentPluginPlatform()
 	client := newPluginStoreClient(cfg, auth)
@@ -103,32 +118,53 @@ func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Conf
 	sort.Strings(ids)
 	for _, id := range ids {
 		item := cfg.Plugins.Configs[id]
+		catalog := isLocalExecutorStoreConfig(item)
 		if !pluginConfigEnabled(item) || !pluginInstanceLoadsInHome(id, item) {
 			continue
 		}
 		manifest, okManifest, errManifest := storeManifestFromPluginConfig(id, item)
 		if errManifest != nil {
+			if catalog {
+				continue
+			}
 			return errManifest
 		}
 		if !okManifest {
 			continue
 		}
-		syncKey, errKey := pluginStoreManifestKey(root, platform, manifest)
-		if errKey != nil {
-			return errKey
-		}
-		if r.pluginStoreArtifactCurrent(root, manifest, syncKey) {
+		if catalog && manifest.ID != id {
 			continue
 		}
-		result, errInstall := r.installPluginStoreManifest(ctx, client, manifest, root, platform)
-		if errInstall != nil {
-			return errInstall
+		var errSync error
+		if errAuth != nil {
+			errSync = fmt.Errorf("home plugins: resolve store auth: %w", errAuth)
+		} else {
+			errSync = r.syncPluginStoreManifest(ctx, client, manifest, root, platform)
 		}
-		if errMark := r.markPluginStoreSynced(root, manifest, syncKey, result); errMark != nil {
-			return errMark
+		if errSync == nil {
+			continue
 		}
+		if !catalog {
+			return errSync
+		}
+		log.WithError(errSync).WithField("plugin_id", id).Warn("ACP plugin unavailable in Home runtime")
 	}
 	return nil
+}
+
+func (r *Runtime) syncPluginStoreManifest(ctx context.Context, client pluginstore.Client, manifest pluginstore.Manifest, root string, platform PluginPlatform) error {
+	syncKey, errKey := pluginStoreManifestKey(root, platform, manifest)
+	if errKey != nil {
+		return errKey
+	}
+	if r.pluginStoreArtifactCurrent(root, manifest, syncKey) {
+		return nil
+	}
+	result, errInstall := r.installPluginStoreManifest(ctx, client, manifest, root, platform)
+	if errInstall != nil {
+		return errInstall
+	}
+	return r.markPluginStoreSynced(root, manifest, syncKey, result)
 }
 
 func (r *Runtime) installPluginStoreManifest(ctx context.Context, client pluginstore.Client, manifest pluginstore.Manifest, root string, platform PluginPlatform) (pluginstore.InstallResult, error) {

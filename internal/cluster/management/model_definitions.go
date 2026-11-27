@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 )
 
@@ -110,7 +111,12 @@ func (h *Handler) getModels(c *gin.Context, includeBillingModels bool) {
 	case "available", "active", "current":
 		if includeBillingModels {
 			h.runtime.PruneCopilotModels()
-			c.JSON(http.StatusOK, gin.H{"scope": "available", "models": h.availableBillingModelDefinitions()})
+			routes, _, errRoutes := h.runtime.LocalExecutorRoutes(c.Request.Context(), "")
+			if errRoutes != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "ACP model catalog unavailable"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"scope": "available", "models": h.availableBillingModelDefinitions(routes)})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
@@ -262,7 +268,7 @@ func (h *Handler) availableBillingRoutes(models []*registry.ModelInfo) iter.Seq[
 	}
 }
 
-func (h *Handler) availableBillingModelDefinitions() []billingModelDefinition {
+func (h *Handler) availableBillingModelDefinitions(routes map[string]home.LocalExecutorRoute) []billingModelDefinition {
 	models := registry.GetGlobalRegistry().GetAvailableModelDefinitions()
 	targets := make(map[string]map[billingModelTarget]struct{}, len(models))
 	for route := range h.availableBillingRoutes(models) {
@@ -285,5 +291,12 @@ func (h *Handler) availableBillingModelDefinitions() []billingModelDefinition {
 		})
 		out = append(out, billingModelDefinition{ModelInfo: model, BillingModels: items})
 	}
+	for _, route := range routes {
+		out = append(out, billingModelDefinition{
+			ModelInfo:     &route.Model,
+			BillingModels: []billingModelTarget{{Provider: route.Plugin, Model: route.Model.SourceModelID}},
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }

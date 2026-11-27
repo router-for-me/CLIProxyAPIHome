@@ -383,6 +383,45 @@ func TestAppendUsageCreatesBillingChargeAndDeductsCredits(t *testing.T) {
 	}
 }
 
+func TestLocalExecutorUsageBillsCallerOnce(t *testing.T) {
+	ctx := t.Context()
+	repo, closeRepo := newBillingTestRepository(t, ctx)
+	defer closeRepo()
+	username := "acp-billing@example.com"
+	credits := 10.0
+	user, errUser := repo.CreateUser(ctx, UserUpdate{Username: &username, Credits: &credits})
+	if errUser != nil {
+		t.Fatal(errUser)
+	}
+	key := "local-acp-billing-key"
+	if _, errKey := repo.CreateAPIKeyForUser(ctx, user.ID, APIKeyUserUpdate{APIKey: &key}); errKey != nil {
+		t.Fatal(errKey)
+	}
+	if _, errPrice := repo.CreateBillingModelPrice(ctx, BillingModelPriceUpdate{
+		Provider: "alpha", Model: "team/local-model", InputPricePerMillion: 2, OutputPricePerMillion: 3, Enabled: true,
+	}); errPrice != nil {
+		t.Fatal(errPrice)
+	}
+	payload := `{"timestamp":"2026-06-10T01:02:03Z","provider":"alpha","executor_type":"plugin:alpha","model":"team/local-model","alias":"acp/team/local-model","auth_index":"local-slot","auth_type":"oauth","api_key":"local-acp-billing-key","execution_id":"acp-execution-1","tokens":{"input_tokens":1000000,"output_tokens":1000000,"total_tokens":2000000}}`
+	for _, wantInserted := range []bool{true, false} {
+		record, inserted, errUsage := repo.AppendUsageWithRuntimeOutcome(ctx, payload, UsageRuntimeMetadata{CPANodeID: "acp-node"})
+		if errUsage != nil || inserted != wantInserted {
+			t.Fatalf("append = inserted %v, error %v, want inserted %v", inserted, errUsage, wantInserted)
+		}
+		if record.AuthIndex != "local-slot" || record.QuotaCredentialID != "" || record.CPANodeID != "acp-node" {
+			t.Fatal("usage did not retain its local attribution")
+		}
+	}
+	charges, errCharges := repo.ListBillingCharges(ctx, BillingChargeQuery{UserID: &user.ID, Limit: 10})
+	if errCharges != nil || len(charges.Records) != 1 {
+		t.Fatalf("charges = %d, error = %v", len(charges.Records), errCharges)
+	}
+	charge := charges.Records[0]
+	if charge.Amount != 5 || charge.OriginalModel != "acp/team/local-model" || charge.ActualModel != "team/local-model" {
+		t.Fatalf("unexpected charge: amount %v, models %s/%s", charge.Amount, charge.OriginalModel, charge.ActualModel)
+	}
+}
+
 func TestAppendUsageUnlimitedCreditsKeepsBalanceAndRecordsCharge(t *testing.T) {
 	t.Parallel()
 
