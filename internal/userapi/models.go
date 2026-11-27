@@ -101,36 +101,16 @@ func (h *Handler) ListModels(c *gin.Context) {
 	if !settings.PublicModelPricing {
 		items := make([]gin.H, 0, len(models))
 		for _, model := range models {
-			items = append(items, userModelResponse(model, nil))
+			items = append(items, userModelResponse(model))
 		}
 		c.JSON(http.StatusOK, gin.H{"models": items, "total": len(items)})
 		return
 	}
 
-	modelIDs := make([]string, 0, len(models))
-	for _, model := range models {
-		modelIDs = append(modelIDs, model.ID)
-	}
-
-	prices, errPrices := h.modelPriceIndex(ctx, modelIDs)
-	if errPrices != nil {
-		respondError(c, http.StatusInternalServerError, "model_price_load_failed", errPrices)
+	items, ok := h.pricedUserModels(c, ctx, models, routes)
+	if !ok {
 		return
 	}
-
-	availability, bounds, errAvailability := h.modelAvailabilityIndex(ctx, modelIDs)
-	if errAvailability != nil {
-		respondError(c, http.StatusInternalServerError, "model_availability_load_failed", errAvailability)
-		return
-	}
-
-	items := make([]gin.H, 0, len(models))
-	for _, model := range models {
-		item := userModelResponse(model, prices)
-		item["availability"] = availabilityFor(availability, model.ID, bounds)
-		items = append(items, item)
-	}
-
 	c.JSON(http.StatusOK, gin.H{"models": items, "total": len(items)})
 }
 
@@ -188,28 +168,9 @@ func (h *Handler) ListAccessibleModels(c *gin.Context) {
 		}
 		models = appendLocalUserModels(models, routes, allowed)
 	}
-	modelIDs := make([]string, 0, len(models))
-	for _, model := range models {
-		modelIDs = append(modelIDs, model.ID)
-	}
-
-	prices, errPrices := h.modelPriceIndex(ctx, modelIDs)
-	if errPrices != nil {
-		respondError(c, http.StatusInternalServerError, "model_price_load_failed", errPrices)
+	items, ok := h.pricedUserModels(c, ctx, models, routes)
+	if !ok {
 		return
-	}
-
-	availability, bounds, errAvailability := h.modelAvailabilityIndex(ctx, modelIDs)
-	if errAvailability != nil {
-		respondError(c, http.StatusInternalServerError, "model_availability_load_failed", errAvailability)
-		return
-	}
-
-	items := make([]gin.H, 0, len(models))
-	for _, model := range models {
-		item := userModelResponse(model, prices)
-		item["availability"] = availabilityFor(availability, model.ID, bounds)
-		items = append(items, item)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -295,34 +256,49 @@ func modelAccessReason(access cluster.UserModelAccess) string {
 	return modelAccessReasonModelGroups
 }
 
-// modelPriceIndex loads the enabled price rules for exactly the models being
-// returned, in one query.
-func (h *Handler) modelPriceIndex(ctx context.Context, modelIDs []string) (modelPriceIndex, error) {
-	if len(modelIDs) == 0 {
-		return modelPriceIndex{}, nil
+func (h *Handler) pricedUserModels(c *gin.Context, ctx context.Context, models []*registry.ModelInfo, routes map[string]home.LocalExecutorRoute) ([]gin.H, bool) {
+	publicIDs := make([]string, 0, len(models))
+	priceIDs := make([]string, 0, len(models))
+	candidates := make([][]string, len(models))
+	for i, model := range models {
+		publicIDs = append(publicIDs, model.ID)
+		native, alias := model.ID, ""
+		if route, ok := routes[model.ID]; ok {
+			native, alias = route.Model.SourceModelID, model.ID
+		}
+		candidates[i] = cluster.BillingCatalogPriceModels(native, alias)
+		priceIDs = append(priceIDs, candidates[i]...)
 	}
-	records, errRecords := h.repo.ListEnabledBillingModelPricesForModels(ctx, modelIDs)
-	if errRecords != nil {
-		return nil, errRecords
+	records, errPrices := h.repo.ListEnabledBillingModelPricesForModels(ctx, priceIDs)
+	if errPrices != nil {
+		respondError(c, http.StatusInternalServerError, "model_price_load_failed", errPrices)
+		return nil, false
 	}
-	return newModelPriceIndex(records), nil
+	prices := newModelPriceIndex(records)
+	availability, bounds, errAvailability := h.modelAvailabilityIndex(ctx, publicIDs)
+	if errAvailability != nil {
+		respondError(c, http.StatusInternalServerError, "model_availability_load_failed", errAvailability)
+		return nil, false
+	}
+	items := make([]gin.H, 0, len(models))
+	for i, model := range models {
+		item := userModelResponse(model)
+		item["pricing"] = prices.pricingFor(candidates[i], model.Providers)
+		item["availability"] = availabilityFor(availability, model.ID, bounds)
+		items = append(items, item)
+	}
+	return items, true
 }
 
 // userModelResponse redacts a registry definition into the buyer-facing shape.
 // Fields the registry never learned are omitted rather than zero-filled: a
 // missing context window is unknown, not a context window of zero.
-func userModelResponse(model *registry.ModelInfo, prices modelPriceIndex) gin.H {
+func userModelResponse(model *registry.ModelInfo) gin.H {
 	providers := copyNonEmptyStrings(model.Providers)
 	entry := gin.H{
 		"id":           strings.TrimSpace(model.ID),
 		"modalities":   userModelModalities(model),
 		"capabilities": userModelCapabilities(model),
-	}
-	// A nil index means the caller is not entitled to pricing at all, which is
-	// not the same as a model nobody priced. The key is absent rather than
-	// present-and-unpublished so the two never blur together.
-	if prices != nil {
-		entry["pricing"] = prices.pricingFor(model.ID, providers)
 	}
 	if displayName := strings.TrimSpace(model.DisplayName); displayName != "" {
 		entry["display_name"] = displayName

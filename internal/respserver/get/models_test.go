@@ -5,10 +5,26 @@ import (
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPIHome/internal/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/registry"
 	"github.com/router-for-me/CLIProxyAPIHome/internal/respserver/dispatch"
 	"github.com/tidwall/gjson"
 )
+
+func TestBuildModelsJSONReservesErrorEnvelope(t *testing.T) {
+	rt, _ := newGetTestRuntime(t)
+	const id = "acp/team/test"
+	payload, errBuild := buildModelsJSON(dispatch.Env{Runtime: rt}, nil, map[string]home.LocalExecutorRoute{
+		id: {Plugin: "error", Model: registry.ModelInfo{ID: id, Providers: []string{"error"}}},
+	})
+	if errBuild != nil {
+		t.Fatal(errBuild)
+	}
+	if gjson.Get(payload, "error").Exists() || gjson.Get(payload, "Error.0.id").String() != id ||
+		gjson.Get(payload, "Error.0.providers.0").String() != "error" {
+		t.Fatalf("invalid provider section: %s", payload)
+	}
+}
 
 func TestBuildModelsJSONClaudeToolSearchCapability(t *testing.T) {
 	rt, _ := newGetTestRuntime(t)

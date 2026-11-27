@@ -209,6 +209,39 @@ func TestRuntimeConfigFromRootRejectsUnsafeTrustedProxy(t *testing.T) {
 	}
 }
 
+func TestLoadPluginSyncConfigReadsOnlyRoutingSettings(t *testing.T) {
+	db := openDatabaseSnapshotSQLiteRawTestDB(t, filepath.Join(t.TempDir(), "home.db"))
+	// Deliberately create no API key, lifecycle or credential tables.
+	if errMigrate := db.AutoMigrate(&ConfigRecord{}); errMigrate != nil {
+		t.Fatal(errMigrate)
+	}
+	records := []ConfigRecord{
+		{Key: "plugins", Value: JSONB(`{"enabled":true,"configs":{"sample":{"enabled":true,"prefix":"team"}}}`)},
+		{Key: "oauth-model-alias", Value: JSONB(`{"gemini":[{"name":"upstream","alias":"acp/reserved"}]}`)},
+		{Key: "proxy-url", Value: JSONB(`"http://proxy.example"`)},
+		{Key: "trusted-proxies", Value: JSONB(`{"invalid":"unrelated setting"}`)},
+	}
+	if errCreate := db.Create(&records).Error; errCreate != nil {
+		t.Fatal(errCreate)
+	}
+	repo := NewRepository(db)
+	cfg, errLoad := repo.LoadPluginSyncConfig(t.Context())
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if !cfg.Plugins.Enabled || cfg.Plugins.Configs["sample"].Enabled == nil ||
+		cfg.ProxyURL != "http://proxy.example" || len(cfg.OAuthModelAlias["gemini"]) != 1 ||
+		cfg.OAuthModelAlias["gemini"][0].Alias != "acp/reserved" {
+		t.Fatal("missing plugin, alias or proxy configuration")
+	}
+	if errDisable := db.Model(&ConfigRecord{}).Where("key = ?", "plugins").Update("value", JSONB(`{"enabled":false}`)).Error; errDisable != nil {
+		t.Fatal(errDisable)
+	}
+	if latest, errLatest := repo.LoadPluginSyncConfig(t.Context()); errLatest != nil || latest.Plugins.Enabled {
+		t.Fatalf("disabled plugin still active or config read failed: %v", errLatest)
+	}
+}
+
 func TestLoadConfigAsRuntimeConfigProjectsPluginAuthRevisionWithoutStoreAuth(t *testing.T) {
 	db, errOpen := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "home.db"))
 	if errOpen != nil {

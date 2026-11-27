@@ -422,6 +422,12 @@ func (r *Runtime) Stop() {
 	if r == nil {
 		return
 	}
+	r.localExecutorCatalogMu.Lock()
+	for _, catalog := range r.localExecutorCatalogs {
+		catalog.cancel()
+	}
+	clear(r.localExecutorCatalogs)
+	r.localExecutorCatalogMu.Unlock()
 	r.cfgMu.Lock()
 	antigravityCancel := r.antigravityCancel
 	r.antigravityCancel = nil

@@ -321,10 +321,7 @@ func run() int {
 	}
 	pluginAuthService := pluginauth.NewService(repo)
 	rt.SetPluginStoreAuthResolver(pluginAuthService.Resolved)
-	rt.SetPluginSyncConfigLoader(func(ctx context.Context) (*config.Config, error) {
-		current, _, errConfig := repo.LoadConfigAsRuntimeConfig(ctx)
-		return current, errConfig
-	})
+	rt.SetPluginSyncConfigLoader(repo.LoadPluginSyncConfig)
 	rt.SetPluginSyncNodeActive(repo.ClientCertificateFingerprintActive)
 
 	clusterClientAddr, errClusterClientAddr := resolveDatabaseNodeIP(runCtx, clusterDB, dbBackend, clusterCfg, clusterExists)

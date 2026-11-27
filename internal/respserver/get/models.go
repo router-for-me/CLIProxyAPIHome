@@ -83,6 +83,10 @@ func buildModelsJSON(env dispatch.Env, policy *coreauth.ModelAccess, localRoutes
 		if groupKey == "" || model == nil {
 			return
 		}
+		// The lowercase wire key is the error envelope. CPA folds provider sections back to lowercase.
+		if groupKey == "error" {
+			groupKey = "Error"
+		}
 		id := strings.TrimSpace(model.ID)
 		if id == "" {
 			return

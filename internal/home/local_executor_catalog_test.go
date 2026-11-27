@@ -3,9 +3,11 @@ package home
 import (
 	"bytes"
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
@@ -96,6 +98,7 @@ store: {id: healthy, tags: [ACP], version: 1.0.0, source-url: "https://example.i
 	}}
 	brokenStarted, healthyStarted := make(chan struct{}), make(chan struct{})
 	release := make(chan struct{})
+	defer close(release)
 	rt := &Runtime{}
 	rt.SetPluginSyncConfigLoader(func(context.Context) (*config.Config, error) { return cfg, nil })
 	rt.SetLocalExecutorCatalogLoader(func(ctx context.Context, _ *config.Config, manifest pluginstore.Manifest, _ []byte) ([]registry.ModelInfo, error) {
@@ -121,9 +124,55 @@ store: {id: healthy, tags: [ACP], version: 1.0.0, source-url: "https://example.i
 			t.Fatal("both catalog loads must start while the broken plugin is blocked")
 		}
 	}
-	close(release)
-	routes, _, errRoutes := rt.LocalExecutorRoutes(ctx, "")
-	if route := routes["acp/healthy-model"]; errRoutes != nil || len(routes) != 1 || route.Plugin != "healthy" {
-		t.Fatalf("routes = %#v, error = %v", routes, errRoutes)
+	for _, requested := range []string{"", "acp/healthy-model"} {
+		routes, _, errRoutes := rt.LocalExecutorRoutes(ctx, requested)
+		if route := routes["acp/healthy-model"]; ctx.Err() != nil || errRoutes != nil || len(routes) != 1 || route.Plugin != "healthy" {
+			t.Fatalf("requested %q while broken plugin was blocked: routes = %#v, error = %v, context = %v", requested, routes, errRoutes, ctx.Err())
+		}
 	}
+}
+
+func TestLocalExecutorCatalogSurvivesCanceledReader(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := &config.Config{Plugins: config.PluginsConfig{Enabled: true, Configs: map[string]config.PluginInstanceConfig{
+			"sample": homePluginConfigFromYAML(t, `enabled: true
+store: {id: sample, tags: [ACP], version: 1.0.0, source-url: "https://example.invalid/registry.json", install: {type: direct}}`),
+		}}}
+		rt := &Runtime{}
+		rt.SetPluginSyncConfigLoader(func(context.Context) (*config.Config, error) { return cfg, nil })
+		started, release := make(chan struct{}, 2), make(chan struct{})
+		rt.SetLocalExecutorCatalogLoader(func(ctx context.Context, _ *config.Config, _ pluginstore.Manifest, _ []byte) ([]registry.ModelInfo, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return []registry.ModelInfo{{ID: "shared"}}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+		first, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() {
+			_, _, errRoutes := rt.LocalExecutorRoutes(first, "")
+			result <- errRoutes
+		}()
+		<-started
+		cancel()
+		if errRoutes := <-result; !errors.Is(errRoutes, context.Canceled) {
+			t.Errorf("first reader error = %v", errRoutes)
+		}
+		start := time.Now()
+		for range 2 {
+			pending, _, errPending := rt.LocalExecutorRoutes(t.Context(), "")
+			if len(pending) != 0 || errPending != nil || time.Since(start) > localExecutorCatalogFirstRead {
+				t.Fatalf("pending catalog held readers for %v: routes = %v, error = %v", time.Since(start), pending, errPending)
+			}
+		}
+		close(release)
+		synctest.Wait()
+		routes, _, errRoutes := rt.LocalExecutorRoutes(t.Context(), "acp/shared")
+		if errRoutes != nil || routes["acp/shared"].Plugin != "sample" || len(started) != 0 {
+			t.Fatalf("shared load was discarded or restarted: routes = %#v, error = %v", routes, errRoutes)
+		}
+	})
 }

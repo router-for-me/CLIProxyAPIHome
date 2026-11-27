@@ -27,9 +27,16 @@ type LocalExecutorRoute struct {
 // LocalExecutorRoutes resolves the installed ACP catalogs before applying any caller policy.
 // A non-nil second result reserves the requested ID for a credential model or explicit alias.
 func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string) (map[string]LocalExecutorRoute, []string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cfg, errConfig := r.pluginSyncConfig(ctx)
 	if errConfig != nil {
 		return nil, nil, errConfig
+	}
+	requestedModel = coreauth.CanonicalModelID(requestedModel)
+	if requestedModel == "" && (cfg == nil || !cfg.Plugins.Enabled) {
+		return nil, nil, nil
 	}
 	reserved := make(map[string][]string)
 	if manager := r.CoreManager(); manager != nil {
@@ -59,7 +66,6 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 		}
 	}
 
-	requestedModel = coreauth.CanonicalModelID(requestedModel)
 	if authIDs, exists := reserved[strings.ToLower(requestedModel)]; exists {
 		return nil, authIDs, nil
 	}
@@ -68,8 +74,11 @@ func (r *Runtime) LocalExecutorRoutes(ctx context.Context, requestedModel string
 	}
 
 	routes := make(map[string]LocalExecutorRoute)
-	for _, plugin := range r.loadLocalExecutorCatalogs(ctx, cfg) {
-		if plugin.catalog == nil {
+	for _, plugin := range r.startLocalExecutorCatalogs(cfg) {
+		if !plugin.catalog.available(ctx) {
+			if errContext := ctx.Err(); errContext != nil {
+				return nil, nil, errContext
+			}
 			continue
 		}
 		id := plugin.manifest.ID

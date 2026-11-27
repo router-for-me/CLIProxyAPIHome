@@ -15,6 +15,32 @@ import (
 	"gorm.io/gorm"
 )
 
+// LoadPluginSyncConfig reads the current store settings, route reservations and download proxy.
+func (r *Repository) LoadPluginSyncConfig(ctx context.Context) (*appconfig.Config, error) {
+	db, errDB := r.database()
+	if errDB != nil {
+		return nil, errDB
+	}
+	var records []ConfigRecord
+	if errFind := db.WithContext(contextOrBackground(ctx)).Select("key", "value").
+		Where("key IN ?", []string{"plugins", "oauth-model-alias", "proxy-url"}).Find(&records).Error; errFind != nil {
+		return nil, errFind
+	}
+	root := make(map[string]any, len(records))
+	for _, record := range records {
+		var value any
+		if errDecode := json.Unmarshal(record.Value, &value); errDecode != nil {
+			return nil, errDecode
+		}
+		root[record.Key] = value
+	}
+	if errProject := projectPluginAuthConfig(root, 0); errProject != nil {
+		return nil, errProject
+	}
+	cfg, _, errConfig := RuntimeConfigFromRoot(root)
+	return cfg, errConfig
+}
+
 // LoadConfigAsRuntimeConfig loads a config as runtime config.
 func (r *Repository) LoadConfigAsRuntimeConfig(ctx context.Context) (*appconfig.Config, []byte, error) {
 	// Normalize source data before building the derived payload.

@@ -113,12 +113,16 @@ func (r *Repository) ListModelAvailability(ctx context.Context, query ModelAvail
 		return map[string]ModelAvailabilitySummary{}, nil
 	}
 
-	// LOWER() on the column rules out an index on model alone, but no such
-	// index exists and none would be used here anyway: the window predicate is
-	// what the planner drives this query from.
+	// CPA reports the authorized registered ID in model. The requested alias
+	// identifies local ACP usage but can also contain a request-option suffix.
+	const publicModel = `CASE WHEN substr("usage"."alias", 1, 4) = 'acp/'
+		AND "usage"."provider" <> '' AND "usage"."executor_type" = ('plugin:' || "usage"."provider")
+		AND COALESCE(TRIM("usage"."payload" ->> 'auth_id'), '') = ''
+		THEN 'acp/' || "usage"."model" ELSE "usage"."model" END`
+	const modelKey = "LOWER(" + publicModel + ")"
 	scope := db.WithContext(contextOrBackground(ctx)).
 		Table("usage").
-		Where(`LOWER("usage"."model") IN ?`, wanted)
+		Where(modelKey+" IN ?", wanted)
 	if !query.From.IsZero() {
 		scope = scope.Where(`"usage"."timestamp" >= ?`, query.From)
 	}
@@ -129,8 +133,8 @@ func (r *Repository) ListModelAvailability(ctx context.Context, query ModelAvail
 	outputTokens := `(` + usageObservabilitySQLDisplayTokens(`"usage"`, "output_tokens") + `)`
 	var rows []modelAvailabilityRow
 	if errScan := scope.Select(`
-		LOWER("usage"."model") AS model_key,
-		MIN("usage"."model") AS model,
+		` + modelKey + ` AS model_key,
+		MIN(` + publicModel + `) AS model,
 		COUNT("usage"."id") AS sample_count,
 		SUM(CASE WHEN "usage"."failed" THEN 0 ELSE 1 END) AS success_count,
 		SUM(CASE WHEN "usage"."failed" THEN 1 ELSE 0 END) AS failed_count,
@@ -140,7 +144,7 @@ func (r *Repository) ListModelAvailability(ctx context.Context, query ModelAvail
 		SUM(CASE WHEN "usage"."failed" THEN 0 WHEN "usage"."latency_ms" > 0 AND ` + outputTokens + ` > 0 THEN "usage"."latency_ms" ELSE 0 END) AS throughput_latency_ms,
 		MIN("usage"."timestamp") AS first_observed_at,
 		MAX("usage"."timestamp") AS last_observed_at`).
-		Group(`LOWER("usage"."model")`).
+		Group(modelKey).
 		Scan(&rows).Error; errScan != nil {
 		return nil, errScan
 	}

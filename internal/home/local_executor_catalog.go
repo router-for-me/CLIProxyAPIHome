@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	sdkpluginhost "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginhost"
@@ -27,10 +26,11 @@ import (
 const LocalExecutorCatalogWorkerArg = "--plugin-catalog-worker"
 
 const (
-	localExecutorCatalogResult  = "catalog.json"
-	localExecutorCatalogReceipt = "catalog-v1.ready"
-	localExecutorCatalogTimeout = 20 * time.Second
-	localExecutorCatalogRetry   = 30 * time.Second
+	localExecutorCatalogResult    = "catalog.json"
+	localExecutorCatalogReceipt   = "catalog-v1.ready"
+	localExecutorCatalogTimeout   = 20 * time.Second
+	localExecutorCatalogRetry     = 30 * time.Second
+	localExecutorCatalogFirstRead = 100 * time.Millisecond
 )
 
 type localExecutorCatalog struct {
@@ -38,6 +38,8 @@ type localExecutorCatalog struct {
 	configKey    [sha256.Size]byte
 	artifactKey  string
 	ready        chan struct{}
+	waitUntil    time.Time
+	cancel       context.CancelFunc
 	models       []registry.ModelInfo
 	err          error
 	retryAt      time.Time
@@ -74,8 +76,10 @@ type installedLocalExecutor struct {
 	catalog  *localExecutorCatalog
 }
 
-func (r *Runtime) loadLocalExecutorCatalogs(ctx context.Context, cfg *config.Config) []installedLocalExecutor {
+func (r *Runtime) startLocalExecutorCatalogs(cfg *config.Config) []installedLocalExecutor {
 	var plugins []installedLocalExecutor
+	// All new catalogs share one short first-read window, regardless of plugin count.
+	waitUntil := time.Now().Add(localExecutorCatalogFirstRead)
 	for id, item := range cfg.Plugins.Configs {
 		if !pluginConfigEnabled(item) || !isLocalExecutorStoreConfig(item) {
 			continue
@@ -88,7 +92,10 @@ func (r *Runtime) loadLocalExecutorCatalogs(ctx context.Context, cfg *config.Con
 		if !installed || manifest.ID != id || normalizeDesiredPluginFileVersion(manifest.Version) == "" {
 			continue
 		}
-		plugins = append(plugins, installedLocalExecutor{manifest: manifest, item: item})
+		catalog := r.startLocalExecutorCatalog(cfg, manifest, item, waitUntil)
+		if catalog != nil {
+			plugins = append(plugins, installedLocalExecutor{manifest: manifest, item: item, catalog: catalog})
+		}
 	}
 	sort.Slice(plugins, func(i, j int) bool {
 		left, right := plugins[i], plugins[j]
@@ -97,18 +104,30 @@ func (r *Runtime) loadLocalExecutorCatalogs(ctx context.Context, cfg *config.Con
 		}
 		return left.manifest.ID < right.manifest.ID
 	})
-	var workers sync.WaitGroup
-	for i := range plugins {
-		entry := &plugins[i]
-		workers.Go(func() {
-			entry.catalog = r.localExecutorModels(ctx, cfg, entry.manifest, entry.item)
-		})
-	}
-	workers.Wait()
 	return plugins
 }
 
-func (r *Runtime) localExecutorModels(ctx context.Context, cfg *config.Config, manifest pluginstore.Manifest, item config.PluginInstanceConfig) *localExecutorCatalog {
+// available lets fast cold loads finish, then serves only published catalogs until the load completes.
+func (c *localExecutorCatalog) available(ctx context.Context) bool {
+	select {
+	case <-c.ready:
+		return c.err == nil
+	default:
+	}
+	if !time.Now().Before(c.waitUntil) {
+		return false
+	}
+	waitCtx, cancel := context.WithDeadline(ctx, c.waitUntil)
+	defer cancel()
+	select {
+	case <-c.ready:
+		return c.err == nil
+	case <-waitCtx.Done():
+		return false
+	}
+}
+
+func (r *Runtime) startLocalExecutorCatalog(cfg *config.Config, manifest pluginstore.Manifest, item config.PluginInstanceConfig, waitUntil time.Time) *localExecutorCatalog {
 	values := map[string]any{}
 	if errDecode := item.Raw.Decode(&values); errDecode != nil {
 		log.WithField("plugin_id", manifest.ID).Warn("invalid ACP plugin configuration")
@@ -140,53 +159,45 @@ func (r *Runtime) localExecutorModels(ctx context.Context, cfg *config.Config, m
 		return nil
 	}
 	r.localExecutorCatalogMu.Lock()
+	defer r.localExecutorCatalogMu.Unlock()
 	if catalog := r.localExecutorCatalogs[manifest.ID]; catalog != nil && catalog.configDigest == digest &&
 		catalog.configKey == configKey && catalog.artifactKey == artifactKey &&
 		(catalog.retryAt.IsZero() || time.Now().Before(catalog.retryAt)) {
-		r.localExecutorCatalogMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-catalog.ready:
-			if catalog.err != nil {
-				return nil
-			}
-			return catalog
-		}
+		return catalog
 	}
-	catalog := &localExecutorCatalog{configDigest: digest, configKey: configKey, artifactKey: artifactKey, ready: make(chan struct{})}
+	if previous := r.localExecutorCatalogs[manifest.ID]; previous != nil {
+		previous.cancel()
+	}
+	// The installed configuration owns this worker across independent client requests.
+	loadCtx, cancel := context.WithTimeout(context.Background(), localExecutorCatalogTimeout)
+	catalog := &localExecutorCatalog{
+		configDigest: digest, configKey: configKey, artifactKey: artifactKey,
+		ready: make(chan struct{}), waitUntil: waitUntil, cancel: cancel,
+	}
 	if r.localExecutorCatalogs == nil {
 		r.localExecutorCatalogs = make(map[string]*localExecutorCatalog)
 	}
 	r.localExecutorCatalogs[manifest.ID] = catalog
-	r.localExecutorCatalogMu.Unlock()
-
-	loadCtx, cancelLoad := context.WithTimeout(ctx, localExecutorCatalogTimeout)
-	defer cancelLoad()
-	if loader := r.localExecutorCatalogLoader; loader != nil {
-		catalog.models, catalog.err = loader(loadCtx, cfg, manifest, raw)
-	} else {
-		catalog.models, catalog.err = r.readLocalExecutorCatalog(loadCtx, cfg, manifest, item, artifactKey)
-	}
-	if catalog.err == nil {
-		catalog.err = loadCtx.Err()
-	}
-	r.localExecutorCatalogMu.Lock()
-	if ctx.Err() != nil {
-		if r.localExecutorCatalogs[manifest.ID] == catalog {
-			delete(r.localExecutorCatalogs, manifest.ID)
+	go func() {
+		defer cancel()
+		if loader := r.localExecutorCatalogLoader; loader != nil {
+			catalog.models, catalog.err = loader(loadCtx, cfg, manifest, raw)
+		} else {
+			catalog.models, catalog.err = r.readLocalExecutorCatalog(loadCtx, cfg, manifest, item, artifactKey)
 		}
-	} else if catalog.err != nil {
-		catalog.retryAt = time.Now().Add(localExecutorCatalogRetry)
-	}
-	close(catalog.ready)
-	r.localExecutorCatalogMu.Unlock()
-	if catalog.err != nil {
-		if ctx.Err() == nil {
+		if catalog.err == nil {
+			catalog.err = loadCtx.Err()
+		}
+		r.localExecutorCatalogMu.Lock()
+		if catalog.err != nil {
+			catalog.retryAt = time.Now().Add(localExecutorCatalogRetry)
+		}
+		close(catalog.ready)
+		r.localExecutorCatalogMu.Unlock()
+		if catalog.err != nil && !errors.Is(loadCtx.Err(), context.Canceled) {
 			log.WithError(catalog.err).WithFields(log.Fields{"plugin_id": manifest.ID, "version": manifest.Version}).Warn("ACP catalog unavailable")
 		}
-		return nil
-	}
+	}()
 	return catalog
 }
 

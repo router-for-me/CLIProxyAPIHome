@@ -896,6 +896,8 @@ Discount metadata is not returned in this version. Clients must not derive, infe
 
 When `status` is `insufficient_data`, no rate, latency, or throughput is published. Clients must render this as "not enough data", never as full availability. The summary is cluster-wide model health and is cached briefly in-process; it contains no per-user request data.
 
+For a published ACP route, pricing uses the plugin ID as the provider. At the same rule specificity, the full registered model ID takes precedence over its public `acp/` ID, matching request-based billing. Availability counts local ACP executions under the public ID, including requests with reasoning suffixes.
+
 ## Billing
 
 User billing routes are under the `/user` base path, so the full paths are `/user/billing/overview` and `/user/billing/charges`. Both routes require the existing bearer token returned by `/user/register` or `/user/login`, and responses are scoped to the authenticated bearer user only.

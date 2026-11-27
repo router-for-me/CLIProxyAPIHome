@@ -79,15 +79,14 @@ func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Conf
 		return nil
 	}
 	r.localExecutorCatalogMu.Lock()
-	if cfg == nil || !cfg.Plugins.Enabled {
-		clear(r.localExecutorCatalogs)
-	} else {
-		for id := range r.localExecutorCatalogs {
-			item := cfg.Plugins.Configs[id]
-			if !pluginConfigEnabled(item) || !isLocalExecutorStoreConfig(item) {
-				delete(r.localExecutorCatalogs, id)
+	for id, catalog := range r.localExecutorCatalogs {
+		if cfg != nil && cfg.Plugins.Enabled {
+			if item := cfg.Plugins.Configs[id]; pluginConfigEnabled(item) && isLocalExecutorStoreConfig(item) {
+				continue
 			}
 		}
+		catalog.cancel()
+		delete(r.localExecutorCatalogs, id)
 	}
 	r.localExecutorCatalogMu.Unlock()
 	if cfg == nil || !cfg.Plugins.Enabled {
@@ -97,7 +96,7 @@ func (r *Runtime) syncPluginStoreManifests(ctx context.Context, cfg *config.Conf
 		ctx = context.Background()
 	}
 	// Catalog reads have their own timeout and can finish after config publication.
-	go r.loadLocalExecutorCatalogs(context.WithoutCancel(ctx), cfg)
+	r.startLocalExecutorCatalogs(cfg)
 
 	auth, errAuth := r.resolvePluginStoreAuth(ctx)
 	defer pluginstore.ClearResolvedAuthConfigs(auth)

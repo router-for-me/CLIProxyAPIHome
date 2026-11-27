@@ -16,6 +16,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPIHome/internal/billingexpr"
 	homeerrors "github.com/router-for-me/CLIProxyAPIHome/internal/errors"
+	"github.com/router-for-me/CLIProxyAPIHome/internal/home"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -1565,6 +1566,11 @@ func billingPriceModelCandidateGroups(usage *UsageRecord, modelSource string) ([
 	alias := strings.TrimSpace(usage.Alias)
 	requestedModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "requested_model"))
 	responseModel := strings.TrimSpace(usagePayloadString(string(usage.PayloadJSON), "response_model"))
+	var publicModel string
+	// Keep explicit prices for a suffixed request, then try its published ACP route.
+	if strings.HasSuffix(alias, ")") && home.IsLocalExecutorUsage(usage.Provider, usage.ExecutorType, usagePayloadString(string(usage.PayloadJSON), "auth_id"), alias) {
+		publicModel = home.LocalExecutorPrefix + model
+	}
 
 	buildGroup := func(seen map[string]struct{}, items ...billingPriceModelCandidate) []billingPriceModelCandidate {
 		var out []billingPriceModelCandidate
@@ -1587,6 +1593,7 @@ func billingPriceModelCandidateGroups(usage *UsageRecord, modelSource string) ([
 		{model: model, source: billingPriceModelSourceModel},
 		{model: alias, source: billingPriceModelSourceAlias},
 		{model: requestedModel, source: billingPriceModelSourceAlias},
+		{model: publicModel, source: billingPriceModelSourceAlias},
 		{model: billingStripChannelPrefix(model), source: billingPriceModelSourceModel},
 		{model: billingStripChannelPrefix(alias), source: billingPriceModelSourceAlias},
 		{model: billingStripChannelPrefix(requestedModel), source: billingPriceModelSourceAlias},
@@ -1613,6 +1620,16 @@ func billingPriceModelCandidateGroups(usage *UsageRecord, modelSource string) ([
 func billingPriceModelCandidates(usage *UsageRecord) []billingPriceModelCandidate {
 	primary, fallback := billingPriceModelCandidateGroups(usage, BillingModelSourceRequest)
 	return append(primary, fallback...)
+}
+
+// BillingCatalogPriceModels returns the request-price candidates known before execution, in charge order.
+func BillingCatalogPriceModels(model, alias string) []string {
+	candidates, _ := billingPriceModelCandidateGroups(&UsageRecord{Model: model, Alias: alias}, BillingModelSourceRequest)
+	names := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		names = append(names, candidate.model)
+	}
+	return names
 }
 
 // billingContextInputTokens returns the full prompt context used for context-band

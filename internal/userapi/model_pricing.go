@@ -42,11 +42,7 @@ func newModelPriceIndex(records []cluster.BillingModelPriceRecord) modelPriceInd
 // 2. exact provider + longest model pattern
 // 3. wildcard provider ("*") + exact model
 // 4. wildcard provider ("*") + longest model pattern
-func (index modelPriceIndex) selectProviderPriceRecords(provider, modelID string) []cluster.BillingModelPriceRecord {
-	candidates := []string{modelID}
-	if bare := cluster.BillingStripChannelPrefix(modelID); bare != "" && !strings.EqualFold(bare, modelID) {
-		candidates = append(candidates, bare)
-	}
+func (index modelPriceIndex) selectProviderPriceRecords(provider string, candidates []string) []cluster.BillingModelPriceRecord {
 	levels := []struct {
 		ruleProvider string
 		pattern      bool
@@ -96,9 +92,8 @@ func (index modelPriceIndex) selectProviderPriceRecords(provider, modelID string
 // they have since removed — and quoting it would promise a route the cluster
 // cannot take. A model whose serving channels are unknown is therefore reported
 // as unpublished, not as priced by everything.
-func (index modelPriceIndex) pricingFor(modelID string, providers []string) gin.H {
-	modelID = strings.TrimSpace(modelID)
-	if len(index) == 0 || modelID == "" {
+func (index modelPriceIndex) pricingFor(candidates, providers []string) gin.H {
+	if len(index) == 0 || len(candidates) == 0 {
 		return gin.H{"status": pricingStatusUnpublished}
 	}
 
@@ -133,7 +128,7 @@ func (index modelPriceIndex) pricingFor(modelID string, providers []string) gin.
 	tiersByProvider := make(map[string][]*tierLadder, len(servable))
 
 	for _, provider := range servable {
-		records := index.selectProviderPriceRecords(provider, modelID)
+		records := index.selectProviderPriceRecords(provider, candidates)
 		if len(records) == 0 {
 			continue
 		}
