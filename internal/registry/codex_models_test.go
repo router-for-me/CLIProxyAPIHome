@@ -7,7 +7,10 @@ import (
 )
 
 func TestCodexChannelsIncludeImageBuiltins(t *testing.T) {
-	wantIDs := []string{"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
+	wantIDs := []string{
+		"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+		"gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+	}
 	for _, channel := range []string{"codex", "codex-free", "codex-plus", "codex-team", "codex-pro"} {
 		found := make(map[string]bool)
 		for _, model := range GetStaticModelDefinitionsByChannel(channel) {
@@ -44,8 +47,8 @@ func TestWithCodexBuiltinsPreservesExistingModels(t *testing.T) {
 		if !reflect.DeepEqual(input, before) {
 			t.Fatal("WithCodexBuiltins mutated its input")
 		}
-		if len(models) != 5 {
-			t.Fatalf("got %d models, want 5", len(models))
+		if len(models) != 8 {
+			t.Fatalf("got %d models, want 8", len(models))
 		}
 		found := 0
 		for _, model := range models {
@@ -81,8 +84,8 @@ func TestCodexCatalogBuiltinsOverrideRemoteDefinitions(t *testing.T) {
 
 	for _, channel := range []string{"codex-free", "codex-plus", "codex-team", "codex-pro"} {
 		models := GetStaticModelDefinitionsByChannel(channel)
-		if len(models) != 4 {
-			t.Fatalf("%s has %d models, want 4", channel, len(models))
+		if len(models) != 7 {
+			t.Fatalf("%s has %d models, want 7", channel, len(models))
 		}
 		for _, model := range models {
 			if model.ID == "gpt-image-2.5" && model.DisplayName != "GPT Image 2.5" {

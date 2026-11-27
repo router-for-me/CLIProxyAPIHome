@@ -12,7 +12,10 @@ import (
 )
 
 func TestCodexImageAliasSurvivesSynthesisAndRegistration(t *testing.T) {
-	for _, id := range []string{"gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"} {
+	for _, id := range []string{
+		"gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+		"gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+	} {
 		t.Run(id, func(t *testing.T) {
 			const upstream = "vendor/upstream-image-25"
 			cfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "test-codex-image-key", Models: []config.CodexModel{{
@@ -88,6 +91,9 @@ func TestRegisterCodexStoredModelsRefreshesBuiltins(t *testing.T) {
 		{name: "wildcard exclusion with override", override: true, excluded: "gpt-image-2.5*", absent: map[string]bool{
 			"gpt-image-2.5": true, "gpt-image-2.5-flare": true, "gpt-image-2.5-sunburst": true,
 		}},
+		{name: "wildcard exclusion of 2.6", excluded: "gpt-image-2.6*", absent: map[string]bool{
+			"gpt-image-2.6": true, "gpt-image-2.6-flare": true, "gpt-image-2.6-sunburst": true,
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var auth coreauth.Auth
@@ -118,10 +124,13 @@ func TestRegisterCodexStoredModelsRefreshesBuiltins(t *testing.T) {
 			for range 2 {
 				runtime.registerModelsForAuth(&auth)
 				models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
-				if len(models) != 4-len(tc.absent) {
-					t.Fatalf("got %d registered models, want %d", len(models), 4-len(tc.absent))
+				if len(models) != 7-len(tc.absent) {
+					t.Fatalf("got %d registered models, want %d", len(models), 7-len(tc.absent))
 				}
-				for _, id := range []string{"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"} {
+				for _, id := range []string{
+					"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+					"gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+				} {
 					info := registry.GetGlobalRegistry().GetModelInfoForClient(auth.ID, id)
 					if (info == nil) != tc.absent[id] {
 						t.Errorf("%s registered = %t, want %t", id, info != nil, !tc.absent[id])

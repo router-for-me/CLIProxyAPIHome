@@ -12,6 +12,9 @@ const (
 	codexBuiltinImage25FlareModelID    = "gpt-image-2.5-flare"
 	codexBuiltinImage25SunburstModelID = "gpt-image-2.5-sunburst"
 	codexBuiltinImage25ModelID         = "gpt-image-2.5"
+	codexBuiltinImage26FlareModelID    = "gpt-image-2.6-flare"
+	codexBuiltinImage26SunburstModelID = "gpt-image-2.6-sunburst"
+	codexBuiltinImage26ModelID         = "gpt-image-2.6"
 	xaiBuiltinImageModelID             = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID      = "grok-imagine-image-quality"
 	xaiBuiltinVideoModelID             = "grok-imagine-video"
@@ -158,13 +161,18 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 		codexBuiltinImageModelInfo(codexBuiltinImage25FlareModelID, "GPT Image 2.5 Flare"),
 		codexBuiltinImageModelInfo(codexBuiltinImage25SunburstModelID, "GPT Image 2.5 Sunburst"),
 		codexBuiltinImageModelInfo(codexBuiltinImage25ModelID, "GPT Image 2.5"),
+		codexBuiltinImageModelInfo(codexBuiltinImage26FlareModelID, "GPT Image 2.6 Flare"),
+		codexBuiltinImageModelInfo(codexBuiltinImage26SunburstModelID, "GPT Image 2.6 Sunburst"),
+		codexBuiltinImageModelInfo(codexBuiltinImage26ModelID, "GPT Image 2.6"),
 	}, models...)
 }
 
 // IsCodexBuiltinModelID reports whether id names a hard-coded Codex built-in model.
 func IsCodexBuiltinModelID(id string) bool {
 	switch strings.ToLower(strings.TrimSpace(id)) {
-	case codexBuiltinImageModelID, codexBuiltinImage25FlareModelID, codexBuiltinImage25SunburstModelID, codexBuiltinImage25ModelID:
+	case codexBuiltinImageModelID,
+		codexBuiltinImage25FlareModelID, codexBuiltinImage25SunburstModelID, codexBuiltinImage25ModelID,
+		codexBuiltinImage26FlareModelID, codexBuiltinImage26SunburstModelID, codexBuiltinImage26ModelID:
 		return true
 	default:
 		return false
